@@ -1,0 +1,9 @@
+[package]
+name = "ide-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core editor engine: rope buffer, cursor, selection, undo tree"
+
+[dependencies]
+ropey = "1.6"
+serde = { version = "1", features = ["derive"] }

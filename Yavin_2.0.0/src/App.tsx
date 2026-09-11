@@ -1,0 +1,947 @@
+import { AppDialog } from "./components/ui/AppDialog";
+import type { DialogRequest } from "./components/ui/AppDialog";
+import type { EditorHandle, EditorState, EditorAction } from "./components/layout/TextEditor";
+import type { TextHistory } from "./services/editor";
+import { matchesShortcut, shortcutLabel } from "./services/commands";
+import type { AppCommand } from "./services/commands";
+import React, { useState, useEffect, useCallback, useRef, Component } from "react";
+import { TitleBar } from "./components/layout/TitleBar";
+import { ActivityBar } from "./components/layout/ActivityBar";
+import { Sidebar } from "./components/layout/Sidebar";
+import { EditorArea } from "./components/layout/EditorArea";
+import { TerminalPanel } from "./components/layout/TerminalPanel";
+import { StatusBar } from "./components/layout/StatusBar";
+import { CommandPalette } from "./components/command-palette/CommandPalette";
+import { AIAssistantPanel } from "./components/ai/AIAssistantPanel";
+import { SearchPanel } from "./components/layout/SearchPanel";
+import type { Replacement } from "./components/layout/SearchPanel";
+import { SourceControlPanel } from "./components/layout/SourceControlPanel";
+import { DiffEditor } from "./components/layout/DiffEditor";
+import type { DiffDocument } from "./components/layout/DiffEditor";
+import type { SearchHit } from "./services/search";
+import { recordEdit } from "./services/editor";
+
+import { isTauri } from "@tauri-apps/api/core";
+import type { FileNode, EditorTab, RecentFile } from "./types";
+import { native } from "./services/native";
+import { isWithin, remapPath } from "./services/workspace";
+// Error boundary to prevent white/black screen crashes
+class ErrorBoundary extends Component<
+  React.PropsWithChildren,
+  { hasError: boolean; error: Error | null }
+> {
+  constructor(props: React.PropsWithChildren) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error("Yavin UI Error:", error, errorInfo);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex h-screen w-screen flex-col items-center justify-center bg-[#000000] text-zinc-300 p-6 font-sans">
+          <div className="max-w-md rounded-xl border border-red-900/50 bg-red-950/20 p-6 flex flex-col gap-3 text-center">
+            <span className="text-3xl text-red-500">⚠</span>
+            <h2 className="text-base font-semibold text-white">Yavin UI Runtime Notice</h2>
+            <p className="text-xs text-zinc-400 font-mono text-left bg-black/60 p-3 rounded overflow-auto max-h-32">
+              {this.state.error?.toString()}
+            </p>
+            <button
+              onClick={() => this.setState({ hasError: false, error: null })}
+              className="mt-2 rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-indigo-500"
+            >
+              Recover UI
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export default function App() {
+  const editorRef = useRef<EditorHandle>(null);
+  const histories = useRef(new Map<string, TextHistory>());
+  const savedContents = useRef<Record<string, string>>({});
+  const [editorState, setEditorState] = useState<EditorState>({
+    canUndo: false,
+    canRedo: false,
+    selected: false,
+  });
+  const [dialog, setDialog] = useState<DialogRequest | null>(null);
+  const [wordWrap, setWordWrap] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [paletteMode, setPaletteMode] = useState<"files" | "commands">("files");
+  const [workspacePath, setWorkspacePath] = useState("");
+  const [fileTree, setFileTree] = useState<FileNode>({
+    name: "Open a workspace",
+    path: "",
+    is_dir: true,
+    children: [],
+  });
+  const [fileContents, setFileContents] = useState<Record<string, string>>({});
+  const contentsRef = useRef(fileContents);
+  const workspaceRevision = useRef(0);
+  const [gitStatus, setGitStatus] = useState<Record<string, string>>({});
+  const [tabs, setTabs] = useState<EditorTab[]>([
+    { id: "welcome", name: "Welcome", path: "welcome", dirty: false },
+  ]);
+  const [activeTabId, setActiveTabId] = useState("welcome");
+  const [recentFiles, setRecentFiles] = useState<RecentFile[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isTerminalOpen, setIsTerminalOpen] = useState(false);
+  const [isTerminalMaximized, setIsTerminalMaximized] = useState(false);
+  const [isAIOpen, setIsAIOpen] = useState(false);
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+  const [activeActivityTab, setActiveActivityTab] = useState("explorer");
+  const [diff, setDiff] = useState<DiffDocument | null>(null);
+  const [searchFocus, setSearchFocus] = useState(0);
+  const [gitRevision, setGitRevision] = useState(0);
+  const [pendingHit, setPendingHit] = useState<SearchHit | null>(null);
+  const hasUnsavedChanges = tabs.some((tab) => tab.dirty);
+
+  useEffect(() => {
+    if (!hasUnsavedChanges) return;
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", beforeUnload);
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    if (isTauri()) {
+      import("@tauri-apps/api/window")
+        .then(({ getCurrentWindow }) =>
+          getCurrentWindow().onCloseRequested((event) => {
+            if (!window.confirm("Discard unsaved changes and close Yavin?")) event.preventDefault();
+          }),
+        )
+        .then((stop) => {
+          if (disposed) stop();
+          else unlisten = stop;
+        })
+        .catch((reason: unknown) =>
+          setError(`Could not register the unsaved-change guard: ${String(reason)}`),
+        );
+    }
+    return () => {
+      disposed = true;
+      unlisten?.();
+      window.removeEventListener("beforeunload", beforeUnload);
+    };
+  }, [hasUnsavedChanges]);
+
+  const reportError = useCallback((reason: unknown) => setError(String(reason)), []);
+  const updateContents = (contents: Record<string, string>) => {
+    contentsRef.current = contents;
+    setFileContents(contents);
+  };
+  const run = async (operation: () => Promise<void>) => {
+    try {
+      await operation();
+    } catch (reason) {
+      reportError(reason);
+    }
+  };
+  const loadWorkspace = useCallback(
+    async (target: string) => {
+      const tree = await native("list_workspace_files", { path: target, maxDepth: 6 });
+      setFileTree(tree);
+      setWorkspacePath(tree.path);
+      setGitStatus({});
+      setGitRevision(value => value + 1);
+    },
+    [reportError],
+  );
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    native("get_default_workspace").then(loadWorkspace).catch(reportError);
+  }, [loadWorkspace, reportError]);
+
+  const handleOpenFile = (path: string, name: string = path.split("/").pop() || path) =>
+    run(async () => {
+      setDiff(null);
+      if (path === "welcome") {
+        setActiveTabId(path);
+        return;
+      }
+      if (contentsRef.current[path] === undefined) {
+        const revision = workspaceRevision.current;
+        const content = await native("read_file_content", { path });
+        if (revision !== workspaceRevision.current) return;
+        savedContents.current[path] = content;
+        if (contentsRef.current[path] === undefined)
+          updateContents({ ...contentsRef.current, [path]: content });
+      }
+      setTabs((prev) =>
+        prev.some((tab) => tab.path === path)
+          ? prev
+          : [...prev, { id: path, path, name, dirty: false }],
+      );
+      setActiveTabId(path);
+      setRecentFiles((prev) =>
+        [{ name, path }, ...prev.filter((file) => file.path !== path)].slice(0, 10),
+      );
+    });
+
+  const handleCloseTab = (id: string) => {
+    if (saving.current.size) {
+      reportError("Wait for saves to finish before closing editors.");
+      return;
+    }
+    if (
+      tabs.find((tab) => tab.id === id)?.dirty &&
+      !window.confirm("Discard unsaved changes in this file?")
+    )
+      return;
+    setTabs((prev) => prev.filter((tab) => tab.id !== id));
+    const next = { ...contentsRef.current };
+    delete next[id];
+    histories.current.delete(id);
+    delete savedContents.current[id];
+    updateContents(next);
+    if (activeTabId === id) setActiveTabId("welcome");
+  };
+  const handleContentChange = (path: string, text: string) => {
+    updateContents({ ...contentsRef.current, [path]: text });
+    setTabs((prev) =>
+      prev.map((tab) =>
+        tab.path === path ? { ...tab, dirty: text !== savedContents.current[path] } : tab,
+      ),
+    );
+  };
+  const saving = useRef(new Set<string>());
+  const handleSaveFile = (path: string) =>
+    run(async () => {
+      const content = contentsRef.current[path];
+      if (content === undefined || saving.current.has(path)) return;
+      saving.current.add(path);
+      try {
+        await native("write_file_guarded", { path, expected: savedContents.current[path], content });
+        savedContents.current[path] = content;
+        setTabs((prev) =>
+          prev.map((tab) =>
+            tab.path === path ? { ...tab, dirty: contentsRef.current[path] !== content } : tab,
+          ),
+        );
+        setGitRevision(value => value + 1);
+      } finally {
+        saving.current.delete(path);
+      }
+    });
+  const handleOpenFolderDialog = () =>
+    run(async () => {
+      if (saving.current.size)
+        throw new Error("Wait for file saves to finish before changing workspace.");
+      if (
+        tabs.some((tab) => tab.dirty) &&
+        !window.confirm("Discard unsaved changes and open another workspace?")
+      )
+        return;
+      const selected = await native("open_folder_dialog");
+      if (!selected) return;
+      workspaceRevision.current++;
+      setDiff(null);
+      setPendingHit(null);
+      updateContents({});
+      savedContents.current = {};
+      histories.current.clear();
+      setTabs([{ id: "welcome", name: "Welcome", path: "welcome", dirty: false }]);
+      setActiveTabId("welcome");
+      setRecentFiles([]);
+      setWorkspacePath(selected);
+      setFileTree({
+        name: selected.split("/").pop() || selected,
+        path: selected,
+        is_dir: true,
+        children: [],
+      });
+      await loadWorkspace(selected);
+    });
+  const handleCreateFile = (path: string) =>
+    run(async () => {
+      await native("create_file", { path });
+      await loadWorkspace(workspacePath);
+      await handleOpenFile(path);
+    });
+  const handleCreateFolder = (path: string) =>
+    run(async () => {
+      await native("create_directory", { path });
+      await loadWorkspace(workspacePath);
+    });
+  const handleRename = (oldPath: string, newPath: string) =>
+    run(async () => {
+      if (saving.current.size)
+        throw new Error("Wait for file saves to finish before renaming files.");
+      await native("rename_path", { oldPath, newPath });
+      const remap = (path: string) => remapPath(path, oldPath, newPath);
+      setTabs((prev) =>
+        prev.map((tab) => ({
+          ...tab,
+          id: remap(tab.id),
+          path: remap(tab.path),
+          name: remap(tab.path).split("/").pop() || tab.name,
+        })),
+      );
+      setActiveTabId(remap);
+      histories.current = new Map(
+        [...histories.current].map(([path, history]) => [remap(path), history]),
+      );
+      savedContents.current = Object.fromEntries(
+        Object.entries(savedContents.current).map(([path, text]) => [remap(path), text]),
+      );
+      updateContents(
+        Object.fromEntries(
+          Object.entries(contentsRef.current).map(([path, text]) => [remap(path), text]),
+        ),
+      );
+      setRecentFiles((prev) =>
+        prev.map((file) => ({
+          path: remap(file.path),
+          name: remap(file.path).split("/").pop() || file.name,
+        })),
+      );
+      await loadWorkspace(workspacePath);
+    });
+  const handleDelete = (path: string, isDir: boolean) =>
+    run(async () => {
+      if (saving.current.size)
+        throw new Error("Wait for file saves to finish before deleting files.");
+      if (
+        tabs.some((tab) => isWithin(tab.path, path) && tab.dirty) &&
+        !window.confirm("Delete this item and discard its unsaved changes?")
+      )
+        return;
+      await native("delete_path", { path, recursive: isDir });
+      setTabs((prev) => prev.filter((tab) => !isWithin(tab.path, path)));
+      for (const key of histories.current.keys())
+        if (isWithin(key, path)) histories.current.delete(key);
+      savedContents.current = Object.fromEntries(
+        Object.entries(savedContents.current).filter(([key]) => !isWithin(key, path)),
+      );
+      if (isWithin(activeTabId, path)) setActiveTabId("welcome");
+      updateContents(
+        Object.fromEntries(
+          Object.entries(contentsRef.current).filter(([key]) => !isWithin(key, path)),
+        ),
+      );
+      setRecentFiles((prev) => prev.filter((file) => !isWithin(file.path, path)));
+      await loadWorkspace(workspacePath);
+    });
+  const handleDuplicate = (path: string) =>
+    run(async () => {
+      await native("duplicate_path", { path });
+      await loadWorkspace(workspacePath);
+    });
+  const handleCopyPath = (src: string, dest: string) =>
+    run(async () => {
+      await native("copy_path", { src, dest });
+      await loadWorkspace(workspacePath);
+    });
+  const handleMovePath = (src: string, dest: string) =>
+    handleRename(src, dest.replace(/\/$/, "") + "/" + src.split("/").pop());
+  const handleReveal = (path: string) => run(() => native("reveal_in_explorer", { path }));
+
+  const activeTab = tabs.find((t) => t.id === activeTabId);
+
+  useEffect(() => {
+    if (!pendingHit || activeTabId !== pendingHit.path || diff) return;
+    const content = fileContents[pendingHit.path];
+    if (content === undefined) return;
+    const lines = content.split("\n");
+    if (lines[pendingHit.line - 1] !== pendingHit.text.replace(/\n$/, "")) {
+      reportError("This search result changed. Search again to locate it.");
+    } else {
+      const start = lines.slice(0, pendingHit.line - 1).reduce((n, line) => n + line.length + 1, 0) + pendingHit.start;
+      editorRef.current?.revealRange(start, start + pendingHit.end - pendingHit.start);
+    }
+    setPendingHit(null);
+  }, [activeTabId, fileContents, pendingHit, diff, reportError]);
+
+  const applyReplacements = async (changes: Replacement[], saved = false) => {
+    const applied: Replacement[] = [];
+    const errors: string[] = [];
+    const revision = workspaceRevision.current;
+    for (const change of changes) {
+      try {
+        if (workspaceRevision.current !== revision) throw new Error("Workspace changed; remaining files skipped");
+        if (saving.current.has(change.path)) throw new Error("File is being saved");
+        const open = contentsRef.current[change.path];
+        if (open !== undefined && open !== change.before) throw new Error("Editor changed; preview again");
+        if (open === undefined || saved) {
+          saving.current.add(change.path);
+          try { await native("write_file_guarded", { path: change.path, expected: change.before, content: change.after }); }
+          finally { saving.current.delete(change.path); }
+          if (saved) savedContents.current[change.path] = change.after;
+        }
+        if (open !== undefined) {
+          if (contentsRef.current[change.path] !== change.before) throw new Error("Editor changed during write; saved file updated, editor retained");
+          const history = histories.current.get(change.path) ?? { past: [], future: [] };
+          recordEdit(history, { text: open, start: 0, end: 0 }); histories.current.set(change.path, history);
+          handleContentChange(change.path, change.after);
+        }
+        applied.push(change);
+      } catch (error) { errors.push(`${change.path}: ${String(error)}`); }
+    }
+    setGitRevision(value => value + 1);
+    return { applied, errors };
+  };
+
+  const reconcileWorkspace = async () => {
+    const revision = workspaceRevision.current;
+    for (const [path, before] of Object.entries(contentsRef.current)) {
+      if (before !== savedContents.current[path]) continue;
+      try {
+        const content = await native("read_file_content", { path });
+        if (revision !== workspaceRevision.current) return;
+        if (contentsRef.current[path] !== before) continue;
+        savedContents.current[path] = content;
+        updateContents({ ...contentsRef.current, [path]: content });
+      } catch (error) { reportError(`${path}: ${String(error)}`); }
+    }
+    await loadWorkspace(workspacePath);
+  };
+
+  const hasEditor = !!activeTab && activeTab.id !== "welcome";
+  const desktop = isTauri();
+  const openPalette = (mode: "files" | "commands") => {
+    setPaletteMode(mode);
+    setIsCommandPaletteOpen(true);
+  };
+  const newFile = () => {
+    if (!desktop) {
+      const path = "preview:" + crypto.randomUUID();
+      const name = "Untitled.ts";
+      savedContents.current[path] = "";
+      updateContents({ ...contentsRef.current, [path]: "" });
+      setTabs((prev) => [...prev, { id: path, path, name, dirty: false }]);
+      setActiveTabId(path);
+      return;
+    }
+    setDialog({
+      title: "New file",
+      afterClose: () => editorRef.current?.focus(),
+      message: "Enter a path relative to the workspace. Existing files will not be overwritten.",
+      input: "untitled.ts",
+      submit: async (value) => {
+        const relative = value.trim().replace(/\\/g, "/");
+        if (
+          !relative ||
+          relative.startsWith("/") ||
+          relative.includes(":") ||
+          relative.split("/").some((part) => !part || part === "." || part === "..")
+        )
+          throw new Error("Enter a valid relative file path.");
+        const path = workspacePath.replace(/\/$/, "") + "/" + relative;
+        await native("create_file", { path });
+        await handleOpenFile(path);
+        await loadWorkspace(workspacePath);
+      },
+    });
+  };
+  const closeAll = () => {
+    if (saving.current.size) throw new Error("Wait for saves to finish before closing editors.");
+    if (hasUnsavedChanges && !window.confirm("Discard all unsaved changes and close all editors?"))
+      return;
+    setTabs([{ id: "welcome", path: "welcome", name: "Welcome", dirty: false }]);
+    setActiveTabId("welcome");
+    updateContents({});
+    histories.current.clear();
+    savedContents.current = {};
+  };
+  const edit = (action: EditorAction) => editorRef.current?.execute(action);
+  const navigateTab = (direction: number) => {
+    if (!tabs.length) return;
+    const index = tabs.findIndex((tab) => tab.id === activeTabId);
+    setActiveTabId(tabs[(index + direction + tabs.length) % tabs.length].id);
+  };
+  const commands: AppCommand[] = [
+    { id: "view.search", menu: "View", label: "Search in Files", shortcut: "Mod+Shift+f", run: () => { setActiveActivityTab("search"); setIsSidebarOpen(true); setSearchFocus(v => v + 1); } },
+    { id: "view.sourceControl", menu: "View", label: "Source Control", shortcut: "Mod+Shift+g", run: () => { setActiveActivityTab("git"); setIsSidebarOpen(true); } },
+    {
+      id: "file.new",
+      menu: "File",
+      label: "New File…",
+      shortcut: "Mod+n",
+      disabled: desktop && !workspacePath,
+      run: newFile,
+    },
+    {
+      id: "file.open",
+      menu: "File",
+      label: "Open File…",
+      shortcut: "Mod+o",
+      disabled: !desktop || !workspacePath,
+      reason: "Choose a file inside the current workspace",
+      run: async () => {
+        const selected = await native("open_file_dialog");
+        if (selected) await handleOpenFile(selected);
+      },
+    },
+    {
+      id: "file.folder",
+      menu: "File",
+      label: "Open Folder…",
+      shortcut: "Mod+Shift+o",
+      disabled: !desktop,
+      run: handleOpenFolderDialog,
+    },
+    {
+      id: "file.save",
+      menu: "File",
+      label: "Save",
+      shortcut: "Mod+s",
+      disabled: !desktop || !hasEditor || !activeTab?.dirty,
+      run: () => handleSaveFile(activeTabId),
+    },
+    {
+      id: "file.saveAll",
+      menu: "File",
+      label: "Save All",
+      shortcut: "Mod+Shift+s",
+      disabled: !desktop || !hasUnsavedChanges,
+      run: async () => {
+        if (saving.current.size) throw new Error("A save is already in progress.");
+        for (const tab of tabs.filter((tab) => tab.dirty)) {
+          const content = contentsRef.current[tab.path];
+          saving.current.add(tab.path);
+          try {
+            await native("write_file_guarded", {
+              path: tab.path,
+              expected: savedContents.current[tab.path],
+              content,
+            });
+            savedContents.current[tab.path] = content;
+            setTabs((prev) =>
+              prev.map((item) =>
+                item.path === tab.path
+                  ? { ...item, dirty: contentsRef.current[tab.path] !== content }
+                  : item,
+              ),
+            );
+          } finally {
+            saving.current.delete(tab.path);
+          }
+        }
+      },
+    },
+    {
+      id: "file.close",
+      menu: "File",
+      label: "Close Editor",
+      shortcut: "Mod+w",
+      disabled: !hasEditor,
+      run: () => handleCloseTab(activeTabId),
+    },
+    {
+      id: "file.closeAll",
+      menu: "File",
+      label: "Close All Editors",
+      disabled: !hasEditor && tabs.length <= 1,
+      run: closeAll,
+    },
+    {
+      id: "file.reveal",
+      menu: "File",
+      label: "Reveal in File Explorer",
+      disabled: !desktop || !hasEditor,
+      run: () => handleReveal(activeTabId),
+    },
+    {
+      id: "file.exit",
+      menu: "File",
+      label: "Exit",
+      disabled: !desktop,
+      run: async () => {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        await getCurrentWindow().close();
+      },
+    },
+    {
+      id: "edit.undo",
+      menu: "Edit",
+      label: "Undo",
+      shortcut: "Mod+z",
+      disabled: !hasEditor || !editorState.canUndo,
+      run: () => edit("undo"),
+    },
+    {
+      id: "edit.redo",
+      menu: "Edit",
+      label: "Redo",
+      shortcut: "Mod+Shift+z",
+      disabled: !hasEditor || !editorState.canRedo,
+      run: () => edit("redo"),
+    },
+    {
+      id: "edit.cut",
+      menu: "Edit",
+      label: "Cut",
+      shortcut: "Mod+x",
+      disabled: !hasEditor || !editorState.selected,
+      run: () => edit("cut"),
+    },
+    {
+      id: "edit.copy",
+      menu: "Edit",
+      label: "Copy",
+      shortcut: "Mod+c",
+      disabled: !hasEditor || !editorState.selected,
+      run: () => edit("copy"),
+    },
+    {
+      id: "edit.paste",
+      menu: "Edit",
+      label: "Paste",
+      shortcut: "Mod+v",
+      disabled: !hasEditor,
+      run: () => edit("paste"),
+    },
+    {
+      id: "edit.find",
+      menu: "Edit",
+      label: "Find…",
+      shortcut: "Mod+f",
+      disabled: !hasEditor,
+      run: () => edit("find"),
+    },
+    {
+      id: "edit.replace",
+      menu: "Edit",
+      label: "Replace…",
+      shortcut: "Mod+h",
+      disabled: !hasEditor,
+      run: () => edit("replace"),
+    },
+    {
+      id: "selection.all",
+      menu: "Selection",
+      label: "Select All",
+      shortcut: "Mod+a",
+      disabled: !hasEditor,
+      run: () => edit("selectAll"),
+    },
+    {
+      id: "selection.line",
+      menu: "Selection",
+      label: "Select Line",
+      shortcut: "Mod+l",
+      disabled: !hasEditor,
+      run: () => edit("selectLine"),
+    },
+    {
+      id: "selection.duplicate",
+      menu: "Selection",
+      label: "Duplicate Selection or Line",
+      shortcut: "Mod+Shift+d",
+      disabled: !hasEditor,
+      run: () => edit("duplicate"),
+    },
+    {
+      id: "view.commands",
+      menu: "View",
+      label: "Command Palette…",
+      shortcut: "Mod+Shift+p",
+      run: () => openPalette("commands"),
+    },
+    {
+      id: "view.sidebar",
+      menu: "View",
+      label: "Primary Sidebar",
+      shortcut: "Mod+b",
+      checked: isSidebarOpen,
+      run: () => setIsSidebarOpen((prev) => !prev),
+    },
+    {
+      id: "view.panel",
+      menu: "View",
+      label: "Bottom Panel",
+      shortcut: "Mod+" + String.fromCharCode(96),
+      checked: isTerminalOpen,
+      run: () => setIsTerminalOpen((prev) => !prev),
+    },
+    {
+      id: "view.ai",
+      menu: "View",
+      label: "AI Assistant Panel",
+      checked: isAIOpen,
+      run: () => setIsAIOpen((prev) => !prev),
+    },
+    {
+      id: "view.wrap",
+      menu: "View",
+      label: "Word Wrap",
+      shortcut: "Alt+z",
+      checked: wordWrap,
+      run: () => setWordWrap((prev) => !prev),
+    },
+    {
+      id: "view.zoomIn",
+      menu: "View",
+      label: "Zoom In",
+      disabled: zoom >= 2,
+      run: () => setZoom((prev) => Math.min(2, prev + 0.1)),
+    },
+    {
+      id: "view.zoomOut",
+      menu: "View",
+      label: "Zoom Out",
+      disabled: zoom <= 0.7,
+      run: () => setZoom((prev) => Math.max(0.7, prev - 0.1)),
+    },
+    { id: "view.zoomReset", menu: "View", label: "Reset Zoom", run: () => setZoom(1) },
+    {
+      id: "go.file",
+      menu: "Go",
+      label: "Go to File…",
+      shortcut: "Mod+p",
+      run: () => openPalette("files"),
+    },
+    {
+      id: "go.line",
+      menu: "Go",
+      label: "Go to Line…",
+      shortcut: "Mod+g",
+      disabled: !hasEditor,
+      run: () =>
+        setDialog({
+          title: "Go to line",
+          input: "1",
+          afterClose: () => editorRef.current?.focus(),
+          submit: (value) => {
+            if (!/^\d+$/.test(value.trim())) throw new Error("Enter a positive whole line number.");
+            editorRef.current?.goToLine(Number(value));
+          },
+        }),
+    },
+    {
+      id: "go.previous",
+      menu: "Go",
+      label: "Previous Editor",
+      shortcut: "Mod+PageUp",
+      disabled: tabs.length < 2,
+      run: () => navigateTab(-1),
+    },
+    {
+      id: "go.next",
+      menu: "Go",
+      label: "Next Editor",
+      shortcut: "Mod+PageDown",
+      disabled: tabs.length < 2,
+      run: () => navigateTab(1),
+    },
+    {
+      id: "terminal.toggle",
+      menu: "Terminal",
+      label: "Show / Hide Panel",
+      checked: isTerminalOpen,
+      run: () => setIsTerminalOpen((prev) => !prev),
+    },
+    {
+      id: "terminal.new",
+      menu: "Terminal",
+      label: "New Terminal (not available)",
+      disabled: true,
+      reason: "Native terminal execution has not been implemented",
+      run: () => {},
+    },
+    {
+      id: "help.shortcuts",
+      menu: "Help",
+      label: "Keyboard Shortcuts",
+      run: () =>
+        setDialog({
+          title: "Keyboard shortcuts",
+          message: commands
+            .filter((command) => command.shortcut)
+            .map((command) => command.label + " — " + shortcutLabel(command.shortcut!))
+            .join("\n"),
+        }),
+    },
+    {
+      id: "help.about",
+      menu: "Help",
+      label: "About Yavin",
+      run: () =>
+        setDialog({
+          title: "About Yavin IDE",
+          message:
+            "Yavin IDE 2.0.0\nReact + TypeScript + Vite + Tauri\n\nBrowse and edit workspace files. Native terminal execution, AI services, and language servers are not connected.\n\nBrowser preview keeps edits only in memory; open the desktop application to save files.",
+        }),
+    },
+  ];
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        event.isComposing ||
+        event.repeat ||
+        dialog ||
+        isCommandPaletteOpen
+      )
+        return;
+      const command = commands.find(
+        (item) => item.shortcut && matchesShortcut(event, item.shortcut),
+      );
+      if (!command) return;
+      const target = event.target;
+      const textControl =
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        (target instanceof HTMLElement && target.isContentEditable);
+      const nativeTextCommand = [
+        "edit.cut",
+        "edit.copy",
+        "edit.paste",
+        "edit.undo",
+        "edit.redo",
+        "selection.all",
+      ].includes(command.id);
+      if (textControl && nativeTextCommand) return;
+      event.preventDefault();
+      if (!command.disabled)
+        void run(async () => {
+          await command.run();
+        });
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  });
+
+  return (
+    <ErrorBoundary>
+      <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#000000] text-zinc-100 font-sans antialiased">
+        {!isTauri() && (
+          <div role="status" className="bg-zinc-900 px-4 py-2 text-xs">
+            Browser preview. Open the desktop app to work with local files.
+          </div>
+        )}
+        {error && (
+          <div role="alert" className="bg-red-950 px-4 py-2 text-sm">
+            {error}
+            <button className="ml-4 underline" onClick={() => setError(null)}>
+              Dismiss
+            </button>
+          </div>
+        )}
+        {/* Top TitleBar */}
+        <TitleBar
+          onToggleSidebar={() => setIsSidebarOpen((prev) => !prev)}
+          onToggleTerminal={() => setIsTerminalOpen((prev) => !prev)}
+          onToggleAI={() => setIsAIOpen((prev) => !prev)}
+          onOpenCommandPalette={() => openPalette("files")}
+          isAIOpen={isAIOpen}
+          commands={commands}
+          onError={reportError}
+        />
+
+        {/* Main Workspace Area */}
+        <div className="flex flex-1 min-h-0 w-full overflow-hidden">
+          {/* Leftmost Activity Bar */}
+          <ActivityBar
+            activeTab={activeActivityTab}
+            onSelectTab={(tabId) => {
+              if (activeActivityTab === tabId && isSidebarOpen) {
+                setIsSidebarOpen(false);
+              } else {
+                setActiveActivityTab(tabId);
+                setIsSidebarOpen(true);
+              }
+            }}
+            onOpenSettings={() => openPalette("commands")}
+          />
+
+          {/* Dynamic File Tree Explorer */}
+          <SearchPanel key={`search:${workspacePath}`} workspace={workspacePath} buffers={fileContents}
+            visible={isSidebarOpen && activeActivityTab === "search"} focusRequest={searchFocus}
+            onOpen={hit => { setPendingHit(hit); void handleOpenFile(hit.path); }}
+            read={path => contentsRef.current[path] !== undefined ? Promise.resolve(contentsRef.current[path]) : native("read_file_content", { path })}
+            apply={applyReplacements} />
+          <SourceControlPanel key={`git:${workspacePath}`} workspace={workspacePath} buffers={fileContents}
+            visible={isSidebarOpen && activeActivityTab === "git"} dirty={hasUnsavedChanges}
+            revision={gitRevision} onDiff={setDiff} onChanged={reconcileWorkspace}
+            apply={changes => applyReplacements(changes, true)}
+            onEntries={entries => setGitStatus(Object.fromEntries(entries.map(entry => [entry.path, entry.conflict ? "CONFLICT" : entry.untracked ? "U" : entry.index !== " " ? entry.index : entry.worktree])))} />
+          {isSidebarOpen && activeActivityTab !== "search" && activeActivityTab !== "git" && (
+            <Sidebar
+              activeTab={activeActivityTab}
+              workspacePath={workspacePath}
+              fileTree={fileTree}
+              gitStatus={gitStatus}
+              onOpenFile={handleOpenFile}
+              activeFile={activeTab?.path || ""}
+              onRefresh={() => run(() => loadWorkspace(workspacePath))}
+              onCreateFile={handleCreateFile}
+              onCreateFolder={handleCreateFolder}
+              onRename={handleRename}
+              onDelete={handleDelete}
+              onDuplicate={handleDuplicate}
+              onCopyFile={handleCopyPath}
+              onMoveFile={handleMovePath}
+              onReveal={handleReveal}
+              onOpenFolderDialog={handleOpenFolderDialog}
+            />
+          )}
+
+          {/* Center: Editor + Bottom Terminal Panel */}
+          <div className="flex flex-1 flex-col min-w-0 bg-[#000000]">
+            {diff ? <DiffEditor key={diff.path + diff.title + diff.text} document={diff} onClose={() => setDiff(null)} onOpen={() => void handleOpenFile(diff.path)} /> : <EditorArea
+              tabs={tabs}
+              activeTabId={activeTabId}
+              onSelectTab={(path, name) => handleOpenFile(path, name || path.split("/").pop())}
+              onCloseTab={handleCloseTab}
+              onNewFile={newFile}
+              onOpenCommandPalette={() => openPalette("commands")}
+              onOpenFolderDialog={handleOpenFolderDialog}
+              fileContents={fileContents}
+              onContentChange={handleContentChange}
+              onSaveFile={handleSaveFile}
+              recentFiles={recentFiles}
+              editorRef={editorRef}
+              histories={histories.current}
+              onEditorState={setEditorState}
+              wordWrap={wordWrap}
+              zoom={zoom}
+            />}
+
+            {isTerminalOpen && (
+              <TerminalPanel
+                onClose={() => setIsTerminalOpen(false)}
+                isMaximized={isTerminalMaximized}
+                onToggleMaximize={() => setIsTerminalMaximized((prev) => !prev)}
+              />
+            )}
+          </div>
+
+          {/* Right AI Drawer */}
+          {isAIOpen && <AIAssistantPanel onClose={() => setIsAIOpen(false)} />}
+        </div>
+
+        {/* Status Bar */}
+        <StatusBar
+          activeFile={activeTab?.path || ""}
+          onToggleTerminal={() => setIsTerminalOpen((prev) => !prev)}
+        />
+
+        {dialog && <AppDialog request={dialog} onClose={() => setDialog(null)} />}
+        {/* Command Palette */}
+        <CommandPalette
+          commands={commands}
+          mode={paletteMode}
+          onError={reportError}
+          fileTree={fileTree}
+          isOpen={isCommandPaletteOpen}
+          onClose={() => setIsCommandPaletteOpen(false)}
+          onSelectFile={handleOpenFile}
+        />
+      </div>
+    </ErrorBoundary>
+  );
+}

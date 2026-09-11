@@ -1,0 +1,11 @@
+[package]
+name = "ide-terminal"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal emulation: PTY spawning and ANSI parsing"
+
+[dependencies]
+portable-pty = "0.9"
+vte = "0.13"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }

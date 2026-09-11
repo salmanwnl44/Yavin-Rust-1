@@ -1,0 +1,10 @@
+[package]
+name = "ide-syntax"
+version = "0.1.0"
+edition = "2021"
+description = "Syntax parsing and highlighting via tree-sitter"
+
+[dependencies]
+tree-sitter = "0.24"
+tree-sitter-highlight = "0.24"
+serde = { version = "1", features = ["derive"] }
