@@ -1,0 +1,40 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: Yavin_2.0.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: Yavin_2.0.0/package-lock.json
+      - run: rustup update stable
+      - run: rustup default stable
+      - run: rustup component add rustfmt clippy
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm test
+      - run: npm run test:ui
+      - run: npm run build
+      - run: ./scripts/setup-search.ps1
+        shell: pwsh
+      - run: cargo fmt --all --check
+        working-directory: Yavin_2.0.0/src-tauri
+      - run: cargo check --workspace --locked
+        working-directory: Yavin_2.0.0/src-tauri
+      - run: cargo test --workspace --locked
+        working-directory: Yavin_2.0.0/src-tauri
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        working-directory: Yavin_2.0.0/src-tauri
