@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { flattenFiles, isWithin, parseGitStatus, remapPath } from "./workspace.ts";
+import type { FileNode } from "../types.ts";
+import {
+  findNode,
+  isWithin,
+  loadedDirectories,
+  nearestLoadedDirectory,
+  parentOf,
+  parseGitStatus,
+  remapPath,
+  setChildren,
+  validateEntryName,
+} from "./workspace.ts";
 
 test("folder rename remaps descendants without matching sibling prefixes", () => {
   assert.equal(remapPath("/work/src/a.ts", "/work/src", "/work/lib"), "/work/lib/a.ts");
@@ -31,22 +42,68 @@ test("Git conflicts are distinct from untracked files", () => {
   assert.deepEqual(parseGitStatus("", "/work"), {});
 });
 
-test("quick open uses full native paths and skips folders", () => {
+test("a new listing keeps the children of folders that were already loaded", () => {
+  const tree: FileNode = {
+    name: "work",
+    path: "/work",
+    is_dir: true,
+    children: [
+      {
+        name: "src",
+        path: "/work/src",
+        is_dir: true,
+        children: [{ name: "a.ts", path: "/work/src/a.ts", is_dir: false }],
+      },
+      { name: "gone", path: "/work/gone", is_dir: true, children: null },
+    ],
+  };
+  const listed = setChildren(tree, "/work", [
+    { name: "new", path: "/work/new", is_dir: true, children: null },
+    { name: "src", path: "/work/src", is_dir: true, children: null },
+  ]);
   assert.deepEqual(
-    flattenFiles({
-      name: "work",
-      path: "/work",
-      is_dir: true,
-      children: [
-        {
-          name: "src",
-          path: "/work/src",
-          is_dir: true,
-          children: [{ name: "app.tsx", path: "/work/src/app.tsx", is_dir: false }],
-        },
-        { name: "empty", path: "/work/empty", is_dir: true, children: null },
-      ],
-    }),
-    [{ title: "app.tsx", subtitle: "/work/src/app.tsx", type: "file" }],
+    listed.children?.map((child) => child.name),
+    ["new", "src"],
   );
+  assert.deepEqual(
+    findNode(listed, "/work/src")?.children?.map((child) => child.path),
+    ["/work/src/a.ts"],
+  );
+
+  const deeper = setChildren(listed, "/work/src", [
+    { name: "b.ts", path: "/work/src/b.ts", is_dir: false },
+  ]);
+  assert.deepEqual(
+    findNode(deeper, "/work/src")?.children?.map((child) => child.name),
+    ["b.ts"],
+  );
+  assert.equal(findNode(deeper, "/work/new")?.children, null);
+  assert.equal(findNode(deeper, "/work/missing"), null);
+  assert.deepEqual(loadedDirectories(deeper), ["/work", "/work/src"]);
+  assert.equal(parentOf("/work/src/b.ts"), "/work/src");
+  assert.equal(nearestLoadedDirectory(deeper, "/work/src/b.ts"), "/work/src");
+  assert.equal(nearestLoadedDirectory(deeper, "/work/new/deep/c.ts"), "/work");
+});
+
+test("entry names are rejected when they are invalid on any supported platform", () => {
+  for (const name of [
+    "",
+    "  ",
+    ".",
+    "..",
+    "a:b",
+    "a\\b",
+    "a*",
+    "name.",
+    "name ",
+    "CON",
+    "com1.txt",
+  ])
+    assert.notEqual(validateEntryName(name), null, name);
+  assert.notEqual(validateEntryName("a/b.ts"), null);
+  assert.equal(validateEntryName("a/b.ts", true), null);
+  assert.notEqual(validateEntryName("a//b.ts", true), null);
+  assert.notEqual(validateEntryName("../b.ts", true), null);
+  assert.equal(validateEntryName(".gitignore"), null);
+  assert.equal(validateEntryName("console.ts"), null);
 });

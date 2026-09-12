@@ -100,7 +100,9 @@ export function TextEditor({
     revealRange(start, end) {
       const current = snapshot();
       apply({ ...current, start, end });
-      if (textarea.current) textarea.current.scrollTop = current.text.slice(0, start).split("\n").length * 22 * zoom - 100;
+      if (textarea.current)
+        textarea.current.scrollTop =
+          current.text.slice(0, start).split("\n").length * 22 * zoom - 100;
     },
     async execute(action) {
       const current = snapshot();

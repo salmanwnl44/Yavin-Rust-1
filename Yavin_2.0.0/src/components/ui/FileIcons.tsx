@@ -1,3 +1,5 @@
+import React from "react";
+
 // Sleek modern chevron
 export function ChevronIcon({
   isExpanded,
@@ -657,8 +659,63 @@ export function DefaultFileIcon({ className = "size-4" }) {
   );
 }
 
-// Dynamic Dispatcher for Top 20+ Languages and Extensions
-export function FileIcon({
+// --- Dispatcher ------------------------------------------------------------
+// Each icon declares the extensions it owns once; the lookup tables are built
+// from those lists at module load, so picking an icon is a couple of Map hits.
+
+type Icon = React.ComponentType<{ className?: string }>;
+
+const EXTENSION_GROUPS: [Icon, string[]][] = [
+  [PythonIcon, ["py", "pyw", "ipynb"]],
+  [CppIcon, ["cpp", "cxx", "cc", "hpp", "hxx", "hh", "inl"]],
+  [CIcon, ["c", "h"]],
+  [CSharpIcon, ["cs", "csx"]],
+  [RustIcon, ["rs"]],
+  [ReactIcon, ["jsx", "tsx"]],
+  [JavaScriptIcon, ["js", "mjs", "cjs"]],
+  [TypeScriptIcon, ["ts", "mts", "cts"]],
+  [GoIcon, ["go"]],
+  [JavaIcon, ["java", "jar", "class", "kt"]],
+  [HtmlIcon, ["html", "htm", "xhtml"]],
+  [CssIcon, ["css", "scss", "sass", "less"]],
+  [JsonIcon, ["json", "jsonc", "json5"]],
+  [TomlIcon, ["toml"]],
+  [YamlIcon, ["yaml", "yml"]],
+  [SqlIcon, ["sql", "db", "sqlite", "sqlite3"]],
+  [ShellIcon, ["sh", "bash", "zsh", "ps1", "bat", "cmd", "fish"]],
+  [MarkdownIcon, ["md", "mdx", "markdown"]],
+  [PhpIcon, ["php", "phtml"]],
+  [RubyIcon, ["rb", "erb"]],
+  [VueIcon, ["vue"]],
+  [SvelteIcon, ["svelte"]],
+  [ImageIcon, ["svg", "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp"]],
+  [MediaIcon, ["mp3", "wav", "ogg", "mp4", "mov", "mkv", "webm"]],
+  [PdfIcon, ["pdf"]],
+  [ZipIcon, ["zip", "tar", "gz", "7z", "rar"]],
+  [LockIcon, ["lock"]],
+];
+
+const BY_EXTENSION = new Map<string, Icon>();
+for (const [icon, extensions] of EXTENSION_GROUPS)
+  for (const extension of extensions) BY_EXTENSION.set(extension, icon);
+
+// Whole-name matches win over the extension, so package-lock.json is a lockfile.
+const BY_NAME = new Map<string, Icon>([
+  ["dockerfile", DockerIcon],
+  [".dockerignore", DockerIcon],
+  ["docker-compose.yml", DockerIcon],
+  ["docker-compose.yaml", DockerIcon],
+  ["gemfile", RubyIcon],
+  [".gitignore", GitFileIcon],
+  [".gitattributes", GitFileIcon],
+  [".gitmodules", GitFileIcon],
+  ["package-lock.json", LockIcon],
+  ["pnpm-lock.yaml", LockIcon],
+  ["yarn.lock", LockIcon],
+]);
+
+/** Picks the icon for a file or folder by name. */
+export const FileIcon = React.memo(function FileIcon({
   name,
   isDir,
   isExpanded,
@@ -669,219 +726,19 @@ export function FileIcon({
   isExpanded?: boolean;
   className?: string;
 }) {
-  if (isDir) {
+  if (isDir)
     return isExpanded ? (
       <FolderOpenIcon name={name} className={className} />
     ) : (
       <FolderClosedIcon name={name} className={className} />
     );
-  }
 
   const lower = (name || "").toLowerCase();
-
-  // Python & Notebooks
-  if (lower.endsWith(".py") || lower.endsWith(".pyw") || lower.endsWith(".ipynb")) {
-    return <PythonIcon className={className} />;
-  }
-
-  // C++
-  if (
-    lower.endsWith(".cpp") ||
-    lower.endsWith(".cxx") ||
-    lower.endsWith(".cc") ||
-    lower.endsWith(".hpp") ||
-    lower.endsWith(".hxx") ||
-    lower.endsWith(".hh") ||
-    lower.endsWith(".inl")
-  ) {
-    return <CppIcon className={className} />;
-  }
-
-  // C
-  if (lower.endsWith(".c") || lower.endsWith(".h")) {
-    return <CIcon className={className} />;
-  }
-
-  // C#
-  if (lower.endsWith(".cs") || lower.endsWith(".csx")) {
-    return <CSharpIcon className={className} />;
-  }
-
-  // Rust
-  if (lower.endsWith(".rs")) {
-    return <RustIcon className={className} />;
-  }
-
-  // React
-  if (lower.endsWith(".jsx") || lower.endsWith(".tsx")) {
-    return <ReactIcon className={className} />;
-  }
-
-  // JavaScript
-  if (lower.endsWith(".js") || lower.endsWith(".mjs") || lower.endsWith(".cjs")) {
-    return <JavaScriptIcon className={className} />;
-  }
-
-  // TypeScript
-  if (lower.endsWith(".ts") || lower.endsWith(".mts") || lower.endsWith(".cts")) {
-    return <TypeScriptIcon className={className} />;
-  }
-
-  // Go
-  if (lower.endsWith(".go")) {
-    return <GoIcon className={className} />;
-  }
-
-  // Java & Kotlin
-  if (
-    lower.endsWith(".java") ||
-    lower.endsWith(".jar") ||
-    lower.endsWith(".class") ||
-    lower.endsWith(".kt")
-  ) {
-    return <JavaIcon className={className} />;
-  }
-
-  // HTML
-  if (lower.endsWith(".html") || lower.endsWith(".htm") || lower.endsWith(".xhtml")) {
-    return <HtmlIcon className={className} />;
-  }
-
-  // CSS, SCSS, SASS, LESS
-  if (
-    lower.endsWith(".css") ||
-    lower.endsWith(".scss") ||
-    lower.endsWith(".sass") ||
-    lower.endsWith(".less")
-  ) {
-    return <CssIcon className={className} />;
-  }
-
-  // JSON
-  if (lower.endsWith(".json") || lower.endsWith(".jsonc") || lower.endsWith(".json5")) {
-    return <JsonIcon className={className} />;
-  }
-
-  // TOML
-  if (lower.endsWith(".toml")) {
-    return <TomlIcon className={className} />;
-  }
-
-  // YAML
-  if (lower.endsWith(".yaml") || lower.endsWith(".yml")) {
-    return <YamlIcon className={className} />;
-  }
-
-  // SQL & Databases
-  if (
-    lower.endsWith(".sql") ||
-    lower.endsWith(".db") ||
-    lower.endsWith(".sqlite") ||
-    lower.endsWith(".sqlite3")
-  ) {
-    return <SqlIcon className={className} />;
-  }
-
-  // Shell, Bash, PowerShell, Batch
-  if (
-    lower.endsWith(".sh") ||
-    lower.endsWith(".bash") ||
-    lower.endsWith(".zsh") ||
-    lower.endsWith(".ps1") ||
-    lower.endsWith(".bat") ||
-    lower.endsWith(".cmd") ||
-    lower.endsWith(".fish")
-  ) {
-    return <ShellIcon className={className} />;
-  }
-
-  // Docker
-  if (lower === "dockerfile" || lower.includes("docker-compose") || lower === ".dockerignore") {
-    return <DockerIcon className={className} />;
-  }
-
-  // Markdown
-  if (lower.endsWith(".md") || lower.endsWith(".mdx") || lower.endsWith(".markdown")) {
-    return <MarkdownIcon className={className} />;
-  }
-
-  // PHP
-  if (lower.endsWith(".php") || lower.endsWith(".phtml")) {
-    return <PhpIcon className={className} />;
-  }
-
-  // Ruby
-  if (lower.endsWith(".rb") || lower.endsWith(".erb") || lower === "gemfile") {
-    return <RubyIcon className={className} />;
-  }
-
-  // Vue & Svelte
-  if (lower.endsWith(".vue")) return <VueIcon className={className} />;
-  if (lower.endsWith(".svelte")) return <SvelteIcon className={className} />;
-
-  // Images & SVGs
-  if (
-    lower.endsWith(".svg") ||
-    lower.endsWith(".png") ||
-    lower.endsWith(".jpg") ||
-    lower.endsWith(".jpeg") ||
-    lower.endsWith(".gif") ||
-    lower.endsWith(".webp") ||
-    lower.endsWith(".ico") ||
-    lower.endsWith(".bmp")
-  ) {
-    return <ImageIcon className={className} />;
-  }
-
-  // Audio & Video
-  if (
-    lower.endsWith(".mp3") ||
-    lower.endsWith(".wav") ||
-    lower.endsWith(".ogg") ||
-    lower.endsWith(".mp4") ||
-    lower.endsWith(".mov") ||
-    lower.endsWith(".mkv") ||
-    lower.endsWith(".webm")
-  ) {
-    return <MediaIcon className={className} />;
-  }
-
-  // Env & Secrets
-  if (lower.startsWith(".env")) {
-    return <EnvIcon className={className} />;
-  }
-
-  // Git files
-  if (
-    lower.includes("git") ||
-    lower === ".gitignore" ||
-    lower === ".gitattributes" ||
-    lower === ".gitmodules"
-  ) {
-    return <GitFileIcon className={className} />;
-  }
-
-  // Lockfiles
-  if (
-    lower.endsWith(".lock") ||
-    lower === "package-lock.json" ||
-    lower === "pnpm-lock.yaml" ||
-    lower === "yarn.lock"
-  ) {
-    return <LockIcon className={className} />;
-  }
-
-  // PDFs & Archives
-  if (lower.endsWith(".pdf")) return <PdfIcon className={className} />;
-  if (
-    lower.endsWith(".zip") ||
-    lower.endsWith(".tar") ||
-    lower.endsWith(".gz") ||
-    lower.endsWith(".7z") ||
-    lower.endsWith(".rar")
-  ) {
-    return <ZipIcon className={className} />;
-  }
-
-  return <DefaultFileIcon className={className} />;
-}
+  const Icon =
+    BY_NAME.get(lower) ??
+    (lower.startsWith(".env")
+      ? EnvIcon
+      : BY_EXTENSION.get(lower.slice(lower.lastIndexOf(".") + 1))) ??
+    DefaultFileIcon;
+  return <Icon className={className} />;
+});

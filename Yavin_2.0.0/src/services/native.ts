@@ -1,8 +1,9 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { FileNode } from "../types";
 
 interface Commands {
-  get_default_workspace: { args: undefined; result: string };
+  get_default_workspace: { args: undefined; result: string | null };
   list_workspace_files: { args: { path: string; maxDepth: number }; result: FileNode };
   read_file_content: { args: { path: string }; result: string };
   create_file: { args: { path: string }; result: void };
@@ -16,16 +17,51 @@ interface Commands {
   open_file_dialog: { args: undefined; result: string | null };
   get_git_status: { args: { path: string }; result: { root: string; output: string } };
   write_file_guarded: { args: { path: string; expected: string; content: string }; result: void };
-  search_project: { args: { workspace: string; id: string; options: SearchOptions }; result: ToolOutput };
+  search_project: {
+    args: { workspace: string; id: string; options: SearchOptions };
+    result: ToolOutput;
+  };
   cancel_search: { args: { id: string }; result: void };
-  git_workbench: { args: { workspace: string; action: string; path?: string; value?: string }; result: string };
+  git_workbench: {
+    args: { workspace: string; action: string; path?: string; value?: string };
+    result: string;
+  };
 }
 
-export interface ToolOutput { stdout: string; stderr: string; code: number; truncated: boolean }
+export interface ToolOutput {
+  stdout: string;
+  stderr: string;
+  code: number;
+  truncated: boolean;
+}
 export interface SearchOptions {
-  query: string; caseSensitive: boolean; wholeWord: boolean; regex: boolean;
-  hidden: boolean; ignored: boolean; include: string[]; exclude: string[];
-  folder: string; buffer: string | null; filesOnly: boolean;
+  query: string;
+  caseSensitive: boolean;
+  wholeWord: boolean;
+  regex: boolean;
+  hidden: boolean;
+  ignored: boolean;
+  include: string[];
+  exclude: string[];
+  folder: string;
+  buffer: string | null;
+  filesOnly: boolean;
+}
+
+/**
+ * Subscribes to edits made outside the app. Returns an unsubscribe function that
+ * is safe to call before the listener has finished registering.
+ */
+export function onWorkspaceChanged(handler: () => void): () => void {
+  if (!isTauri()) return () => {};
+  let cancelled = false;
+  const pending = listen("workspace-changed", () => {
+    if (!cancelled) handler();
+  }).catch(() => undefined);
+  return () => {
+    cancelled = true;
+    void pending.then((unlisten) => unlisten?.());
+  };
 }
 
 export function native<K extends keyof Commands>(

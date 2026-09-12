@@ -1,65 +1,96 @@
 use file_tree::WorkspaceManager;
 use ide_workspace::file_tree::{self, FileNode};
-use std::{env, sync::Mutex};
-use tauri::State;
+use ide_workspace::watcher::{self, RecommendedWatcher};
+use std::{env, path::Path, sync::Mutex};
+use tauri::{AppHandle, Emitter, State};
 mod workbench;
 use workbench::{cancel_search, git_workbench, search_project, write_file_guarded};
 
 struct Workspace(Mutex<Option<WorkspaceManager>>);
 
+/// Holds the live filesystem watcher; replacing it stops watching the previous root.
+#[derive(Default)]
+struct Watch(Mutex<Option<RecommendedWatcher>>);
+
+/// Reports edits made outside the app (a checkout, a build, another editor) to the UI.
+fn watch_workspace(app: &AppHandle, watch: &Watch, root: &Path) {
+    let handle = app.clone();
+    let started = watcher::start_watcher(root, move || {
+        let _ = handle.emit("workspace-changed", ());
+    });
+    match started {
+        Ok(active) => {
+            if let Ok(mut guard) = watch.0.lock() {
+                *guard = Some(active);
+            }
+        }
+        // Losing live updates is not fatal; the explorer still has manual Refresh.
+        Err(error) => eprintln!("Cannot watch workspace: {error}"),
+    }
+}
+
+/// Runs `action` on a copy of the workspace so long filesystem work does not hold the lock.
 fn with_workspace<T>(
     state: &Workspace,
     action: impl FnOnce(&WorkspaceManager) -> Result<T, String>,
 ) -> Result<T, String> {
-    let guard = state.0.lock().map_err(|e| e.to_string())?;
-    action(guard.as_ref().ok_or("Open a workspace first")?)
+    let manager = state
+        .0
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or("Open a workspace first")?;
+    action(&manager)
 }
 
-#[tauri::command]
-fn get_default_workspace(state: State<'_, Workspace>) -> Result<String, String> {
+/// Release builds start without a workspace; development builds open the current directory.
+#[tauri::command(async)]
+fn get_default_workspace(
+    app: AppHandle,
+    state: State<'_, Workspace>,
+    watch: State<'_, Watch>,
+) -> Result<Option<String>, String> {
     let mut guard = state.0.lock().map_err(|e| e.to_string())?;
-    if guard.is_none() {
+    if guard.is_none() && cfg!(debug_assertions) {
         *guard = Some(WorkspaceManager::new(
             env::current_dir().map_err(|e| e.to_string())?,
         )?);
     }
-    guard
-        .as_ref()
-        .map(|manager| file_tree::clean_path_str(manager.root()))
-        .ok_or_else(|| "Workspace initialization failed".into())
+    let root = guard.as_ref().map(|manager| manager.root().to_path_buf());
+    drop(guard);
+    if let Some(root) = &root {
+        watch_workspace(&app, &watch, root);
+    }
+    Ok(root.as_deref().map(file_tree::clean_path_str))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_workspace_files(
     state: State<'_, Workspace>,
     path: String,
     max_depth: Option<usize>,
 ) -> Result<FileNode, String> {
     with_workspace(&state, |manager| {
-        let validated = manager.validate_path(&path)?;
-        file_tree::list_directory(
-            &file_tree::clean_path_str(validated),
-            Some(max_depth.unwrap_or(6).min(12)),
-        )
+        manager.list_directory(&path, max_depth.unwrap_or(1).min(12))
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn read_file_content(state: State<'_, Workspace>, path: String) -> Result<String, String> {
     with_workspace(&state, |manager| manager.read_file(&path))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn create_file(state: State<'_, Workspace>, path: String) -> Result<(), String> {
     with_workspace(&state, |manager| manager.create_file(&path))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn create_directory(state: State<'_, Workspace>, path: String) -> Result<(), String> {
     with_workspace(&state, |manager| manager.create_directory(&path))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn rename_path(
     state: State<'_, Workspace>,
     old_path: String,
@@ -68,12 +99,12 @@ fn rename_path(
     with_workspace(&state, |manager| manager.rename_path(&old_path, &new_path))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_path(state: State<'_, Workspace>, path: String, recursive: bool) -> Result<(), String> {
     with_workspace(&state, |manager| manager.delete_path(&path, recursive))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn duplicate_path(state: State<'_, Workspace>, path: String) -> Result<String, String> {
     with_workspace(&state, |manager| {
         let p = manager.validate_path(&path)?;
@@ -84,19 +115,26 @@ fn duplicate_path(state: State<'_, Workspace>, path: String) -> Result<String, S
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reveal_in_explorer(state: State<'_, Workspace>, path: String) -> Result<(), String> {
     with_workspace(&state, |manager| {
         file_tree::reveal_in_os_explorer(&file_tree::clean_path_str(manager.validate_path(&path)?))
     })
 }
 
+// Native dialogs stay on the main thread (required on macOS).
 #[tauri::command]
-fn open_folder_dialog(state: State<'_, Workspace>) -> Result<Option<String>, String> {
+fn open_folder_dialog(
+    app: AppHandle,
+    state: State<'_, Workspace>,
+    watch: State<'_, Watch>,
+) -> Result<Option<String>, String> {
     let selected = file_tree::pick_workspace_folder()?;
     if let Some(path) = &selected {
         let manager = WorkspaceManager::new(path)?;
+        let root = manager.root().to_path_buf();
         *state.0.lock().map_err(|e| e.to_string())? = Some(manager);
+        watch_workspace(&app, &watch, &root);
     }
     Ok(selected)
 }
@@ -113,7 +151,7 @@ fn open_file_dialog(state: State<'_, Workspace>) -> Result<Option<String>, Strin
         .transpose()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn copy_path(state: State<'_, Workspace>, src: String, dest: String) -> Result<(), String> {
     with_workspace(&state, |manager| {
         file_tree::copy_path(
@@ -123,7 +161,7 @@ fn copy_path(state: State<'_, Workspace>, src: String, dest: String) -> Result<(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_git_status(
     state: State<'_, Workspace>,
     path: String,
@@ -139,6 +177,7 @@ fn get_git_status(
 pub fn run() {
     if let Err(error) = tauri::Builder::default()
         .manage(Workspace(Mutex::new(None)))
+        .manage(Watch::default())
         .manage(workbench::Jobs::default())
         .manage(workbench::GitLock::default())
         .invoke_handler(tauri::generate_handler![

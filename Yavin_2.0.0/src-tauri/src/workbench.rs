@@ -145,7 +145,7 @@ pub async fn search_project(
     result?
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn write_file_guarded(
     state: State<'_, Workspace>,
     path: String,

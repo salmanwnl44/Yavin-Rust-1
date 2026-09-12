@@ -14,11 +14,18 @@ test-results
 playwright-report
 *.local
 
+# Rust and Tauri
+target/
+**/target/
+src-tauri/gen/
+**/*.rs.bk
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
 .idea
 .DS_Store
+Thumbs.db
 *.suo
 *.ntvs*
 *.njsproj

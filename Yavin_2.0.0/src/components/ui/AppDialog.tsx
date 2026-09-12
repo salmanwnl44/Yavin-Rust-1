@@ -5,17 +5,21 @@ export interface DialogRequest {
   message?: string;
   input?: string;
   submit?: (value: string) => void | Promise<void>;
+  confirmLabel?: string;
   afterClose?: () => void;
 }
 
 export function AppDialog({ request, onClose }: { request: DialogRequest; onClose: () => void }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const confirm = useRef<HTMLButtonElement>(null);
   const [value, setValue] = useState(request.input ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   useEffect(() => {
     ref.current?.showModal();
-  }, []);
+    // Without an input, Enter confirms and Escape cancels.
+    if (request.input === undefined) confirm.current?.focus();
+  }, [request.input]);
   return (
     <dialog
       ref={ref}
@@ -70,8 +74,13 @@ export function AppDialog({ request, onClose }: { request: DialogRequest; onClos
               Cancel
             </button>
           )}
-          <button type="submit" disabled={busy} className="rounded bg-indigo-600 px-4 py-2">
-            {busy ? "Working…" : request.submit ? "Continue" : "Close"}
+          <button
+            ref={confirm}
+            type="submit"
+            disabled={busy}
+            className="rounded bg-indigo-600 px-4 py-2"
+          >
+            {busy ? "Working…" : request.submit ? (request.confirmLabel ?? "Continue") : "Close"}
           </button>
         </div>
       </form>

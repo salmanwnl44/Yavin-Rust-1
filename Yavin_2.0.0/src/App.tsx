@@ -23,8 +23,19 @@ import { recordEdit } from "./services/editor";
 
 import { isTauri } from "@tauri-apps/api/core";
 import type { FileNode, EditorTab, RecentFile } from "./types";
-import { native } from "./services/native";
-import { isWithin, remapPath } from "./services/workspace";
+import { native, onWorkspaceChanged } from "./services/native";
+import {
+  findNode,
+  isWithin,
+  loadedDirectories,
+  nearestLoadedDirectory,
+  remapPath,
+  setChildren,
+  validateEntryName,
+} from "./services/workspace";
+import { buildDecorations } from "./services/git";
+import type { Decorations } from "./services/git";
+import { listFiles } from "./services/search";
 // Error boundary to prevent white/black screen crashes
 class ErrorBoundary extends Component<
   React.PropsWithChildren,
@@ -78,16 +89,17 @@ export default function App() {
   const [zoom, setZoom] = useState(1);
   const [paletteMode, setPaletteMode] = useState<"files" | "commands">("files");
   const [workspacePath, setWorkspacePath] = useState("");
-  const [fileTree, setFileTree] = useState<FileNode>({
-    name: "Open a workspace",
-    path: "",
-    is_dir: true,
-    children: [],
-  });
+  const [fileTree, setFileTree] = useState<FileNode | null>(null);
+  const treeRef = useRef<FileNode | null>(null);
+  const treeRequests = useRef(new Map<string, number>());
+  const [quickOpen, setQuickOpen] = useState<{ files: string[]; note: string } | null>(null);
   const [fileContents, setFileContents] = useState<Record<string, string>>({});
   const contentsRef = useRef(fileContents);
   const workspaceRevision = useRef(0);
-  const [gitStatus, setGitStatus] = useState<Record<string, string>>({});
+  const [decorations, setDecorations] = useState<Decorations>({
+    files: new Map(),
+    folders: new Set(),
+  });
   const [tabs, setTabs] = useState<EditorTab[]>([
     { id: "welcome", name: "Welcome", path: "welcome", dirty: false },
   ]);
@@ -149,21 +161,81 @@ export default function App() {
       reportError(reason);
     }
   };
+  const applyTree = (tree: FileNode | null) => {
+    treeRef.current = tree;
+    setFileTree(tree);
+  };
+  // Lists one directory and patches it into the tree; stale responses are dropped.
+  const loadDirectory = useCallback(async (path: string) => {
+    const sequence = (treeRequests.current.get(path) ?? 0) + 1;
+    treeRequests.current.set(path, sequence);
+    const revision = workspaceRevision.current;
+    const node = await native("list_workspace_files", { path, maxDepth: 1 });
+    if (revision !== workspaceRevision.current || treeRequests.current.get(path) !== sequence)
+      return;
+    const current = treeRef.current;
+    applyTree(
+      current && isWithin(node.path, current.path)
+        ? setChildren(current, node.path, node.children ?? [])
+        : node,
+    );
+  }, []);
   const loadWorkspace = useCallback(
     async (target: string) => {
-      const tree = await native("list_workspace_files", { path: target, maxDepth: 6 });
-      setFileTree(tree);
-      setWorkspacePath(tree.path);
-      setGitStatus({});
-      setGitRevision(value => value + 1);
+      await loadDirectory(target);
+      setWorkspacePath(treeRef.current?.path ?? target);
+      setQuickOpen(null);
+      setGitRevision((value) => value + 1);
     },
-    [reportError],
+    [loadDirectory],
   );
+  // Re-lists every loaded folder: manual refresh, and after Git operations.
+  const refreshTree = async () => {
+    const tree = treeRef.current;
+    if (!tree) return;
+    for (const directory of loadedDirectories(tree)) {
+      if (!treeRef.current || !findNode(treeRef.current, directory)) continue;
+      try {
+        await loadDirectory(directory);
+      } catch (error) {
+        reportError(`${directory}: ${String(error)}`);
+      }
+    }
+    setQuickOpen(null);
+    setGitRevision((value) => value + 1);
+  };
+  // Re-lists the loaded folders that hold `paths` after a file operation.
+  const refreshAround = async (...paths: string[]) => {
+    const tree = treeRef.current;
+    if (!tree) return;
+    for (const directory of new Set(paths.map((path) => nearestLoadedDirectory(tree, path))))
+      await loadDirectory(directory);
+    setQuickOpen(null);
+    setGitRevision((value) => value + 1);
+  };
 
   useEffect(() => {
     if (!isTauri()) return;
-    native("get_default_workspace").then(loadWorkspace).catch(reportError);
+    native("get_default_workspace")
+      .then((path) => (path ? loadWorkspace(path) : undefined))
+      .catch(reportError);
   }, [loadWorkspace, reportError]);
+
+  // Edits made outside the app (a checkout, a build, another editor) re-list the tree.
+  const refreshTreeRef = useRef(refreshTree);
+  refreshTreeRef.current = refreshTree;
+  useEffect(
+    () => onWorkspaceChanged(() => void refreshTreeRef.current().catch(reportError)),
+    [reportError],
+  );
+
+  // Git decorations refresh on focus when the Source Control panel is not polling.
+  useEffect(() => {
+    if (isSidebarOpen && activeActivityTab === "git") return;
+    const refresh = () => setGitRevision((value) => value + 1);
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, [isSidebarOpen, activeActivityTab]);
 
   const handleOpenFile = (path: string, name: string = path.split("/").pop() || path) =>
     run(async () => {
@@ -224,14 +296,18 @@ export default function App() {
       if (content === undefined || saving.current.has(path)) return;
       saving.current.add(path);
       try {
-        await native("write_file_guarded", { path, expected: savedContents.current[path], content });
+        await native("write_file_guarded", {
+          path,
+          expected: savedContents.current[path],
+          content,
+        });
         savedContents.current[path] = content;
         setTabs((prev) =>
           prev.map((tab) =>
             tab.path === path ? { ...tab, dirty: contentsRef.current[path] !== content } : tab,
           ),
         );
-        setGitRevision(value => value + 1);
+        setGitRevision((value) => value + 1);
       } finally {
         saving.current.delete(path);
       }
@@ -257,24 +333,20 @@ export default function App() {
       setActiveTabId("welcome");
       setRecentFiles([]);
       setWorkspacePath(selected);
-      setFileTree({
-        name: selected.split("/").pop() || selected,
-        path: selected,
-        is_dir: true,
-        children: [],
-      });
+      applyTree(null);
+      setDecorations({ files: new Map(), folders: new Set() });
       await loadWorkspace(selected);
     });
   const handleCreateFile = (path: string) =>
     run(async () => {
       await native("create_file", { path });
-      await loadWorkspace(workspacePath);
+      await refreshAround(path);
       await handleOpenFile(path);
     });
   const handleCreateFolder = (path: string) =>
     run(async () => {
       await native("create_directory", { path });
-      await loadWorkspace(workspacePath);
+      await refreshAround(path);
     });
   const handleRename = (oldPath: string, newPath: string) =>
     run(async () => {
@@ -308,42 +380,54 @@ export default function App() {
           name: remap(file.path).split("/").pop() || file.name,
         })),
       );
-      await loadWorkspace(workspacePath);
+      await refreshAround(oldPath, newPath);
     });
-  const handleDelete = (path: string, isDir: boolean) =>
-    run(async () => {
-      if (saving.current.size)
-        throw new Error("Wait for file saves to finish before deleting files.");
-      if (
-        tabs.some((tab) => isWithin(tab.path, path) && tab.dirty) &&
-        !window.confirm("Delete this item and discard its unsaved changes?")
-      )
-        return;
-      await native("delete_path", { path, recursive: isDir });
-      setTabs((prev) => prev.filter((tab) => !isWithin(tab.path, path)));
-      for (const key of histories.current.keys())
-        if (isWithin(key, path)) histories.current.delete(key);
-      savedContents.current = Object.fromEntries(
-        Object.entries(savedContents.current).filter(([key]) => !isWithin(key, path)),
-      );
-      if (isWithin(activeTabId, path)) setActiveTabId("welcome");
-      updateContents(
-        Object.fromEntries(
-          Object.entries(contentsRef.current).filter(([key]) => !isWithin(key, path)),
-        ),
-      );
-      setRecentFiles((prev) => prev.filter((file) => !isWithin(file.path, path)));
-      await loadWorkspace(workspacePath);
+  // Deletes one entry or a whole Explorer selection behind a single confirmation.
+  const handleDelete = (entries: { path: string; isDir: boolean }[]) => {
+    if (!entries.length) return;
+    if (saving.current.size) {
+      reportError("Wait for file saves to finish before deleting files.");
+      return;
+    }
+    const doomed = (path: string) => entries.some((entry) => isWithin(path, entry.path));
+    const dirty = tabs.some((tab) => tab.dirty && doomed(tab.path));
+    const [only] = entries;
+    const subject =
+      entries.length === 1
+        ? `“${only.path.split("/").pop()}”${only.isDir ? " and everything inside it" : ""}`
+        : `these ${entries.length} items and everything inside them`;
+    setDialog({
+      title: entries.length > 1 ? "Delete items" : only.isDir ? "Delete folder" : "Delete file",
+      confirmLabel: "Delete",
+      message:
+        `Permanently delete ${subject}? This cannot be undone.` +
+        (dirty ? "\n\nUnsaved changes in open editors will be discarded." : ""),
+      submit: async () => {
+        for (const entry of entries)
+          await native("delete_path", { path: entry.path, recursive: entry.isDir });
+        setTabs((prev) => prev.filter((tab) => !doomed(tab.path)));
+        for (const key of histories.current.keys()) if (doomed(key)) histories.current.delete(key);
+        savedContents.current = Object.fromEntries(
+          Object.entries(savedContents.current).filter(([key]) => !doomed(key)),
+        );
+        if (doomed(activeTabId)) setActiveTabId("welcome");
+        updateContents(
+          Object.fromEntries(Object.entries(contentsRef.current).filter(([key]) => !doomed(key))),
+        );
+        setRecentFiles((prev) => prev.filter((file) => !doomed(file.path)));
+        await refreshAround(...entries.map((entry) => entry.path));
+      },
     });
+  };
   const handleDuplicate = (path: string) =>
     run(async () => {
-      await native("duplicate_path", { path });
-      await loadWorkspace(workspacePath);
+      const copy = await native("duplicate_path", { path });
+      await refreshAround(copy);
     });
   const handleCopyPath = (src: string, dest: string) =>
     run(async () => {
       await native("copy_path", { src, dest });
-      await loadWorkspace(workspacePath);
+      await refreshAround(dest);
     });
   const handleMovePath = (src: string, dest: string) =>
     handleRename(src, dest.replace(/\/$/, "") + "/" + src.split("/").pop());
@@ -359,7 +443,9 @@ export default function App() {
     if (lines[pendingHit.line - 1] !== pendingHit.text.replace(/\n$/, "")) {
       reportError("This search result changed. Search again to locate it.");
     } else {
-      const start = lines.slice(0, pendingHit.line - 1).reduce((n, line) => n + line.length + 1, 0) + pendingHit.start;
+      const start =
+        lines.slice(0, pendingHit.line - 1).reduce((n, line) => n + line.length + 1, 0) +
+        pendingHit.start;
       editorRef.current?.revealRange(start, start + pendingHit.end - pendingHit.start);
     }
     setPendingHit(null);
@@ -371,26 +457,39 @@ export default function App() {
     const revision = workspaceRevision.current;
     for (const change of changes) {
       try {
-        if (workspaceRevision.current !== revision) throw new Error("Workspace changed; remaining files skipped");
+        if (workspaceRevision.current !== revision)
+          throw new Error("Workspace changed; remaining files skipped");
         if (saving.current.has(change.path)) throw new Error("File is being saved");
         const open = contentsRef.current[change.path];
-        if (open !== undefined && open !== change.before) throw new Error("Editor changed; preview again");
+        if (open !== undefined && open !== change.before)
+          throw new Error("Editor changed; preview again");
         if (open === undefined || saved) {
           saving.current.add(change.path);
-          try { await native("write_file_guarded", { path: change.path, expected: change.before, content: change.after }); }
-          finally { saving.current.delete(change.path); }
+          try {
+            await native("write_file_guarded", {
+              path: change.path,
+              expected: change.before,
+              content: change.after,
+            });
+          } finally {
+            saving.current.delete(change.path);
+          }
           if (saved) savedContents.current[change.path] = change.after;
         }
         if (open !== undefined) {
-          if (contentsRef.current[change.path] !== change.before) throw new Error("Editor changed during write; saved file updated, editor retained");
+          if (contentsRef.current[change.path] !== change.before)
+            throw new Error("Editor changed during write; saved file updated, editor retained");
           const history = histories.current.get(change.path) ?? { past: [], future: [] };
-          recordEdit(history, { text: open, start: 0, end: 0 }); histories.current.set(change.path, history);
+          recordEdit(history, { text: open, start: 0, end: 0 });
+          histories.current.set(change.path, history);
           handleContentChange(change.path, change.after);
         }
         applied.push(change);
-      } catch (error) { errors.push(`${change.path}: ${String(error)}`); }
+      } catch (error) {
+        errors.push(`${change.path}: ${String(error)}`);
+      }
     }
-    setGitRevision(value => value + 1);
+    setGitRevision((value) => value + 1);
     return { applied, errors };
   };
 
@@ -404,14 +503,29 @@ export default function App() {
         if (contentsRef.current[path] !== before) continue;
         savedContents.current[path] = content;
         updateContents({ ...contentsRef.current, [path]: content });
-      } catch (error) { reportError(`${path}: ${String(error)}`); }
+      } catch (error) {
+        reportError(`${path}: ${String(error)}`);
+      }
     }
-    await loadWorkspace(workspacePath);
+    await refreshTree();
   };
 
   const hasEditor = !!activeTab && activeTab.id !== "welcome";
   const desktop = isTauri();
+  // Quick open lists the whole workspace through the packaged search tool, not the lazy tree.
+  const loadQuickOpen = () => {
+    if (!desktop || !workspacePath) return;
+    const revision = workspaceRevision.current;
+    setQuickOpen({ files: [], note: "Loading workspace files…" });
+    listFiles(workspacePath)
+      .then(({ files, truncated }) => {
+        if (revision === workspaceRevision.current)
+          setQuickOpen({ files, note: truncated ? "Some files could not be listed." : "" });
+      })
+      .catch((error) => setQuickOpen({ files: [], note: String(error) }));
+  };
   const openPalette = (mode: "files" | "commands") => {
+    if (!quickOpen?.files.length) loadQuickOpen();
     setPaletteMode(mode);
     setIsCommandPaletteOpen(true);
   };
@@ -431,18 +545,13 @@ export default function App() {
       message: "Enter a path relative to the workspace. Existing files will not be overwritten.",
       input: "untitled.ts",
       submit: async (value) => {
-        const relative = value.trim().replace(/\\/g, "/");
-        if (
-          !relative ||
-          relative.startsWith("/") ||
-          relative.includes(":") ||
-          relative.split("/").some((part) => !part || part === "." || part === "..")
-        )
-          throw new Error("Enter a valid relative file path.");
+        const relative = value.trim();
+        const problem = validateEntryName(relative, true);
+        if (problem) throw new Error(problem);
         const path = workspacePath.replace(/\/$/, "") + "/" + relative;
         await native("create_file", { path });
         await handleOpenFile(path);
-        await loadWorkspace(workspacePath);
+        await refreshAround(path);
       },
     });
   };
@@ -463,8 +572,27 @@ export default function App() {
     setActiveTabId(tabs[(index + direction + tabs.length) % tabs.length].id);
   };
   const commands: AppCommand[] = [
-    { id: "view.search", menu: "View", label: "Search in Files", shortcut: "Mod+Shift+f", run: () => { setActiveActivityTab("search"); setIsSidebarOpen(true); setSearchFocus(v => v + 1); } },
-    { id: "view.sourceControl", menu: "View", label: "Source Control", shortcut: "Mod+Shift+g", run: () => { setActiveActivityTab("git"); setIsSidebarOpen(true); } },
+    {
+      id: "view.search",
+      menu: "View",
+      label: "Search in Files",
+      shortcut: "Mod+Shift+f",
+      run: () => {
+        setActiveActivityTab("search");
+        setIsSidebarOpen(true);
+        setSearchFocus((v) => v + 1);
+      },
+    },
+    {
+      id: "view.sourceControl",
+      menu: "View",
+      label: "Source Control",
+      shortcut: "Mod+Shift+g",
+      run: () => {
+        setActiveActivityTab("git");
+        setIsSidebarOpen(true);
+      },
+    },
     {
       id: "file.new",
       menu: "File",
@@ -859,57 +987,86 @@ export default function App() {
           />
 
           {/* Dynamic File Tree Explorer */}
-          <SearchPanel key={`search:${workspacePath}`} workspace={workspacePath} buffers={fileContents}
-            visible={isSidebarOpen && activeActivityTab === "search"} focusRequest={searchFocus}
-            onOpen={hit => { setPendingHit(hit); void handleOpenFile(hit.path); }}
-            read={path => contentsRef.current[path] !== undefined ? Promise.resolve(contentsRef.current[path]) : native("read_file_content", { path })}
-            apply={applyReplacements} />
-          <SourceControlPanel key={`git:${workspacePath}`} workspace={workspacePath} buffers={fileContents}
-            visible={isSidebarOpen && activeActivityTab === "git"} dirty={hasUnsavedChanges}
-            revision={gitRevision} onDiff={setDiff} onChanged={reconcileWorkspace}
-            apply={changes => applyReplacements(changes, true)}
-            onEntries={entries => setGitStatus(Object.fromEntries(entries.map(entry => [entry.path, entry.conflict ? "CONFLICT" : entry.untracked ? "U" : entry.index !== " " ? entry.index : entry.worktree])))} />
-          {isSidebarOpen && activeActivityTab !== "search" && activeActivityTab !== "git" && (
-            <Sidebar
-              activeTab={activeActivityTab}
-              workspacePath={workspacePath}
-              fileTree={fileTree}
-              gitStatus={gitStatus}
-              onOpenFile={handleOpenFile}
-              activeFile={activeTab?.path || ""}
-              onRefresh={() => run(() => loadWorkspace(workspacePath))}
-              onCreateFile={handleCreateFile}
-              onCreateFolder={handleCreateFolder}
-              onRename={handleRename}
-              onDelete={handleDelete}
-              onDuplicate={handleDuplicate}
-              onCopyFile={handleCopyPath}
-              onMoveFile={handleMovePath}
-              onReveal={handleReveal}
-              onOpenFolderDialog={handleOpenFolderDialog}
-            />
-          )}
+          <SearchPanel
+            key={`search:${workspacePath}`}
+            workspace={workspacePath}
+            buffers={fileContents}
+            visible={isSidebarOpen && activeActivityTab === "search"}
+            focusRequest={searchFocus}
+            onOpen={(hit) => {
+              setPendingHit(hit);
+              void handleOpenFile(hit.path);
+            }}
+            read={(path) =>
+              contentsRef.current[path] !== undefined
+                ? Promise.resolve(contentsRef.current[path])
+                : native("read_file_content", { path })
+            }
+            apply={applyReplacements}
+          />
+          <SourceControlPanel
+            key={`git:${workspacePath}`}
+            workspace={workspacePath}
+            buffers={fileContents}
+            visible={isSidebarOpen && activeActivityTab === "git"}
+            dirty={hasUnsavedChanges}
+            revision={gitRevision}
+            onDiff={setDiff}
+            onChanged={reconcileWorkspace}
+            apply={(changes) => applyReplacements(changes, true)}
+            onEntries={(entries) => setDecorations(buildDecorations(entries, workspacePath))}
+          />
+          <Sidebar
+            key={`explorer:${workspacePath}`}
+            visible={isSidebarOpen && activeActivityTab !== "search" && activeActivityTab !== "git"}
+            activeTab={activeActivityTab}
+            workspacePath={workspacePath}
+            fileTree={fileTree}
+            decorations={decorations}
+            onLoadDirectory={loadDirectory}
+            onOpenFile={handleOpenFile}
+            activeFile={activeTab?.path || ""}
+            onRefresh={() => run(refreshTree)}
+            onCreateFile={handleCreateFile}
+            onCreateFolder={handleCreateFolder}
+            onRename={handleRename}
+            onDelete={handleDelete}
+            onDuplicate={handleDuplicate}
+            onCopyFile={handleCopyPath}
+            onMoveFile={handleMovePath}
+            onReveal={handleReveal}
+            onOpenFolderDialog={handleOpenFolderDialog}
+          />
 
           {/* Center: Editor + Bottom Terminal Panel */}
           <div className="flex flex-1 flex-col min-w-0 bg-[#000000]">
-            {diff ? <DiffEditor key={diff.path + diff.title + diff.text} document={diff} onClose={() => setDiff(null)} onOpen={() => void handleOpenFile(diff.path)} /> : <EditorArea
-              tabs={tabs}
-              activeTabId={activeTabId}
-              onSelectTab={(path, name) => handleOpenFile(path, name || path.split("/").pop())}
-              onCloseTab={handleCloseTab}
-              onNewFile={newFile}
-              onOpenCommandPalette={() => openPalette("commands")}
-              onOpenFolderDialog={handleOpenFolderDialog}
-              fileContents={fileContents}
-              onContentChange={handleContentChange}
-              onSaveFile={handleSaveFile}
-              recentFiles={recentFiles}
-              editorRef={editorRef}
-              histories={histories.current}
-              onEditorState={setEditorState}
-              wordWrap={wordWrap}
-              zoom={zoom}
-            />}
+            {diff ? (
+              <DiffEditor
+                key={diff.path + diff.title + diff.text}
+                document={diff}
+                onClose={() => setDiff(null)}
+                onOpen={() => void handleOpenFile(diff.path)}
+              />
+            ) : (
+              <EditorArea
+                tabs={tabs}
+                activeTabId={activeTabId}
+                onSelectTab={(path, name) => handleOpenFile(path, name || path.split("/").pop())}
+                onCloseTab={handleCloseTab}
+                onNewFile={newFile}
+                onOpenCommandPalette={() => openPalette("commands")}
+                onOpenFolderDialog={handleOpenFolderDialog}
+                fileContents={fileContents}
+                onContentChange={handleContentChange}
+                onSaveFile={handleSaveFile}
+                recentFiles={recentFiles}
+                editorRef={editorRef}
+                histories={histories.current}
+                onEditorState={setEditorState}
+                wordWrap={wordWrap}
+                zoom={zoom}
+              />
+            )}
 
             {isTerminalOpen && (
               <TerminalPanel
@@ -936,7 +1093,10 @@ export default function App() {
           commands={commands}
           mode={paletteMode}
           onError={reportError}
-          fileTree={fileTree}
+          files={quickOpen?.files ?? []}
+          filesNote={
+            quickOpen?.note ?? (desktop ? "" : "Open the desktop application to search files.")
+          }
           isOpen={isCommandPaletteOpen}
           onClose={() => setIsCommandPaletteOpen(false)}
           onSelectFile={handleOpenFile}

@@ -137,6 +137,32 @@ impl WorkspaceManager {
         Ok(final_path)
     }
 
+    /// Validates a path whose final component is operated on itself (delete, rename):
+    /// the parent is resolved, but a final symbolic link is not followed to its target.
+    pub fn validate_entry<P: AsRef<Path>>(&self, target: P) -> Result<PathBuf, String> {
+        let p = target.as_ref();
+        let name = p
+            .file_name()
+            .ok_or_else(|| format!("Invalid path: {}", p.display()))?;
+        let parent = p.parent().unwrap_or(Path::new(""));
+        let entry = self.validate_path(parent)?.join(name);
+        if entry == self.root {
+            return Err("Security rejection: Cannot modify the workspace root directory".into());
+        }
+        Ok(entry)
+    }
+
+    /// Lists a workspace directory. Directories deeper than `max_depth` have `children: None`,
+    /// meaning they have not been loaded yet.
+    pub fn list_directory<P: AsRef<Path>>(
+        &self,
+        path: P,
+        max_depth: usize,
+    ) -> Result<FileNode, String> {
+        let validated = self.validate_path(path)?;
+        list_directory_inner(&validated, 0, max_depth, &self.root)
+    }
+
     /// Reads a file from disk with size and binary classification guards.
     pub fn read_file<P: AsRef<Path>>(&self, path: P) -> Result<String, String> {
         let validated = self.validate_path(path)?;
@@ -179,38 +205,34 @@ impl WorkspaceManager {
     }
 
     /// Renames a file or directory within the workspace without overwriting existing files.
+    /// A symbolic link is renamed itself; a case-only rename is allowed.
     pub fn rename_path<P: AsRef<Path>>(&self, old_path: P, new_path: P) -> Result<(), String> {
-        let old_val = self.validate_path(&old_path)?;
-        let new_val = self.validate_path(&new_path)?;
+        let old_val = self.validate_entry(&old_path)?;
+        let new_val = self.validate_entry(&new_path)?;
 
-        if old_val == self.root {
-            return Err(
-                "Security rejection: Cannot rename the workspace root directory".to_string(),
-            );
-        }
-        if !old_val.exists() {
+        if fs::symlink_metadata(&old_val).is_err() {
             return Err(format!("Source does not exist: {}", old_val.display()));
         }
-        if new_val.exists() {
+        if fs::symlink_metadata(&new_val).is_ok() && !is_case_only_rename(&old_val, &new_val) {
             return Err(format!("Destination already exists: {}", new_val.display()));
         }
 
         fs::rename(&old_val, &new_val).map_err(|e| e.to_string())
     }
 
-    /// Deletes a file or directory inside the workspace. Protects root directory.
+    /// Deletes a file or directory inside the workspace. Protects the root directory.
+    /// A symbolic link or junction is removed itself, never its target.
     pub fn delete_path<P: AsRef<Path>>(&self, path: P, recursive: bool) -> Result<(), String> {
-        let validated = self.validate_path(path)?;
-        if validated == self.root {
-            return Err(
-                "Security rejection: Cannot delete the workspace root directory".to_string(),
-            );
-        }
-        if !validated.exists() {
-            return Err(format!("Path does not exist: {}", validated.display()));
-        }
+        let validated = self.validate_entry(path)?;
+        let metadata = fs::symlink_metadata(&validated)
+            .map_err(|_| format!("Path does not exist: {}", validated.display()))?;
 
-        if validated.is_dir() {
+        if metadata.file_type().is_symlink() {
+            // Directory links and Windows junctions need remove_dir.
+            fs::remove_file(&validated)
+                .or_else(|_| fs::remove_dir(&validated))
+                .map_err(|e| e.to_string())
+        } else if metadata.is_dir() {
             if recursive {
                 fs::remove_dir_all(&validated).map_err(|e| e.to_string())
             } else {
@@ -303,14 +325,20 @@ pub fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Top-level helper: Lists directory contents with clean normalized paths.
-pub fn list_directory(root_path: &str, max_depth: Option<usize>) -> Result<FileNode, String> {
-    let path = Path::new(root_path);
-    if !path.exists() {
-        return Err(format!("Path does not exist: {}", root_path));
-    }
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    list_directory_inner(&canonical, 0, max_depth.unwrap_or(6), &canonical)
+/// On case-insensitive filesystems `Foo` and `foo` name the same entry. Allow renaming to
+/// such an alias only when no entry with exactly the new name exists.
+fn is_case_only_rename(from: &Path, to: &Path) -> bool {
+    let (Some(from_name), Some(to_name), Some(parent)) =
+        (from.file_name(), to.file_name(), to.parent())
+    else {
+        return false;
+    };
+    from.parent() == Some(parent)
+        && from_name != to_name
+        && from_name.to_string_lossy().to_lowercase() == to_name.to_string_lossy().to_lowercase()
+        && fs::read_dir(parent)
+            .map(|entries| !entries.flatten().any(|entry| entry.file_name() == to_name))
+            .unwrap_or(false)
 }
 
 fn list_directory_inner(
@@ -336,55 +364,54 @@ fn list_directory_inner(
     let readonly = metadata.permissions().readonly();
     let normalized_path = clean_path_str(path);
 
-    let children = if is_dir && current_depth < max_depth {
-        let mut entries = Vec::new();
-        if let Ok(read_dir) = fs::read_dir(path) {
-            for entry in read_dir.flatten() {
-                let entry_path = entry.path();
-                let entry_name = entry.file_name().to_string_lossy().to_string();
+    // `None` for a directory means "not loaded yet"; an empty directory is `Some(vec![])`.
+    let children = if !is_dir || current_depth >= max_depth {
+        None
+    } else {
+        match fs::read_dir(path) {
+            Err(error) if current_depth == 0 => {
+                return Err(format!("Cannot read {}: {error}", normalized_path));
+            }
+            // A nested unreadable directory stays unloaded, so expanding it reports the error.
+            Err(_) => None,
+            Ok(read_dir) => {
+                let mut entries = Vec::new();
+                for entry in read_dir.flatten() {
+                    let entry_path = entry.path();
+                    let entry_name = entry.file_name().to_string_lossy().to_string();
 
-                if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
-                    if let Ok(target) = entry_path.canonicalize() {
-                        if !target.starts_with(workspace_root) {
-                            continue;
+                    if entry_name == ".git" {
+                        continue;
+                    }
+                    if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+                        if let Ok(target) = entry_path.canonicalize() {
+                            if !target.starts_with(workspace_root) {
+                                continue;
+                            }
                         }
+                    }
+
+                    // Large generated folders are listed but only loaded when expanded.
+                    let depth = if entry_name == "node_modules" || entry_name == "target" {
+                        max_depth
+                    } else {
+                        current_depth + 1
+                    };
+                    if let Ok(child_node) =
+                        list_directory_inner(&entry_path, depth, max_depth, workspace_root)
+                    {
+                        entries.push(child_node);
                     }
                 }
 
-                if entry_name == ".git" || entry_name == "node_modules" || entry_name == "target" {
-                    let entry_meta = entry.metadata().ok();
-                    let is_entry_dir = entry_meta.as_ref().map(|m| m.is_dir()).unwrap_or(true);
-                    entries.push(FileNode {
-                        name: entry_name,
-                        path: clean_path_str(&entry_path),
-                        is_dir: is_entry_dir,
-                        size: 0,
-                        modified: None,
-                        readonly: false,
-                        children: if is_entry_dir { Some(Vec::new()) } else { None },
-                    });
-                    continue;
-                }
-
-                if let Ok(child_node) =
-                    list_directory_inner(&entry_path, current_depth + 1, max_depth, workspace_root)
-                {
-                    entries.push(child_node);
-                }
+                entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                });
+                Some(entries)
             }
         }
-
-        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        });
-
-        Some(entries)
-    } else if is_dir {
-        Some(Vec::new())
-    } else {
-        None
     };
 
     Ok(FileNode {
@@ -730,6 +757,108 @@ mod tests {
             .is_err());
         assert_eq!(mgr.read_file(&text_path).unwrap(), "Hello, Yavin!");
 
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "yavin_{label}_{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_lazy_listing_marks_unloaded_directories() {
+        let tmp_dir = unique_temp_dir("lazy");
+        fs::create_dir_all(tmp_dir.join("src/deep")).unwrap();
+        fs::create_dir_all(tmp_dir.join(".git")).unwrap();
+        fs::create_dir_all(tmp_dir.join("node_modules/pkg")).unwrap();
+        fs::create_dir(tmp_dir.join("empty")).unwrap();
+        fs::write(tmp_dir.join("src/main.rs"), "").unwrap();
+        let mgr = WorkspaceManager::new(&tmp_dir).unwrap();
+
+        let root = mgr.list_directory(&tmp_dir, 1).unwrap();
+        let children = root.children.unwrap();
+        let names: Vec<_> = children.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["empty", "node_modules", "src"]);
+        assert!(children.iter().all(|n| n.is_dir && n.children.is_none()));
+
+        let src = mgr.list_directory(tmp_dir.join("src"), 1).unwrap();
+        let src_children = src.children.unwrap();
+        assert_eq!(src_children[0].name, "deep");
+        assert!(src_children[0].children.is_none());
+        assert!(!src_children[1].is_dir && src_children[1].children.is_none());
+
+        let empty = mgr.list_directory(tmp_dir.join("empty"), 1).unwrap();
+        assert_eq!(empty.children, Some(Vec::new()));
+
+        let deep = mgr.list_directory(&tmp_dir, 3).unwrap();
+        let node_modules = &deep.children.unwrap()[1];
+        assert_eq!(node_modules.name, "node_modules");
+        assert!(node_modules.children.is_none());
+
+        assert!(mgr.list_directory(tmp_dir.join("missing"), 1).is_err());
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_case_only_rename() {
+        let tmp_dir = unique_temp_dir("case");
+        let mgr = WorkspaceManager::new(&tmp_dir).unwrap();
+        fs::write(tmp_dir.join("Case.txt"), "x").unwrap();
+        mgr.rename_path(&tmp_dir.join("Case.txt"), &tmp_dir.join("case.txt"))
+            .unwrap();
+        let names: Vec<_> = fs::read_dir(&tmp_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["case.txt"]);
+
+        fs::write(tmp_dir.join("other.txt"), "keep").unwrap();
+        assert!(mgr
+            .rename_path(&tmp_dir.join("case.txt"), &tmp_dir.join("other.txt"))
+            .is_err());
+        assert_eq!(
+            fs::read_to_string(tmp_dir.join("other.txt")).unwrap(),
+            "keep"
+        );
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_link_operations_never_touch_the_target() {
+        let tmp_dir = unique_temp_dir("link");
+        let target = tmp_dir.join("real");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep.txt"), "keep").unwrap();
+        let link = tmp_dir.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let mgr = WorkspaceManager::new(&tmp_dir).unwrap();
+
+        let renamed = tmp_dir.join("renamed");
+        mgr.rename_path(&link, &renamed).unwrap();
+        assert!(fs::symlink_metadata(&renamed)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        mgr.delete_path(&renamed, true).unwrap();
+        assert!(fs::symlink_metadata(&renamed).is_err());
+        assert_eq!(fs::read_to_string(target.join("keep.txt")).unwrap(), "keep");
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 

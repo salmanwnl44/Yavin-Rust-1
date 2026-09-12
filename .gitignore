@@ -1,0 +1,27 @@
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+
+# Logs & temp
+*.log
+*.tmp
+*.bak
+
+# Rust
+**/target/
+**/*.rs.bk
+
+# Node & web builds
+**/node_modules/
+**/dist/
+**/dist-ssr/
+**/test-results/
+**/playwright-report/
+
+# Editor directories and files
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.sw?

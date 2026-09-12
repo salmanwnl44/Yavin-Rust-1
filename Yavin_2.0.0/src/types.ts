@@ -5,6 +5,7 @@ export interface FileNode {
   size?: number;
   modified?: number | null;
   readonly?: boolean;
+  /** For a directory, `null`/`undefined` means not loaded yet; `[]` means empty. */
   children?: FileNode[] | null;
 }
 

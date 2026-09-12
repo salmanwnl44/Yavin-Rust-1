@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseSearch } from "./search.ts";
+import { parseFileList, parseSearch } from "./search.ts";
 
 const match = JSON.stringify({
   type: "match",
@@ -28,6 +28,20 @@ test("search keeps partial results when some paths cannot be read", () => {
   ]);
   assert.equal(result.truncated, true);
   assert.match(result.warning, /Access denied/);
+});
+
+test("file lists map ripgrep paths and drop a cut-off final name", () => {
+  assert.deepEqual(
+    parseFileList(
+      { stdout: ".\\src\\b.ts\0./a.ts\0", stderr: "", code: 0, truncated: false },
+      "/work/",
+    ),
+    { files: ["/work/a.ts", "/work/src/b.ts"], truncated: false },
+  );
+  assert.deepEqual(
+    parseFileList({ stdout: "a.ts\0parti", stderr: "", code: 0, truncated: true }, "/work").files,
+    ["/work/a.ts"],
+  );
 });
 
 test("search reports fatal errors such as an invalid regex", () => {

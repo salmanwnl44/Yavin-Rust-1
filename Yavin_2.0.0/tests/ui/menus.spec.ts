@@ -234,7 +234,7 @@ test("desktop New File validates paths and refuses overwrite", async ({ page }) 
   const input = page.getByRole("textbox", { name: "New file", exact: true });
   await input.fill("../escape.ts");
   await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("alert")).toContainText("valid relative");
+  await expect(page.getByRole("alert")).toContainText("not a valid name");
   await input.fill("file.ts");
   await page.getByRole("button", { name: "Continue" }).click();
   await expect(page.getByRole("alert")).toContainText("already exists");

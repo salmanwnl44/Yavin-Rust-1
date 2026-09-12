@@ -1,14 +1,23 @@
-﻿import { useEffect, useMemo, useRef, useState } from "react";
-import type { FileNode } from "../../types";
-import { flattenFiles } from "../../services/workspace";
+import { useEffect, useRef, useState } from "react";
 import { shortcutLabel } from "../../services/commands";
 import type { AppCommand } from "../../services/commands";
+
+const MAX_RESULTS = 200;
+
+interface PaletteItem {
+  id: string;
+  title: string;
+  subtitle: string;
+  disabled?: boolean;
+  run: () => void | Promise<void>;
+}
 
 export function CommandPalette({
   isOpen,
   onClose,
   onSelectFile,
-  fileTree,
+  files,
+  filesNote,
   commands,
   mode,
   onError,
@@ -16,7 +25,8 @@ export function CommandPalette({
   isOpen: boolean;
   onClose: () => void;
   onSelectFile: (path: string, name: string) => void;
-  fileTree: FileNode;
+  files: string[];
+  filesNote: string;
   commands: AppCommand[];
   mode: "files" | "commands";
   onError: (reason: unknown) => void;
@@ -25,7 +35,6 @@ export function CommandPalette({
   const [selectedIndex, setSelectedIndex] = useState(0);
   const dialog = useRef<HTMLDialogElement>(null);
   const input = useRef<HTMLInputElement>(null);
-  const files = useMemo(() => flattenFiles(fileTree), [fileTree]);
   useEffect(() => {
     if (isOpen) {
       setQuery(mode === "commands" ? ">" : "");
@@ -36,29 +45,34 @@ export function CommandPalette({
   }, [isOpen, mode]);
   const commandMode = query.startsWith(">");
   const search = (commandMode ? query.slice(1) : query).trim().toLowerCase();
-  const items = (
-    commandMode
-      ? commands.map((command) => ({
-          id: command.id,
-          title: `${command.menu}: ${command.label}`,
-          subtitle: command.disabled
-            ? command.reason || "Unavailable in the current context"
-            : command.shortcut
-              ? shortcutLabel(command.shortcut)
-              : "Command",
-          disabled: command.disabled,
-          run: command.run,
-        }))
-      : files.map((file) => ({
-          id: file.subtitle,
-          title: file.title,
-          subtitle: file.subtitle,
-          disabled: false,
-          run: () => onSelectFile(file.subtitle, file.title),
-        }))
-  ).filter((item) => `${item.title} ${item.subtitle}`.toLowerCase().includes(search));
+  let items: PaletteItem[] = [];
+  let total = 0;
+  // Nothing is filtered while closed; the file list can hold tens of thousands of paths.
+  if (isOpen && commandMode) {
+    items = commands
+      .map((command) => ({
+        id: command.id,
+        title: `${command.menu}: ${command.label}`,
+        subtitle: command.disabled
+          ? command.reason || "Unavailable in the current context"
+          : command.shortcut
+            ? shortcutLabel(command.shortcut)
+            : "Command",
+        disabled: command.disabled,
+        run: command.run,
+      }))
+      .filter((item) => `${item.title} ${item.subtitle}`.toLowerCase().includes(search));
+    total = items.length;
+  } else if (isOpen) {
+    const matches = search ? files.filter((path) => path.toLowerCase().includes(search)) : files;
+    total = matches.length;
+    items = matches.slice(0, MAX_RESULTS).map((path) => {
+      const title = path.slice(path.lastIndexOf("/") + 1);
+      return { id: path, title, subtitle: path, run: () => onSelectFile(path, title) };
+    });
+  }
   const index = Math.min(selectedIndex, Math.max(0, items.length - 1));
-  const activate = (item: (typeof items)[number]) => {
+  const activate = (item: PaletteItem) => {
     if (item.disabled) return;
     dialog.current?.close();
     onClose();
@@ -137,6 +151,12 @@ export function CommandPalette({
             </div>
           ))}
         </div>
+        {!commandMode && filesNote && <p className="mt-2 text-xs text-zinc-500">{filesNote}</p>}
+        {total > items.length && (
+          <p className="mt-2 text-xs text-zinc-500">
+            Showing {items.length} of {total} matches. Type to narrow the list.
+          </p>
+        )}
         <div className="mt-2 text-xs text-zinc-500">
           ↑ ↓ Navigate · Enter Open · Esc Close · &gt; Commands
         </div>
