@@ -4,12 +4,16 @@ import type { EditorHandle, EditorState, EditorAction } from "./components/layou
 import type { TextHistory } from "./services/editor";
 import { matchesShortcut, shortcutLabel } from "./services/commands";
 import type { AppCommand } from "./services/commands";
-import React, { useState, useEffect, useCallback, useRef, Component } from "react";
+import React, { useState, useEffect, useCallback, useRef, Component, lazy, Suspense } from "react";
 import { TitleBar } from "./components/layout/TitleBar";
 import { ActivityBar } from "./components/layout/ActivityBar";
 import { Sidebar } from "./components/layout/Sidebar";
 import { EditorArea } from "./components/layout/EditorArea";
-import { TerminalPanel } from "./components/layout/TerminalPanel";
+const TerminalPanel = lazy(() =>
+  import("./components/layout/TerminalPanel").then((module) => ({
+    default: module.TerminalPanel,
+  })),
+);
 import { StatusBar } from "./components/layout/StatusBar";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { AIAssistantPanel } from "./components/ai/AIAssistantPanel";
@@ -18,8 +22,10 @@ import type { Replacement } from "./components/layout/SearchPanel";
 import { SourceControlPanel } from "./components/layout/SourceControlPanel";
 import { DiffEditor } from "./components/layout/DiffEditor";
 import type { DiffDocument } from "./components/layout/DiffEditor";
+import { CommitGraphPanel } from "./components/git/CommitGraphPanel";
 import type { SearchHit } from "./services/search";
 import { recordEdit } from "./services/editor";
+import { requestTerminal } from "./services/terminal";
 
 import { isTauri } from "@tauri-apps/api/core";
 import type { FileNode, EditorTab, RecentFile } from "./types";
@@ -33,7 +39,13 @@ import {
   setChildren,
   validateEntryName,
 } from "./services/workspace";
-import { buildDecorations } from "./services/git";
+import {
+  buildDecorations,
+  gitRegistry,
+  useActiveRepo,
+  useRepoSnapshot,
+  useTotalChanges,
+} from "./services/git";
 import type { Decorations } from "./services/git";
 import { listFiles } from "./services/search";
 // Error boundary to prevent white/black screen crashes
@@ -108,15 +120,30 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isTerminalOpen, setIsTerminalOpen] = useState(false);
+  // Once opened, the panel stays mounted and is only hidden, so shells keep running.
+  const [wasTerminalOpened, setWasTerminalOpened] = useState(false);
+
+  /** Shows or hides the panel, mounting it the first time it is needed. */
+  const showTerminal = useCallback((next: boolean | ((open: boolean) => boolean)) => {
+    setIsTerminalOpen((open) => {
+      const shown = typeof next === "function" ? next(open) : next;
+      if (shown) setWasTerminalOpened(true);
+      return shown;
+    });
+  }, []);
   const [isTerminalMaximized, setIsTerminalMaximized] = useState(false);
   const [isAIOpen, setIsAIOpen] = useState(false);
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const [activeActivityTab, setActiveActivityTab] = useState("explorer");
   const [diff, setDiff] = useState<DiffDocument | null>(null);
+  const [showGraph, setShowGraph] = useState(false);
   const [searchFocus, setSearchFocus] = useState(0);
   const [gitRevision, setGitRevision] = useState(0);
   const [pendingHit, setPendingHit] = useState<SearchHit | null>(null);
   const hasUnsavedChanges = tabs.some((tab) => tab.dirty);
+  const totalGitChanges = useTotalChanges();
+  const activeRepo = useActiveRepo();
+  const activeRepoSnapshot = useRepoSnapshot(activeRepo?.store);
 
   useEffect(() => {
     if (!hasUnsavedChanges) return;
@@ -510,6 +537,39 @@ export default function App() {
     await refreshTree();
   };
 
+  const handleHunkAction = async (action: "stage" | "unstage" | "discard", hunkIndex: number) => {
+    if (!diff?.repoId || !diff.kind) return;
+    const entry = gitRegistry.getSnapshot().repos.find((r) => r.repoId === diff.repoId);
+    if (!entry) return;
+    const repo = entry.store.repository;
+    const targetPath = diff.path;
+    const targetKind = diff.kind;
+    const targetText = diff.text;
+
+    // Routed through the shared `guarded()` (same as commit/stage/pull/push) so a
+    // hunk action sets the repo's busy flag, blocks conflicting concurrent
+    // operations, and reports failures through the store's shared notice.
+    const ok = await entry.store.guarded(`${action}-hunk`, false, async () => {
+      if (action === "stage") await repo.stageHunks(targetText, [hunkIndex]);
+      else if (action === "unstage") await repo.unstageHunks(targetText, [hunkIndex]);
+      else await repo.discardHunks(targetText, [hunkIndex]);
+      return "Hunk updated.";
+    });
+    if (!ok) return;
+
+    try {
+      await reconcileWorkspace();
+      setGitRevision((value) => value + 1);
+
+      // Re-fetch so hunk indices/content reflect the new state; if nothing textual
+      // remains, the change is fully staged/discarded, so close the view.
+      const refreshed = await repo.diff(targetPath, targetKind === "staged");
+      setDiff(refreshed.trim() ? { ...diff, text: refreshed } : null);
+    } catch (error) {
+      entry.store.setNotice(String(error));
+    }
+  };
+
   const hasEditor = !!activeTab && activeTab.id !== "welcome";
   const desktop = isTauri();
   // Quick open lists the whole workspace through the packaged search tool, not the lazy tree.
@@ -577,6 +637,17 @@ export default function App() {
       menu: "View",
       label: "Search in Files",
       shortcut: "Mod+Shift+f",
+      run: () => {
+        setActiveActivityTab("search");
+        setIsSidebarOpen(true);
+        setSearchFocus((v) => v + 1);
+      },
+    },
+    {
+      id: "view.replace",
+      menu: "View",
+      label: "Replace in Files",
+      shortcut: "Mod+Shift+h",
       run: () => {
         setActiveActivityTab("search");
         setIsSidebarOpen(true);
@@ -793,7 +864,7 @@ export default function App() {
       label: "Bottom Panel",
       shortcut: "Mod+" + String.fromCharCode(96),
       checked: isTerminalOpen,
-      run: () => setIsTerminalOpen((prev) => !prev),
+      run: () => showTerminal((prev) => !prev),
     },
     {
       id: "view.ai",
@@ -870,15 +941,50 @@ export default function App() {
       menu: "Terminal",
       label: "Show / Hide Panel",
       checked: isTerminalOpen,
-      run: () => setIsTerminalOpen((prev) => !prev),
+      run: () => showTerminal((prev) => !prev),
     },
     {
       id: "terminal.new",
       menu: "Terminal",
-      label: "New Terminal (not available)",
-      disabled: true,
-      reason: "Native terminal execution has not been implemented",
-      run: () => {},
+      label: "New Terminal",
+      shortcut: "Mod+Shift+" + String.fromCharCode(96),
+      run: () => {
+        showTerminal(true);
+        requestTerminal("new");
+      },
+    },
+    {
+      id: "terminal.split",
+      menu: "Terminal",
+      label: "Split Terminal",
+      run: () => {
+        showTerminal(true);
+        requestTerminal("split");
+      },
+    },
+    {
+      id: "terminal.clear",
+      menu: "Terminal",
+      label: "Clear Terminal",
+      disabled: !isTerminalOpen,
+      reason: "Show the panel first",
+      run: () => requestTerminal("clear"),
+    },
+    {
+      id: "terminal.find",
+      menu: "Terminal",
+      label: "Find in Terminal",
+      disabled: !isTerminalOpen,
+      reason: "Show the panel first",
+      run: () => requestTerminal("find"),
+    },
+    {
+      id: "terminal.kill",
+      menu: "Terminal",
+      label: "Close Terminal",
+      disabled: !isTerminalOpen,
+      reason: "Show the panel first",
+      run: () => requestTerminal("kill"),
     },
     {
       id: "help.shortcuts",
@@ -901,7 +1007,7 @@ export default function App() {
         setDialog({
           title: "About Yavin IDE",
           message:
-            "Yavin IDE 2.0.0\nReact + TypeScript + Vite + Tauri\n\nBrowse and edit workspace files. Native terminal execution, AI services, and language servers are not connected.\n\nBrowser preview keeps edits only in memory; open the desktop application to save files.",
+            "Yavin IDE 2.0.0\nReact + TypeScript + Vite + Tauri\n\nBrowse and edit workspace files, and run a shell in the terminal panel. AI services and language servers are not connected.\n\nBrowser preview keeps edits only in memory; open the desktop application to save files.",
         }),
     },
   ];
@@ -962,7 +1068,7 @@ export default function App() {
         {/* Top TitleBar */}
         <TitleBar
           onToggleSidebar={() => setIsSidebarOpen((prev) => !prev)}
-          onToggleTerminal={() => setIsTerminalOpen((prev) => !prev)}
+          onToggleTerminal={() => showTerminal((prev) => !prev)}
           onToggleAI={() => setIsAIOpen((prev) => !prev)}
           onOpenCommandPalette={() => openPalette("files")}
           isAIOpen={isAIOpen}
@@ -975,6 +1081,7 @@ export default function App() {
           {/* Leftmost Activity Bar */}
           <ActivityBar
             activeTab={activeActivityTab}
+            gitBadge={totalGitChanges > 0 ? String(totalGitChanges) : ""}
             onSelectTab={(tabId) => {
               if (activeActivityTab === tabId && isSidebarOpen) {
                 setIsSidebarOpen(false);
@@ -1015,6 +1122,11 @@ export default function App() {
             onChanged={reconcileWorkspace}
             apply={(changes) => applyReplacements(changes, true)}
             onEntries={(entries) => setDecorations(buildDecorations(entries, workspacePath))}
+            activeDiffPath={diff?.path}
+            onOpenGraph={() => {
+              setDiff(null);
+              setShowGraph(true);
+            }}
           />
           <Sidebar
             key={`explorer:${workspacePath}`}
@@ -1040,12 +1152,33 @@ export default function App() {
 
           {/* Center: Editor + Bottom Terminal Panel */}
           <div className="flex flex-1 flex-col min-w-0 bg-[#000000]">
-            {diff ? (
+            {showGraph && activeRepo ? (
+              <CommitGraphPanel
+                key={activeRepo.repoId}
+                repository={activeRepo.store.repository}
+                onClose={() => setShowGraph(false)}
+              />
+            ) : diff ? (
               <DiffEditor
                 key={diff.path + diff.title + diff.text}
                 document={diff}
                 onClose={() => setDiff(null)}
                 onOpen={() => void handleOpenFile(diff.path)}
+                onStageHunk={
+                  diff.repoId && diff.kind === "unstaged"
+                    ? (i) => void handleHunkAction("stage", i)
+                    : undefined
+                }
+                onUnstageHunk={
+                  diff.repoId && diff.kind === "staged"
+                    ? (i) => void handleHunkAction("unstage", i)
+                    : undefined
+                }
+                onDiscardHunk={
+                  diff.repoId && diff.kind === "unstaged"
+                    ? (i) => void handleHunkAction("discard", i)
+                    : undefined
+                }
               />
             ) : (
               <EditorArea
@@ -1068,12 +1201,15 @@ export default function App() {
               />
             )}
 
-            {isTerminalOpen && (
-              <TerminalPanel
-                onClose={() => setIsTerminalOpen(false)}
-                isMaximized={isTerminalMaximized}
-                onToggleMaximize={() => setIsTerminalMaximized((prev) => !prev)}
-              />
+            {wasTerminalOpened && (
+              <Suspense fallback={null}>
+                <TerminalPanel
+                  hidden={!isTerminalOpen}
+                  onClose={() => setIsTerminalOpen(false)}
+                  isMaximized={isTerminalMaximized}
+                  onToggleMaximize={() => setIsTerminalMaximized((prev) => !prev)}
+                />
+              </Suspense>
             )}
           </div>
 
@@ -1084,7 +1220,8 @@ export default function App() {
         {/* Status Bar */}
         <StatusBar
           activeFile={activeTab?.path || ""}
-          onToggleTerminal={() => setIsTerminalOpen((prev) => !prev)}
+          onToggleTerminal={() => showTerminal((prev) => !prev)}
+          branch={activeRepoSnapshot?.branch}
         />
 
         {dialog && <AppDialog request={dialog} onClose={() => setDialog(null)} />}

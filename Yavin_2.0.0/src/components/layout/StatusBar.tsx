@@ -1,9 +1,13 @@
-﻿interface StatusBarProps {
+﻿import type { Branch } from "../../services/git";
+import { GitBranchIcon } from "../ui/Icons";
+
+interface StatusBarProps {
   activeFile: string;
   onToggleTerminal: () => void;
+  branch?: Branch;
 }
 
-export function StatusBar({ activeFile, onToggleTerminal }: StatusBarProps) {
+export function StatusBar({ activeFile, onToggleTerminal, branch }: StatusBarProps) {
   const language = activeFile.endsWith(".tsx")
     ? "TypeScript React"
     : activeFile.endsWith(".ts")
@@ -13,11 +17,33 @@ export function StatusBar({ activeFile, onToggleTerminal }: StatusBarProps) {
         : "Plain text";
   return (
     <footer className="flex h-6 items-center justify-between border-t border-[#151515] bg-black px-3 text-[11px] text-zinc-400">
-      <span className="truncate">{activeFile || "Yavin IDE"}</span>
+      <div className="flex min-w-0 items-center gap-3">
+        {branch?.name && (
+          <span
+            className="flex items-center gap-1 shrink-0"
+            title={branch.upstream ? `Tracking ${branch.upstream}` : branch.name}
+          >
+            <GitBranchIcon size={12} />
+            {branch.name}
+            {(branch.ahead > 0 || branch.behind > 0) && (
+              <span className="font-mono">
+                ↑{branch.ahead} ↓{branch.behind}
+              </span>
+            )}
+          </span>
+        )}
+        <span className="truncate">{activeFile || "Yavin IDE"}</span>
+      </div>
       <div className="flex shrink-0 items-center gap-4">
         <span>UTF-8</span>
         <span>{language}</span>
-        <button onClick={onToggleTerminal}>Terminal: unavailable</button>
+        <button
+          onClick={onToggleTerminal}
+          title="Show or hide the terminal panel"
+          className="hover:text-zinc-200"
+        >
+          Terminal
+        </button>
       </div>
     </footer>
   );

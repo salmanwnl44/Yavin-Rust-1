@@ -1,6 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { FileNode } from "../types";
+import type { Shell } from "./terminal";
 
 interface Commands {
   get_default_workspace: { args: undefined; result: string | null };
@@ -14,18 +15,30 @@ interface Commands {
   copy_path: { args: { src: string; dest: string }; result: void };
   reveal_in_explorer: { args: { path: string }; result: void };
   open_folder_dialog: { args: undefined; result: string | null };
+  pick_folder_dialog: { args: undefined; result: string | null };
   open_file_dialog: { args: undefined; result: string | null };
-  get_git_status: { args: { path: string }; result: { root: string; output: string } };
   write_file_guarded: { args: { path: string; expected: string; content: string }; result: void };
   search_project: {
     args: { workspace: string; id: string; options: SearchOptions };
     result: ToolOutput;
   };
   cancel_search: { args: { id: string }; result: void };
-  git_workbench: {
-    args: { workspace: string; action: string; path?: string; value?: string };
+  git_open_repo: { args: { path: string }; result: { repoId: string; root: string } };
+  git_close_repo: { args: { repoId: string }; result: void };
+  git_exec: {
+    args: { repoId: string; args: string[]; input?: string };
+    result: ToolOutput;
+  };
+  git_repo_state: { args: { repoId: string }; result: string };
+  terminal_shells: { args: undefined; result: Shell[] };
+  terminal_open: {
+    args: { id: string; shell?: string; cols: number; rows: number };
     result: string;
   };
+  terminal_write: { args: { id: string; data: string }; result: void };
+  terminal_resize: { args: { id: string; cols: number; rows: number }; result: void };
+  terminal_close: { args: { id: string }; result: void };
+  terminal_close_all: { args: undefined; result: void };
 }
 
 export interface ToolOutput {

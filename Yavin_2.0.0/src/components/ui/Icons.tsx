@@ -200,3 +200,72 @@ export const DiffIcon = (props: IconProps) => (
     <line x1="12" y1="3" x2="12" y2="21" />
   </Stroke>
 );
+
+export const ArrowUpIcon = (props: IconProps) => (
+  <Stroke {...props}>
+    <line x1="12" y1="19" x2="12" y2="5" />
+    <polyline points="5 12 12 5 19 12" />
+  </Stroke>
+);
+
+export const ArrowDownIcon = (props: IconProps) => (
+  <Stroke {...props}>
+    <line x1="12" y1="5" x2="12" y2="19" />
+    <polyline points="19 12 12 19 5 12" />
+  </Stroke>
+);
+
+export const SyncIcon = (props: IconProps) => (
+  <Stroke {...props}>
+    <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2" />
+  </Stroke>
+);
+
+export const FilterIcon = (props: IconProps) => (
+  <Stroke {...props}>
+    <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
+  </Stroke>
+);
+
+export const CheckCircleIcon = (props: IconProps) => (
+  <Stroke {...props}>
+    <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+    <polyline points="22 4 12 14.01 9 11.01" />
+  </Stroke>
+);
+
+export const AlertCircleIcon = (props: IconProps) => (
+  <Stroke {...props}>
+    <circle cx="12" cy="12" r="10" />
+    <line x1="12" y1="8" x2="12" y2="12" />
+    <line x1="12" y1="16" x2="12.01" y2="16" />
+  </Stroke>
+);
+
+export const ReplaceAllIcon = (props: IconProps) => (
+  <Stroke {...props}>
+    <polyline points="14 9 9 4 4 9" />
+    <path d="M20 20v-7a4 4 0 0 0-4-4H9" />
+    <polyline points="18 13 13 8 8 13" />
+  </Stroke>
+);
+
+export const SparklesIcon = (props: IconProps) => (
+  <Stroke {...props}>
+    <path d="M12 3l1.912 5.813a2 2 0 0 0 1.275 1.275L21 12l-5.813 1.912a2 2 0 0 0-1.275 1.275L12 21l-1.912-5.813a2 2 0 0 0-1.275-1.275L3 12l5.813-1.912a2 2 0 0 0 1.275-1.275L12 3z" />
+  </Stroke>
+);
+
+export const ExternalLinkIcon = (props: IconProps) => (
+  <Stroke {...props}>
+    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+    <polyline points="15 3 21 3 21 9" />
+    <line x1="10" y1="14" x2="21" y2="3" />
+  </Stroke>
+);
+
+export const ChevronDownIcon = (props: IconProps) => (
+  <Stroke {...props}>
+    <polyline points="6 9 12 15 18 9" />
+  </Stroke>
+);

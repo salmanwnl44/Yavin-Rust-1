@@ -79,8 +79,14 @@ async function explorer(page: Page, status = "") {
             entries[args.dest] = { ...entries[args.src] };
             return null;
           }
-          if (command === "git_workbench")
-            return args.action === "discover" ? "/work" : args.action === "status" ? gitStatus : "";
+          if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
+          if (command === "git_repo_state") return "";
+          if (command === "git_exec") {
+            const gitArgs = (args as unknown as { args: string[] }).args;
+            const isStatus = gitArgs[0] === "status";
+            const stdout = isStatus && !gitArgs.includes("--porcelain=v2") ? gitStatus : "";
+            return { stdout, stderr: "", code: 0, truncated: false };
+          }
           if (command === "search_project")
             return {
               stdout: Object.keys(entries)

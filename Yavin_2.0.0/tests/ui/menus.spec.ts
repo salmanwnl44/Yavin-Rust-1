@@ -182,7 +182,6 @@ async function desktopFixture(page: Page) {
                 is_dir: false,
               })),
             };
-          if (command === "get_git_status") return { root: "/work", output: "" };
           if (command === "read_file_content") return files[args.path!];
           if (command === "open_file_dialog") return "/work/file.ts";
           if (command === "create_file") {

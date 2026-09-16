@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildDecorations, parseGitEntries } from "./git.ts";
+import { buildDecorations, parseGitEntries } from "./status.ts";
 
 test("decorations cover every status, use workspace casing and mark ancestor folders", () => {
   const entries = parseGitEntries(

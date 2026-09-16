@@ -2,9 +2,16 @@ use file_tree::WorkspaceManager;
 use ide_workspace::file_tree::{self, FileNode};
 use ide_workspace::watcher::{self, RecommendedWatcher};
 use std::{env, path::Path, sync::Mutex};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
+mod git;
+mod terminal;
 mod workbench;
-use workbench::{cancel_search, git_workbench, search_project, write_file_guarded};
+use git::{git_close_repo, git_exec, git_open_repo, git_repo_state, Repos};
+use terminal::{
+    terminal_close, terminal_close_all, terminal_open, terminal_resize, terminal_shells,
+    terminal_write, Terminals,
+};
+use workbench::{cancel_search, search_project, write_file_guarded};
 
 struct Workspace(Mutex<Option<WorkspaceManager>>);
 
@@ -139,6 +146,13 @@ fn open_folder_dialog(
     Ok(selected)
 }
 
+// A side-effect-free folder picker: unlike `open_folder_dialog`, this never replaces
+// the active file-tree workspace. Used to add an extra repository to Source Control.
+#[tauri::command]
+fn pick_folder_dialog() -> Result<Option<String>, String> {
+    file_tree::pick_workspace_folder()
+}
+
 #[tauri::command]
 fn open_file_dialog(state: State<'_, Workspace>) -> Result<Option<String>, String> {
     let selected = file_tree::pick_file()?;
@@ -161,25 +175,14 @@ fn copy_path(state: State<'_, Workspace>, src: String, dest: String) -> Result<(
     })
 }
 
-#[tauri::command(async)]
-fn get_git_status(
-    state: State<'_, Workspace>,
-    path: String,
-) -> Result<ide_workspace::git::GitStatus, String> {
-    with_workspace(&state, |manager| {
-        ide_workspace::git::get_workspace_git_status(&file_tree::clean_path_str(
-            manager.validate_path(&path)?,
-        ))
-    })
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     if let Err(error) = tauri::Builder::default()
         .manage(Workspace(Mutex::new(None)))
         .manage(Watch::default())
         .manage(workbench::Jobs::default())
-        .manage(workbench::GitLock::default())
+        .manage(Repos::default())
+        .manage(Terminals::default())
         .invoke_handler(tauri::generate_handler![
             get_default_workspace,
             list_workspace_files,
@@ -192,14 +195,35 @@ pub fn run() {
             copy_path,
             reveal_in_explorer,
             open_folder_dialog,
+            pick_folder_dialog,
             open_file_dialog,
-            get_git_status,
             search_project,
             cancel_search,
             write_file_guarded,
-            git_workbench,
+            git_open_repo,
+            git_close_repo,
+            git_exec,
+            git_repo_state,
+            terminal_shells,
+            terminal_open,
+            terminal_write,
+            terminal_resize,
+            terminal_close,
+            terminal_close_all,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
+        .map(|app| {
+            // Shells are children of this process, not of the window, so they have to be
+            // ended explicitly or they outlive the application.
+            app.run(|handle, event| {
+                if matches!(
+                    event,
+                    tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+                ) {
+                    terminal::close_all(&handle.state::<Terminals>());
+                }
+            })
+        })
     {
         eprintln!("Failed to run Yavin: {error}");
         std::process::exit(1);

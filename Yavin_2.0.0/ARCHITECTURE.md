@@ -33,7 +33,7 @@ The seven excluded crates (`ide-core`, `ide-config`, `ide-syntax`, `ide-lsp`, `i
 ## Remaining product and release work
 
 1. Replace the textarea with a TypeScript editor integration when syntax, structured undo, large-file virtualization, and language tooling are implemented. Existing inactive Rust buffers were never connected to the UI.
-2. Implement actual terminal, language-server, debugging, AI, and extension services in TypeScript. Keep any Rust process transport small and restrict process spawning to explicit user actions and validated arguments.
+2. Implement actual language-server, debugging, AI, and extension services in TypeScript. Keep any Rust process transport small and restrict process spawning to explicit user actions and validated arguments. The terminal follows this shape: `src-tauri/src/terminal.rs` only opens a PTY, starts the user's own shell with no arguments, and streams bytes; xterm.js does the emulation in TypeScript. One session exists per window, started by an explicit user action and ended when the panel closes.
 3. Add desktop end-to-end coverage for folder selection, CRUD, unsaved-close prompts, window controls, and failure recovery. Exercise nested Git repositories, UNC paths, read-only files, symlinks/junctions, and non-ASCII names on supported platforms.
 4. Add file-change reconciliation and conflict detection before enabling autosave. Today refresh is manual, and saving can overwrite changes made externally since opening the file.
 5. Measure large-workspace traversal and memory use. Native scans currently run synchronously and stop at a bounded depth; add incremental loading or background execution when needed.

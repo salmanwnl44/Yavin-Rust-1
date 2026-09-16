@@ -1,4 +1,4 @@
-import { isWithin, parentOf } from "./workspace.ts";
+import { isWithin, parentOf } from "../../workspace.ts";
 
 export interface GitEntry {
   path: string;
@@ -8,6 +8,7 @@ export interface GitEntry {
   untracked: boolean;
   conflict: boolean;
 }
+
 export function parseGitEntries(output: string, root: string): GitEntry[] {
   const records = output.split("\0");
   const entries: GitEntry[] = [];
@@ -33,6 +34,7 @@ export function parseGitEntries(output: string, root: string): GitEntry[] {
   }
   return entries;
 }
+
 export interface Decorations {
   files: Map<string, string>;
   folders: Set<string>;
@@ -68,24 +70,4 @@ export function buildDecorations(entries: GitEntry[], workspace: string): Decora
       folders.add(dir);
   }
   return { files, folders };
-}
-
-export function parseBranch(output: string): {
-  name: string;
-  upstream: string;
-  ahead: number;
-  behind: number;
-} {
-  const field = (name: string) =>
-    output
-      .split("\n")
-      .find((l) => l.startsWith(`# branch.${name} `))
-      ?.slice(name.length + 10) ?? "";
-  const ab = field("ab").match(/\+(\d+) -(\d+)/);
-  return {
-    name: field("head"),
-    upstream: field("upstream"),
-    ahead: Number(ab?.[1] ?? 0),
-    behind: Number(ab?.[2] ?? 0),
-  };
 }

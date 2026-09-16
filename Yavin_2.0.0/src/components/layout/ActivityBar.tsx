@@ -1,9 +1,11 @@
 export function ActivityBar({
   activeTab,
+  gitBadge = "",
   onSelectTab,
   onOpenSettings,
 }: {
   activeTab: string;
+  gitBadge?: string;
   onSelectTab: (tab: string) => void;
   onOpenSettings: () => void;
 }) {
@@ -48,7 +50,7 @@ export function ActivityBar({
     {
       id: "git",
       title: "Source Control (Ctrl+Shift+G)",
-      badge: "",
+      badge: gitBadge,
       icon: (
         <svg
           width="20"

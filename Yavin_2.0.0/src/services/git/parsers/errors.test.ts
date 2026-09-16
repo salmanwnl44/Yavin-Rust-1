@@ -1,0 +1,39 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { describeGitError } from "./errors.ts";
+
+test("Git failures are explained without hiding what Git said", () => {
+  const auth = describeGitError(
+    new Error(
+      "Git: fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+    ),
+  );
+  assert.match(auth, /never prompts for passwords/);
+  assert.match(auth, /Git said: fatal: could not read Username/);
+
+  assert.match(
+    describeGitError("Git: ! [rejected] main -> main (non-fast-forward)"),
+    /does not force push/,
+  );
+  assert.match(
+    describeGitError("fatal: Not possible to fast-forward, aborting."),
+    /Choose Rebase or Merge/,
+  );
+  assert.match(
+    describeGitError("error: Your local changes to the following files would be overwritten"),
+    /never stashes your work/,
+  );
+  assert.match(describeGitError("CONFLICT (content): Merge conflict in a.ts"), /stage each one/);
+  assert.match(
+    describeGitError("fatal: The current branch x has no upstream branch"),
+    /Publish it to a remote/,
+  );
+  assert.match(describeGitError("Permission denied (publickey)."), /SSH key/);
+
+  // A rejection by a hook must never read as if Yavin could retry past it.
+  assert.match(describeGitError("pre-push hook declined"), /never bypasses hooks/);
+
+  // Anything unrecognized survives verbatim rather than being flattened.
+  assert.equal(describeGitError("Git: some unmapped failure"), "some unmapped failure");
+  assert.equal(describeGitError(""), "The Git operation failed.");
+});

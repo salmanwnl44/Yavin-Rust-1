@@ -43,5 +43,5 @@ Browser tests use installed Microsoft Edge on Windows. On other platforms, run `
 
 See [MENUS.md](MENUS.md) for the menu audit, reviewed plan, and command scope.
 
-The editor currently uses a textarea. AI, terminal execution, language servers, debugger, plugins, and automatic filesystem watching are not connected. Their UI must not claim that work has executed.
+The editor currently uses a textarea. The terminal panel runs your own shell in the workspace root, one session per window. AI, language servers, debugger, plugins, and automatic filesystem watching are not connected. Their UI must not claim that work has executed.
 See [ARCHITECTURE.md](ARCHITECTURE.md) for ownership boundaries and the remaining release plan.

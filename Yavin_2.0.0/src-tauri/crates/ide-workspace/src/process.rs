@@ -7,7 +7,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct ToolOutput {
     pub stdout: String,
     pub stderr: String,

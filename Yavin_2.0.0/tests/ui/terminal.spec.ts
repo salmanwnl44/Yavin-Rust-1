@@ -1,0 +1,496 @@
+import { test, expect } from "@playwright/test";
+import type { Page } from "@playwright/test";
+
+interface Call {
+  command: string;
+  args: Record<string, unknown>;
+}
+
+const CMD = "C:\\Windows\\System32\\cmd.exe";
+const BASH = "C:\\Program Files\\Git\\bin\\bash.exe";
+
+/** Opens the bottom panel through the Terminal menu. */
+async function openPanel(page: Page) {
+  await page.getByRole("menubar").getByRole("menuitem", { name: "Terminal", exact: true }).click();
+  await page
+    .getByRole("menu", { name: "Terminal", exact: true })
+    .getByRole("menuitemcheckbox", { name: "Show / Hide Panel", exact: true })
+    .click();
+}
+
+async function terminalMenu(page: Page, item: string) {
+  await page.getByRole("menubar").getByRole("menuitem", { name: "Terminal", exact: true }).click();
+  await page
+    .getByRole("menu", { name: "Terminal", exact: true })
+    .getByRole("menuitem", { name: item, exact: true })
+    .click();
+}
+
+/**
+ * Installs a Tauri mock that can deliver events, so shells can be driven from the test.
+ * `failOpen` makes a spawn fail the way a missing workspace would.
+ */
+async function desktop(page: Page, options: { failOpen?: string } = {}) {
+  await page.addInitScript((setup) => {
+    const calls: Call[] = [];
+    const callbacks: Record<number, (event: unknown) => void> = {};
+    const listeners: Record<string, number[]> = {};
+    let nextId = 1;
+
+    Object.assign(window, {
+      __calls: calls,
+      // Delivers a native event to every listener registered for it.
+      __emit: (event: string, payload: unknown) => {
+        for (const id of listeners[event] ?? []) callbacks[id]?.({ event, id, payload });
+      },
+      isTauri: true,
+      __TAURI_INTERNALS__: {
+        metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
+        transformCallback: (callback: (event: unknown) => void) => {
+          const id = nextId++;
+          callbacks[id] = callback;
+          return id;
+        },
+        unregisterCallback: (id: number) => delete callbacks[id],
+        invoke: async (command: string, args: Record<string, unknown> = {}) => {
+          calls.push({ command, args });
+          if (command === "plugin:event|listen") {
+            const event = args.event as string;
+            (listeners[event] ??= []).push(args.handler as number);
+            return nextId++;
+          }
+          if (command === "get_default_workspace") return "/work";
+          if (command === "list_workspace_files")
+            return { path: "/work", name: "work", is_dir: true, children: [] };
+          if (command === "terminal_shells")
+            return [
+              { name: "Command Prompt", path: "C:\\Windows\\System32\\cmd.exe" },
+              { name: "Git Bash", path: "C:\\Program Files\\Git\\bin\\bash.exe" },
+            ];
+          if (command === "terminal_open") {
+            if (setup.failOpen) throw setup.failOpen;
+            return args.shell || "C:\\Windows\\System32\\cmd.exe";
+          }
+          if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
+          if (command === "git_repo_state") return "";
+          if (command === "git_exec") return { stdout: "", stderr: "", code: 0, truncated: false };
+          return null;
+        },
+      },
+      __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => {} },
+    });
+  }, options);
+  await page.goto("/");
+}
+
+const calls = (page: Page, command: string) =>
+  page.evaluate(
+    (name) =>
+      (window as unknown as { __calls: Call[] }).__calls.filter((call) => call.command === name),
+    command,
+  );
+
+const countCalls = async (page: Page, command: string) => (await calls(page, command)).length;
+
+const emit = (page: Page, event: string, payload: unknown) =>
+  page.evaluate(
+    ([name, data]) =>
+      (window as unknown as { __emit: (e: string, p: unknown) => void }).__emit(
+        name as string,
+        data,
+      ),
+    [event, payload] as const,
+  );
+
+const uniqueIds = async (page: Page) => {
+  const opened = await calls(page, "terminal_open");
+  return [...new Set(opened.map((call) => call.args.id as string))];
+};
+
+/**
+ * The distinct terminals opened so far, once at least `expected` exist. Ids are
+ * de-duplicated because React's development StrictMode mounts effects twice, which
+ * opens the same terminal again.
+ */
+async function terminalIds(page: Page, expected = 1): Promise<string[]> {
+  await expect.poll(async () => (await uniqueIds(page)).length).toBeGreaterThanOrEqual(expected);
+  return uniqueIds(page);
+}
+
+const view = (page: Page, id: string) => page.getByLabel(`Terminal ${id}`);
+
+test("a shell starts with the panel and its output is displayed", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+
+  await expect(page.getByRole("tab", { name: "Command Prompt", exact: true })).toBeVisible();
+  const [open] = await calls(page, "terminal_open");
+  // The size sent to the shell is a real measurement, not a placeholder.
+  expect(open.args.cols).toBeGreaterThan(0);
+  expect(open.args.rows).toBeGreaterThan(0);
+
+  await emit(page, "terminal-output", { id, data: "hello from the shell\r\n" });
+  await expect(view(page, id)).toContainText("hello from the shell");
+});
+
+test("typing reaches the shell as bytes", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await view(page, id).click();
+
+  await page.keyboard.type("ls");
+  await page.keyboard.press("Enter");
+
+  await expect
+    .poll(async () => (await calls(page, "terminal_write")).map((c) => c.args.data).join(""))
+    .toBe("ls\r");
+});
+
+test("output is delivered only to the terminal that produced it", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+
+  await page.getByLabel("New Terminal").click();
+  const [first, second] = await terminalIds(page, 2);
+
+  await emit(page, "terminal-output", { id: first, data: "belongs to one" });
+  await emit(page, "terminal-output", { id: second, data: "belongs to two" });
+
+  await expect(view(page, second)).toContainText("belongs to two");
+  await expect(view(page, second)).not.toContainText("belongs to one");
+  // Switching back shows the first terminal with only its own output.
+  await page.getByRole("tab", { name: "Command Prompt", exact: true }).click();
+  await expect(view(page, first)).toContainText("belongs to one");
+  await expect(view(page, first)).not.toContainText("belongs to two");
+});
+
+test("terminals are named for their shell and numbered when repeated", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("New Terminal").click();
+
+  await expect(page.getByRole("tab", { name: "Command Prompt", exact: true })).toBeVisible();
+  await expect(page.getByRole("tab", { name: "Command Prompt (2)", exact: true })).toBeVisible();
+});
+
+test("a different shell can be chosen for a new terminal", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+
+  await page.getByLabel("Choose a shell").click();
+  await page.getByRole("menuitem", { name: "Git Bash", exact: true }).click();
+  await terminalIds(page, 2);
+
+  const opened = await calls(page, "terminal_open");
+  expect(opened.some((call) => call.args.shell === BASH)).toBe(true);
+  expect(opened.some((call) => call.args.shell === CMD)).toBe(true);
+  await expect(page.getByRole("tab", { name: "Git Bash", exact: true })).toBeVisible();
+});
+
+test("splitting shows two terminals at once and unsplitting keeps both", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+
+  await page.getByLabel("Split Terminal").click();
+  const [first, second] = await terminalIds(page, 2);
+  await expect(view(page, first)).toBeVisible();
+  await expect(view(page, second)).toBeVisible();
+
+  // Unsplitting hides the second pane but does not end its shell.
+  const closed = await countCalls(page, "terminal_close");
+  await page.getByLabel("Unsplit Terminal").click();
+  await expect(view(page, second)).toBeHidden();
+  expect(await countCalls(page, "terminal_close")).toBe(closed);
+});
+
+test("closing one terminal leaves the others running", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("New Terminal").click();
+  const [first, second] = await terminalIds(page, 2);
+
+  const closed = await countCalls(page, "terminal_close");
+  await page.getByLabel("Close Command Prompt (2)").click();
+
+  await expect.poll(async () => countCalls(page, "terminal_close")).toBe(closed + 1);
+  const closes = await calls(page, "terminal_close");
+  expect(closes[closes.length - 1].args.id).toBe(second);
+  await expect(view(page, first)).toBeVisible();
+});
+
+test("closing the last terminal closes the panel, and reopening starts a new one", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openPanel(page);
+  const [first] = await terminalIds(page);
+  await expect(page.getByRole("tab", { name: "Command Prompt", exact: true })).toBeVisible();
+
+  await terminalMenu(page, "Close Terminal");
+  await expect(page.getByLabel("New Terminal")).toBeHidden();
+
+  await openPanel(page);
+  const ids = await terminalIds(page, 2);
+  expect(ids[1]).not.toBe(first);
+  await expect(view(page, ids[1])).toBeVisible();
+});
+
+test("hiding the panel keeps shells running", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await emit(page, "terminal-output", { id, data: "long running build" });
+
+  const closed = await countCalls(page, "terminal_close");
+  await page.getByLabel("Close Panel").click();
+  await expect(view(page, id)).toBeHidden();
+  // Nothing was killed: the shell is still there, with its scrollback.
+  expect(await countCalls(page, "terminal_close")).toBe(closed);
+
+  await openPanel(page);
+  await expect(view(page, id)).toContainText("long running build");
+  expect(await uniqueIds(page)).toHaveLength(1);
+});
+
+test("a shell that will not start says why instead of looking idle", async ({ page }) => {
+  await desktop(page, { failOpen: "Open a workspace first" });
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+
+  await expect(page.getByRole("status")).toContainText("Open a workspace first");
+  await expect(view(page, id)).toContainText("Open a workspace first");
+  // Nothing is sent to a shell that never started.
+  await view(page, id).click();
+  await page.keyboard.type("x");
+  await expect.poll(async () => countCalls(page, "terminal_write")).toBe(0);
+});
+
+test("an exited shell reports its code and can be restarted", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+
+  await emit(page, "terminal-exit", { id, code: 130 });
+  await expect(view(page, id)).toContainText("exited with code 130");
+
+  // Typing into a dead shell is not sent anywhere.
+  await view(page, id).click();
+  await page.keyboard.type("x");
+  expect(await countCalls(page, "terminal_write")).toBe(0);
+
+  const opens = await countCalls(page, "terminal_open");
+  await page.getByRole("button", { name: "Restart", exact: true }).click();
+  await expect.poll(async () => countCalls(page, "terminal_open")).toBe(opens + 1);
+  // The restarted shell keeps the same identity, so its tab does not change.
+  expect(await uniqueIds(page)).toEqual([id]);
+});
+
+test("a shell that ends cleanly is not reported as a failure", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+
+  await emit(page, "terminal-exit", { id, code: 0 });
+  await expect(view(page, id)).toContainText("The shell exited.");
+  await expect(view(page, id)).not.toContainText("code");
+});
+
+test("find locates output and reports when there is no match", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  // Wait for the shell to be attached so the search runs against a settled terminal.
+  await expect(page.getByRole("status")).toContainText("Running");
+  await emit(page, "terminal-output", { id, data: "compiling widget.rs\r\n" });
+
+  // xterm writes asynchronously; search only sees what has reached its buffer.
+  await expect(view(page, id)).toContainText("widget.rs");
+
+  await page.getByLabel("Find in Terminal", { exact: true }).click();
+  const bar = page.getByRole("search", { name: "Terminal search" });
+  const box = bar.getByLabel("Find in terminal", { exact: true });
+  await box.fill("widget");
+  await expect(bar.getByRole("status")).toContainText("1 of 1");
+
+  await box.fill("nothing-here");
+  await expect(bar.getByRole("status")).toContainText("No results");
+
+  await box.press("Escape");
+  await expect(box).toBeHidden();
+});
+
+test("find counts every match and can be made case sensitive", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await emit(page, "terminal-output", { id, data: "Widget widget WIDGET\r\n" });
+  await expect(view(page, id)).toContainText("WIDGET");
+
+  await page.getByLabel("Find in Terminal", { exact: true }).click();
+  const bar = page.getByRole("search", { name: "Terminal search" });
+  await bar.getByLabel("Find in terminal", { exact: true }).fill("widget");
+  await expect(bar.getByRole("status")).toContainText("of 3");
+
+  // Matching case narrows it to the one spelled exactly that way.
+  await bar.getByLabel("Match case").click();
+  await expect(bar.getByRole("status")).toContainText("of 1");
+});
+
+test("right clicking offers the terminal actions, with copy disabled until there is a selection", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await emit(page, "terminal-output", { id, data: "some output to clear\r\n" });
+  await expect(view(page, id)).toContainText("some output");
+
+  await view(page, id).click({ button: "right" });
+  const menu = page.getByRole("menu", { name: "Terminal actions" });
+  await expect(menu).toBeVisible();
+  // Nothing is selected, so there is nothing to copy.
+  await expect(menu.getByRole("menuitem", { name: "Copy", exact: true })).toBeDisabled();
+  await expect(menu.getByRole("menuitem", { name: "Paste", exact: true })).toBeEnabled();
+
+  await menu.getByRole("menuitem", { name: "Clear", exact: true }).click();
+  await expect(menu).toBeHidden();
+  await expect(view(page, id)).not.toContainText("some output");
+});
+
+test("a terminal can be renamed and keeps the name", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+
+  await page.getByRole("tab", { name: "Command Prompt", exact: true }).dblclick();
+  const box = page.getByLabel("Rename terminal");
+  await box.fill("build watch");
+  await box.press("Enter");
+
+  await expect(page.getByRole("tab", { name: "build watch", exact: true })).toBeVisible();
+  // A second terminal is numbered from its shell, not from the renamed one.
+  await page.getByLabel("New Terminal").click();
+  await expect(page.getByRole("tab", { name: "Command Prompt", exact: true })).toBeVisible();
+});
+
+test("the font size zooms with the keyboard and resets", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  const size = () =>
+    page.evaluate(
+      (label) =>
+        parseFloat(
+          getComputedStyle(document.querySelector(`[aria-label="${label}"] .xterm-rows`) as Element)
+            .fontSize,
+        ),
+      `Terminal ${id}`,
+    );
+
+  const original = await size();
+  await view(page, id).click();
+  await page.keyboard.press("Control+=");
+  await expect.poll(size).toBeGreaterThan(original);
+
+  await page.keyboard.press("Control+0");
+  await expect.poll(size).toBe(original);
+});
+
+test("a terminal that rings while hidden is marked", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const [first] = await terminalIds(page);
+  await page.getByLabel("New Terminal").click();
+  await terminalIds(page, 2);
+
+  // The first terminal is no longer on screen when it rings.
+  await emit(page, "terminal-output", { id: first, data: "\u0007" });
+  const tab = page.getByRole("tab", { name: "Command Prompt", exact: true }).locator("..");
+  await expect(tab.getByTitle("This terminal rang")).toBeVisible();
+
+  // Looking at it clears the mark.
+  await page.getByRole("tab", { name: "Command Prompt", exact: true }).click();
+  await expect(tab.getByTitle("This terminal rang")).toHaveCount(0);
+});
+
+test("the panel and the split can be resized", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+
+  const panel = page.getByRole("separator", { name: "Resize panel" });
+  await expect(panel).toBeVisible();
+  const before = (await page.getByLabel("Terminal actions").count()) === 0;
+  expect(before).toBe(true);
+
+  await page.getByLabel("Split Terminal").click();
+  await terminalIds(page, 2);
+  await expect(page.getByRole("separator", { name: "Resize split" })).toBeVisible();
+});
+
+test("the terminal menu drives the panel", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+
+  await terminalMenu(page, "New Terminal");
+  await terminalIds(page, 2);
+
+  await terminalMenu(page, "Find in Terminal");
+  await expect(page.getByLabel("Find in terminal", { exact: true })).toBeVisible();
+});
+
+test("New Terminal from the menu opens the panel when it is hidden", async ({ page }) => {
+  await desktop(page);
+  await terminalMenu(page, "New Terminal");
+
+  await expect(page.getByLabel("New Terminal")).toBeVisible();
+  await terminalIds(page);
+});
+
+test("the panel is not built until a terminal is first opened", async ({ page }) => {
+  await desktop(page);
+  // Nothing terminal-related runs on startup.
+  expect(await countCalls(page, "terminal_shells")).toBe(0);
+
+  await openPanel(page);
+  await expect.poll(async () => countCalls(page, "terminal_shells")).toBeGreaterThan(0);
+});
+
+test("copy and paste use the terminal conventions", async ({ page, context }) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+
+  await page.evaluate(() => navigator.clipboard.writeText("pasted text"));
+  await view(page, id).click();
+  await page.keyboard.press("Control+Shift+V");
+  await expect
+    .poll(async () => (await calls(page, "terminal_write")).map((c) => c.args.data).join(""))
+    .toBe("pasted text");
+
+  // Ctrl+C with no selection must reach the shell so a program can be interrupted.
+  await page.keyboard.press("Control+c");
+  await expect
+    .poll(async () => (await calls(page, "terminal_write")).map((c) => c.args.data).join(""))
+    .toBe("pasted text\x03");
+});
+
+test("the browser preview says a shell needs the desktop application", async ({ page }) => {
+  // No Tauri at all, which is what a browser gets.
+  await page.goto("/");
+  await openPanel(page);
+
+  await expect(page.getByText("Open the desktop application to run a shell.")).toBeVisible();
+  // Controls that cannot work are disabled rather than failing when pressed.
+  await expect(page.getByLabel("New Terminal")).toBeDisabled();
+  await expect(page.getByLabel("Split Terminal")).toBeDisabled();
+});
