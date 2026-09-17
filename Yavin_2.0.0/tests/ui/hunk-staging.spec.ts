@@ -123,6 +123,26 @@ test("staging one hunk sends only that hunk's patch and leaves the other unstage
   await expect(diffView.getByText("TWO", { exact: true })).toHaveCount(0);
 });
 
+test("split view shows the old and new lines side by side and still stages hunks", async ({
+  page,
+}) => {
+  const region = await panel(page);
+  await region.getByText("a.ts").click();
+
+  const diffView = page.locator("section[aria-label='Git diff editor']");
+  await diffView.getByRole("button", { name: "Toggle split view" }).click();
+
+  const split = diffView.locator("[aria-label='Split diff view']");
+  await expect(split).toBeVisible();
+  await expect(split.getByText("two", { exact: true })).toBeVisible();
+  await expect(split.getByText("TWO", { exact: true })).toBeVisible();
+  await expect(split.getByText("eleven")).toBeVisible();
+
+  await split.getByRole("button", { name: "Stage Hunk" }).first().click();
+  const calls = await applyCalls(page);
+  assertPatchContainsOnlyFirstHunk(calls);
+});
+
 test("a staged file's diff offers Unstage Hunk, not Stage or Discard", async ({ page }) => {
   await page.addInitScript((diff) => {
     const ok = (stdout: string) => ({ stdout, stderr: "", code: 0, truncated: false });

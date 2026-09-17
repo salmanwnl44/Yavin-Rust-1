@@ -56,6 +56,63 @@ function attachWordDiffs(parsed: ParsedDiffLine[]): void {
   }
 }
 
+type SplitRow =
+  | { type: "header"; text: string }
+  | { type: "hunk"; text: string; hunkIndex?: number }
+  | { type: "pair"; left: ParsedDiffLine | null; right: ParsedDiffLine | null };
+
+/**
+ * Turns the flat unified-diff lines into side-by-side rows: a context line occupies
+ * both columns, and each run of deletions is paired row-for-row with the run of
+ * additions that follows it (the same replacement runs `attachWordDiffs` already
+ * found), so a changed line lands on one row instead of two. A run longer than its
+ * counterpart leaves the extra rows blank on the shorter side, same as VS Code's and
+ * GitHub's split view.
+ */
+function buildSplitRows(parsed: ParsedDiffLine[]): SplitRow[] {
+  const rows: SplitRow[] = [];
+  let index = 0;
+  while (index < parsed.length) {
+    const line = parsed[index];
+    if (line.type === "header" || line.type === "hunk") {
+      rows.push({ type: line.type, text: line.text, hunkIndex: line.hunkIndex });
+      index++;
+      continue;
+    }
+    if (line.type === "context") {
+      rows.push({ type: "pair", left: line, right: line });
+      index++;
+      continue;
+    }
+    if (line.type === "add") {
+      rows.push({ type: "pair", left: null, right: line });
+      index++;
+      continue;
+    }
+    // A run of deletions, paired against whatever additions immediately follow it.
+    let deleteEnd = index;
+    while (deleteEnd + 1 < parsed.length && parsed[deleteEnd + 1].type === "delete") deleteEnd++;
+    const addStart = deleteEnd + 1;
+    let addEnd = addStart;
+    while (addEnd < parsed.length && parsed[addEnd].type === "add") addEnd++;
+
+    const deleteCount = deleteEnd - index + 1;
+    const addCount = addEnd - addStart;
+    const pairs = Math.min(deleteCount, addCount);
+    for (let offset = 0; offset < pairs; offset++) {
+      rows.push({ type: "pair", left: parsed[index + offset], right: parsed[addStart + offset] });
+    }
+    for (let offset = pairs; offset < deleteCount; offset++) {
+      rows.push({ type: "pair", left: parsed[index + offset], right: null });
+    }
+    for (let offset = pairs; offset < addCount; offset++) {
+      rows.push({ type: "pair", left: null, right: parsed[addStart + offset] });
+    }
+    index = addEnd;
+  }
+  return rows;
+}
+
 export function DiffEditor({
   document,
   onClose,
@@ -145,15 +202,33 @@ export function DiffEditor({
   }, [document.text]);
 
   const [activeHunk, setActiveHunk] = useState(0);
+  const [splitView, setSplitView] = useState(false);
+
+  const splitRows = useMemo(() => buildSplitRows(lines), [lines]);
+  const splitHunkIndices = useMemo(() => {
+    const positions: number[] = [];
+    splitRows.forEach((row, i) => {
+      if (row.type === "hunk") positions.push(i);
+    });
+    return positions;
+  }, [splitRows]);
+
+  const toggleSplitView = () => {
+    setSplitView((was) => !was);
+    setPage(0);
+  };
+
+  const activeHunkIndices = splitView ? splitHunkIndices : hunkIndices;
+  const activeRowCount = splitView ? splitRows.length : lines.length;
 
   const jumpToHunk = (direction: "next" | "prev") => {
-    if (!hunkIndices.length) return;
+    if (!activeHunkIndices.length) return;
     let nextIndex = direction === "next" ? activeHunk + 1 : activeHunk - 1;
-    if (nextIndex < 0) nextIndex = hunkIndices.length - 1;
-    if (nextIndex >= hunkIndices.length) nextIndex = 0;
+    if (nextIndex < 0) nextIndex = activeHunkIndices.length - 1;
+    if (nextIndex >= activeHunkIndices.length) nextIndex = 0;
     setActiveHunk(nextIndex);
 
-    const lineIndex = hunkIndices[nextIndex];
+    const lineIndex = activeHunkIndices[nextIndex];
     // Jump to correct page if needed
     const targetPage = Math.floor(lineIndex / PAGE_SIZE);
     if (targetPage !== page) {
@@ -169,7 +244,123 @@ export function DiffEditor({
   };
 
   const paginatedLines = lines.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-  const totalPages = Math.ceil(lines.length / PAGE_SIZE);
+  const paginatedSplitRows = splitRows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+  const totalPages = Math.ceil(activeRowCount / PAGE_SIZE);
+
+  const renderHunkRow = (line: { text: string; hunkIndex?: number }, key: number) => {
+    const hunkIndex = (line.hunkIndex ?? 1) - 1;
+    return (
+      <div
+        key={key}
+        data-hunk={line.hunkIndex}
+        className="flex items-center gap-2 bg-[#0d131f] text-indigo-300 font-semibold border-y border-indigo-950/60 py-0.5 px-2 my-1 select-none text-[11px]"
+      >
+        <span className="w-16 shrink-0 text-center text-indigo-400/80 font-bold">@@</span>
+        <span className="truncate flex-1">{line.text}</span>
+        {(onStageHunk || onUnstageHunk || onDiscardHunk) && (
+          <div className="flex items-center gap-1 shrink-0">
+            {onStageHunk && (
+              <button
+                onClick={() => onStageHunk(hunkIndex)}
+                title="Stage Hunk"
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#141414] hover:bg-[#202020] text-zinc-300 hover:text-white transition-colors text-[10.5px] font-normal"
+              >
+                <PlusIcon size={10} />
+                Stage Hunk
+              </button>
+            )}
+            {onUnstageHunk && (
+              <button
+                onClick={() => onUnstageHunk(hunkIndex)}
+                title="Unstage This Hunk"
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#141414] hover:bg-[#202020] text-zinc-300 hover:text-white transition-colors text-[10.5px] font-normal"
+              >
+                <UndoIcon size={10} />
+                Unstage This Hunk
+              </button>
+            )}
+            {onDiscardHunk && (
+              <button
+                onClick={() => {
+                  if (window.confirm("Discard this hunk? This cannot be undone."))
+                    onDiscardHunk(hunkIndex);
+                }}
+                title="Discard Hunk"
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#141414] hover:bg-[#2a1414] text-zinc-300 hover:text-rose-300 transition-colors text-[10.5px] font-normal"
+              >
+                <UndoIcon size={10} />
+                Discard Hunk
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  /** One side of a split-view row: the line number, the +/-/blank marker, and its text. */
+  const renderSplitCell = (line: ParsedDiffLine | null, side: "old" | "new") => {
+    const isAdd = line?.type === "add";
+    const isDelete = line?.type === "delete";
+    return (
+      <div
+        className={`flex flex-1 min-w-0 items-stretch ${
+          isAdd
+            ? "bg-emerald-950/20 text-emerald-200"
+            : isDelete
+              ? "bg-rose-950/20 text-rose-200"
+              : "text-zinc-300"
+        } ${!line ? "bg-[#0a0a0a]" : ""}`}
+      >
+        <span
+          className={`w-12 shrink-0 text-right pr-2 text-[11px] select-none ${
+            isDelete
+              ? "text-rose-400/70 font-semibold bg-rose-950/30"
+              : isAdd
+                ? "text-emerald-400/70 font-semibold bg-emerald-950/30"
+                : "text-zinc-600"
+          }`}
+        >
+          {(side === "old" ? line?.oldLineNumber : line?.newLineNumber) ?? ""}
+        </span>
+        <span
+          className={`w-5 shrink-0 text-center select-none font-bold text-xs ${
+            isAdd
+              ? "text-emerald-400 bg-emerald-500/10"
+              : isDelete
+                ? "text-rose-400 bg-rose-500/10"
+                : "text-transparent"
+          }`}
+        >
+          {isAdd ? "+" : isDelete ? "-" : " "}
+        </span>
+        <pre className="flex-1 min-w-0 pl-2 pr-3 font-mono text-[12px] leading-[20px] whitespace-pre overflow-x-visible">
+          {line ? (
+            line.segments ? (
+              line.segments.map((segment, segmentIndex) => (
+                <span
+                  key={segmentIndex}
+                  className={
+                    segment.type === "del"
+                      ? "rounded-[2px] bg-rose-500/30"
+                      : segment.type === "add"
+                        ? "rounded-[2px] bg-emerald-500/30"
+                        : undefined
+                  }
+                >
+                  {segment.text}
+                </span>
+              ))
+            ) : (
+              <>{line.text || " "}</>
+            )
+          ) : (
+            " "
+          )}
+        </pre>
+      </div>
+    );
+  };
 
   return (
     <section
@@ -212,7 +403,7 @@ export function DiffEditor({
 
         {/* Right Toolbar Actions */}
         <div className="flex items-center gap-1 shrink-0">
-          {hunkIndices.length > 1 && (
+          {activeHunkIndices.length > 1 && (
             <div className="flex items-center gap-0.5 mr-2 bg-[#101010] border border-[#222222] rounded p-0.5">
               <button
                 onClick={() => jumpToHunk("prev")}
@@ -222,7 +413,7 @@ export function DiffEditor({
                 <ArrowUpIcon size={12} />
               </button>
               <span className="text-[10px] font-mono px-1 text-zinc-400">
-                {activeHunk + 1}/{hunkIndices.length}
+                {activeHunk + 1}/{activeHunkIndices.length}
               </span>
               <button
                 onClick={() => jumpToHunk("next")}
@@ -233,6 +424,20 @@ export function DiffEditor({
               </button>
             </div>
           )}
+
+          <button
+            onClick={toggleSplitView}
+            aria-pressed={splitView}
+            aria-label="Toggle split view"
+            title={splitView ? "Switch to Unified View" : "Switch to Split View"}
+            className={`px-2 py-1 rounded border text-[11px] font-medium transition-colors ${
+              splitView
+                ? "bg-indigo-950/60 border-indigo-800 text-indigo-300"
+                : "bg-[#141414] hover:bg-[#202020] border-[#262626] text-zinc-200 hover:text-white"
+            }`}
+          >
+            {splitView ? "Split View" : "Unified View"}
+          </button>
 
           <button
             onClick={onOpen}
@@ -262,61 +467,34 @@ export function DiffEditor({
             <p className="text-sm font-medium text-zinc-400">No textual differences</p>
             <p className="text-xs text-zinc-600">The file change may be metadata or binary only.</p>
           </div>
-        ) : (
-          <div className="min-w-full inline-block py-1">
-            {paginatedLines.map((line, idx) => {
-              if (line.type === "hunk") {
-                const hunkIndex = (line.hunkIndex ?? 1) - 1;
+        ) : splitView ? (
+          <div className="min-w-full inline-block py-1" aria-label="Split diff view">
+            {paginatedSplitRows.map((row, idx) => {
+              if (row.type === "hunk") return renderHunkRow(row, idx);
+              if (row.type === "header") {
                 return (
                   <div
                     key={idx}
-                    data-hunk={line.hunkIndex}
-                    className="flex items-center gap-2 bg-[#0d131f] text-indigo-300 font-semibold border-y border-indigo-950/60 py-0.5 px-2 my-1 select-none text-[11px]"
+                    className="flex items-center text-zinc-600 text-[11px] py-0.2 px-2 select-none"
                   >
-                    <span className="w-16 shrink-0 text-center text-indigo-400/80 font-bold">
-                      @@
-                    </span>
-                    <span className="truncate flex-1">{line.text}</span>
-                    {(onStageHunk || onUnstageHunk || onDiscardHunk) && (
-                      <div className="flex items-center gap-1 shrink-0">
-                        {onStageHunk && (
-                          <button
-                            onClick={() => onStageHunk(hunkIndex)}
-                            title="Stage Hunk"
-                            className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#141414] hover:bg-[#202020] text-zinc-300 hover:text-white transition-colors text-[10.5px] font-normal"
-                          >
-                            <PlusIcon size={10} />
-                            Stage Hunk
-                          </button>
-                        )}
-                        {onUnstageHunk && (
-                          <button
-                            onClick={() => onUnstageHunk(hunkIndex)}
-                            title="Unstage This Hunk"
-                            className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#141414] hover:bg-[#202020] text-zinc-300 hover:text-white transition-colors text-[10.5px] font-normal"
-                          >
-                            <UndoIcon size={10} />
-                            Unstage This Hunk
-                          </button>
-                        )}
-                        {onDiscardHunk && (
-                          <button
-                            onClick={() => {
-                              if (window.confirm("Discard this hunk? This cannot be undone."))
-                                onDiscardHunk(hunkIndex);
-                            }}
-                            title="Discard Hunk"
-                            className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#141414] hover:bg-[#2a1414] text-zinc-300 hover:text-rose-300 transition-colors text-[10.5px] font-normal"
-                          >
-                            <UndoIcon size={10} />
-                            Discard Hunk
-                          </button>
-                        )}
-                      </div>
-                    )}
+                    <span className="w-24 shrink-0 text-right pr-4 font-mono">---</span>
+                    <span className="truncate">{row.text}</span>
                   </div>
                 );
               }
+              return (
+                <div key={idx} className="flex items-stretch min-w-full">
+                  {renderSplitCell(row.left, "old")}
+                  <div className="w-px shrink-0 bg-[#1a1a1a]" />
+                  {renderSplitCell(row.right, "new")}
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="min-w-full inline-block py-1">
+            {paginatedLines.map((line, idx) => {
+              if (line.type === "hunk") return renderHunkRow(line, idx);
 
               if (line.type === "header") {
                 return (
@@ -416,8 +594,8 @@ export function DiffEditor({
             Previous lines
           </button>
           <span className="text-[11px] font-mono text-zinc-500">
-            Lines {page * PAGE_SIZE + 1}–{Math.min((page + 1) * PAGE_SIZE, lines.length)} of{" "}
-            {lines.length}
+            Lines {page * PAGE_SIZE + 1}–{Math.min((page + 1) * PAGE_SIZE, activeRowCount)} of{" "}
+            {activeRowCount}
           </span>
           <button
             disabled={page >= totalPages - 1}
