@@ -113,6 +113,8 @@ function buildSplitRows(parsed: ParsedDiffLine[]): SplitRow[] {
   return rows;
 }
 
+const EMPTY_SPLIT_ROWS: SplitRow[] = [];
+
 export function DiffEditor({
   document,
   onClose,
@@ -204,7 +206,13 @@ export function DiffEditor({
   const [activeHunk, setActiveHunk] = useState(0);
   const [splitView, setSplitView] = useState(false);
 
-  const splitRows = useMemo(() => buildSplitRows(lines), [lines]);
+  // Building side-by-side rows is an extra full pass over the diff, so it only runs
+  // once the user actually opens split view -- not on every keystroke while unified
+  // view (the default) is all anyone is looking at.
+  const splitRows = useMemo(
+    () => (splitView ? buildSplitRows(lines) : EMPTY_SPLIT_ROWS),
+    [lines, splitView],
+  );
   const splitHunkIndices = useMemo(() => {
     const positions: number[] = [];
     splitRows.forEach((row, i) => {
