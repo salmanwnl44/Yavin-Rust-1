@@ -294,6 +294,11 @@ const LOG: &[FlagRule] = &[
     prefix_flag("--date="),
 ];
 const FOR_EACH_REF: &[FlagRule] = &[prefix_flag("--format=")];
+// Like `stash` (`push`/`pop`/`apply`/`drop`/`list` are positional, not flags, so this
+// allow-list only governs `--porcelain`), TypeScript currently only ever calls
+// `worktree list --porcelain`; nothing constructs `worktree add/remove/lock/prune`
+// yet, so there is nothing else to validate here today.
+const WORKTREE: &[FlagRule] = &[flag("--porcelain")];
 
 /// The declarative allow-list this whole design leans on: every subcommand
 /// TypeScript may run, and every flag it may pass before a literal `--`. Anything not
@@ -326,6 +331,7 @@ fn rules_for(subcommand: &str) -> Option<&'static [FlagRule]> {
         "revert" => ABORT_CONTINUE,
         "log" => LOG,
         "for-each-ref" => FOR_EACH_REF,
+        "worktree" => WORKTREE,
         _ => return None,
     })
 }
@@ -550,6 +556,30 @@ mod tests {
             linked_toplevel.unwrap(),
             "a linked worktree's own toplevel must differ from the main worktree's"
         );
+    }
+
+    #[test]
+    fn worktree_list_porcelain_is_reachable_through_the_guarded_executor() {
+        let (dir, git) = fixture();
+        let linked = temp_dir();
+        assert!(git(&[
+            "worktree",
+            "add",
+            linked.to_str().unwrap(),
+            "-b",
+            "feature",
+        ]));
+
+        let repo = open(&dir);
+        let output = exec_on(&repo, &args(&["worktree", "list", "--porcelain"]), None);
+        // Only `--porcelain` is allow-listed; an unrelated flag must still be refused.
+        let rejected = exec_on(&repo, &args(&["worktree", "list", "--bogus-flag"]), None);
+
+        let _ = fs::remove_dir_all(&linked);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(output.unwrap().stdout.contains("branch refs/heads/feature"));
+        assert!(rejected.unwrap_err().contains("not permitted"));
     }
 
     #[test]

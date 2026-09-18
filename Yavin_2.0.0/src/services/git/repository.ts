@@ -85,12 +85,16 @@ export class Repository {
   /**
    * The repository's shared Git directory (`rev-parse --git-common-dir`) -- unlike
    * `root`, this is identical from every worktree of the same repository, which is
-   * what makes it the correct repository-identity key once linked worktrees exist.
-   * Not yet used by any production code path; see the Repository & Worktree
-   * Architecture plan's later phases for `GitRegistry` re-keying on this value.
+   * what `GitRegistry` groups worktrees of one repository together by (see
+   * `identity.ts`'s `attachWorktree`).
    */
   commonGitDir(): Promise<string> {
     return this.run(["rev-parse", "--git-common-dir"]);
+  }
+
+  /** Raw `git worktree list --porcelain` output; see `parsers/worktree.ts` for parsing. */
+  listWorktrees(): Promise<string> {
+    return this.run(["worktree", "list", "--porcelain"]);
   }
 
   async branches(): Promise<string[]> {
