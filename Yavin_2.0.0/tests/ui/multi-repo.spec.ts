@@ -13,6 +13,8 @@ interface Scenario {
   repos: Record<string, Partial<RepoScenario>>;
   /** Path `pick_folder_dialog` returns the next time it is invoked. */
   pick?: string;
+  /** Pre-seeds `localStorage["yavin.git.repos"]` before the app loads, for testing restore/migration. */
+  seedStorage?: unknown;
 }
 
 function repo(branchName: string, status = ""): RepoScenario {
@@ -26,6 +28,8 @@ function repo(branchName: string, status = ""): RepoScenario {
 
 async function panel(page: Page, scenario: Scenario) {
   await page.addInitScript((s) => {
+    if (s.seedStorage !== undefined)
+      localStorage.setItem("yavin.git.repos", JSON.stringify(s.seedStorage));
     const calls: { command: string; args: Record<string, unknown> }[] = [];
     const ok = (stdout: string) => ({ stdout, stderr: "", code: 0, truncated: false });
     Object.assign(window, {
@@ -188,6 +192,36 @@ test("opening a different workspace folder does not steal the active repository"
   const branchSelect = region.getByLabel("Switch branch");
   await expect(branchSelect.getByRole("option", { name: "main" })).toHaveCount(1);
   await expect(branchSelect.getByRole("option", { name: "feature" })).toHaveCount(0);
+});
+
+test("a pre-worktree persisted repository list is restored and migrated on read", async ({
+  page,
+}) => {
+  const region = await panel(page, {
+    workspace: "/work",
+    repos: {
+      "/work": repo("main"),
+      "/other": repo("feature"),
+    },
+    // The schema this test seeds predates GitRegistry knowing about worktrees: a
+    // plain array of repository root paths (see persistence.ts's migration).
+    seedStorage: ["/work", "/other"],
+  });
+
+  // Both persisted repositories are restored -- /other was never opened through the
+  // workspace or "Add Repository Folder" in this session, only found in storage.
+  await expect(region.getByRole("group", { name: "work" })).toBeVisible();
+  await expect(region.getByRole("group", { name: "other" })).toBeVisible();
+
+  // Restoring rewrote the persisted value under the versioned schema.
+  const persisted = await page.evaluate(() => localStorage.getItem("yavin.git.repos"));
+  const parsed = JSON.parse(persisted ?? "null");
+  expect(parsed.schemaVersion).toBe(1);
+  expect(parsed.repositories).toHaveLength(2);
+  expect(parsed.repositories.map((r: { worktrees: string[] }) => r.worktrees)).toEqual([
+    ["/work"],
+    ["/other"],
+  ]);
 });
 
 test("the activity bar badge aggregates changes across every open repository", async ({ page }) => {

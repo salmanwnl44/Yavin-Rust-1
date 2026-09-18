@@ -1,6 +1,8 @@
 import { Repository } from "./repository.ts";
 import { RepoStore } from "./store.ts";
 import { attachWorktree, normalizeCommonDir } from "./identity.ts";
+import { parsePersistedState } from "./persistence.ts";
+import type { PersistedGitState } from "./persistence.ts";
 
 /**
  * One open worktree. Kept under this name (rather than `WorktreeEntry`) so every
@@ -44,14 +46,11 @@ interface RegistrySnapshot {
 
 const STORAGE_KEY = "yavin.git.repos";
 
-function readPersistedRoots(): string[] {
+function readPersisted(): PersistedGitState {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === "string") : [];
+    return parsePersistedState(localStorage.getItem(STORAGE_KEY));
   } catch {
-    return [];
+    return { schemaVersion: 1, repositories: [] };
   }
 }
 
@@ -116,21 +115,50 @@ class GitRegistry {
 
   private persist() {
     try {
-      // Persists every known worktree root, flattened -- the same plain-array shape
-      // as before this phase. Restoring re-derives the repository grouping by
-      // re-opening each path. See the plan's Phase 4 for a versioned schema that
-      // also remembers which worktrees belonged together.
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.snapshot.repos.map((r) => r.root)));
+      const state: PersistedGitState = {
+        schemaVersion: 1,
+        repositories: this.snapshot.repositories.map((repository) => {
+          const activeWorktree = repository.worktrees.some(
+            (w) => w.root === this.snapshot.activeWorktreePath,
+          )
+            ? this.snapshot.activeWorktreePath!
+            : undefined;
+          return {
+            commonDirHint: repository.repositoryId,
+            worktrees: repository.worktrees.map((w) => w.root),
+            ...(activeWorktree ? { activeWorktree } : {}),
+          };
+        }),
+        ...(this.snapshot.activeRepositoryId
+          ? { activeRepository: this.snapshot.activeRepositoryId }
+          : {}),
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     } catch {
       /* Repo list stays session-only when storage is unavailable. */
     }
   }
 
-  /** Reopens every persisted repository once; a path that no longer resolves is dropped. */
+  /**
+   * Reopens every persisted worktree once (a path that no longer resolves is
+   * dropped) and restores the previously-active repository/worktree if it's among
+   * them, migrating a pre-worktree persisted value transparently on read.
+   */
   restore(): Promise<void> {
     if (!this.restorePromise) {
       this.restorePromise = (async () => {
-        for (const path of readPersistedRoots()) await this.open(path, { silent: true });
+        const persisted = readPersisted();
+        for (const repository of persisted.repositories)
+          for (const path of repository.worktrees) await this.open(path, { silent: true });
+
+        const rememberedRepository = persisted.repositories.find(
+          (r) => r.commonDirHint === persisted.activeRepository,
+        );
+        const rememberedWorktree = rememberedRepository?.activeWorktree;
+        if (rememberedWorktree) {
+          const found = this.findByRoot(rememberedWorktree);
+          if (found) this.makeActive(found);
+        }
       })();
     }
     return this.restorePromise;
