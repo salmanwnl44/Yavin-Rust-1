@@ -41,7 +41,7 @@ async function panel(page: Page, scenario: Scenario) {
           if (command === "get_default_workspace") return s.workspace;
           if (command === "list_workspace_files")
             return {
-              path: s.workspace,
+              path: args.path as string,
               name: "work",
               is_dir: true,
               children: [],
@@ -52,6 +52,8 @@ async function panel(page: Page, scenario: Scenario) {
             (window as unknown as { __pick: string | null }).__pick = null;
             return next;
           }
+          if (command === "open_folder_dialog")
+            return (window as unknown as { __openFolder?: string }).__openFolder ?? null;
           if (command === "git_open_repo") {
             const path = args.path as string;
             const found = s.repos[path];
@@ -151,6 +153,41 @@ test("removing a repository from the switcher stops tracking it", async ({ page 
     .getByRole("button", { name: /Remove other/ })
     .click();
   await expect(region.getByRole("group", { name: "other" })).toHaveCount(0);
+});
+
+test("opening a different workspace folder does not steal the active repository", async ({
+  page,
+}) => {
+  const region = await panel(page, {
+    workspace: "/work",
+    repos: {
+      "/work": repo("main", " M a.ts\0"),
+      "/other": repo("feature", " M b.ts\0"),
+    },
+  });
+  // Nothing had been selected yet, so the workspace's own repository became active
+  // on load.
+  await expect(region.getByRole("group", { name: "work" })).toContainText("main");
+
+  await page.evaluate(() => {
+    (window as unknown as { __openFolder?: string }).__openFolder = "/other";
+  });
+  await page.getByRole("menubar").getByRole("menuitem", { name: "File", exact: true }).click();
+  await page
+    .getByRole("menu", { name: "File", exact: true })
+    .getByRole("menuitem", { name: "Open Folder…", exact: true })
+    .click();
+
+  // The new workspace's repository is registered and shown in the switcher...
+  await expect(region.getByRole("group", { name: "other" })).toBeVisible();
+  // ...but the previously active repository is left alone: its own row still shows
+  // its branch, and the active repo's branch drawer still lists only its branch,
+  // not the newly-opened repository's.
+  await expect(region.getByRole("group", { name: "work" })).toContainText("main");
+  await region.getByTitle("Branches and remotes").click();
+  const branchSelect = region.getByLabel("Switch branch");
+  await expect(branchSelect.getByRole("option", { name: "main" })).toHaveCount(1);
+  await expect(branchSelect.getByRole("option", { name: "feature" })).toHaveCount(0);
 });
 
 test("the activity bar badge aggregates changes across every open repository", async ({ page }) => {

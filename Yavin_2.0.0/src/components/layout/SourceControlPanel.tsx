@@ -155,7 +155,13 @@ export function SourceControlPanel({
     let cancelled = false;
     setOpenError("");
     if (!workspace) return;
-    gitRegistry.open(workspace, { makeActive: true }).catch((error) => {
+    // Registers the workspace's repository without stealing focus from whichever
+    // repository the user has already selected in the switcher -- `open()` still
+    // activates it when nothing is active yet (e.g. on first load), matching
+    // `GitRegistry.openNew`'s own default-activation rule. See the Repository &
+    // Worktree Architecture plan's Gap 1: Explorer navigation must never silently
+    // reassign the active repository once the user has made an explicit choice.
+    gitRegistry.open(workspace).catch((error) => {
       if (!cancelled) setOpenError(String(error));
     });
     return () => {
