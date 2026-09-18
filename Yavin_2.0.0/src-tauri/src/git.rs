@@ -102,6 +102,41 @@ fn discover_toplevel(path: &Path) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Resolves any path inside a repository -- main worktree or linked worktree alike --
+/// to that repository's *shared* Git directory (`--git-common-dir`). Unlike
+/// `discover_toplevel`, which returns a different, worktree-specific root for each
+/// linked worktree, this value is identical from every worktree of the same
+/// repository, which is what makes it the correct repository-identity key (a linked
+/// worktree must never be mistaken for an independent repository). Not yet used by
+/// any production code path -- see the Repository & Worktree Architecture plan.
+#[allow(dead_code)]
+fn discover_common_dir(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_dir() {
+        return Err("Not a directory".into());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("Invalid path: {e}"))?;
+    let discover = run(&canonical, &["rev-parse", "--git-common-dir"])?;
+    if discover.code != 0 {
+        return Err(if discover.stderr.contains("not a git repository") {
+            "This folder is not a Git repository.".to_string()
+        } else {
+            discover.stderr.trim().to_string()
+        });
+    }
+    let reported = PathBuf::from(discover.stdout.trim());
+    // Git reports a path relative to the queried directory when the common dir lies
+    // under it (the common case); resolve against that directory, not the process's
+    // own working directory, before canonicalizing.
+    let absolute = if reported.is_absolute() {
+        reported
+    } else {
+        canonical.join(reported)
+    };
+    absolute.canonicalize().map_err(|e| e.to_string())
+}
+
 /// Registers (or reuses) a repository whose top-level has already been resolved.
 fn register_repo(repos: &Repos, toplevel: PathBuf) -> Result<RepoInfo, String> {
     let repo_id = clean_path_str(&toplevel);
@@ -212,6 +247,7 @@ const REV_PARSE: &[FlagRule] = &[
     flag("--show-toplevel"),
     flag("--verify"),
     flag("--absolute-git-dir"),
+    flag("--git-common-dir"),
 ];
 const CAT_FILE: &[FlagRule] = &[flag("--filters")];
 const DIFF: &[FlagRule] = &[
@@ -479,6 +515,40 @@ mod tests {
         assert_eq!(
             toplevel, root,
             "a nested folder resolves to the real repo root"
+        );
+    }
+
+    #[test]
+    fn a_linked_worktree_shares_its_main_worktrees_common_directory() {
+        let (dir, git) = fixture();
+        let linked = temp_dir();
+        assert!(git(&[
+            "worktree",
+            "add",
+            linked.to_str().unwrap(),
+            "-b",
+            "feature",
+        ]));
+
+        let main_common = discover_common_dir(&dir);
+        let linked_common = discover_common_dir(&linked);
+        // discover_toplevel, by contrast, is expected to differ between them --
+        // that's exactly why identity must key on the common dir, not the toplevel.
+        let main_toplevel = discover_toplevel(&dir);
+        let linked_toplevel = discover_toplevel(&linked);
+
+        let _ = fs::remove_dir_all(&linked);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            main_common.unwrap(),
+            linked_common.unwrap(),
+            "a linked worktree's common Git directory must match its main worktree's"
+        );
+        assert_ne!(
+            main_toplevel.unwrap(),
+            linked_toplevel.unwrap(),
+            "a linked worktree's own toplevel must differ from the main worktree's"
         );
     }
 
