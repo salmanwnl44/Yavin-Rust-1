@@ -6,6 +6,10 @@ interface RepoScenario {
   branchInfo: string;
   branches: string;
   remotes: string;
+  /** `rev-parse --git-common-dir` response, for grouping worktrees of one repository. */
+  commonDir?: string;
+  /** `worktree list --porcelain` response. */
+  worktreeList?: string;
 }
 
 interface Scenario {
@@ -75,6 +79,9 @@ async function panel(page: Page, scenario: Scenario) {
               );
             if (argv[0] === "for-each-ref") return ok(found.branches ?? "");
             if (argv[0] === "remote") return ok(found.remotes ?? "");
+            if (argv[0] === "rev-parse" && argv.includes("--git-common-dir"))
+              return ok(found.commonDir ?? "");
+            if (argv[0] === "worktree" && argv[1] === "list") return ok(found.worktreeList ?? "");
             return ok("");
           }
           return null;
@@ -222,6 +229,46 @@ test("a pre-worktree persisted repository list is restored and migrated on read"
     ["/work"],
     ["/other"],
   ]);
+});
+
+test("a known-but-unopened worktree of the active repository can be opened from the switcher", async ({
+  page,
+}) => {
+  const worktreeList = [
+    "worktree /work",
+    "HEAD abc123",
+    "branch refs/heads/main",
+    "",
+    "worktree /work-feature",
+    "HEAD abc123",
+    "branch refs/heads/feature",
+    "",
+  ].join("\n");
+  const region = await panel(page, {
+    workspace: "/work",
+    repos: {
+      "/work": { ...repo("main"), commonDir: "/work/.git", worktreeList },
+      "/work-feature": { ...repo("feature"), commonDir: "/work/.git" },
+    },
+  });
+
+  const workRow = region.getByRole("group", { name: "work" });
+  await expect(workRow).toBeVisible();
+  // Only /work has been opened; /work-feature is known (from worktree list) but not
+  // tracked yet, so it shows as a collapsed "more worktrees" affordance, not its own row.
+  await expect(region.getByRole("group", { name: "work-feature" })).toHaveCount(0);
+
+  await region.getByText("1 more worktree").click();
+  await region.getByRole("button", { name: "Open worktree /work-feature" }).click();
+
+  // Opening it tracks it as its own row, grouped under the same repository (not
+  // duplicated as an unrelated one), and it becomes the active worktree.
+  await expect(region.getByRole("group", { name: "work-feature" })).toBeVisible();
+  await expect(region.getByLabel("Commit message")).toBeVisible();
+  await region.getByTitle("Branches and remotes").click();
+  await expect(
+    region.getByLabel("Switch branch").getByRole("option", { name: "feature" }),
+  ).toHaveCount(1);
 });
 
 test("the activity bar badge aggregates changes across every open repository", async ({ page }) => {

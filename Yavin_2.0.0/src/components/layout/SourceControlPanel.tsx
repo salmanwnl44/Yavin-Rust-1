@@ -226,6 +226,15 @@ export function SourceControlPanel({
     }
   };
 
+  const selectWorktree = async (path: string) => {
+    setOpenError("");
+    try {
+      await gitRegistry.open(path, { makeActive: true });
+    } catch (error) {
+      setOpenError(String(error));
+    }
+  };
+
   const removeRepository = (repoId: string) => void gitRegistry.close(repoId);
   const selectRepository = (repoId: string) => gitRegistry.setActive(repoId);
 
@@ -438,12 +447,14 @@ export function SourceControlPanel({
         {sectionVisible.repositories && (
           <RepositoriesSection
             repos={registrySnapshot.repos}
+            repositories={registrySnapshot.repositories}
             activeRepoId={registrySnapshot.activeRepoId}
             dirty={dirty}
             message={message}
             collapsed={sectionCollapsed.repositories}
             onToggleCollapse={() => toggleCollapsed("repositories")}
             onSelect={selectRepository}
+            onSelectWorktree={(path) => void selectWorktree(path)}
             onRemove={removeRepository}
             onAdd={() => void addRepository()}
             onCommitted={() => setMessage("")}

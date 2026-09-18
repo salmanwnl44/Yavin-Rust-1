@@ -55,7 +55,7 @@ test("attachWorktree keeps two different repositories as separate entries", () =
 
 test("attachWorktree does not mutate the repositories array it was given", () => {
   const original: RepositoryEntry[] = [
-    { repositoryId: "/work/main/.git", worktrees: [worktree("/work/main")] },
+    { repositoryId: "/work/main/.git", worktrees: [worktree("/work/main")], knownWorktrees: [] },
   ];
   attachWorktree(original, "/work/main/.git", worktree("/work/feature"));
   assert.equal(original[0].worktrees.length, 1, "the input array is untouched");

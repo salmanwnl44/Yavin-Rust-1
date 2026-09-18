@@ -3,6 +3,8 @@ import { RepoStore } from "./store.ts";
 import { attachWorktree, normalizeCommonDir } from "./identity.ts";
 import { parsePersistedState } from "./persistence.ts";
 import type { PersistedGitState } from "./persistence.ts";
+import { parseWorktreeList } from "./parsers/worktree.ts";
+import type { WorktreeInfo } from "./parsers/worktree.ts";
 
 /**
  * One open worktree. Kept under this name (rather than `WorktreeEntry`) so every
@@ -21,14 +23,23 @@ export interface RepoEntry {
 /**
  * The worktrees Git considers one repository (identical `git rev-parse
  * --git-common-dir`), grouped so a linked worktree is never mistaken for an
- * independent repository. Not yet surfaced in any UI -- `repos` below remains the
- * flat, one-row-per-worktree list every current view renders -- but real starting
- * from this phase: opening two different worktree paths of the same repository
- * attaches the second as a sibling here instead of creating an unrelated entry.
+ * independent repository. `repos` below remains the flat, one-row-per-*tracked*-
+ * worktree list most views render -- opening two different worktree paths of the
+ * same repository attaches the second as a sibling here instead of creating an
+ * unrelated entry.
  */
 export interface RepositoryEntry {
   repositoryId: string;
+  /** Worktrees the user has actually opened/tracked -- each has a live `RepoStore`. */
   worktrees: RepoEntry[];
+  /**
+   * Every worktree `git worktree list --porcelain` reports for this repository,
+   * whether or not it's been opened -- inert metadata only (no `RepoStore` is
+   * created for one until it's actually opened, so browsing this list never starts
+   * eager status polling for worktrees nobody asked to track). Refreshed each time a
+   * worktree of this repository is opened; `[]` until the first successful refresh.
+   */
+  knownWorktrees: WorktreeInfo[];
 }
 
 interface RegistrySnapshot {
@@ -239,7 +250,17 @@ class GitRegistry {
       // rather than registered as an unrelated top-level entry -- this is the actual
       // fix this phase makes: a linked worktree is never mistaken for its own
       // independent repository.
-      const repositories = attachWorktree(this.snapshot.repositories, repositoryId, worktree);
+      const attached = attachWorktree(this.snapshot.repositories, repositoryId, worktree);
+      // Inert metadata only -- discovering a worktree here never creates a RepoStore
+      // for it, so browsing this list doesn't start status polling for worktrees
+      // nobody has actually opened. See the plan's Phase 5/6 notes.
+      const knownWorktrees = await repository
+        .listWorktrees()
+        .then(parseWorktreeList)
+        .catch(() => []);
+      const repositories = attached.map((r) =>
+        r.repositoryId === repositoryId ? { ...r, knownWorktrees } : r,
+      );
 
       const shouldActivate = options.makeActive || !this.snapshot.activeWorktreePath;
       this.set(repositories, {

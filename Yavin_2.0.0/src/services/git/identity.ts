@@ -28,7 +28,8 @@ export function attachWorktree(
   worktree: RepoEntry,
 ): RepositoryEntry[] {
   const existing = repositories.find((r) => r.repositoryId === repositoryId);
-  if (!existing) return [...repositories, { repositoryId, worktrees: [worktree] }];
+  if (!existing)
+    return [...repositories, { repositoryId, worktrees: [worktree], knownWorktrees: [] }];
   return repositories.map((r) =>
     r === existing ? { ...r, worktrees: [...r.worktrees, worktree] } : r,
   );
