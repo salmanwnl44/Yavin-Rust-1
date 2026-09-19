@@ -191,6 +191,22 @@ export function SourceControlPanel({
     void activeRepo.store.refresh();
   }, [activeRepo, revision]);
 
+  // Re-fetches the active repository's knownWorktrees (which worktree/lock/prune
+  // metadata `git worktree list --porcelain` reports) on focus regain -- the one
+  // existing signal for "the user may have done something outside Yavin," and the
+  // only thing that otherwise keeps that list from ever refreshing after a
+  // repository is first opened (see the Git State & Synchronization plan's
+  // Section U). Piggybacks on `window`'s own focus event rather than adding a new
+  // watch target; full live worktree add/remove detection stays out of scope.
+  useEffect(() => {
+    if (!activeRepo) return;
+    const repositoryId = gitRegistry.repositoryFor(activeRepo.repoId)?.repositoryId;
+    if (!repositoryId) return;
+    const update = () => void gitRegistry.refreshKnownWorktrees(repositoryId);
+    window.addEventListener("focus", update);
+    return () => window.removeEventListener("focus", update);
+  }, [activeRepo]);
+
   // Refreshes every open repo (not just the active one) so the Repositories section
   // and the aggregated activity-bar count stay live while this panel is visible.
   useEffect(() => {

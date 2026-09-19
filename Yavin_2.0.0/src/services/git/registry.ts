@@ -343,6 +343,35 @@ class GitRegistry {
   repositoryById(repositoryId: string): RepositoryEntry | undefined {
     return this.snapshot.repositories.find((r) => r.repositoryId === repositoryId);
   }
+
+  /**
+   * Re-fetches `repositoryId`'s `knownWorktrees` (`git worktree list --porcelain`,
+   * unchanged from what `openNew` already runs once at open time) -- addressing
+   * the gap that list is otherwise never refreshed again, so a worktree added or
+   * removed externally after that point stays silently stale. Piggybacks on
+   * whichever call site already has a reason to check in (the active repository's
+   * own focus-regain event, see `SourceControlPanel.tsx`) rather than adding a new
+   * watch target of its own -- full live external worktree add/remove detection
+   * remains Module 1's Open Question #4, unchanged and out of scope here. A
+   * repository that's no longer tracked, or whose `listWorktrees()` call fails
+   * (e.g. it's mid-close), is a silent no-op.
+   */
+  async refreshKnownWorktrees(repositoryId: string): Promise<void> {
+    const repository = this.repositoryById(repositoryId);
+    const anyWorktree = repository?.worktrees[0];
+    if (!anyWorktree) return;
+    const knownWorktrees = await anyWorktree.store.repository
+      .listWorktrees()
+      .then(parseWorktreeList)
+      .catch(() => null);
+    if (!knownWorktrees) return;
+    // Re-check after the await: the repository could have closed meanwhile.
+    if (!this.repositoryById(repositoryId)) return;
+    this.set(
+      this.snapshot.repositories.map((r) => (r.repositoryId === repositoryId ? { ...r, knownWorktrees } : r)),
+      { repositoryId: this.snapshot.activeRepositoryId, worktreePath: this.snapshot.activeWorktreePath },
+    );
+  }
 }
 
 export const gitRegistry = new GitRegistry();

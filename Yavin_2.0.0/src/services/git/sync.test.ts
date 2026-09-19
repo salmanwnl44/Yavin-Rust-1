@@ -91,32 +91,27 @@ test("switch/commit/abort/continue never invalidate a sibling's RepoSnapshot fie
   }
 });
 
-test("GRAPH_RESETS is exactly fetch/pull/pullRebase/pullMerge -- narrower than the pre-Module-3 behavior", () => {
+test("GRAPH_RESETS is exactly fetch/pull/pullRebase/pullMerge/commit -- narrower than the pre-Module-3 behavior", () => {
   // The pre-existing InlineGraphSection code reset unconditionally on Fetch, Pull,
   // AND Push -- but push never adds a commit (it only moves a remote ref to match
-  // what's already local), so it is correctly excluded here.
+  // what's already local), so it is correctly excluded here. `commit` was added
+  // in Phase 6 (it grows this worktree's own branch's history by one).
   assert.deepEqual(
     [...GRAPH_RESETS].sort(),
-    ["fetch", "pull", "pullMerge", "pullRebase"].sort(),
+    ["commit", "fetch", "pull", "pullMerge", "pullRebase"].sort(),
   );
   assert.ok(!GRAPH_RESETS.has("push"));
   assert.ok(!GRAPH_RESETS.has("publish"));
 });
 
-test("GRAPH_RESETS does not yet cover commit/switch/branch/abort/continue/stash -- Phase 6's scope, not this phase's", () => {
-  for (const kind of [
-    "commit",
-    "switch",
-    "branch",
-    "abort",
-    "continue",
-    "stash",
-    "stashApply",
-    "stashPop",
-    "stashDrop",
-  ]) {
-    assert.ok(!GRAPH_RESETS.has(kind), `"${kind}" must not be in GRAPH_RESETS yet`);
+test("GRAPH_RESETS never statically covers switch/branch/abort/stash -- none of them can add a commit", () => {
+  for (const kind of ["switch", "branch", "abort", "stash", "stashApply", "stashPop", "stashDrop"]) {
+    assert.ok(!GRAPH_RESETS.has(kind), `"${kind}" must not be in GRAPH_RESETS`);
   }
+});
+
+test("GRAPH_RESETS never lists 'continue' -- its reset is conditional, decided at runtime by guardedAffecting", () => {
+  assert.ok(!GRAPH_RESETS.has("continue"));
 });
 
 function fakeWorktree(root: string): { entry: RepoEntry; refreshCalls: unknown[][] } {

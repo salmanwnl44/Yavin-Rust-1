@@ -96,6 +96,12 @@ async function panel(page: Page, scenario: Partial<Scenario> = {}) {
             if (action === "branches") return ok(state.branches);
             if (action === "remotes") return ok(state.remotes);
             if (action === "symbolic-ref") return ok("main\n");
+            // A successful continue really does end the interrupted operation --
+            // mutating state here (as a side effect of the call itself, not
+            // before it) means abortOrContinue's own state() lookup still sees
+            // "merge" (deciding which op to continue) while guarded()'s later
+            // post-op refresh sees the now-cleared state, exactly like real Git.
+            if (action === "continue") state.state = "";
             // A "fetch" hangs until either the test resolves it or git_cancel_repo
             // is called, simulating the real Rust cancellation path rejecting an
             // in-flight/lock-queued call with the literal string "Cancelled".
@@ -284,6 +290,25 @@ test("an interrupted merge must be resolved or aborted before it can continue", 
   await expect.poll(() => gitCalls(page, "continue")).toBe(1);
 });
 
+test("a continue that actually completes the merge resets the commit graph", async ({ page }) => {
+  const region = await panel(page, { state: "merge", status: "M  conflict.ts\0" });
+  const logCalls = () =>
+    page.evaluate(
+      () =>
+        (
+          window as unknown as { __calls: { command: string; args: { args?: string[] } }[] }
+        ).__calls.filter((c) => c.command === "git_exec" && c.args.args?.[0] === "log").length,
+    );
+  const before = await logCalls();
+
+  const banner = region.getByRole("alert").filter({ hasText: "in progress" });
+  await expect(banner.getByRole("button", { name: "Continue" })).toBeEnabled();
+  await banner.getByRole("button", { name: "Continue" }).click();
+  await expect.poll(() => gitCalls(page, "continue")).toBe(1);
+
+  await expect.poll(logCalls).toBeGreaterThan(before);
+});
+
 test("an aborted merge clears the banner", async ({ page }) => {
   const region = await panel(page, { state: "merge", status: "UU conflict.ts\0" });
   const banner = region.getByRole("alert").filter({ hasText: "in progress" });
@@ -357,6 +382,26 @@ test("committing re-fetches status, branch and operation state, still skipping b
   await expect.poll(() => gitCalls(page, "state")).toBe(before.state + 1);
   expect(await gitCalls(page, "branches")).toBe(before.branches);
   expect(await gitCalls(page, "remotes")).toBe(before.remotes);
+});
+
+test("committing resets the commit graph", async ({ page }) => {
+  const region = await panel(page, { status: "M  a.ts\0" });
+  const logCalls = () =>
+    page.evaluate(
+      () =>
+        (
+          window as unknown as { __calls: { command: string; args: { args?: string[] } }[] }
+        ).__calls.filter((c) => c.command === "git_exec" && c.args.args?.[0] === "log").length,
+    );
+  // The sidebar's inline graph section mounts by default, loading page 1 once.
+  await expect.poll(logCalls).toBeGreaterThan(0);
+  const before = await logCalls();
+
+  await region.getByLabel("Commit message").fill("a commit");
+  await region.getByRole("button", { name: /Commit Staged/ }).click();
+  await expect.poll(() => gitCalls(page, "commit")).toBe(1);
+
+  await expect.poll(logCalls).toBeGreaterThan(before);
 });
 
 test("a Cancel button stops a running Git operation and reports it distinctly from a failure", async ({

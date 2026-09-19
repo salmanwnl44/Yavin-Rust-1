@@ -59,13 +59,23 @@ export const SIBLING_INVALIDATES: Readonly<Record<string, readonly RefreshField[
  * Pull/Push regardless of which was actually clicked: `push`/`publish` never add
  * a commit (they only move a remote ref to match what's already local), so they
  * are correctly excluded here even though the pre-existing UI code reset on them.
- * `commit`, `switch` (-c or not), `abort`, and the stash family never appear here
- * for the same reason `SIBLING_INVALIDATES` excludes most of them -- extending
- * this table to cover them (and `continue`'s conditional case, which only resets
- * when it actually completes a merge/rebase/cherry-pick/revert) is Phase 6 of the
- * plan, not this phase.
+ * `switch` (-c or not), `abort`, and the stash family never appear here: `switch`
+ * moves HEAD to an *existing* commit already in the graph; `branch` (`switch -c`)
+ * creates a ref at an existing commit; `abort` restores pre-operation state --
+ * none of these make a new commit reachable. `commit` does (this worktree's own
+ * branch grows by one). `continue`'s case is genuinely conditional -- a
+ * `merge`/`rebase`/`cherry-pick --continue` (or `revert --continue`) only creates
+ * a commit when it actually *completes* the operation, not on a call that still
+ * leaves conflicts remaining -- so it isn't a static table entry; see
+ * `guardedAffecting`'s own before/after `operationInProgress` check below.
  */
-export const GRAPH_RESETS: ReadonlySet<string> = new Set(["fetch", "pull", "pullRebase", "pullMerge"]);
+export const GRAPH_RESETS: ReadonlySet<string> = new Set([
+  "fetch",
+  "pull",
+  "pullRebase",
+  "pullMerge",
+  "commit",
+]);
 
 /**
  * Runs `entry.store.guarded(kind, dirty, operation)` exactly as before (own-worktree
@@ -84,6 +94,14 @@ export const GRAPH_RESETS: ReadonlySet<string> = new Set(["fetch", "pull", "pull
  * worktrees (and must not gain any, to avoid a `store.ts` <-> `registry.ts` <->
  * `sync.ts` import cycle -- `registry.ts` already imports `RepoStore`). Sitting
  * above both, `sync.ts` can import from each without either importing it back.
+ *
+ * `continue`'s graph reset is conditional, not a static `GRAPH_RESETS` entry:
+ * captures `operationInProgress` before running, and resets the graph only if it
+ * was non-empty before and empty afterward (`guarded()`'s own refresh already
+ * includes `operationInProgress` for `continue`, per Module 2's `INVALIDATES`, so
+ * the post-call snapshot is already current by the time this checks it) -- a
+ * `continue` that still leaves conflicts remaining never creates a commit, and
+ * must not reset the graph.
  */
 export async function guardedAffecting(
   entry: RepoEntry,
@@ -91,6 +109,8 @@ export async function guardedAffecting(
   dirty: boolean,
   operation: () => Promise<string>,
 ): Promise<boolean> {
+  const operationBefore =
+    kind === "continue" ? entry.store.getSnapshot().operationInProgress : "";
   const ok = await entry.store.guarded(kind, dirty, operation);
   if (!ok) return ok;
 
@@ -101,7 +121,11 @@ export async function guardedAffecting(
       if (sibling !== entry) void sibling.store.refresh(siblingFields);
     }
   }
-  if (repository && GRAPH_RESETS.has(kind)) {
+  const operationJustCompleted =
+    kind === "continue" &&
+    operationBefore !== "" &&
+    entry.store.getSnapshot().operationInProgress === "";
+  if (repository && (GRAPH_RESETS.has(kind) || operationJustCompleted)) {
     resetSharedGraphLoader(repository.repositoryId);
   }
   return ok;

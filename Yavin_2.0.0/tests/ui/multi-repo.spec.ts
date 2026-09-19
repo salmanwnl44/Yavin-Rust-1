@@ -43,6 +43,7 @@ async function panel(page: Page, scenario: Scenario) {
     let nextId = 1;
     Object.assign(window, {
       __calls: calls,
+      __scenario: s,
       __emit: (event: string, payload: unknown) => {
         for (const id of listeners[event] ?? []) callbacks[id]?.({ event, id, payload });
       },
@@ -542,4 +543,46 @@ test("a 'git-changed' head event from the .git watcher refreshes only the worktr
   // it were going to, then confirm it didn't.
   await page.waitForTimeout(200);
   expect(await branchInfoCallsFor("/work-feature")).toBe(featureBefore);
+});
+
+test("regaining window focus re-fetches the active repository's knownWorktrees", async ({ page }) => {
+  const region = await panel(page, {
+    workspace: "/work",
+    repos: {
+      "/work": {
+        ...repo("main"),
+        commonDir: "/work/.git",
+        worktreeList: ["worktree /work", "HEAD abc123", "branch refs/heads/main", ""].join("\n"),
+      },
+    },
+  });
+  // No other worktree is known yet -- the affordance only appears once one is.
+  await expect(region.getByText(/more worktree/)).toHaveCount(0);
+
+  const worktreeListCalls = () =>
+    page.evaluate(
+      () =>
+        (
+          window as unknown as { __calls: { command: string; args: { args?: string[] } }[] }
+        ).__calls.filter(
+          (c) => c.command === "git_exec" && c.args.args?.[0] === "worktree" && c.args.args?.[1] === "list",
+        ).length,
+    );
+  const before = await worktreeListCalls();
+
+  // Simulates a worktree having been added externally (a terminal `git worktree
+  // add`) since /work was opened -- the scenario's own git_exec mock now reports
+  // it, but only a fresh `worktree list --porcelain` call will discover it.
+  await page.evaluate((list) => {
+    interface ScenarioLike {
+      repos: Record<string, { worktreeList?: string }>;
+    }
+    const scenario = (window as unknown as { __scenario?: ScenarioLike }).__scenario;
+    if (scenario) scenario.repos["/work"].worktreeList = list;
+  }, ["worktree /work", "HEAD abc123", "branch refs/heads/main", "", "worktree /work-feature", "HEAD abc123", "branch refs/heads/feature", ""].join("\n"));
+
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+
+  await expect.poll(worktreeListCalls).toBeGreaterThan(before);
+  await expect(region.getByText("1 more worktree")).toBeVisible();
 });
