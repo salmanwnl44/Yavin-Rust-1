@@ -112,6 +112,11 @@ async function panel(page: Page, scenario: Scenario) {
   await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
   const region = page.getByRole("complementary", { name: "Source control" });
   await expect(region).toBeVisible();
+  // The repository switcher is off by default (only Changes and Graph show); every test
+  // in this file exercises it, so turn it on the way a user would.
+  await region.getByLabel("Source Control view options").click();
+  await page.getByRole("menuitem", { name: "Repositories" }).click();
+  await expect(region.locator("section[aria-label='Repositories']")).toBeVisible();
   return region;
 }
 
@@ -729,4 +734,23 @@ test("the poll refreshes the active repository fully but a background one with a
   // Active: the full six-field refresh (two status calls plus branches).
   expect(after.otherRefs - before.otherRefs).toBe(1);
   expect(after.otherStatus - before.otherStatus).toBe(2);
+});
+
+test("a workspace folder that is not a repository does not show an error next to a tracked repository", async ({
+  page,
+}) => {
+  const region = await panel(page, {
+    workspace: "/plain-folder",
+    repos: { "/work": repo("main", " M a.ts\0") },
+    seedStorage: ["/work"],
+  });
+  await expect(region.getByRole("group", { name: "work" })).toBeVisible();
+  await expect(region.getByText(/not a Git repository/)).toHaveCount(0);
+});
+
+test("a workspace folder that is not a repository says so when nothing else is tracked", async ({
+  page,
+}) => {
+  const region = await panel(page, { workspace: "/plain-folder", repos: {} });
+  await expect(region.getByText(/not a Git repository/).first()).toBeVisible();
 });

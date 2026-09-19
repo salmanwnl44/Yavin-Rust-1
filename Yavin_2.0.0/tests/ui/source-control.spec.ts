@@ -232,8 +232,15 @@ test("merge is an equal, separate choice from rebase", async ({ page }) => {
   expect(await gitCalls(page, "pullRebase")).toBe(0);
 });
 
+async function showRepositories(page: Page, region: ReturnType<Page["getByRole"]>) {
+  await region.getByLabel("Source Control view options").click();
+  await page.getByRole("menuitem", { name: "Repositories" }).click();
+  await expect(region.locator("section[aria-label='Repositories']")).toBeVisible();
+}
+
 test("the sync pill asks on a divergence rather than choosing a side", async ({ page }) => {
   const region = await panel(page, { branchInfo: diverged });
+  await showRepositories(page, region);
   await region.getByTitle(/Sync changes/).click();
 
   await expect(region.getByRole("status")).toContainText(/diverged.*Choose Rebase or Merge/s);
@@ -247,6 +254,7 @@ test("the sync pill asks on a divergence rather than choosing a side", async ({ 
 
 test("a branch behind its upstream still fast-forwards on sync", async ({ page }) => {
   const region = await panel(page, { branchInfo: behind });
+  await showRepositories(page, region);
   await region.getByTitle(/Sync changes/).click();
   await expect.poll(() => gitCalls(page, "pull")).toBe(1);
 });
@@ -262,7 +270,7 @@ test("an unpublished branch offers publication to a chosen remote", async ({ pag
   await expect(region.getByRole("button", { name: "Pull" })).toBeHidden();
   await expect(region.getByRole("button", { name: "Push" })).toBeHidden();
 
-  await region.getByLabel("Remote").selectOption("upstream");
+  await region.getByLabel("Remote", { exact: true }).selectOption("upstream");
   await region.getByRole("button", { name: "Publish branch" }).click();
 
   await expect
@@ -590,7 +598,7 @@ test("committing re-fetches status, branch and operation state, still skipping b
   };
 
   await region.getByLabel("Commit message").fill("a commit");
-  await region.getByRole("button", { name: /Commit Staged/ }).click();
+  await region.getByRole("button", { name: /^Commit( \d+)?$/ }).click();
   await expect.poll(() => gitCalls(page, "commit")).toBe(1);
 
   await expect.poll(() => gitCalls(page, "status")).toBe(before.status + 1);
@@ -614,7 +622,7 @@ test("committing resets the commit graph", async ({ page }) => {
   const before = await logCalls();
 
   await region.getByLabel("Commit message").fill("a commit");
-  await region.getByRole("button", { name: /Commit Staged/ }).click();
+  await region.getByRole("button", { name: /^Commit( \d+)?$/ }).click();
   await expect.poll(() => gitCalls(page, "commit")).toBe(1);
 
   await expect.poll(logCalls).toBeGreaterThan(before);
@@ -687,7 +695,7 @@ test("typing a commit message does not lose the draft or the Commit button state
 }) => {
   const region = await panel(page, { status: "M  a.ts\0" });
   const box = region.getByLabel("Commit message");
-  const commit = region.getByRole("button", { name: /Commit Staged/ });
+  const commit = region.getByRole("button", { name: /^Commit( \d+)?$/ });
   await expect(commit).toBeDisabled();
   await box.fill("first line");
   await expect(commit).toBeEnabled();
@@ -699,4 +707,76 @@ test("typing a commit message does not lose the draft or the Commit button state
   await expect(
     page.getByRole("complementary", { name: "Source control" }).getByLabel("Commit message"),
   ).toHaveValue("draft survives reload");
+});
+
+test("every changed file appears once in one list, with a checkbox for its staging state", async ({
+  page,
+}) => {
+  // a: staged then edited again; b: only edited; c: untracked; d: fully staged; e: deleted.
+  const region = await panel(page, {
+    status: "MM a.ts\0 M b.ts\0?? c.ts\0M  d.ts\0 D e.ts\0",
+  });
+  const list = region.getByRole("list", { name: "Changed files" });
+  await expect(list.getByRole("button", { name: /^Open diff for/ })).toHaveCount(5);
+  // The old Staged Changes / Changes sections are gone.
+  await expect(region.locator("section[aria-label='Staged Changes']")).toHaveCount(0);
+  await expect(region.locator("section[aria-label='Changes']")).toHaveCount(0);
+
+  const box = (name: string) => list.getByRole("checkbox", { name: `Stage /work/${name}` });
+  await expect(box("a.ts")).toHaveAttribute("aria-checked", "mixed");
+  await expect(box("b.ts")).toHaveAttribute("aria-checked", "false");
+  await expect(box("c.ts")).toHaveAttribute("aria-checked", "false");
+  await expect(box("d.ts")).toHaveAttribute("aria-checked", "true");
+  await expect(box("e.ts")).toHaveAttribute("aria-checked", "false");
+
+  // One status letter per file, from the working tree when anything is left unstaged.
+  const letter = (name: string) =>
+    list.getByRole("button", { name: `Open diff for /work/${name}` }).getByTitle(/^Status: /);
+  await expect(letter("a.ts")).toHaveText("M");
+  await expect(letter("c.ts")).toHaveText("U");
+  await expect(letter("d.ts")).toHaveText("M");
+  await expect(letter("e.ts")).toHaveText("D");
+
+  // The header count is the number of files, and the Commit button counts only staged ones.
+  await expect(region.getByLabel("5 changed files")).toBeVisible();
+  await region.getByLabel("Commit message").fill("msg");
+  await expect(region.getByRole("button", { name: "Commit 2" })).toBeEnabled();
+});
+
+test("the row checkbox stages an unstaged or partly staged file and unstages a fully staged one", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: " M b.ts\0M  d.ts\0MM a.ts\0" });
+  const box = (name: string) =>
+    region.getByRole("list", { name: "Changed files" }).getByRole("checkbox", {
+      name: `Stage /work/${name}`,
+    });
+
+  await box("b.ts").click();
+  await expect.poll(() => gitCalls(page, "stage")).toBe(1);
+  await box("d.ts").click();
+  await expect.poll(() => gitCalls(page, "unstage")).toBe(1);
+  // Partly staged: ticking it stages what is left rather than unstaging.
+  await box("a.ts").click();
+  await expect.poll(() => gitCalls(page, "stage")).toBe(2);
+  expect(await gitCalls(page, "unstage")).toBe(1);
+});
+
+test("Repositories and Stashes are hidden by default and the choice is remembered", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: " M a.ts\0" });
+  await expect(region.locator("section[aria-label='Repositories']")).toHaveCount(0);
+  await expect(region.locator("section[aria-label='Stashes']")).toHaveCount(0);
+  await expect(region.locator("section[aria-label='Changes panel']")).toBeVisible();
+  await expect(region.locator("section[aria-label='Graph']")).toBeVisible();
+
+  await showRepositories(page, region);
+  await page.reload();
+  await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
+  await expect(
+    page
+      .getByRole("complementary", { name: "Source control" })
+      .locator("section[aria-label='Repositories']"),
+  ).toBeVisible();
 });

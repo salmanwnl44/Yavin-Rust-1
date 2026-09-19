@@ -53,11 +53,20 @@ async function panel(page: Page) {
   return region;
 }
 
-test("all four sections are visible by default", async ({ page }) => {
+test("only Changes and Graph are visible by default; Repositories and Stashes are opt-in", async ({
+  page,
+}) => {
   const region = await panel(page);
-  await expect(region.locator("section[aria-label='Repositories']")).toBeVisible();
   await expect(region.locator("section[aria-label='Changes panel']")).toBeVisible();
   await expect(region.locator("section[aria-label='Graph']")).toBeVisible();
+  await expect(region.locator("section[aria-label='Repositories']")).toHaveCount(0);
+  await expect(region.locator("section[aria-label='Stashes']")).toHaveCount(0);
+
+  await region.getByLabel("Source Control view options").click();
+  await page.getByRole("menuitem", { name: "Repositories" }).click();
+  await expect(region.locator("section[aria-label='Repositories']")).toBeVisible();
+  await region.getByLabel("Source Control view options").click();
+  await page.getByRole("menuitem", { name: "Stashes" }).click();
   await expect(region.locator("section[aria-label='Stashes']")).toBeVisible();
 });
 
@@ -87,13 +96,15 @@ test("a section's own chevron collapses just that section", async ({ page }) => 
 
 test("the repository row's menu offers the expected commands", async ({ page }) => {
   const region = await panel(page);
+  await region.getByLabel("Source Control view options").click();
+  await page.getByRole("menuitem", { name: "Repositories" }).click();
   await region.getByLabel("work actions").click();
   await expect(page.getByRole("menuitem", { name: "Fetch" })).toBeEnabled();
   await expect(page.getByRole("menuitem", { name: "Clone…" })).toBeDisabled();
   await expect(page.getByRole("menuitem", { name: "Checkout to…" })).toBeDisabled();
 });
 
-test("modified and untracked files share one Changes group, like VS Code", async ({ page }) => {
+test("modified and untracked files share one Changes list", async ({ page }) => {
   await page.addInitScript(() => {
     const ok = (stdout: string) => ({ stdout, stderr: "", code: 0, truncated: false });
     Object.assign(window, {
@@ -126,10 +137,13 @@ test("modified and untracked files share one Changes group, like VS Code", async
   await page.goto("/");
   await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
   const region = page.getByRole("complementary", { name: "Source control" });
-  const changesGroup = region.locator("section[aria-label='Changes']");
-  await expect(changesGroup).toHaveCount(1);
-  await expect(changesGroup.getByText("a.ts")).toBeVisible();
-  await expect(changesGroup.getByText("b.ts")).toBeVisible();
+  const list = region.getByRole("list", { name: "Changed files" });
+  await expect(list).toHaveCount(1);
+  await expect(list.getByText("a.ts")).toBeVisible();
+  await expect(list.getByText("b.ts")).toBeVisible();
+  // No separate Staged / Changes sections any more.
+  await expect(region.locator("section[aria-label='Staged Changes']")).toHaveCount(0);
+  await expect(region.locator("section[aria-label='Changes']")).toHaveCount(0);
 });
 
 test("the inline graph lists commits without colliding with the branch drawer's buttons", async ({

@@ -52,6 +52,13 @@ async function panel(page: Page, initial: string[] = []) {
       __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => {} },
     });
   }, initial);
+  // Stashes is an opt-in section now; choose it the way a user's saved layout would.
+  await page.addInitScript(() =>
+    localStorage.setItem(
+      "yavin.scm.sections",
+      JSON.stringify({ repositories: false, changes: true, graph: true, stashes: true }),
+    ),
+  );
   await page.goto("/");
   await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
   const region = page.getByRole("complementary", { name: "Source control" });

@@ -14,9 +14,7 @@ export type MenuEntry = MenuItemDef | { separator: true };
 
 const itemClass = (disabled?: boolean) =>
   `w-full flex items-center justify-between gap-3 px-3 py-1.5 text-left transition-colors ${
-    disabled
-      ? "text-zinc-600 cursor-not-allowed"
-      : "text-zinc-200 hover:bg-indigo-600 hover:text-white"
+    disabled ? "text-ink-3 cursor-not-allowed" : "text-ink hover:bg-accent hover:text-white"
   }`;
 
 function MenuRow({ item, onDone }: { item: MenuItemDef; onDone: () => void }) {
@@ -47,13 +45,13 @@ function MenuRow({ item, onDone }: { item: MenuItemDef; onDone: () => void }) {
           )}
           {item.label}
         </span>
-        {hasChildren && <span className="text-zinc-500 shrink-0">›</span>}
+        {hasChildren && <span className="text-ink-3 shrink-0">›</span>}
       </button>
       {hasChildren && subOpen && (
         <div
           role="menu"
           aria-label={item.label}
-          className="absolute left-full top-0 ml-0.5 min-w-[180px] rounded border border-[#2a2a2a] bg-[#161616] shadow-xl py-1 z-50"
+          className="absolute left-full top-0 ml-0.5 min-w-[180px] rounded border border-border-strong bg-surface-hover shadow-xl py-1 z-50"
         >
           {item.children!.map((child) => (
             <button
@@ -124,7 +122,7 @@ export function GitMenu({
         aria-label={label}
         className={
           buttonClassName ??
-          "p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#121212] transition-colors"
+          "p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover transition-colors"
         }
       >
         {icon}
@@ -134,11 +132,11 @@ export function GitMenu({
           role="menu"
           aria-label={label}
           onClick={(e) => e.stopPropagation()}
-          className={`absolute ${align === "end" ? "right-0" : "left-0"} top-full mt-1 z-50 min-w-[190px] rounded border border-[#2a2a2a] bg-[#161616] shadow-xl py-1 text-[12px]`}
+          className={`absolute ${align === "end" ? "right-0" : "left-0"} top-full mt-1 z-50 min-w-[190px] rounded border border-border-strong bg-surface-hover shadow-xl py-1 text-[12px]`}
         >
           {items.map((entry, i) =>
             "separator" in entry ? (
-              <div key={i} className="my-1 border-t border-[#262626]" />
+              <div key={i} className="my-1 border-t border-border-strong" />
             ) : (
               <MenuRow key={entry.label} item={entry} onDone={() => setOpen(false)} />
             ),

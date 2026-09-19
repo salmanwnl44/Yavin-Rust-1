@@ -30,34 +30,31 @@ import {
   UndoIcon,
 } from "../ui/Icons";
 
-const badgeStyles: Record<string, { badge: string; text: string }> = {
-  M: { badge: "bg-amber-500/15 text-amber-400 border-amber-500/30", text: "text-amber-300" },
-  U: {
-    badge: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
-    text: "text-emerald-400",
-  },
-  A: { badge: "bg-cyan-500/15 text-cyan-400 border-cyan-500/30", text: "text-cyan-300" },
-  D: {
-    badge: "bg-rose-500/15 text-rose-400 border-rose-500/30",
-    text: "text-rose-400 line-through",
-  },
-  R: { badge: "bg-sky-500/15 text-sky-400 border-sky-500/30", text: "text-sky-300" },
-  C: { badge: "bg-sky-500/15 text-sky-400 border-sky-500/30", text: "text-sky-300" },
-  T: { badge: "bg-amber-500/15 text-amber-400 border-amber-500/30", text: "text-amber-300" },
-  "!": { badge: "bg-red-500/15 text-red-400 border-red-500/30", text: "text-red-400" },
+/** Status letter colours come from the global theme tokens (see styles/index.css). */
+const letterColor: Record<string, string> = {
+  M: "text-yellow",
+  T: "text-yellow",
+  U: "text-green",
+  A: "text-green",
+  D: "text-red",
+  R: "text-blue",
+  C: "text-blue",
+  "!": "text-red",
 };
 
-function getStatusInfo(entry: GitEntry, staged: boolean) {
-  if (entry.conflict) return { letter: "!", style: badgeStyles["!"] };
-  if (entry.untracked) return { letter: "U", style: badgeStyles["U"] };
-  const letter = staged ? entry.index : entry.worktree;
-  return {
-    letter,
-    style: badgeStyles[letter] || {
-      badge: "bg-zinc-800 text-zinc-400 border-zinc-700",
-      text: "text-zinc-300",
-    },
-  };
+/** Whether the index holds a staged change for this entry (conflicts are never "staged"). */
+const hasStagedPart = (e: GitEntry) => !e.conflict && !e.untracked && e.index !== " ";
+/** Whether the working tree still has changes the index does not (untracked counts). */
+const hasUnstagedPart = (e: GitEntry) => e.untracked || e.worktree !== " ";
+
+/** One merged list, one letter per file: conflict, untracked, else the working-tree state
+ * if any remains, else the staged state -- the same letter VS Code-style panels show. */
+function getStatusInfo(entry: GitEntry) {
+  let letter: string;
+  if (entry.conflict) letter = "!";
+  else if (entry.untracked) letter = "U";
+  else letter = entry.worktree !== " " ? entry.worktree : entry.index;
+  return { letter, color: letterColor[letter] ?? "text-ink-2" };
 }
 
 const OPERATION_LABEL: Record<Exclude<GitOperation, "">, string> = {
@@ -87,6 +84,34 @@ interface SectionVisibility {
   changes: boolean;
   graph: boolean;
   stashes: boolean;
+}
+
+const SECTIONS_STORAGE_KEY = "yavin.scm.sections";
+// Only Changes and Graph by default; Repositories and Stashes stay one click away in the
+// view-options menu.
+const DEFAULT_SECTIONS: SectionVisibility = {
+  repositories: false,
+  changes: true,
+  graph: true,
+  stashes: false,
+};
+
+/** Which sections the user has shown or hidden. Remembered across restarts and across the
+ * panel remounting when the workspace folder changes. */
+function readSectionVisibility(): SectionVisibility {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SECTIONS_STORAGE_KEY) ?? "null");
+    if (saved && typeof saved === "object") {
+      const next = { ...DEFAULT_SECTIONS };
+      for (const key of Object.keys(DEFAULT_SECTIONS) as (keyof SectionVisibility)[]) {
+        if (typeof saved[key] === "boolean") next[key] = saved[key];
+      }
+      return next;
+    }
+  } catch {
+    /* Fall through to the defaults. */
+  }
+  return DEFAULT_SECTIONS;
 }
 
 export function SourceControlPanel({
@@ -126,7 +151,11 @@ export function SourceControlPanel({
     ) ?? null;
   const workspaceSnapshot = useRepoSnapshot(workspaceRepo?.store);
 
+  // Errors from an explicit user action (adding a repository folder) always show. A failure
+  // to discover a repository in the open *workspace folder* only matters when nothing else is
+  // tracked -- otherwise "not a Git repository" is noise next to a working repository.
   const [openError, setOpenError] = useState("");
+  const [workspaceError, setWorkspaceError] = useState("");
   // The commit draft itself lives in <CommitBox>; the panel keeps only whether one
   // exists (re-rendering only when that flips) and a ref for click-time reads.
   const [hasMessage, setHasMessage] = useState(false);
@@ -140,15 +169,16 @@ export function SourceControlPanel({
   const [newBranch, setNewBranch] = useState("");
   const [chosenRemote, setChosenRemote] = useState("");
   const [branchesOpen, setBranchesOpen] = useState(false);
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   const [rowLimits, setRowLimits] = useState<Record<string, number>>({});
   const [recovery, setRecovery] = useState<Replacement[] | null>(null);
-  const [sectionVisible, setSectionVisible] = useState<SectionVisibility>({
-    repositories: true,
-    changes: true,
-    graph: true,
-    stashes: true,
-  });
+  const [sectionVisible, setSectionVisible] = useState<SectionVisibility>(readSectionVisibility);
+  useEffect(() => {
+    try {
+      localStorage.setItem(SECTIONS_STORAGE_KEY, JSON.stringify(sectionVisible));
+    } catch {
+      /* The choice simply is not remembered when storage is unavailable. */
+    }
+  }, [sectionVisible]);
   const [sectionCollapsed, setSectionCollapsed] = useState({
     repositories: false,
     changes: false,
@@ -176,7 +206,7 @@ export function SourceControlPanel({
 
   useEffect(() => {
     let cancelled = false;
-    setOpenError("");
+    setWorkspaceError("");
     if (!workspace) return;
     // Registers the workspace's repository without stealing focus from whichever
     // repository the user has already selected in the switcher -- `open()` still
@@ -185,7 +215,7 @@ export function SourceControlPanel({
     // Worktree Architecture plan's Gap 1: Explorer navigation must never silently
     // reassign the active repository once the user has made an explicit choice.
     gitRegistry.open(workspace).catch((error) => {
-      if (!cancelled) setOpenError(String(error));
+      if (!cancelled) setWorkspaceError(String(error));
     });
     return () => {
       cancelled = true;
@@ -336,6 +366,29 @@ export function SourceControlPanel({
     }
   };
 
+  /** Clicking a row shows what is still uncommitted-and-unstaged; a fully staged file shows
+   * its staged change instead. (A partly staged file offers both.) */
+  const openEntry = (entry: GitEntry) =>
+    showDiff(entry, hasStagedPart(entry) && !hasUnstagedPart(entry));
+
+  /** The row checkbox: checked means fully staged, so clicking it unstages; anything less
+   * (empty or partly staged) stages what is left. */
+  const toggleStage = (entry: GitEntry) => {
+    if (!activeRepo) return;
+    const fullyStaged = hasStagedPart(entry) && !hasUnstagedPart(entry);
+    if (
+      !fullyStaged &&
+      entry.conflict &&
+      !window.confirm("Stage this file as resolved? Review and remove conflict markers first.")
+    )
+      return;
+    void guarded(fullyStaged ? "unstage" : "stage", () =>
+      fullyStaged
+        ? activeRepo.store.repository.unstage(entry.path)
+        : activeRepo.store.repository.stage(entry.path),
+    );
+  };
+
   const deleteBranch = async (name: string) => {
     if (!activeRepo) return;
     const ok = await guarded("deleteBranch", () =>
@@ -420,15 +473,7 @@ export function SourceControlPanel({
       return `Unstaged ${targetEntries.length} files.`;
     });
 
-  const toggleGroupCollapse = (groupName: string) => {
-    setCollapsedGroups((prev) => {
-      const next = new Set(prev);
-      if (next.has(groupName)) next.delete(groupName);
-      else next.add(groupName);
-      return next;
-    });
-  };
-
+  const shownError = openError || (registrySnapshot.repos.length === 0 ? workspaceError : "");
   const entries = snapshot?.entries ?? [];
   const branch = snapshot?.branch ?? {
     name: "",
@@ -445,30 +490,21 @@ export function SourceControlPanel({
   const notice = snapshot?.notice ?? "";
   const cancelled = snapshot?.cancelled ?? false;
 
-  // Re-filtering `entries` three times on every render -- including every
-  // commit-message keystroke, since `message` lives in this same component --
-  // is wasted work once a repository has any real number of changed files.
-  // Memoized on `entries` alone; nothing else these filters read ever changes
-  // independently of it.
-  const groups = useMemo(
-    () => [
-      { name: "Conflicts", entries: entries.filter((e) => e.conflict), staged: false },
-      {
-        name: "Staged Changes",
-        entries: entries.filter((e) => !e.conflict && !e.untracked && e.index !== " "),
-        staged: true,
-      },
-      {
-        name: "Changes",
-        entries: entries.filter((e) => !e.conflict && (e.untracked || e.worktree !== " ")),
-        staged: false,
-      },
-    ],
-    [entries],
-  );
-
-  const stagedCount = groups[1].entries.length;
-  const conflictCount = groups[0].entries.length;
+  // One list for everything: conflicts first, then every other changed file. Whether a
+  // file is staged is shown by its checkbox, not by which section it sits in.
+  // Memoized on `entries` alone so typing a commit message never re-derives it.
+  const { listed, stagedCount, conflictCount, allStaged } = useMemo(() => {
+    const conflicts = entries.filter((e) => e.conflict);
+    const others = entries.filter((e) => !e.conflict);
+    const stageable = others; // conflicts are resolved one at a time, never in bulk
+    return {
+      listed: [...conflicts, ...others],
+      stagedCount: entries.filter(hasStagedPart).length,
+      conflictCount: conflicts.length,
+      allStaged:
+        stageable.length > 0 && stageable.every((e) => hasStagedPart(e) && !hasUnstagedPart(e)),
+    };
+  }, [entries]);
   const sync = divergence(branch);
 
   const toggleSection = (name: keyof SectionVisibility) =>
@@ -480,11 +516,11 @@ export function SourceControlPanel({
     <aside
       hidden={!visible}
       aria-label="Source control"
-      className="flex flex-col h-full w-[300px] shrink-0 border-r border-[#141414] bg-black select-none text-[12px] font-sans"
+      className="flex flex-col h-full w-[300px] shrink-0 border-r border-border bg-canvas select-none text-[12px] font-sans text-ink"
     >
-      {/* Panel Header */}
-      <div className="flex h-9 items-center justify-between px-3 border-b border-[#141414] text-zinc-300 shrink-0">
-        <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
+      {/* Panel Header -- same shape as the Explorer and Search headers */}
+      <div className="flex h-9 items-center justify-between px-3 border-b border-border text-ink-2 shrink-0">
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-ink-2">
           Source Control
         </span>
         <div className="flex items-center gap-0.5">
@@ -493,7 +529,7 @@ export function SourceControlPanel({
             onClick={() => void activeRepo?.store.refresh()}
             title="Refresh Status"
             aria-label="Refresh Status"
-            className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#121212] transition-colors disabled:opacity-30"
+            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover transition-colors disabled:opacity-30"
           >
             <RefreshIcon size={13} className={loading || busy ? "animate-spin" : ""} />
           </button>
@@ -526,9 +562,9 @@ export function SourceControlPanel({
         </div>
       </div>
 
-      {openError && (
+      {shownError && (
         <p role="status" className="px-3 pt-2 text-[11px] text-red-400 break-words">
-          {openError}
+          {shownError}
         </p>
       )}
 
@@ -553,31 +589,68 @@ export function SourceControlPanel({
         )}
 
         {sectionVisible.changes && (
-          <section
-            aria-label="Changes panel"
-            className="text-xs border-b border-[#141414] shrink-0"
-          >
+          <section aria-label="Changes panel" className="text-xs shrink-0">
             <div
               onClick={() => toggleCollapsed("changes")}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 cursor-pointer hover:bg-[#0c0c0c] transition-colors group/header"
+              className="flex items-center gap-1.5 px-2 h-7 cursor-pointer hover:bg-surface-hover transition-colors"
             >
               <ChevronIcon isExpanded={!sectionCollapsed.changes} className="size-3" />
-              <span className="font-semibold text-[11px] uppercase tracking-wider text-zinc-400">
-                Changes
-              </span>
+              <span className="font-semibold text-[12px] text-ink">Changes</span>
+              {entries.length > 0 && (
+                <span
+                  aria-label={`${entries.length} changed files`}
+                  className="px-1.5 rounded-full text-[10px] leading-4 bg-border-strong text-ink-2 font-mono"
+                >
+                  {entries.length}
+                </span>
+              )}
               <div className="flex-1" />
               {activeRepo && (
-                <div
-                  className="flex items-center gap-0.5 opacity-0 group-hover/header:opacity-100 transition-opacity"
-                  onClick={(e) => e.stopPropagation()}
-                >
+                <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
+                  {entries.length > 0 && (
+                    <>
+                      <button
+                        disabled={busy || loading}
+                        title="Discard All Changes"
+                        aria-label="Discard All Changes"
+                        onClick={() => void discardAll(entries)}
+                        className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"
+                      >
+                        <UndoIcon size={12} />
+                      </button>
+                      {allStaged ? (
+                        <button
+                          disabled={busy || loading}
+                          title="Unstage All Changes"
+                          aria-label="Unstage All Changes"
+                          onClick={() => void unstageAll(entries.filter(hasStagedPart))}
+                          className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"
+                        >
+                          <MinusIcon size={12} />
+                        </button>
+                      ) : (
+                        <button
+                          disabled={busy || loading}
+                          title="Stage All Changes"
+                          aria-label="Stage All Changes"
+                          onClick={() =>
+                            void stageAll(entries.filter((e) => !e.conflict && hasUnstagedPart(e)))
+                          }
+                          className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"
+                        >
+                          <PlusIcon size={12} />
+                        </button>
+                      )}
+                    </>
+                  )}
                   <button
                     onClick={() => setBranchesOpen(!branchesOpen)}
                     title="Branches and remotes"
+                    aria-label="Branches and remotes"
                     className={`p-1 rounded transition-colors ${
                       branchesOpen
-                        ? "text-indigo-400 bg-indigo-950/60"
-                        : "text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e]"
+                        ? "text-accent-hover bg-accent/15"
+                        : "text-ink-3 hover:text-ink hover:bg-border-strong"
                     }`}
                   >
                     <GitBranchIcon size={12} />
@@ -585,7 +658,7 @@ export function SourceControlPanel({
                   <GitMenu
                     icon={<MoreIcon size={14} />}
                     label="Changes actions"
-                    buttonClassName="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e]"
+                    buttonClassName="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong"
                     items={buildGitCommandMenu({
                       entry: activeRepo,
                       dirty,
@@ -603,15 +676,32 @@ export function SourceControlPanel({
             {!sectionCollapsed.changes && (
               <div className="p-3 pt-1 space-y-2.5">
                 {!activeRepo ? (
-                  <p className="text-zinc-500 text-[11px]">
-                    {registrySnapshot.repos.length > 0
-                      ? "Choose a repository above."
-                      : !workspace
+                  registrySnapshot.repos.length > 0 ? (
+                    <div className="space-y-1">
+                      <p className="text-ink-3 text-[11px]">Choose a repository:</p>
+                      {registrySnapshot.repos.map((entry) => (
+                        <button
+                          key={entry.repoId}
+                          onClick={() => selectRepository(entry.repoId)}
+                          aria-label={`Select repository ${entry.root.split("/").filter(Boolean).pop() ?? entry.root}`}
+                          className="flex w-full items-center gap-1.5 rounded px-2 py-1 text-left text-xs text-ink hover:bg-surface-hover"
+                        >
+                          <GitBranchIcon size={12} className="shrink-0 text-ink-3" />
+                          <span className="truncate">
+                            {entry.root.split("/").filter(Boolean).pop() ?? entry.root}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-ink-3 text-[11px]">
+                      {!workspace
                         ? "Open a workspace, or add a repository folder, to use Source Control."
-                        : openError
-                          ? openError
+                        : shownError
+                          ? shownError
                           : "Discovering repository…"}
-                  </p>
+                    </p>
+                  )
                 ) : (
                   <>
                     {operationInProgress && (
@@ -634,7 +724,7 @@ export function SourceControlPanel({
                             onClick={() =>
                               void guarded("abort", () => activeRepo.store.repository.abort())
                             }
-                            className="flex-1 py-1 rounded bg-[#121212] hover:bg-[#1a1a1a] text-[11px] text-zinc-200 disabled:opacity-40 transition-colors"
+                            className="flex-1 py-1 rounded bg-surface-hover hover:bg-surface-hover text-[11px] text-ink disabled:opacity-40 transition-colors"
                           >
                             Abort
                           </button>
@@ -647,7 +737,7 @@ export function SourceControlPanel({
                               onClick={() =>
                                 void guarded("skip", () => activeRepo.store.repository.skip())
                               }
-                              className="flex-1 py-1 rounded bg-[#121212] hover:bg-[#1a1a1a] text-[11px] text-zinc-200 disabled:opacity-40 transition-colors"
+                              className="flex-1 py-1 rounded bg-surface-hover hover:bg-surface-hover text-[11px] text-ink disabled:opacity-40 transition-colors"
                             >
                               Skip
                             </button>
@@ -659,7 +749,7 @@ export function SourceControlPanel({
                                 activeRepo.store.repository.continueOperation(),
                               )
                             }
-                            className="flex-1 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-[11px] text-white disabled:opacity-40 transition-colors"
+                            className="flex-1 py-1 rounded bg-accent hover:bg-accent-hover text-[11px] text-white disabled:opacity-40 transition-colors"
                           >
                             Continue
                           </button>
@@ -671,6 +761,22 @@ export function SourceControlPanel({
                       <CommitBox
                         ref={commitBoxRef}
                         draftKey={activeRepo.root}
+                        branchName={branch.name}
+                        menu={
+                          <GitMenu
+                            icon={<ChevronIcon isExpanded className="size-3.5" />}
+                            label="Commit actions"
+                            buttonClassName="flex items-center justify-center text-white"
+                            items={buildGitCommandMenu({
+                              entry: activeRepo,
+                              dirty,
+                              hasMessage,
+                              getMessage,
+                              onCommitted: () => commitBoxRef.current?.clear(),
+                              onOpenBranches: () => setBranchesOpen(true),
+                            })}
+                          />
+                        }
                         stagedCount={stagedCount}
                         conflictCount={conflictCount}
                         busy={busy}
@@ -682,10 +788,10 @@ export function SourceControlPanel({
                       />
 
                       {branchesOpen && (
-                        <div className="space-y-2 pt-1 border-t border-[#181818]">
+                        <div className="space-y-2 pt-1 border-t border-border">
                           <select
                             aria-label="Switch branch"
-                            className="w-full rounded border border-[#222222] bg-[#0a0a0a] px-2 py-1 text-xs text-zinc-300 focus:border-indigo-500 focus:outline-none"
+                            className="w-full rounded border border-border-strong bg-surface px-2 py-1 text-xs text-ink-2 focus:border-accent focus:outline-none"
                             value={branches.includes(branch.name) ? branch.name : ""}
                             disabled={dirty}
                             onChange={(e) =>
@@ -708,7 +814,7 @@ export function SourceControlPanel({
                             <input
                               aria-label="New branch name"
                               placeholder="New branch name"
-                              className="flex-1 min-w-0 rounded border border-[#222222] bg-[#0a0a0a] px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-indigo-500 focus:outline-none"
+                              className="flex-1 min-w-0 rounded border border-border-strong bg-surface px-2 py-1 text-xs text-ink placeholder:text-ink-3 focus:border-accent focus:outline-none"
                               value={newBranch}
                               onChange={(e) => setNewBranch(e.target.value)}
                             />
@@ -719,7 +825,7 @@ export function SourceControlPanel({
                                   activeRepo.store.repository.createBranch(newBranch),
                                 ).then((ok) => ok && setNewBranch(""))
                               }
-                              className="px-2 py-1 rounded bg-[#181818] hover:bg-[#222222] text-[11px] text-zinc-200 disabled:opacity-40 transition-colors shrink-0"
+                              className="px-2 py-1 rounded bg-surface-hover hover:bg-border-strong text-[11px] text-ink disabled:opacity-40 transition-colors shrink-0"
                             >
                               Create
                             </button>
@@ -730,16 +836,16 @@ export function SourceControlPanel({
                               {branches.map((name) => (
                                 <li
                                   key={name}
-                                  className="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-[#141414]"
+                                  className="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-surface-hover"
                                 >
-                                  <span className="flex-1 min-w-0 truncate text-[11px] text-zinc-400 font-mono">
+                                  <span className="flex-1 min-w-0 truncate text-[11px] text-ink-2 font-mono">
                                     {name}
                                   </span>
                                   <button
                                     aria-label={`Delete ${name}`}
                                     title={`Delete ${name}`}
                                     onClick={() => void deleteBranch(name)}
-                                    className="p-0.5 rounded text-zinc-600 hover:text-red-400 hover:bg-red-950/40 transition-colors shrink-0"
+                                    className="p-0.5 rounded text-ink-3 hover:text-red-400 hover:bg-red-950/40 transition-colors shrink-0"
                                   >
                                     <TrashIcon size={11} />
                                   </button>
@@ -749,11 +855,11 @@ export function SourceControlPanel({
                           )}
 
                           {sync === "diverged" && (
-                            <div className="rounded border border-zinc-800 bg-zinc-900/60 p-2 space-y-1.5">
-                              <p className="text-zinc-300 text-[11px]">
+                            <div className="rounded border border-border bg-surface p-2 space-y-1.5">
+                              <p className="text-ink-2 text-[11px]">
                                 Diverged: {branch.ahead} local and {branch.behind} remote commits.
                               </p>
-                              <p className="text-zinc-500 text-[10.5px]">
+                              <p className="text-ink-3 text-[10.5px]">
                                 Neither choice stashes your work — save or commit anything you want
                                 to keep first.
                               </p>
@@ -765,7 +871,7 @@ export function SourceControlPanel({
                                       activeRepo.store.repository.pullRebase(),
                                     )
                                   }
-                                  className="flex-1 py-1 rounded bg-[#121212] hover:bg-[#1a1a1a] text-[11px] text-zinc-300 disabled:opacity-40 transition-colors"
+                                  className="flex-1 py-1 rounded bg-surface-hover hover:bg-surface-hover text-[11px] text-ink-2 disabled:opacity-40 transition-colors"
                                 >
                                   Rebase
                                 </button>
@@ -776,7 +882,7 @@ export function SourceControlPanel({
                                       activeRepo.store.repository.pullMerge(),
                                     )
                                   }
-                                  className="flex-1 py-1 rounded bg-[#121212] hover:bg-[#1a1a1a] text-[11px] text-zinc-300 disabled:opacity-40 transition-colors"
+                                  className="flex-1 py-1 rounded bg-surface-hover hover:bg-surface-hover text-[11px] text-ink-2 disabled:opacity-40 transition-colors"
                                 >
                                   Merge
                                 </button>
@@ -789,7 +895,7 @@ export function SourceControlPanel({
                               onClick={() =>
                                 void guarded("fetch", () => activeRepo.store.repository.fetch())
                               }
-                              className="flex-1 py-1 rounded bg-[#121212] hover:bg-[#1a1a1a] text-[11px] text-zinc-300 disabled:opacity-40 transition-colors"
+                              className="flex-1 py-1 rounded bg-surface-hover hover:bg-surface-hover text-[11px] text-ink-2 disabled:opacity-40 transition-colors"
                             >
                               Fetch
                             </button>
@@ -804,7 +910,7 @@ export function SourceControlPanel({
                                 onClick={() =>
                                   void guarded("pull", () => activeRepo.store.repository.pull())
                                 }
-                                className="flex-1 py-1 rounded bg-[#121212] hover:bg-[#1a1a1a] text-[11px] text-zinc-300 disabled:opacity-40 transition-colors"
+                                className="flex-1 py-1 rounded bg-surface-hover hover:bg-surface-hover text-[11px] text-ink-2 disabled:opacity-40 transition-colors"
                               >
                                 Pull
                               </button>
@@ -814,7 +920,7 @@ export function SourceControlPanel({
                                 onClick={() =>
                                   void guarded("push", () => activeRepo.store.repository.push())
                                 }
-                                className="flex-1 py-1 rounded bg-[#121212] hover:bg-[#1a1a1a] text-[11px] text-zinc-300 disabled:opacity-40 transition-colors"
+                                className="flex-1 py-1 rounded bg-surface-hover hover:bg-surface-hover text-[11px] text-ink-2 disabled:opacity-40 transition-colors"
                               >
                                 Push
                               </button>
@@ -823,7 +929,7 @@ export function SourceControlPanel({
 
                           {!branch.upstream &&
                             (remotes.length === 0 ? (
-                              <p className="text-zinc-500 text-[11px]">
+                              <p className="text-ink-3 text-[11px]">
                                 No remote is configured. Add one with `git remote add` to publish
                                 this branch.
                               </p>
@@ -831,7 +937,7 @@ export function SourceControlPanel({
                               <div className="flex gap-1">
                                 <select
                                   aria-label="Remote"
-                                  className="flex-1 min-w-0 rounded border border-[#222222] bg-[#0a0a0a] px-2 py-1 text-xs text-zinc-300 focus:border-indigo-500 focus:outline-none"
+                                  className="flex-1 min-w-0 rounded border border-border-strong bg-surface px-2 py-1 text-xs text-ink-2 focus:border-accent focus:outline-none"
                                   value={chosenRemote}
                                   onChange={(e) => setChosenRemote(e.target.value)}
                                 >
@@ -848,7 +954,7 @@ export function SourceControlPanel({
                                       activeRepo.store.repository.publish(chosenRemote),
                                     )
                                   }
-                                  className="px-2 py-1 rounded bg-[#181818] hover:bg-[#222222] text-[11px] text-zinc-200 disabled:opacity-40 transition-colors shrink-0"
+                                  className="px-2 py-1 rounded bg-surface-hover hover:bg-border-strong text-[11px] text-ink disabled:opacity-40 transition-colors shrink-0"
                                 >
                                   Publish branch
                                 </button>
@@ -866,7 +972,7 @@ export function SourceControlPanel({
                       role="status"
                       aria-live="polite"
                       className={`flex-1 text-[11px] break-words leading-tight ${
-                        cancelled ? "text-zinc-500" : "text-zinc-400"
+                        cancelled ? "text-ink-3" : "text-ink-2"
                       }`}
                     >
                       {busy ? "Running Git operation…" : loading ? "Refreshing…" : notice}
@@ -875,7 +981,7 @@ export function SourceControlPanel({
                       <button
                         onClick={() => activeRepo?.store.cancel()}
                         title="Cancel this Git operation"
-                        className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-zinc-400 hover:bg-[#1e1e1e] hover:text-zinc-200"
+                        className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-ink-2 hover:bg-surface-hover hover:text-ink"
                       >
                         Cancel
                       </button>
@@ -906,7 +1012,7 @@ export function SourceControlPanel({
                         })
                         .catch((e) => activeRepo?.store.setNotice(String(e)));
                     }}
-                    className="w-full rounded bg-zinc-800 hover:bg-zinc-700 py-1 text-[11px] text-zinc-200 transition-colors flex items-center justify-center gap-1.5"
+                    className="w-full rounded bg-border-strong hover:bg-surface-hover py-1 text-[11px] text-ink transition-colors flex items-center justify-center gap-1.5"
                   >
                     <UndoIcon size={12} />
                     <span>Undo last discard</span>
@@ -916,230 +1022,152 @@ export function SourceControlPanel({
             )}
 
             {!sectionCollapsed.changes && activeRepo && (
-              <div className="divide-y divide-[#101010]">
+              <div role="list" aria-label="Changed files" className="pb-1">
                 {entries.length === 0 && !loading && (
-                  <div className="flex flex-col items-center justify-center p-8 text-center text-zinc-500 gap-2">
-                    <CheckIcon size={24} className="text-zinc-600" />
+                  <div className="flex flex-col items-center justify-center p-8 text-center text-ink-3 gap-2">
+                    <CheckIcon size={24} className="text-ink-3" />
                     <p className="text-xs">Working tree clean</p>
-                    <p className="text-[11px] text-zinc-600">No changes detected in repository</p>
+                    <p className="text-[11px]">No changes detected in repository</p>
                   </div>
                 )}
 
-                {groups.map((group) => {
-                  if (group.entries.length === 0) return null;
-                  const isCollapsed = collapsedGroups.has(group.name);
+                {listed.slice(0, rowLimits.Changes ?? ROWS_PER_PAGE).map((entry) => {
+                  const root = activeRepo.root;
+                  const relativePath = entry.path.startsWith(root)
+                    ? entry.path.slice(root.length + 1)
+                    : entry.path;
+                  const parts = relativePath.split(/[/\\]/);
+                  const fileName = parts.pop() || relativePath;
+                  const dirPath = parts.join("/");
+                  const status = getStatusInfo(entry);
+                  const staged = hasStagedPart(entry);
+                  const partial = staged && hasUnstagedPart(entry);
+                  const checked = staged && !partial;
+                  const isActiveDiff = activeDiffPath === entry.path;
 
                   return (
-                    <section key={group.name} aria-label={group.name} className="text-xs">
-                      <div
-                        role="button"
-                        tabIndex={0}
-                        aria-expanded={!isCollapsed}
-                        onClick={() => toggleGroupCollapse(group.name)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter" || e.key === " ") {
-                            e.preventDefault();
-                            toggleGroupCollapse(group.name);
-                          }
+                    <div
+                      key={entry.path}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`Open diff for ${entry.path}`}
+                      className={`flex items-center gap-1.5 pl-2 pr-2.5 h-[22px] hover:bg-surface-hover group/row transition-colors cursor-pointer ${
+                        isActiveDiff ? "bg-accent/15" : ""
+                      }`}
+                      onClick={() => void openEntry(entry)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          void openEntry(entry);
+                        }
+                      }}
+                    >
+                      <button
+                        role="checkbox"
+                        aria-checked={checked ? true : partial ? "mixed" : false}
+                        aria-label={`Stage ${entry.path}`}
+                        title={checked ? `Unstage ${fileName}` : `Stage ${fileName}`}
+                        disabled={busy || loading}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleStage(entry);
                         }}
-                        className="flex items-center justify-between px-2.5 py-1.5 bg-[#080808] hover:bg-[#121212] cursor-pointer transition-colors group/header"
+                        className={`flex size-3.5 shrink-0 items-center justify-center rounded-[3px] border transition-colors disabled:opacity-40 ${
+                          staged
+                            ? "bg-accent border-accent text-white"
+                            : "border-border-strong text-transparent hover:border-ink-3"
+                        }`}
                       >
-                        <div className="flex items-center gap-1.5 min-w-0">
-                          <ChevronIcon isExpanded={!isCollapsed} className="size-3" />
-                          <span className="font-semibold text-[11px] uppercase tracking-wider text-zinc-400">
-                            {group.name}
-                          </span>
-                          <span className="ml-1 px-1.5 py-0.2 rounded-full text-[10px] bg-zinc-800 text-zinc-400 font-mono">
-                            {group.entries.length}
-                          </span>
-                        </div>
+                        {checked ? (
+                          <CheckIcon size={10} />
+                        ) : partial ? (
+                          <MinusIcon size={10} />
+                        ) : null}
+                      </button>
 
-                        <div
-                          className="flex items-center gap-0.5 opacity-0 group-hover/header:opacity-100 transition-opacity"
-                          onClick={(e) => e.stopPropagation()}
+                      <FileIcon name={fileName} isDir={false} className="size-3.5 shrink-0" />
+
+                      <div className="flex items-baseline min-w-0 flex-1 truncate">
+                        <span
+                          className={`text-xs truncate ${
+                            status.letter === "D" ? "line-through text-ink-3" : "text-ink"
+                          }`}
+                          title={
+                            entry.originalPath
+                              ? `${entry.originalPath} → ${entry.path}`
+                              : entry.path
+                          }
                         >
-                          {group.name === "Changes" && (
-                            <>
-                              <button
-                                disabled={busy || loading}
-                                title="Discard All Changes"
-                                aria-label="Discard All Changes"
-                                onClick={() => void discardAll(group.entries)}
-                                className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
-                              >
-                                <UndoIcon size={12} />
-                              </button>
-                              <button
-                                disabled={busy || loading}
-                                title="Stage All Changes"
-                                aria-label="Stage All Changes"
-                                onClick={() => void stageAll(group.entries)}
-                                className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
-                              >
-                                <PlusIcon size={12} />
-                              </button>
-                            </>
-                          )}
-                          {group.name === "Staged Changes" && (
-                            <button
-                              disabled={busy || loading}
-                              title="Unstage All Changes"
-                              aria-label="Unstage All Changes"
-                              onClick={() => void unstageAll(group.entries)}
-                              className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
-                            >
-                              <MinusIcon size={12} />
-                            </button>
-                          )}
-                        </div>
+                          {fileName}
+                        </span>
+                        {dirPath && (
+                          <span className="text-ink-3 text-[10.5px] ml-1.5 truncate">
+                            {dirPath}
+                          </span>
+                        )}
                       </div>
 
-                      {!isCollapsed && (
-                        <div className="divide-y divide-[#0c0c0c]">
-                          {group.entries
-                            .slice(0, rowLimits[group.name] ?? ROWS_PER_PAGE)
-                            .map((entry) => {
-                              const root = activeRepo.root;
-                              const relativePath = entry.path.startsWith(root)
-                                ? entry.path.slice(root.length + 1)
-                                : entry.path;
-                              const parts = relativePath.split(/[/\\]/);
-                              const fileName = parts.pop() || relativePath;
-                              const dirPath = parts.join("/");
-                              const status = getStatusInfo(entry, group.staged);
-                              const isActiveDiff = activeDiffPath === entry.path;
+                      <div
+                        className="flex items-center gap-0.5 opacity-0 group-hover/row:opacity-100 focus-within:opacity-100 transition-opacity shrink-0"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <button
+                          disabled={busy}
+                          title="Open Diff"
+                          aria-label="Open Diff"
+                          onClick={() => void openEntry(entry)}
+                          className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
+                        >
+                          <DiffIcon size={12} />
+                        </button>
+                        {partial && (
+                          <button
+                            disabled={busy}
+                            title="Open staged changes"
+                            aria-label={`Open staged diff for ${entry.path}`}
+                            onClick={() => void showDiff(entry, true)}
+                            className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
+                          >
+                            <CheckIcon size={12} />
+                          </button>
+                        )}
+                        {entry.worktree === "M" && !entry.conflict && (
+                          <button
+                            disabled={busy || loading}
+                            aria-label={`Discard ${entry.path}`}
+                            title={`Discard changes in ${fileName}`}
+                            onClick={() => void discard(entry)}
+                            className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
+                          >
+                            <UndoIcon size={12} />
+                          </button>
+                        )}
+                      </div>
 
-                              return (
-                                <div
-                                  key={entry.path}
-                                  role="button"
-                                  tabIndex={0}
-                                  aria-label={`Open diff for ${entry.path}`}
-                                  className={`flex items-center gap-1.5 px-2.5 py-1.5 hover:bg-[#121212] group/row transition-colors cursor-pointer ${
-                                    isActiveDiff ? "bg-[#161a24]" : ""
-                                  }`}
-                                  onClick={() => void showDiff(entry, group.staged)}
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter" || e.key === " ") {
-                                      e.preventDefault();
-                                      void showDiff(entry, group.staged);
-                                    }
-                                  }}
-                                >
-                                  <FileIcon
-                                    name={fileName}
-                                    isDir={false}
-                                    className="size-3.5 shrink-0"
-                                  />
-
-                                  <div className="flex items-baseline min-w-0 flex-1 truncate">
-                                    <span
-                                      className={`text-xs font-medium truncate ${status.style.text}`}
-                                      title={
-                                        entry.originalPath
-                                          ? `${entry.originalPath} → ${entry.path}`
-                                          : entry.path
-                                      }
-                                    >
-                                      {fileName}
-                                    </span>
-                                    {dirPath && (
-                                      <span className="text-zinc-500 text-[10.5px] ml-1.5 truncate">
-                                        {dirPath}
-                                      </span>
-                                    )}
-                                  </div>
-
-                                  <span
-                                    title={`Status: ${status.letter}`}
-                                    className={`px-1 py-0.2 rounded text-[10px] font-mono font-bold border shrink-0 ${status.style.badge}`}
-                                  >
-                                    {status.letter}
-                                  </span>
-
-                                  <div
-                                    className="flex items-center gap-0.5 opacity-0 group-hover/row:opacity-100 transition-opacity shrink-0"
-                                    onClick={(e) => e.stopPropagation()}
-                                  >
-                                    <button
-                                      disabled={busy}
-                                      title="Open Diff"
-                                      aria-label="Open Diff"
-                                      onClick={() => void showDiff(entry, group.staged)}
-                                      className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
-                                    >
-                                      <DiffIcon size={12} />
-                                    </button>
-
-                                    {!group.staged && entry.worktree === "M" && !entry.conflict && (
-                                      <button
-                                        disabled={busy || loading}
-                                        aria-label={`Discard ${entry.path}`}
-                                        title={`Discard changes in ${fileName}`}
-                                        onClick={() => void discard(entry)}
-                                        className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
-                                      >
-                                        <UndoIcon size={12} />
-                                      </button>
-                                    )}
-
-                                    <button
-                                      disabled={busy || loading}
-                                      aria-label={`${group.staged ? "Unstage" : "Stage"} ${entry.path}`}
-                                      title={
-                                        group.staged ? `Unstage ${fileName}` : `Stage ${fileName}`
-                                      }
-                                      onClick={() => {
-                                        if (
-                                          entry.conflict &&
-                                          !window.confirm(
-                                            "Stage this file as resolved? Review and remove conflict markers first.",
-                                          )
-                                        )
-                                          return;
-                                        void guarded(group.staged ? "unstage" : "stage", () =>
-                                          group.staged
-                                            ? activeRepo.store.repository.unstage(entry.path)
-                                            : activeRepo.store.repository.stage(entry.path),
-                                        );
-                                      }}
-                                      className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
-                                    >
-                                      {group.staged ? (
-                                        <MinusIcon size={12} />
-                                      ) : (
-                                        <PlusIcon size={12} />
-                                      )}
-                                    </button>
-                                  </div>
-                                </div>
-                              );
-                            })}
-                          {group.entries.length > (rowLimits[group.name] ?? ROWS_PER_PAGE) && (
-                            <button
-                              onClick={() =>
-                                setRowLimits((prev) => ({
-                                  ...prev,
-                                  [group.name]: (prev[group.name] ?? ROWS_PER_PAGE) + ROWS_PER_PAGE,
-                                }))
-                              }
-                              className="w-full py-1.5 text-[11px] text-zinc-400 hover:bg-[#121212] hover:text-zinc-200"
-                            >
-                              Show{" "}
-                              {Math.min(
-                                ROWS_PER_PAGE,
-                                group.entries.length - (rowLimits[group.name] ?? ROWS_PER_PAGE),
-                              )}{" "}
-                              more of{" "}
-                              {group.entries.length - (rowLimits[group.name] ?? ROWS_PER_PAGE)}{" "}
-                              remaining
-                            </button>
-                          )}
-                        </div>
-                      )}
-                    </section>
+                      <span
+                        title={`Status: ${status.letter}`}
+                        className={`w-3 text-center text-[11px] font-semibold shrink-0 ${status.color}`}
+                      >
+                        {status.letter}
+                      </span>
+                    </div>
                   );
                 })}
+                {listed.length > (rowLimits.Changes ?? ROWS_PER_PAGE) && (
+                  <button
+                    onClick={() =>
+                      setRowLimits((prev) => ({
+                        ...prev,
+                        Changes: (prev.Changes ?? ROWS_PER_PAGE) + ROWS_PER_PAGE,
+                      }))
+                    }
+                    className="w-full py-1.5 text-[11px] text-ink-2 hover:bg-surface-hover hover:text-ink"
+                  >
+                    Show{" "}
+                    {Math.min(ROWS_PER_PAGE, listed.length - (rowLimits.Changes ?? ROWS_PER_PAGE))}{" "}
+                    more of {listed.length - (rowLimits.Changes ?? ROWS_PER_PAGE)} remaining
+                  </button>
+                )}
               </div>
             )}
           </section>

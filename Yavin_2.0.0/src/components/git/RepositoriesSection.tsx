@@ -49,7 +49,7 @@ function UntrackedWorktrees({
     <div className="pl-6 pb-1">
       <button
         onClick={() => setExpanded((was) => !was)}
-        className="flex items-center gap-1 py-0.5 text-[10.5px] text-zinc-500 hover:text-zinc-300"
+        className="flex items-center gap-1 py-0.5 text-[10.5px] text-ink-3 hover:text-ink"
       >
         <ChevronIcon isExpanded={expanded} className="size-2.5" />
         {untracked.length} more worktree{untracked.length === 1 ? "" : "s"}
@@ -59,9 +59,9 @@ function UntrackedWorktrees({
           {untracked.map((info) => (
             <div
               key={info.path}
-              className="flex items-center gap-1.5 py-0.5 text-[11px] text-zinc-400"
+              className="flex items-center gap-1.5 py-0.5 text-[11px] text-ink-2"
             >
-              <GitBranchIcon size={11} className="shrink-0 text-zinc-600" />
+              <GitBranchIcon size={11} className="shrink-0 text-ink-3" />
               <span className="truncate flex-1">
                 {info.detached ? `detached @ ${info.headHash.slice(0, 7)}` : info.branch}
               </span>
@@ -82,7 +82,7 @@ function UntrackedWorktrees({
                 onClick={() => onSelect(info.path)}
                 title={`Open worktree ${info.path}`}
                 aria-label={`Open worktree ${info.path}`}
-                className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-zinc-400 hover:bg-[#1e1e1e] hover:text-zinc-200"
+                className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-ink-2 hover:bg-surface-hover hover:text-ink"
               >
                 Open
               </button>
@@ -126,13 +126,13 @@ function RepoRow({
       aria-label={repoName(entry.root)}
       onClick={onSelect}
       className={`group/repo flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] cursor-pointer transition-colors ${
-        active ? "bg-[#0e0e0e]" : "hover:bg-[#101010]"
+        active ? "bg-surface" : "hover:bg-surface-hover"
       }`}
     >
-      <GitBranchIcon size={13} className="shrink-0 text-zinc-500" />
-      <span className="flex-1 truncate text-zinc-200">{repoName(entry.root)}</span>
+      <GitBranchIcon size={13} className="shrink-0 text-ink-3" />
+      <span className="flex-1 truncate text-ink">{repoName(entry.root)}</span>
       {snapshot?.branch.name && (
-        <span className="shrink-0 text-zinc-500 text-[11px] font-mono">
+        <span className="shrink-0 text-ink-3 text-[11px] font-mono">
           {snapshot.branch.name}
           {hasChanges ? "*" : ""}
         </span>
@@ -145,7 +145,7 @@ function RepoRow({
           e.stopPropagation();
           sync.run(onOpenBranches);
         }}
-        className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e] shrink-0 disabled:opacity-40"
+        className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover shrink-0 disabled:opacity-40"
       >
         <SyncIcon size={12} className={busy ? "animate-spin" : ""} />
       </button>
@@ -153,7 +153,7 @@ function RepoRow({
         <GitMenu
           icon={<MoreIcon size={14} />}
           label={`${repoName(entry.root)} actions`}
-          buttonClassName="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e]"
+          buttonClassName="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
           items={buildGitCommandMenu({
             entry,
             dirty,
@@ -171,7 +171,7 @@ function RepoRow({
           e.stopPropagation();
           onRemove();
         }}
-        className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e] opacity-0 group-hover/repo:opacity-100 shrink-0"
+        className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover opacity-0 group-hover/repo:opacity-100 shrink-0"
       >
         <CloseIcon size={11} />
       </button>
@@ -229,13 +229,13 @@ export function RepositoriesSection({
   }, [repos, sort]);
 
   return (
-    <section aria-label="Repositories" className="text-xs shrink-0 border-b border-[#141414]">
+    <section aria-label="Repositories" className="text-xs shrink-0 border-b border-border">
       <div
         onClick={onToggleCollapse}
-        className="flex items-center gap-1.5 px-2.5 py-1.5 cursor-pointer hover:bg-[#0c0c0c] transition-colors group/header"
+        className="flex items-center gap-1.5 px-2.5 py-1.5 cursor-pointer hover:bg-surface-hover transition-colors group/header"
       >
         <ChevronIcon isExpanded={!collapsed} className="size-3" />
-        <span className="font-semibold text-[11px] uppercase tracking-wider text-zinc-400 flex-1">
+        <span className="font-semibold text-[11px] uppercase tracking-wider text-ink-2 flex-1">
           Repositories
         </span>
         <div
@@ -246,14 +246,14 @@ export function RepositoriesSection({
             onClick={onAdd}
             title="Add Repository Folder"
             aria-label="Add Repository Folder"
-            className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e]"
+            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
           >
             <FolderPlusIcon size={13} />
           </button>
           <GitMenu
             icon={<MoreIcon size={14} />}
             label="Repositories actions"
-            buttonClassName="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e]"
+            buttonClassName="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
             items={[
               {
                 label: "Sort by Discovery Time",
@@ -267,7 +267,7 @@ export function RepositoriesSection({
         </div>
       </div>
       {!collapsed && (
-        <div className="divide-y divide-[#0c0c0c]">
+        <div className="divide-y divide-border">
           {sorted.map((entry) => {
             const owner = ownerOf(repositories, entry);
             return (

@@ -28,38 +28,35 @@ export function StashesSection({
   };
 
   return (
-    <section
-      aria-label="Stashes"
-      className="text-xs flex flex-col min-h-0 border-b border-[#141414]"
-    >
+    <section aria-label="Stashes" className="text-xs flex flex-col min-h-0 border-b border-border">
       <div
         onClick={onToggleCollapse}
-        className="flex items-center gap-1.5 px-2.5 py-1.5 cursor-pointer hover:bg-[#0c0c0c] transition-colors shrink-0"
+        className="flex items-center gap-1.5 px-2.5 py-1.5 cursor-pointer hover:bg-surface-hover transition-colors shrink-0"
       >
         <ChevronIcon isExpanded={!collapsed} className="size-3" />
-        <span className="font-semibold text-[11px] uppercase tracking-wider text-zinc-400">
+        <span className="font-semibold text-[11px] uppercase tracking-wider text-ink-2">
           Stashes
         </span>
         {stashes.length > 0 && (
-          <span className="text-zinc-600 text-[10px] font-mono">{stashes.length}</span>
+          <span className="text-ink-3 text-[10px] font-mono">{stashes.length}</span>
         )}
       </div>
 
       {!collapsed && (
         <div className="overflow-y-auto max-h-[200px] pb-1">
           {stashes.length === 0 ? (
-            <p className="px-3 py-1 text-[11px] text-zinc-600">No stashed changes.</p>
+            <p className="px-3 py-1 text-[11px] text-ink-3">No stashed changes.</p>
           ) : (
             stashes.map((stash) => (
               <div
                 key={stash.index}
-                className="group/stash flex items-center gap-1.5 px-2.5 py-1 hover:bg-[#0c0c0c]"
+                className="group/stash flex items-center gap-1.5 px-2.5 py-1 hover:bg-surface-hover"
               >
-                <span className="truncate flex-1 text-zinc-300" title={stash.message}>
+                <span className="truncate flex-1 text-ink-2" title={stash.message}>
                   {stash.message}
                 </span>
                 {stash.branch && (
-                  <span className="shrink-0 text-zinc-600 text-[10px] truncate max-w-[70px]">
+                  <span className="shrink-0 text-ink-3 text-[10px] truncate max-w-[70px]">
                     {stash.branch}
                   </span>
                 )}
@@ -70,7 +67,7 @@ export function StashesSection({
                     onClick={() =>
                       run("stashApply", () => entry.store.repository.stashApply(stash.index))
                     }
-                    className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e]"
+                    className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
                   >
                     <ArrowDownIcon size={11} />
                   </button>
@@ -80,7 +77,7 @@ export function StashesSection({
                     onClick={() =>
                       run("stashPop", () => entry.store.repository.stashPop(stash.index))
                     }
-                    className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e]"
+                    className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
                   >
                     <UndoIcon size={11} />
                   </button>
@@ -88,7 +85,7 @@ export function StashesSection({
                     title="Drop Stash"
                     aria-label={`Drop stash ${stash.message}`}
                     onClick={() => drop(stash.index, stash.message)}
-                    className="p-1 rounded text-zinc-500 hover:text-rose-300 hover:bg-[#1e1e1e]"
+                    className="p-1 rounded text-ink-3 hover:text-rose-300 hover:bg-surface-hover"
                   >
                     <TrashIcon size={11} />
                   </button>

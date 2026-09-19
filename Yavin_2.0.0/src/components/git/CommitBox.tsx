@@ -1,4 +1,5 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useState } from "react";
+import type { ReactNode } from "react";
 import { CheckIcon } from "../ui/Icons";
 
 export interface CommitBoxHandle {
@@ -19,15 +20,19 @@ export const CommitBox = forwardRef<
   {
     /** Repository root the draft is stored under; `null` while none is active. */
     draftKey: string | null;
+    /** Current branch name, shown in the placeholder like a VS Code-style SCM input. */
+    branchName?: string;
     stagedCount: number;
     conflictCount: number;
     busy: boolean;
     loading: boolean;
     onCommit: (message: string) => Promise<boolean>;
     onChange: (message: string) => void;
+    /** A dropdown trigger rendered attached to the right of the Commit button. */
+    menu?: ReactNode;
   }
 >(function CommitBox(
-  { draftKey, stagedCount, conflictCount, busy, loading, onCommit, onChange },
+  { draftKey, branchName, stagedCount, conflictCount, busy, loading, onCommit, onChange, menu },
   ref,
 ) {
   const [text, setText] = useState("");
@@ -68,12 +73,14 @@ export const CommitBox = forwardRef<
     void onCommit(text).then((ok) => ok && update("", draftKey));
   };
 
+  const hint = branchName ? ` on "${branchName}"` : "";
+
   return (
-    <>
+    <div className="space-y-1.5">
       <textarea
         aria-label="Commit message"
-        placeholder="Message (Ctrl+Enter to commit)"
-        rows={3}
+        placeholder={`Message (Ctrl+Enter to commit${hint})`}
+        rows={2}
         value={text}
         onChange={(e) => update(e.target.value, draftKey)}
         onKeyDown={(e) => {
@@ -82,17 +89,40 @@ export const CommitBox = forwardRef<
             if (!busy && !loading) commit();
           }
         }}
-        className="w-full rounded border border-[#222222] bg-[#0a0a0a] p-2 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-indigo-500 focus:outline-none resize-none transition-colors"
+        className="w-full rounded border border-border-strong bg-surface p-2 text-xs text-ink placeholder:text-ink-3 focus:border-accent focus:outline-none resize-none transition-colors"
       />
 
-      <button
-        disabled={!canCommit}
-        onClick={commit}
-        className="w-full rounded bg-indigo-600 hover:bg-indigo-500 py-1.5 px-3 text-xs font-medium text-white flex items-center justify-center gap-1.5 transition-colors shadow-sm disabled:opacity-40 disabled:hover:bg-indigo-600"
-      >
-        <CheckIcon size={13} />
-        <span>Commit Staged ({stagedCount})</span>
-      </button>
-    </>
+      <div className="flex">
+        <button
+          disabled={!canCommit}
+          onClick={commit}
+          title={
+            stagedCount === 0
+              ? "Tick the files you want to include first"
+              : conflictCount > 0
+                ? "Resolve conflicts first"
+                : text.trim()
+                  ? `Commit ${stagedCount} staged file${stagedCount === 1 ? "" : "s"}`
+                  : "Enter a commit message"
+          }
+          className={`flex-1 min-w-0 py-1.5 px-3 text-xs font-medium text-white flex items-center justify-center gap-1.5 bg-accent hover:bg-accent-hover transition-colors disabled:opacity-40 disabled:hover:bg-accent ${
+            menu ? "rounded-l" : "rounded"
+          }`}
+        >
+          <CheckIcon size={13} />
+          <span>Commit</span>
+          {stagedCount > 0 && (
+            <span className="rounded-full bg-white/20 px-1.5 text-[10px] leading-4">
+              {stagedCount}
+            </span>
+          )}
+        </button>
+        {menu && (
+          <div className="flex border-l border-white/20 [&>div>button]:h-full [&>div>button]:rounded-l-none [&>div>button]:rounded-r [&>div>button]:px-1.5 [&>div>button]:bg-accent [&>div>button:hover]:bg-accent-hover [&>div>button]:text-white">
+            {menu}
+          </div>
+        )}
+      </div>
+    </div>
   );
 });

@@ -65,23 +65,18 @@ export function InlineGraphSection({
     <section aria-label="Graph" className="text-xs flex flex-col min-h-0">
       <div
         onClick={onToggleCollapse}
-        className="flex items-center gap-1.5 px-2.5 py-1.5 cursor-pointer hover:bg-[#0c0c0c] transition-colors group/header shrink-0"
+        className="flex items-center gap-1.5 px-2 h-7 cursor-pointer hover:bg-surface-hover transition-colors shrink-0 border-t border-border"
       >
         <ChevronIcon isExpanded={!collapsed} className="size-3" />
-        <span className="font-semibold text-[11px] uppercase tracking-wider text-zinc-400">
-          Graph
-        </span>
-        <span className="text-zinc-600 text-[10px]">Auto</span>
+        <span className="font-semibold text-[12px] text-ink">Graph</span>
+        <span className="text-ink-3 text-[10px]">Auto</span>
         <div className="flex-1" />
-        <div
-          className="flex items-center gap-0.5 opacity-0 group-hover/header:opacity-100 transition-opacity"
-          onClick={(e) => e.stopPropagation()}
-        >
+        <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
           <button
             title="Fetch"
             aria-label="Check for new commits"
             onClick={() => run("fetch", () => entry.store.repository.fetch())}
-            className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e]"
+            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
           >
             <SyncIcon size={12} />
           </button>
@@ -89,7 +84,7 @@ export function InlineGraphSection({
             title="Pull"
             aria-label="Download new commits"
             onClick={() => run("pull", () => entry.store.repository.pull())}
-            className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e]"
+            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
           >
             <ArrowDownIcon size={12} />
           </button>
@@ -97,21 +92,21 @@ export function InlineGraphSection({
             title="Push"
             aria-label="Upload local commits"
             onClick={() => run("push", () => entry.store.repository.push())}
-            className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e]"
+            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
           >
             <ArrowUpIcon size={12} />
           </button>
           <button
             title="Refresh Graph"
             onClick={() => reset()}
-            className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e]"
+            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
           >
             <RefreshIcon size={12} className={snapshot.loading ? "animate-spin" : ""} />
           </button>
           <GitMenu
             icon={<MoreIcon size={14} />}
             label="Graph view options"
-            buttonClassName="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e]"
+            buttonClassName="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
             items={[
               { label: "View as List", checked: true },
               { label: "View as Tree", disabled: true },
@@ -191,7 +186,7 @@ export function InlineGraphSection({
                   height: ROW_HEIGHT,
                 }}
                 title={node.commit.subject}
-                className="flex items-center gap-1.5 px-1.5 text-[11px] hover:bg-[#121212] truncate"
+                className="flex items-center gap-1.5 px-1.5 text-[11px] hover:bg-surface-hover truncate"
               >
                 {node.commit.refs
                   .filter((r) => r.kind === "branch" || r.kind === "head")
@@ -199,14 +194,14 @@ export function InlineGraphSection({
                   .map((r) => (
                     <span
                       key={r.name}
-                      className="shrink-0 flex items-center gap-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 px-1.5 text-[9.5px]"
+                      className="shrink-0 flex items-center gap-0.5 rounded-full bg-accent/20 text-accent-hover border border-accent/40 px-1.5 text-[9.5px]"
                     >
                       <GitBranchIcon size={9} />
                       {r.name}
                     </span>
                   ))}
-                <span className="truncate flex-1 text-zinc-200">{node.commit.subject}</span>
-                <span className="shrink-0 text-zinc-600">{node.commit.authorName}</span>
+                <span className="truncate flex-1 text-ink">{node.commit.subject}</span>
+                <span className="shrink-0 text-ink-3">{node.commit.authorName}</span>
               </div>
             ))}
           </div>
@@ -215,7 +210,7 @@ export function InlineGraphSection({
               <button
                 disabled={snapshot.loading}
                 onClick={loadMore}
-                className="text-[11px] text-zinc-400 hover:text-zinc-200 disabled:opacity-40"
+                className="text-[11px] text-ink-2 hover:text-ink disabled:opacity-40"
               >
                 {snapshot.loading ? "Loading…" : "Show more commits"}
               </button>
@@ -223,7 +218,7 @@ export function InlineGraphSection({
             {onExpand && (
               <button
                 onClick={onExpand}
-                className="text-[11px] text-zinc-500 hover:text-zinc-200"
+                className="text-[11px] text-ink-3 hover:text-ink"
                 title="Open full commit graph"
               >
                 Open in full view
