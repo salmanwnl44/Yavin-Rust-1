@@ -2,7 +2,12 @@ import { useMemo, useRef, useState } from "react";
 import { FileIcon } from "../ui/FileIcons";
 import { ArrowDownIcon, ArrowUpIcon, CloseIcon, DiffIcon, PlusIcon, UndoIcon } from "../ui/Icons";
 import { parseUnifiedDiff } from "../../services/git/diffHunks";
-import { diffWords, type WordSegment } from "../../services/git/wordDiff";
+import { diffWords, wordDiffCells, type WordSegment } from "../../services/git/wordDiff";
+
+// Total LCS cells one diff may spend on intra-line highlights (~250 ms worst case);
+// pairs past it render as plain changed lines. Bounds the eager pass over the whole
+// diff, not just the visible page.
+const WORD_DIFF_DIFF_BUDGET = 4_000_000;
 
 export interface DiffDocument {
   path: string;
@@ -32,6 +37,7 @@ interface ParsedDiffLine {
  * a replacement -- are left without `segments` and render as whole lines.
  */
 function attachWordDiffs(parsed: ParsedDiffLine[]): void {
+  let budget = WORD_DIFF_DIFF_BUDGET;
   let index = 0;
   while (index < parsed.length) {
     if (parsed[index].type !== "delete") {
@@ -48,6 +54,9 @@ function attachWordDiffs(parsed: ParsedDiffLine[]): void {
     for (let offset = 0; offset < pairs; offset++) {
       const deleted = parsed[index + offset];
       const added = parsed[addStart + offset];
+      const cells = wordDiffCells(deleted.text, added.text);
+      if (cells > budget) continue;
+      budget -= cells;
       const words = diffWords(deleted.text, added.text);
       deleted.segments = words.old;
       added.segments = words.new;

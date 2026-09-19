@@ -38,7 +38,7 @@ const FIRST_HUNK_ONLY = [
   "+TWO",
 ].join("\n");
 
-async function panel(page: Page) {
+async function panel(page: Page, bothDiff: string = TWO_HUNK_DIFF) {
   await page.addInitScript(
     (diffs) => {
       const calls: { command: string; args: Record<string, unknown> }[] = [];
@@ -86,7 +86,7 @@ async function panel(page: Page) {
         __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => {} },
       });
     },
-    { both: TWO_HUNK_DIFF, first: FIRST_HUNK_ONLY, second: SECOND_HUNK_ONLY },
+    { both: bothDiff, first: FIRST_HUNK_ONLY, second: SECOND_HUNK_ONLY },
   );
   await page.goto("/");
   await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
@@ -305,12 +305,16 @@ test("a failed hunk stage shows a clear message and reloads the now-provably-sta
   await region.getByText("a.ts").click();
 
   const diffView = page.locator("section[aria-label='Git diff editor']");
-  const callsBefore = await page.evaluate(() => (window as unknown as { __diffCalls: () => number }).__diffCalls());
+  const callsBefore = await page.evaluate(() =>
+    (window as unknown as { __diffCalls: () => number }).__diffCalls(),
+  );
   await diffView.getByRole("button", { name: "Stage Hunk" }).first().click();
 
   await expect(region.getByText(/no longer matches the file/)).toBeVisible();
   await expect
-    .poll(() => page.evaluate(() => (window as unknown as { __diffCalls: () => number }).__diffCalls()))
+    .poll(() =>
+      page.evaluate(() => (window as unknown as { __diffCalls: () => number }).__diffCalls()),
+    )
     .toBeGreaterThan(callsBefore);
 });
 
@@ -321,3 +325,26 @@ function assertPatchContainsOnlyFirstHunk(calls: { args: { args?: string[]; inpu
   expect(patch).not.toContain("@@ -10,2 +10,3 @@");
   expect(patch).not.toContain("eleven");
 }
+
+test("a diff with one enormous changed line opens promptly and keeps the whole line", async ({
+  page,
+}) => {
+  const long = "word ".repeat(10000);
+  const bigDiff = [
+    "diff --git a/a.ts b/a.ts",
+    "index abc..def 100644",
+    "--- a/a.ts",
+    "+++ b/a.ts",
+    "@@ -1,1 +1,1 @@",
+    `-${long}`,
+    `+${long}changed`,
+  ].join("\n");
+  const region = await panel(page, bigDiff);
+  await region.getByText("a.ts").click();
+
+  const diffView = page.locator("section[aria-label='Git diff editor']");
+  // Word-level LCS on 20,000 tokens per side would need minutes and gigabytes.
+  await expect(diffView.getByText("changed", { exact: false }).first()).toBeVisible({
+    timeout: 10000,
+  });
+});

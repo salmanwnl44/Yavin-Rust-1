@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { diffWords } from "./wordDiff.ts";
+import { diffWords, wordDiffCells, WORD_DIFF_MAX_CELLS } from "./wordDiff.ts";
 
 function text(segments: { text: string }[]): string {
   return segments.map((segment) => segment.text).join("");
@@ -54,4 +54,21 @@ test("diffWords treats non-ASCII scripts as whole word runs, not one segment per
   );
   assert.equal(text(old), "café 日本語 test");
   assert.equal(text(next), "café 中文 test");
+});
+
+test("a pair too large for the LCS budget is reported as a wholly changed line, never truncated", () => {
+  const long = "x ".repeat(2000);
+  const changed = long.replace("x x", "y y");
+  const started = Date.now();
+  const { old, new: next } = diffWords(long, changed);
+  assert.ok(Date.now() - started < 200, "over-budget pairs must not run the quadratic LCS");
+  assert.equal(text(old), long);
+  assert.equal(text(next), changed);
+  assert.ok(old.every((s) => s.type === "del") && next.every((s) => s.type === "add"));
+});
+
+test("a pair inside the budget still gets fine-grained segments", () => {
+  const { old } = diffWords("a b c", "a X c");
+  assert.ok(old.some((s) => s.type === "same"));
+  assert.ok(wordDiffCells("a b c", "a X c") < WORD_DIFF_MAX_CELLS);
 });
