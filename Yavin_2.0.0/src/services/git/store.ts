@@ -121,7 +121,22 @@ export class RepoStore {
   private readonly onAnyChange?: () => void;
   private snapshot: RepoSnapshot = initialSnapshot;
   private listeners = new Set<() => void>();
-  private generation = 0;
+  /**
+   * One generation per field, not per store. A refresh claims the fields it fetches and may
+   * only apply a field while nobody newer has claimed it. With a single store-wide counter,
+   * two overlapping refreshes of *different* fields (a watcher's `refs` event refreshing the
+   * branch list at the same instant its `head` event refreshes status and branch) made the
+   * later one supersede the earlier, throwing away a perfectly good, unrelated result -- the
+   * branch dropdown then stayed stale until the next 5-second poll.
+   */
+  private fieldGeneration: Record<RefreshField, number> = {
+    entries: 0,
+    branch: 0,
+    branches: 0,
+    remotes: 0,
+    stashes: 0,
+    operationInProgress: 0,
+  };
   private inFlight = false;
   /**
    * The currently-running bare `refresh()` call (if any), and exactly which
@@ -129,7 +144,7 @@ export class RepoStore {
    * watcher event landing right after the 5s poll fires) that asks for a subset
    * of what's already in flight share that same call instead of spawning
    * duplicate `git` processes for fields already being fetched. Not a
-   * correctness mechanism (the existing `generation` guard already prevents a
+   * correctness mechanism (the per-field generation guard already prevents a
    * stale result from ever being applied) -- purely avoids wasted process spawns
    * for the specific overlapping-refresh race the Git State & Synchronization
    * plan's Section N/Race 2 identifies. A request that isn't fully covered by
@@ -209,12 +224,12 @@ export class RepoStore {
   }
 
   private async doRefresh(fields: readonly RefreshField[]): Promise<void> {
-    const current = ++this.generation;
-    const wants = (field: RefreshField) => fields.includes(field);
+    const claimed = new Map<RefreshField, number>();
+    for (const field of fields) claimed.set(field, ++this.fieldGeneration[field]);
     this.activeRefreshes++;
     this.patch({ loading: true });
     try {
-      await this.fetchAndApply(current, wants);
+      await this.fetchAndApply(claimed);
     } finally {
       this.activeRefreshes--;
       // A superseded refresh discards its data, but must still hand `loading` back
@@ -223,10 +238,10 @@ export class RepoStore {
     }
   }
 
-  private async fetchAndApply(
-    current: number,
-    wants: (field: RefreshField) => boolean,
-  ): Promise<void> {
+  private async fetchAndApply(claimed: ReadonlyMap<RefreshField, number>): Promise<void> {
+    const wants = (field: RefreshField) => claimed.has(field);
+    // Still ours: no newer refresh (or mutation) has claimed this field since.
+    const live = (field: RefreshField) => this.fieldGeneration[field] === claimed.get(field);
     try {
       const [status, branchInfo, branches, remotes, stashList, operationInProgress] =
         await Promise.all([
@@ -237,23 +252,28 @@ export class RepoStore {
           wants("stashes") ? this.repository.stashList() : undefined,
           wants("operationInProgress") ? this.repository.state() : undefined,
         ]);
-      if (this.generation !== current) return;
-      const next: Partial<RepoSnapshot> = { stale: false };
+      const next: Partial<RepoSnapshot> = {};
+      if (status !== undefined && live("entries"))
+        next.entries = parseGitEntries(status, this.repository.root);
+      if (branchInfo !== undefined && live("branch")) next.branch = parseBranch(branchInfo);
+      if (branches !== undefined && live("branches")) next.branches = branches;
+      if (remotes !== undefined && live("remotes")) next.remotes = remotes;
+      if (stashList !== undefined && live("stashes")) next.stashes = parseStashList(stashList);
+      if (operationInProgress !== undefined && live("operationInProgress"))
+        next.operationInProgress = operationInProgress;
+      // Everything this call fetched was superseded: nothing of it is worth applying.
+      if (Object.keys(next).length === 0) return;
+      next.stale = false;
       // A notice that only reported this store's own failed refresh is obsolete now.
       if (this.refreshError !== null && this.snapshot.notice === this.refreshError) {
         next.notice = "";
       }
       this.refreshError = null;
-      if (status !== undefined) next.entries = parseGitEntries(status, this.repository.root);
-      if (branchInfo !== undefined) next.branch = parseBranch(branchInfo);
-      if (branches !== undefined) next.branches = branches;
-      if (remotes !== undefined) next.remotes = remotes;
-      if (stashList !== undefined) next.stashes = parseStashList(stashList);
-      if (operationInProgress !== undefined) next.operationInProgress = operationInProgress;
       this.patch(next);
       this.lastRefreshedAt = Date.now();
     } catch (error) {
-      if (this.generation !== current) return;
+      // Only report a failure the current state still depends on.
+      if (![...claimed.keys()].some(live)) return;
       this.refreshError = String(error);
       this.patch({ notice: this.refreshError, stale: true });
     }
@@ -281,7 +301,8 @@ export class RepoStore {
     }
     this.inFlight = true;
     this.patch({ busy: true, notice: "", cancelled: false });
-    this.generation++;
+    for (const field of Object.keys(this.fieldGeneration) as RefreshField[])
+      this.fieldGeneration[field]++;
     this.mutationEpoch++;
     let ok = false;
     try {

@@ -274,3 +274,64 @@ test("a refresh success does not erase an operation's own notice", async () => {
   await store.refresh(["entries"]);
   assert.equal(store.getSnapshot().notice, "Staged 1 file");
 });
+
+// The bug: a watcher's `refs` event (branch list) and `head` event (status + branch) start
+// overlapping refreshes of DIFFERENT fields. A store-wide generation made the later one
+// supersede the earlier and drop its result; the branch dropdown stayed stale until the
+// next 5-second poll (measured in the real app: 3-5 s of lag).
+for (const order of ["branches first", "status first"] as const) {
+  test(`overlapping refreshes of different fields each apply (${order})`, async () => {
+    const calls: string[] = [];
+    let resolveBranches!: (v: string[]) => void;
+    let resolveStatus!: (v: string) => void;
+    let resolveInfo!: (v: string) => void;
+    const repo = fakeRepository(calls, {
+      branches: () => new Promise<string[]>((r) => (resolveBranches = r)),
+      status: () => new Promise<string>((r) => (resolveStatus = r)),
+      branchInfo: () => new Promise<string>((r) => (resolveInfo = r)),
+    });
+    const store = new RepoStore(repo);
+
+    const refs = store.refresh(["branches"]);
+    const head = store.refresh(["entries", "branch"]); // starts while the first is in flight
+    const settleBranches = () => resolveBranches(["main", "probe-br-1"]);
+    const settleHead = () => {
+      resolveStatus(" M a.ts\0");
+      resolveInfo("# branch.head probe-br-1\n");
+    };
+    if (order === "branches first") {
+      settleBranches();
+      settleHead();
+    } else {
+      settleHead();
+      settleBranches();
+    }
+    await Promise.all([refs, head]);
+
+    const snap = store.getSnapshot();
+    assert.deepEqual(snap.branches, ["main", "probe-br-1"], "the branch list must not be dropped");
+    assert.equal(snap.branch.name, "probe-br-1");
+    assert.equal(snap.entries.length, 1);
+    assert.equal(snap.loading, false);
+  });
+}
+
+test("a newer refresh of the SAME field still wins over an older, slower one", async () => {
+  const calls: string[] = [];
+  const resolvers: Array<(v: string[]) => void> = [];
+  const repo = fakeRepository(calls, {
+    branches: () => new Promise<string[]>((r) => resolvers.push(r)),
+  });
+  const store = new RepoStore(repo);
+
+  const older = store.refresh(["branches"]);
+  // Force a second, independent request for the same field (a full refresh is not a subset
+  // match for a scoped one, so it runs its own fetch).
+  const newer = store.refresh();
+  resolvers[1](["fresh"]);
+  await newer;
+  resolvers[0](["stale"]); // the older call finishes last with older data
+  await older;
+
+  assert.deepEqual(store.getSnapshot().branches, ["fresh"]);
+});
