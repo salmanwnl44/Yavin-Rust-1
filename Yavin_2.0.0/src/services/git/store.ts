@@ -121,7 +121,16 @@ export class RepoStore {
    * UI-local-only state (a commit message draft, a new-branch input) on success only.
    */
   async guarded(kind: string, dirty: boolean, operation: () => Promise<string>): Promise<boolean> {
-    if (this.inFlight) return false;
+    if (this.inFlight) {
+      // Previously a silent no-op (see the Git Operation Engine plan's error
+      // model, Section G) -- a second click while busy looked like nothing
+      // happened at all, rather than telling the user why it was refused.
+      this.patch({
+        notice: "Another Git operation is already running for this worktree.",
+        cancelled: false,
+      });
+      return false;
+    }
     if (DIRTY_BLOCKED.has(kind) && dirty) {
       this.patch({ notice: "Save or close unsaved editors before changing the working tree." });
       return false;
