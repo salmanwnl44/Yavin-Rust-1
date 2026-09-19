@@ -643,6 +643,10 @@ const WORKTREE: &[FlagRule] = &[flag("--porcelain")];
 // neither can bypass Git's separate, unconditional refusal to delete a branch
 // checked out in any worktree (verified empirically, not assumed).
 const BRANCH: &[FlagRule] = &[flag("-d"), flag("-D")];
+// `--prune` only ever removes LOCAL records of refs the remote no longer has -- it
+// can never delete anything from the remote itself, and it never resets the graph
+// (it removes a ref, never a commit object; see the plan's Section T).
+const FETCH: &[FlagRule] = &[flag("--prune")];
 
 /// The declarative allow-list this whole design leans on: every subcommand
 /// TypeScript may run, and every flag it may pass before a literal `--`. Anything not
@@ -661,7 +665,7 @@ fn rules_for(subcommand: &str) -> Option<&'static [FlagRule]> {
         "switch" => SWITCH,
         "branch" => BRANCH,
         "remote" => NONE,
-        "fetch" => NONE,
+        "fetch" => FETCH,
         "pull" => PULL,
         "push" => PUSH,
         "show" => SHOW,
@@ -1800,6 +1804,79 @@ mod tests {
         let (dir, _git) = fixture();
         let repo = open(&dir);
         let result = exec(&repo, &args(&["branch", "--move", "renamed"]), None);
+        let _ = fs::remove_dir_all(&dir);
+        let error = result.unwrap_err();
+        assert!(error.contains("not permitted"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn fetch_prune_is_reachable_and_removes_a_stale_remote_tracking_branch() {
+        let bare = temp_dir();
+        fs::create_dir_all(&bare).unwrap();
+        assert!(Command::new("git")
+            .current_dir(&bare)
+            .args(["init", "-q", "--bare"])
+            .status()
+            .unwrap()
+            .success());
+        let (dir, git) = fixture();
+        let repo = open(&dir);
+        let remote_url = clean_path_str(&bare);
+        assert!(git(&["remote", "add", "origin", &remote_url]));
+        assert!(git(&["push", "-q", "origin", "HEAD:main"]));
+        assert!(git(&["push", "-q", "origin", "HEAD:doomed"]));
+        assert!(git(&["fetch", "-q", "origin"]));
+        assert!(git(&[
+            "show-ref",
+            "--verify",
+            "-q",
+            "refs/remotes/origin/doomed"
+        ]));
+
+        // Delete the branch on the "remote" directly (bypassing Yavin, simulating an
+        // external deletion), then confirm a plain fetch (no --prune) leaves the
+        // stale remote-tracking ref behind, and fetch --prune removes it.
+        assert!(Command::new("git")
+            .current_dir(&bare)
+            .args(["branch", "-D", "doomed"])
+            .status()
+            .unwrap()
+            .success());
+        let plain = exec(&repo, &args(&["fetch"]), None).unwrap();
+        assert_eq!(plain.code, 0);
+        assert!(git(&[
+            "show-ref",
+            "--verify",
+            "-q",
+            "refs/remotes/origin/doomed"
+        ]));
+
+        let pruned = exec(&repo, &args(&["fetch", "--prune"]), None).unwrap();
+        let still_present = Command::new("git")
+            .current_dir(&dir)
+            .args(["show-ref", "--verify", "-q", "refs/remotes/origin/doomed"])
+            .status()
+            .unwrap()
+            .success();
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&bare);
+
+        assert_eq!(
+            pruned.code, 0,
+            "fetch --prune must succeed: {}",
+            pruned.stderr
+        );
+        assert!(
+            !still_present,
+            "fetch --prune must remove the stale remote-tracking ref"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_fetch_flag_is_rejected() {
+        let (dir, _git) = fixture();
+        let repo = open(&dir);
+        let result = exec(&repo, &args(&["fetch", "--all"]), None);
         let _ = fs::remove_dir_all(&dir);
         let error = result.unwrap_err();
         assert!(error.contains("not permitted"), "unexpected error: {error}");

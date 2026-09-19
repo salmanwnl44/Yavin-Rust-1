@@ -200,8 +200,12 @@ export class Repository {
     return this.run(["branch", force ? "-D" : "-d", name]);
   }
 
+  // Always prunes: a remote branch deleted upstream would otherwise leave its
+  // refs/remotes/<remote>/* entry (and any graph decoration badge on it) around
+  // indefinitely -- --prune only ever removes local records of refs the remote no
+  // longer has, it can never delete anything from the remote itself.
   fetch(): Promise<string> {
-    return this.run(["fetch"]);
+    return this.run(["fetch", "--prune"]);
   }
 
   /**
