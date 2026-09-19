@@ -234,6 +234,7 @@ export function RepositoriesSection({
           <button
             onClick={onAdd}
             title="Add Repository Folder"
+            aria-label="Add Repository Folder"
             className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e]"
           >
             <FolderPlusIcon size={13} />

@@ -100,6 +100,7 @@ function CommitDetail({
         <button
           onClick={onClose}
           title="Close commit details"
+          aria-label="Close commit details"
           className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#121212]"
         >
           <CloseIcon size={12} />
@@ -225,6 +226,7 @@ export function CommitGraphPanel({
           <button
             onClick={onClose}
             title="Close graph"
+            aria-label="Close graph"
             className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#121212]"
           >
             <CloseIcon size={13} />

@@ -649,3 +649,13 @@ test("a Cancel button stops a running Git operation and reports it distinctly fr
   expect(cancelCalls).toHaveLength(1);
   expect(cancelCalls[0].args.repoId).toBe("/work");
 });
+
+test("a changed file's diff can be opened with the keyboard alone", async ({ page }) => {
+  const region = await panel(page, { status: " M a.ts\0" });
+  const row = region.getByRole("button", { name: "Open diff for /work/a.ts" });
+  await row.focus();
+  await row.press("Enter");
+
+  const diffView = page.locator("section[aria-label='Git diff editor']");
+  await expect(diffView).toBeVisible();
+});

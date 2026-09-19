@@ -416,6 +416,7 @@ export function DiffEditor({
               <button
                 onClick={() => jumpToHunk("prev")}
                 title="Previous Change"
+                aria-label="Previous Change"
                 className="p-1 rounded text-zinc-400 hover:text-white hover:bg-[#1c1c1c] transition-colors"
               >
                 <ArrowUpIcon size={12} />
@@ -426,6 +427,7 @@ export function DiffEditor({
               <button
                 onClick={() => jumpToHunk("next")}
                 title="Next Change"
+                aria-label="Next Change"
                 className="p-1 rounded text-zinc-400 hover:text-white hover:bg-[#1c1c1c] transition-colors"
               >
                 <ArrowDownIcon size={12} />
@@ -457,6 +459,7 @@ export function DiffEditor({
           <button
             onClick={onClose}
             title="Close Diff (Escape)"
+            aria-label="Close Diff"
             className="p-1 rounded text-zinc-400 hover:text-white hover:bg-[#1a1a1a] transition-colors ml-1"
           >
             <CloseIcon size={14} />

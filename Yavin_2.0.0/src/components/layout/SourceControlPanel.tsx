@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { native } from "../../services/native";
 import { divergence } from "../../services/git/parsers/branch";
 import type { GitEntry } from "../../services/git/parsers/status";
@@ -428,19 +428,27 @@ export function SourceControlPanel({
   const notice = snapshot?.notice ?? "";
   const cancelled = snapshot?.cancelled ?? false;
 
-  const groups = [
-    { name: "Conflicts", entries: entries.filter((e) => e.conflict), staged: false },
-    {
-      name: "Staged Changes",
-      entries: entries.filter((e) => !e.conflict && !e.untracked && e.index !== " "),
-      staged: true,
-    },
-    {
-      name: "Changes",
-      entries: entries.filter((e) => !e.conflict && (e.untracked || e.worktree !== " ")),
-      staged: false,
-    },
-  ];
+  // Re-filtering `entries` three times on every render -- including every
+  // commit-message keystroke, since `message` lives in this same component --
+  // is wasted work once a repository has any real number of changed files.
+  // Memoized on `entries` alone; nothing else these filters read ever changes
+  // independently of it.
+  const groups = useMemo(
+    () => [
+      { name: "Conflicts", entries: entries.filter((e) => e.conflict), staged: false },
+      {
+        name: "Staged Changes",
+        entries: entries.filter((e) => !e.conflict && !e.untracked && e.index !== " "),
+        staged: true,
+      },
+      {
+        name: "Changes",
+        entries: entries.filter((e) => !e.conflict && (e.untracked || e.worktree !== " ")),
+        staged: false,
+      },
+    ],
+    [entries],
+  );
 
   const stagedCount = groups[1].entries.length;
   const conflictCount = groups[0].entries.length;
@@ -479,6 +487,7 @@ export function SourceControlPanel({
             disabled={busy || loading}
             onClick={() => void activeRepo?.store.refresh()}
             title="Refresh Status"
+            aria-label="Refresh Status"
             className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#121212] transition-colors disabled:opacity-30"
           >
             <RefreshIcon size={13} className={loading || busy ? "animate-spin" : ""} />
@@ -926,7 +935,16 @@ export function SourceControlPanel({
                   return (
                     <section key={group.name} aria-label={group.name} className="text-xs">
                       <div
+                        role="button"
+                        tabIndex={0}
+                        aria-expanded={!isCollapsed}
                         onClick={() => toggleGroupCollapse(group.name)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            toggleGroupCollapse(group.name);
+                          }
+                        }}
                         className="flex items-center justify-between px-2.5 py-1.5 bg-[#080808] hover:bg-[#121212] cursor-pointer transition-colors group/header"
                       >
                         <div className="flex items-center gap-1.5 min-w-0">
@@ -948,6 +966,7 @@ export function SourceControlPanel({
                               <button
                                 disabled={busy || loading}
                                 title="Discard All Changes"
+                                aria-label="Discard All Changes"
                                 onClick={() => void discardAll(group.entries)}
                                 className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
                               >
@@ -956,6 +975,7 @@ export function SourceControlPanel({
                               <button
                                 disabled={busy || loading}
                                 title="Stage All Changes"
+                                aria-label="Stage All Changes"
                                 onClick={() => void stageAll(group.entries)}
                                 className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
                               >
@@ -967,6 +987,7 @@ export function SourceControlPanel({
                             <button
                               disabled={busy || loading}
                               title="Unstage All Changes"
+                              aria-label="Unstage All Changes"
                               onClick={() => void unstageAll(group.entries)}
                               className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
                             >
@@ -992,10 +1013,19 @@ export function SourceControlPanel({
                             return (
                               <div
                                 key={entry.path}
+                                role="button"
+                                tabIndex={0}
+                                aria-label={`Open diff for ${entry.path}`}
                                 className={`flex items-center gap-1.5 px-2.5 py-1.5 hover:bg-[#121212] group/row transition-colors cursor-pointer ${
                                   isActiveDiff ? "bg-[#161a24]" : ""
                                 }`}
                                 onClick={() => void showDiff(entry, group.staged)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" || e.key === " ") {
+                                    e.preventDefault();
+                                    void showDiff(entry, group.staged);
+                                  }
+                                }}
                               >
                                 <FileIcon
                                   name={fileName}
@@ -1035,6 +1065,7 @@ export function SourceControlPanel({
                                   <button
                                     disabled={busy}
                                     title="Open Diff"
+                                    aria-label="Open Diff"
                                     onClick={() => void showDiff(entry, group.staged)}
                                     className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
                                   >
