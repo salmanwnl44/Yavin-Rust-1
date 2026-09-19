@@ -172,9 +172,7 @@ test("a file with no trailing newline preserves Git's own marker in the hunk", (
     const diffText = git(dir, ["diff", "--", "a.txt"]);
     const parsed = parseUnifiedDiff(diffText);
     assert.equal(parsed.hunks.length, 1);
-    assert.ok(
-      parsed.hunks[0].lines.some((line) => line.includes("No newline at end of file")),
-    );
+    assert.ok(parsed.hunks[0].lines.some((line) => line.includes("No newline at end of file")));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

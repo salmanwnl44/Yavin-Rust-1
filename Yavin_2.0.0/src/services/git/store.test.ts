@@ -158,10 +158,14 @@ test("two different RepoStore instances never share generation state -- a late r
   const callsA: string[] = [];
   let resolveA!: (value: string) => void;
   const storeA = new RepoStore(
-    fakeRepository(callsA, { status: () => new Promise<string>((resolve) => (resolveA = resolve)) }),
+    fakeRepository(callsA, {
+      status: () => new Promise<string>((resolve) => (resolveA = resolve)),
+    }),
   );
   const callsB: string[] = [];
-  const storeB = new RepoStore(fakeRepository(callsB, { status: () => Promise.resolve(" M b.ts\0") }));
+  const storeB = new RepoStore(
+    fakeRepository(callsB, { status: () => Promise.resolve(" M b.ts\0") }),
+  );
 
   const pendingA = storeA.refresh(["entries"]); // "switch to B" happens conceptually here
   await storeB.refresh(["entries"]); // B's own refresh completes first
@@ -170,7 +174,11 @@ test("two different RepoStore instances never share generation state -- a late r
   resolveA(" M a.ts\0"); // "A completes late"
   await pendingA;
   assert.equal(storeA.getSnapshot().entries.length, 1, "A's own result still applies to A");
-  assert.equal(storeB.getSnapshot().entries.length, 1, "B's snapshot is untouched by A's late completion");
+  assert.equal(
+    storeB.getSnapshot().entries.length,
+    1,
+    "B's snapshot is untouched by A's late completion",
+  );
 });
 
 // Race 3: "operation completion + watcher event + focus refresh, all near-

@@ -215,9 +215,7 @@ test("closing the graph returns to the editor", async ({ page }) => {
   await expect(graph).toHaveCount(0);
 });
 
-test("a graph reset that removes the selected commit clears its detail panel", async ({
-  page,
-}) => {
+test("a graph reset that removes the selected commit clears its detail panel", async ({ page }) => {
   const graph = await panel(page, {
     commits: [
       { hash: "c2", parents: ["c1"], subject: "Second commit" },
@@ -225,16 +223,18 @@ test("a graph reset that removes the selected commit clears its detail panel", a
     ],
   });
   await graph.getByText("Second commit").click();
-  const detail = page.getByRole("complementary").filter({ has: page.getByTitle("Close commit details") });
+  const detail = page
+    .getByRole("complementary")
+    .filter({ has: page.getByTitle("Close commit details") });
   await expect(detail).toBeVisible();
 
   // Simulate a same-repository history rewrite (an amend, a rebase, or an
   // external rewrite the .git watcher picked up): the previously-selected
   // commit no longer exists once the graph reloads.
   await page.evaluate(() => {
-    (
-      window as unknown as { __scenario: { commits: unknown[] } }
-    ).__scenario.commits = [{ hash: "c3", parents: [], subject: "Rewritten commit" }];
+    (window as unknown as { __scenario: { commits: unknown[] } }).__scenario.commits = [
+      { hash: "c3", parents: [], subject: "Rewritten commit" },
+    ];
   });
   await page.getByTitle("Refresh Graph").click();
 

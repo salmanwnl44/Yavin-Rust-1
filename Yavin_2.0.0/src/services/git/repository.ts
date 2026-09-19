@@ -288,7 +288,8 @@ export class Repository {
   async skip(): Promise<string> {
     const op = await this.state();
     if (!op) throw new Error("No merge, rebase, cherry-pick or revert is in progress.");
-    if (op === "merge") throw new Error("Merge has no commits to skip -- abort or continue instead.");
+    if (op === "merge")
+      throw new Error("Merge has no commits to skip -- abort or continue instead.");
     return this.run([op, "--skip"]);
   }
   private async abortOrContinue(flag: "--abort" | "--continue"): Promise<string> {

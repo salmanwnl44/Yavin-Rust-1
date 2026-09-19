@@ -270,7 +270,11 @@ class GitRegistry {
       // external-change detection is not fatal, the existing poll/focus refresh
       // remains the permanent fallback (see the Git State & Synchronization plan).
       const owner = repositories.find((r) => r.repositoryId === repositoryId);
-      if (owner) void watchRepo(repositoryId, owner.worktrees.map((w) => w.repoId));
+      if (owner)
+        void watchRepo(
+          repositoryId,
+          owner.worktrees.map((w) => w.repoId),
+        );
 
       const shouldActivate = options.makeActive || !this.snapshot.activeWorktreePath;
       this.set(repositories, {
@@ -368,8 +372,13 @@ class GitRegistry {
     // Re-check after the await: the repository could have closed meanwhile.
     if (!this.repositoryById(repositoryId)) return;
     this.set(
-      this.snapshot.repositories.map((r) => (r.repositoryId === repositoryId ? { ...r, knownWorktrees } : r)),
-      { repositoryId: this.snapshot.activeRepositoryId, worktreePath: this.snapshot.activeWorktreePath },
+      this.snapshot.repositories.map((r) =>
+        r.repositoryId === repositoryId ? { ...r, knownWorktrees } : r,
+      ),
+      {
+        repositoryId: this.snapshot.activeRepositoryId,
+        worktreePath: this.snapshot.activeWorktreePath,
+      },
     );
   }
 }

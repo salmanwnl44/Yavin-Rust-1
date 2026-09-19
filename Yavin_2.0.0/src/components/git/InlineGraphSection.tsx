@@ -58,7 +58,8 @@ export function InlineGraphSection({
   // commit (see sync.ts's GRAPH_RESETS) but was reset unconditionally here before.
   // Since the loader is shared, that reset is visible through this same `reset`/
   // `snapshot` pair without an extra manual call.
-  const run = (kind: string, op: () => Promise<string>) => void guardedAffecting(entry, kind, dirty, op);
+  const run = (kind: string, op: () => Promise<string>) =>
+    void guardedAffecting(entry, kind, dirty, op);
 
   return (
     <section aria-label="Graph" className="text-xs flex flex-col min-h-0">

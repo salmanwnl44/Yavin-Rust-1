@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyGitChangeEvent, GRAPH_RESETS, SIBLING_INVALIDATES, WATCHER_INVALIDATES } from "./sync.ts";
+import {
+  applyGitChangeEvent,
+  GRAPH_RESETS,
+  SIBLING_INVALIDATES,
+  WATCHER_INVALIDATES,
+} from "./sync.ts";
 import type { RepoEntry, RepositoryEntry } from "./registry.ts";
 import type { GitChangeEvent } from "../native.ts";
 
@@ -108,14 +113,7 @@ test("GRAPH_RESETS is every kind that adds a commit or moves HEAD -- and never p
 });
 
 test("GRAPH_RESETS never covers branch-create/deleteBranch/stash -- HEAD stays on the same history", () => {
-  for (const kind of [
-    "branch",
-    "deleteBranch",
-    "stash",
-    "stashApply",
-    "stashPop",
-    "stashDrop",
-  ]) {
+  for (const kind of ["branch", "deleteBranch", "stash", "stashApply", "stashPop", "stashDrop"]) {
     assert.ok(!GRAPH_RESETS.has(kind), `"${kind}" must not be in GRAPH_RESETS`);
   }
 });
@@ -141,7 +139,10 @@ function fakeWorktree(root: string): { entry: RepoEntry; refreshCalls: unknown[]
 }
 
 test("WATCHER_INVALIDATES maps every event kind to the fields Section H's watcher-path table specifies", () => {
-  const expected: Record<GitChangeEvent["kind"], { fields: readonly string[]; graphReset: boolean }> = {
+  const expected: Record<
+    GitChangeEvent["kind"],
+    { fields: readonly string[]; graphReset: boolean }
+  > = {
     head: { fields: ["entries", "branch"], graphReset: true },
     "operation-state": { fields: ["entries", "branch", "operationInProgress"], graphReset: false },
     refs: { fields: ["branches"], graphReset: true },
@@ -162,7 +163,11 @@ test("a 'head'/'operation-state' event refreshes only the worktree it names, nev
     knownWorktrees: [],
   };
 
-  applyGitChangeEvent(repository, { repositoryId: "/work/.git", kind: "head", worktreeRoot: "/work/a" });
+  applyGitChangeEvent(repository, {
+    repositoryId: "/work/.git",
+    kind: "head",
+    worktreeRoot: "/work/a",
+  });
 
   assert.deepEqual(a.refreshCalls, [[["entries", "branch"]]]);
   assert.deepEqual(b.refreshCalls, [], "the sibling must not be refreshed by a per-worktree event");
@@ -197,6 +202,10 @@ test("'refs'/'remotes'/'stash' events refresh every worktree of the repository",
     applyGitChangeEvent(repository, { repositoryId: "/work/.git", kind });
     assert.equal(a.refreshCalls.length, 1, `worktree A must refresh for "${kind}"`);
     assert.equal(b.refreshCalls.length, 1, `worktree B must refresh for "${kind}"`);
-    assert.deepEqual(a.refreshCalls[0], b.refreshCalls[0], `both worktrees get the same fields for "${kind}"`);
+    assert.deepEqual(
+      a.refreshCalls[0],
+      b.refreshCalls[0],
+      `both worktrees get the same fields for "${kind}"`,
+    );
   }
 });
