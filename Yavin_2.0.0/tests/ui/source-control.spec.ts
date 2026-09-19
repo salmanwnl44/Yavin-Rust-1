@@ -84,7 +84,8 @@ async function panel(page: Page, scenario: Partial<Scenario> = {}) {
               case "merge":
               case "cherry-pick":
               case "revert":
-                return argv.includes("--abort") ? "abort" : "continue";
+                if (argv.includes("--abort")) return "abort";
+                return argv.includes("--skip") ? "skip" : "continue";
               case "add":
                 return "stage";
               case "restore":
@@ -127,6 +128,13 @@ async function panel(page: Page, scenario: Partial<Scenario> = {}) {
             // "merge" (deciding which op to continue) while guarded()'s later
             // post-op refresh sees the now-cleared state, exactly like real Git.
             if (action === "continue") state.state = "";
+            // Simulates skip having been the sequence's last remaining commit -- the
+            // operation completes as a side effect of the skip call itself, exactly
+            // like a completing continue (same reasoning as above).
+            if (action === "skip") {
+              state.state = "";
+              state.status = "";
+            }
             // A "fetch" hangs until either the test resolves it or git_cancel_repo
             // is called, simulating the real Rust cancellation path rejecting an
             // in-flight/lock-queued call with the literal string "Cancelled".
@@ -415,6 +423,47 @@ test("an aborted merge clears the banner", async ({ page }) => {
   await expect.poll(() => gitCalls(page, "abort")).toBe(1);
 
   await update(page, { state: "", status: "" });
+  await expect(region.getByRole("alert").filter({ hasText: "in progress" })).toHaveCount(0);
+});
+
+test("an interrupted rebase shows its own label and offers Skip, unlike a merge", async ({
+  page,
+}) => {
+  const region = await panel(page, { state: "rebase", status: "UU conflict.ts\0" });
+
+  const banner = region.getByRole("alert").filter({ hasText: "in progress" });
+  await expect(banner).toContainText(/rebase in progress/i);
+  await expect(banner.getByRole("button", { name: "Skip" })).toBeEnabled();
+  await expect(banner.getByRole("button", { name: "Continue" })).toBeDisabled();
+  await expect(banner.getByRole("button", { name: "Abort" })).toBeEnabled();
+});
+
+test("a merge in progress never offers Skip -- Git itself has no merge --skip", async ({
+  page,
+}) => {
+  const region = await panel(page, { state: "merge", status: "UU conflict.ts\0" });
+  const banner = region.getByRole("alert").filter({ hasText: "in progress" });
+  await expect(banner.getByRole("button", { name: "Skip" })).toHaveCount(0);
+});
+
+test("skipping the last commit of a rebase completes it and resets the commit graph", async ({
+  page,
+}) => {
+  const region = await panel(page, { state: "rebase", status: "UU conflict.ts\0" });
+  const logCalls = () =>
+    page.evaluate(
+      () =>
+        (
+          window as unknown as { __calls: { command: string; args: { args?: string[] } }[] }
+        ).__calls.filter((c) => c.command === "git_exec" && c.args.args?.[0] === "log").length,
+    );
+  const before = await logCalls();
+
+  const banner = region.getByRole("alert").filter({ hasText: "in progress" });
+  await banner.getByRole("button", { name: "Skip" }).click();
+  await expect.poll(() => gitCalls(page, "skip")).toBe(1);
+
+  await expect.poll(logCalls).toBeGreaterThan(before);
   await expect(region.getByRole("alert").filter({ hasText: "in progress" })).toHaveCount(0);
 });
 

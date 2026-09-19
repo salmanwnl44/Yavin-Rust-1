@@ -21,6 +21,7 @@ const ALL_KINDS = [
   "commit",
   "abort",
   "continue",
+  "skip",
   "stash",
   "stashApply",
   "stashPop",
@@ -85,11 +86,11 @@ test("stash-family mutations invalidate only a sibling's shared stash list, neve
   assert.equal(SIBLING_INVALIDATES.publish, undefined);
 });
 
-test("switch/commit/abort/continue never invalidate a sibling's RepoSnapshot fields", () => {
+test("switch/commit/abort/continue/skip never invalidate a sibling's RepoSnapshot fields", () => {
   // Git's own worktree-exclusivity guarantee (see the Git Operation Engine plan's
   // empirical verification) means no sibling can ever be on the branch these
   // mutations move -- so nothing about them can go stale on a *different* worktree.
-  for (const kind of ["switch", "commit", "abort", "continue"]) {
+  for (const kind of ["switch", "commit", "abort", "continue", "skip"]) {
     assert.equal(SIBLING_INVALIDATES[kind], undefined, `"${kind}" must have no sibling entry`);
   }
 });
@@ -122,8 +123,9 @@ test("GRAPH_RESETS never statically covers switch/branch/abort/stash/deleteBranc
   }
 });
 
-test("GRAPH_RESETS never lists 'continue' -- its reset is conditional, decided at runtime by guardedAffecting", () => {
+test("GRAPH_RESETS never lists 'continue' or 'skip' -- their reset is conditional, decided at runtime by guardedAffecting", () => {
   assert.ok(!GRAPH_RESETS.has("continue"));
+  assert.ok(!GRAPH_RESETS.has("skip"));
 });
 
 function fakeWorktree(root: string): { entry: RepoEntry; refreshCalls: unknown[][] } {

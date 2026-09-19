@@ -269,6 +269,20 @@ export class Repository {
   async continueOperation(): Promise<string> {
     return this.abortOrContinue("--continue");
   }
+  /**
+   * Advances past the current commit without applying it -- real, Git-supported for
+   * rebase/cherry-pick/revert (each processes a sequence of commits). Merge has no
+   * such sequence, so Git itself has no `merge --skip`; refused here with a specific
+   * message rather than letting Git's own generic argument-error text through, since
+   * (unlike every other refusal this codebase exposes as-is) that text wouldn't be
+   * semantically clear about why.
+   */
+  async skip(): Promise<string> {
+    const op = await this.state();
+    if (!op) throw new Error("No merge, rebase, cherry-pick or revert is in progress.");
+    if (op === "merge") throw new Error("Merge has no commits to skip -- abort or continue instead.");
+    return this.run([op, "--skip"]);
+  }
   private async abortOrContinue(flag: "--abort" | "--continue"): Promise<string> {
     const op = await this.state();
     if (!op) throw new Error("No merge, rebase, cherry-pick or revert is in progress.");

@@ -19,6 +19,7 @@ export const DIRTY_BLOCKED = new Set([
   "pullMerge",
   "abort",
   "continue",
+  "skip",
 ]);
 
 export interface RepoSnapshot {
@@ -83,6 +84,7 @@ const INVALIDATES: Readonly<Record<string, readonly RefreshField[]>> = {
   commit: ["entries", "branch", "operationInProgress"],
   abort: ["entries", "branch", "operationInProgress"],
   continue: ["entries", "branch", "operationInProgress"],
+  skip: ["entries", "branch", "operationInProgress"],
   stash: ["entries", "stashes"],
   stashApply: ["entries", "stashes"],
   stashPop: ["entries", "stashes"],

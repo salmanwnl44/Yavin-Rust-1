@@ -73,11 +73,14 @@ export const SIBLING_INVALIDATES: Readonly<Record<string, readonly RefreshField[
  * become unreachable from any remaining ref, but the graph view only ever walks
  * from currently-existing refs, so nothing needs evicting) -- none of these make a
  * new commit reachable. `commit` does (this worktree's own
- * branch grows by one). `continue`'s case is genuinely conditional -- a
+ * branch grows by one). `continue`/`skip`'s case is genuinely conditional -- a
  * `merge`/`rebase`/`cherry-pick --continue` (or `revert --continue`) only creates
  * a commit when it actually *completes* the operation, not on a call that still
- * leaves conflicts remaining -- so it isn't a static table entry; see
- * `guardedAffecting`'s own before/after `operationInProgress` check below.
+ * leaves conflicts (or more commits) remaining; `skip` itself never creates a
+ * commit at all, but completing a multi-commit sequence via skip still needs the
+ * graph reset that would otherwise only fire on a completing `continue` -- so
+ * neither is a static table entry; see `guardedAffecting`'s own before/after
+ * `operationInProgress` check below.
  */
 export const GRAPH_RESETS: ReadonlySet<string> = new Set([
   "fetch",
@@ -105,13 +108,19 @@ export const GRAPH_RESETS: ReadonlySet<string> = new Set([
  * `sync.ts` import cycle -- `registry.ts` already imports `RepoStore`). Sitting
  * above both, `sync.ts` can import from each without either importing it back.
  *
- * `continue`'s graph reset is conditional, not a static `GRAPH_RESETS` entry:
- * captures `operationInProgress` before running, and resets the graph only if it
- * was non-empty before and empty afterward (`guarded()`'s own refresh already
- * includes `operationInProgress` for `continue`, per Module 2's `INVALIDATES`, so
- * the post-call snapshot is already current by the time this checks it) -- a
- * `continue` that still leaves conflicts remaining never creates a commit, and
- * must not reset the graph.
+ * `continue`/`skip`'s graph reset is conditional, not a static `GRAPH_RESETS`
+ * entry: captures `operationInProgress` before running, and resets the graph only
+ * if it was non-empty before and empty afterward (`guarded()`'s own refresh
+ * already includes `operationInProgress` for both, per Module 2's `INVALIDATES`,
+ * so the post-call snapshot is already current by the time this checks it) -- a
+ * `continue`/`skip` that still leaves conflicts (or more commits) remaining never
+ * completes the operation, and must not reset the graph. `skip` needs the same
+ * check as `continue`: during a multi-commit rebase/cherry-pick/revert, only the
+ * FINAL completing call resets the graph (an intermediate continue that still
+ * leaves commits remaining does not, so any commits it created stay unreflected
+ * until completion) -- if that final call happens to be a skip rather than a
+ * continue, the graph must still reset, or every commit created by the whole
+ * sequence would stay stale indefinitely.
  */
 export async function guardedAffecting(
   entry: RepoEntry,
@@ -120,7 +129,7 @@ export async function guardedAffecting(
   operation: () => Promise<string>,
 ): Promise<boolean> {
   const operationBefore =
-    kind === "continue" ? entry.store.getSnapshot().operationInProgress : "";
+    kind === "continue" || kind === "skip" ? entry.store.getSnapshot().operationInProgress : "";
   const ok = await entry.store.guarded(kind, dirty, operation);
   if (!ok) return ok;
 
@@ -132,7 +141,7 @@ export async function guardedAffecting(
     }
   }
   const operationJustCompleted =
-    kind === "continue" &&
+    (kind === "continue" || kind === "skip") &&
     operationBefore !== "" &&
     entry.store.getSnapshot().operationInProgress === "";
   if (repository && (GRAPH_RESETS.has(kind) || operationJustCompleted)) {

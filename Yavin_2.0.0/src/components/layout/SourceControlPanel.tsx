@@ -615,6 +615,20 @@ export function SourceControlPanel({
                           >
                             Abort
                           </button>
+                          {/* Merge has no commit sequence to advance past -- Git itself has no
+                              `merge --skip`, so this is only ever offered for the three
+                              operations that genuinely process one. */}
+                          {operationInProgress !== "merge" && (
+                            <button
+                              disabled={busy || loading || dirty}
+                              onClick={() =>
+                                void guarded("skip", () => activeRepo.store.repository.skip())
+                              }
+                              className="flex-1 py-1 rounded bg-[#121212] hover:bg-[#1a1a1a] text-[11px] text-zinc-200 disabled:opacity-40 transition-colors"
+                            >
+                              Skip
+                            </button>
+                          )}
                           <button
                             disabled={busy || loading || dirty || conflictCount > 0}
                             onClick={() =>

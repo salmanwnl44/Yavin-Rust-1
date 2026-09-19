@@ -624,7 +624,12 @@ const APPLY: &[FlagRule] = &[flag("--cached"), flag("-R")];
 // through untouched (even if it starts with '-') for Git's own check to accept/reject.
 const CHECK_REF_FORMAT: &[FlagRule] = &[value_flag("--branch")];
 const SYMBOLIC_REF: &[FlagRule] = &[flag("--short")];
-const ABORT_CONTINUE: &[FlagRule] = &[flag("--abort"), flag("--continue")];
+// `--skip` is meaningless for `merge` (Git has no multi-commit sequence for it to
+// advance past) -- allowing it here is still safe, since `merge --skip` simply fails
+// with Git's own argument error; `Repository.skip()` never issues it for merge in the
+// first place (a client-side guard, since Git's own error text here is generic, not
+// semantically clear the way its worktree-exclusivity/unresolved-conflict refusals are).
+const ABORT_CONTINUE: &[FlagRule] = &[flag("--abort"), flag("--continue"), flag("--skip")];
 const LOG: &[FlagRule] = &[
     value_flag("-n"),
     value_flag("--skip"),
@@ -1880,5 +1885,146 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let error = result.unwrap_err();
         assert!(error.contains("not permitted"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn a_rebase_conflict_can_be_skipped_advancing_to_the_next_commit() {
+        let (dir, git) = fixture();
+        assert!(git(&["branch", "feature"]));
+        assert!(git(&["switch", "-q", "feature"]));
+        fs::write(dir.join("a.txt"), "feat1\n").unwrap();
+        assert!(git(&["commit", "-qam", "feat1"]));
+        assert!(git(&["switch", "-q", "-"]));
+        fs::write(dir.join("a.txt"), "m1\n").unwrap();
+        assert!(git(&["commit", "-qam", "m1"]));
+        fs::write(dir.join("a.txt"), "m2\n").unwrap();
+        assert!(git(&["commit", "-qam", "m2"]));
+
+        // Two commits to rebase onto "feature", both conflicting.
+        assert!(!git(&["rebase", "feature"]));
+        let repo = open(&dir);
+        let during_round1 = repo_state(&repo).unwrap();
+        let gitdir = dir.join(".git");
+        let msgnum_round1 = fs::read_to_string(gitdir.join("rebase-merge/msgnum")).unwrap();
+        let end = fs::read_to_string(gitdir.join("rebase-merge/end")).unwrap();
+
+        let skip = exec(&repo, &args(&["rebase", "--skip"]), None);
+        let during_round2 = repo_state(&repo).unwrap();
+        let msgnum_round2 = fs::read_to_string(gitdir.join("rebase-merge/msgnum")).unwrap();
+        let abort = exec(&repo, &args(&["rebase", "--abort"]), None);
+        let after = repo_state(&repo).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(during_round1, "rebase");
+        assert_eq!(msgnum_round1.trim(), "1");
+        assert_eq!(end.trim(), "2");
+        assert!(skip.is_ok(), "skip failed: {:?}", skip.err());
+        assert_eq!(
+            during_round2, "rebase",
+            "the rebase must still be in progress on its second, still-conflicting commit"
+        );
+        assert_eq!(
+            msgnum_round2.trim(),
+            "2",
+            "skip must advance the sequencer to the next commit"
+        );
+        assert!(abort.is_ok());
+        assert_eq!(after, "");
+    }
+
+    #[test]
+    fn a_cherry_pick_conflict_can_be_skipped_and_cherry_pick_head_persists_across_it() {
+        let (dir, git) = fixture();
+        fs::write(dir.join("a.txt"), "c1\n").unwrap();
+        assert!(git(&["commit", "-qam", "c1"]));
+        fs::write(dir.join("a.txt"), "c2\n").unwrap();
+        assert!(git(&["commit", "-qam", "c2"]));
+        assert!(git(&["switch", "-qc", "other", "HEAD~2"]));
+        fs::write(dir.join("a.txt"), "other1\n").unwrap();
+        assert!(git(&["commit", "-qam", "other1"]));
+
+        assert!(!git(&["cherry-pick", "master~1", "master"]));
+        let repo = open(&dir);
+        let during_round1 = repo_state(&repo).unwrap();
+        let gitdir = dir.join(".git");
+        let head_round1 = fs::read_to_string(gitdir.join("CHERRY_PICK_HEAD")).unwrap();
+        let todo_round1 = fs::read_to_string(gitdir.join("sequencer/todo")).unwrap();
+
+        let skip = exec(&repo, &args(&["cherry-pick", "--skip"]), None);
+        let during_round2 = repo_state(&repo).unwrap();
+        let head_round2 = fs::read_to_string(gitdir.join("CHERRY_PICK_HEAD")).unwrap();
+        let abort = exec(&repo, &args(&["cherry-pick", "--abort"]), None);
+        let after = repo_state(&repo).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(during_round1, "cherry-pick");
+        assert!(todo_round1.contains("pick"));
+        assert!(skip.is_ok(), "skip failed: {:?}", skip.err());
+        assert_eq!(
+            during_round2, "cherry-pick",
+            "CHERRY_PICK_HEAD must still be present for the second commit"
+        );
+        assert_ne!(
+            head_round1, head_round2,
+            "the marker must now point at the next (second) commit"
+        );
+        assert!(abort.is_ok());
+        assert_eq!(after, "");
+    }
+
+    #[test]
+    fn a_merge_conflict_is_correctly_isolated_from_a_sibling_worktrees_own_state() {
+        let (dir, repo_a, repo_b) = fixture_with_two_linked_worktrees();
+        // Deliberately conflict A against its OWN prior commit on worktree-a's branch,
+        // not against worktree-b's branch -- Git's worktree-exclusivity guarantee
+        // (already established) means A can never merge B's own checked-out branch
+        // directly, so this fixture merges a third, unrelated ref into A instead.
+        let root_a = repo_a.root.clone();
+        assert!(Command::new("git")
+            .current_dir(&root_a)
+            .args(["switch", "-qc", "conflict-source", "HEAD~0"])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root_a.join("a.txt"), "conflict\n").unwrap();
+        assert!(Command::new("git")
+            .current_dir(&root_a)
+            .args(["commit", "-qam", "conflict"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&root_a)
+            .args(["switch", "-q", "worktree-a"])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root_a.join("a.txt"), "other-side\n").unwrap();
+        assert!(Command::new("git")
+            .current_dir(&root_a)
+            .args(["commit", "-qam", "other-side"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(!Command::new("git")
+            .current_dir(&root_a)
+            .args(["merge", "conflict-source"])
+            .status()
+            .unwrap()
+            .success());
+
+        let state_a = repo_state(&repo_a).unwrap();
+        let state_b = repo_state(&repo_b).unwrap();
+        let _ = Command::new("git")
+            .current_dir(&root_a)
+            .args(["merge", "--abort"])
+            .status();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(state_a, "merge");
+        assert_eq!(
+            state_b, "",
+            "a merge conflict in worktree A must never appear as a merge in worktree B"
+        );
     }
 }
