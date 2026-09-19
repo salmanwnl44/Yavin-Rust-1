@@ -1,34 +1,3 @@
-export interface GitCommitItem {
-  hash: string;
-  subject: string;
-  author: string;
-  relativeTime: string;
-  decorations: string;
-  fullHash?: string;
-  date?: string;
-}
-
-export function parseGitLog(output: string): GitCommitItem[] {
-  if (!output.trim()) return [];
-  const lines = output.trim().split("\n");
-  const items: GitCommitItem[] = [];
-  for (const line of lines) {
-    const parts = line.split("\x1f");
-    if (parts.length >= 4) {
-      items.push({
-        hash: parts[0] || "",
-        subject: parts[1] || "",
-        author: parts[2] || "",
-        relativeTime: parts[3] || "",
-        decorations: parts[4] || "",
-        fullHash: parts[5] || parts[0] || "",
-        date: parts[6] || "",
-      });
-    }
-  }
-  return items;
-}
-
 export interface CommitFileChange {
   path: string;
   status: string; // 'A' | 'M' | 'D' | 'B' (best-effort: numstat has no rename/copy letter)

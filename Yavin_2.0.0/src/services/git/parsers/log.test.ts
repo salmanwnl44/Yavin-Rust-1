@@ -1,35 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseCommitDetails, parseGitLog, parseGraphLog, parseRefLabels } from "./log.ts";
-
-test("parseGitLog reads unit-separated commit fields and tolerates missing decorations", () => {
-  const output = [
-    "abc123\x1fFix the thing\x1fJane Doe\x1f2 days ago\x1f (HEAD -> main)\x1fabc123full\x1fJanuary 01, 2026 at 01:02 PM",
-    "def456\x1fAdd the other thing\x1fJohn Roe\x1f3 days ago\x1f\x1fdef456full\x1fJanuary 02, 2026 at 03:04 PM",
-  ].join("\n");
-  assert.deepEqual(parseGitLog(output), [
-    {
-      hash: "abc123",
-      subject: "Fix the thing",
-      author: "Jane Doe",
-      relativeTime: "2 days ago",
-      decorations: " (HEAD -> main)",
-      fullHash: "abc123full",
-      date: "January 01, 2026 at 01:02 PM",
-    },
-    {
-      hash: "def456",
-      subject: "Add the other thing",
-      author: "John Roe",
-      relativeTime: "3 days ago",
-      decorations: "",
-      fullHash: "def456full",
-      date: "January 02, 2026 at 03:04 PM",
-    },
-  ]);
-  assert.deepEqual(parseGitLog(""), []);
-  assert.deepEqual(parseGitLog("   \n  "), []);
-});
+import { parseCommitDetails, parseGraphLog, parseRefLabels } from "./log.ts";
 
 test("parseCommitDetails reads numstat's tab-separated per-file line counts", () => {
   const output = [

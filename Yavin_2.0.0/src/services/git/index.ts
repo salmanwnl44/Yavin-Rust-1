@@ -10,14 +10,13 @@ export { parseBranch, divergence } from "./parsers/branch.ts";
 export { describeGitError } from "./parsers/errors.ts";
 
 export type {
-  GitCommitItem,
   CommitFileChange,
   CommitDetailedInfo,
   RawCommit,
   RefLabel,
   RefKind,
 } from "./parsers/log.ts";
-export { parseGitLog, parseCommitDetails, parseGraphLog, parseRefLabels } from "./parsers/log.ts";
+export { parseCommitDetails, parseGraphLog, parseRefLabels } from "./parsers/log.ts";
 
 export { Repository } from "./repository.ts";
 

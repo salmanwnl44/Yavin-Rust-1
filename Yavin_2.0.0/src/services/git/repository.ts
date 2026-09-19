@@ -297,16 +297,6 @@ export class Repository {
     return this.run([op, flag]);
   }
 
-  log(limit = 30): Promise<string> {
-    return this.run([
-      "log",
-      "-n",
-      String(limit),
-      "--pretty=format:%h\x1f%s\x1f%an\x1f%cr\x1f%d\x1f%H\x1f%ad",
-      "--date=format:%B %d, %Y at %I:%M %p",
-    ]);
-  }
-
   /** One page of commit-graph history, oldest-first-within-page, for `graph/incremental.ts`. */
   graphLog(skip: number, limit: number): Promise<string> {
     return this.run([
