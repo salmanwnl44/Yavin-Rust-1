@@ -11,10 +11,21 @@ pub use notify::RecommendedWatcher;
 const SETTLE: Duration = Duration::from_millis(300);
 
 /// Directories that churn constantly and are never shown in the tree.
+/// `build`/`dist` (bundler/compiler output -- the same "generated, high-churn,
+/// never hand-edited" profile that already justifies excluding `target`,
+/// Rust's own build directory) and `.cache` (Parcel/Babel/linter caches) were
+/// added by the Filesystem Watcher & Invalidation Architecture plan: none of
+/// the five are ever meaningfully hand-edited, so watching them only produces
+/// event bursts for output nobody asked to see change.
 fn is_noise(path: &Path) -> bool {
     path.components().any(|component| {
         matches!(component, Component::Normal(name)
-            if name == ".git" || name == "node_modules" || name == "target")
+            if name == ".git"
+                || name == "node_modules"
+                || name == "target"
+                || name == "build"
+                || name == "dist"
+                || name == ".cache")
     })
 }
 
@@ -235,6 +246,18 @@ mod tests {
         assert!(!is_noise(Path::new("/w/src/target.rs")));
         assert!(!is_noise(Path::new("/w/.github/workflows/ci.yml")));
         assert!(!is_noise(Path::new("/w/src/git.rs")));
+    }
+
+    #[test]
+    fn noise_excludes_common_generated_output_and_cache_directories() {
+        assert!(is_noise(Path::new("/w/dist/bundle.js")));
+        assert!(is_noise(Path::new("/w/build/index.html")));
+        assert!(is_noise(Path::new("/w/.cache/babel/x.json")));
+        // A real source file/directory is not noise just because its name
+        // contains one of the words as a substring, not a whole path component.
+        assert!(!is_noise(Path::new("/w/src/build.rs")));
+        assert!(!is_noise(Path::new("/w/src/distance.ts")));
+        assert!(!is_noise(Path::new("/w/.cache-config/settings.json")));
     }
 
     #[test]
