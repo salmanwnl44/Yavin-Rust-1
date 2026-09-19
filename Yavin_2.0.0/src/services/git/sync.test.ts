@@ -17,6 +17,7 @@ const ALL_KINDS = [
   "discard-hunk",
   "switch",
   "branch",
+  "deleteBranch",
   "commit",
   "abort",
   "continue",
@@ -35,6 +36,7 @@ const ALL_KINDS = [
 test("SIBLING_INVALIDATES only lists kinds that actually touch repository-shared refs", () => {
   const expected: Record<string, readonly string[]> = {
     branch: ["branches"],
+    deleteBranch: ["branches"],
     stash: ["stashes"],
     stashApply: ["stashes"],
     stashPop: ["stashes"],
@@ -65,9 +67,10 @@ test("fetch/pull invalidate a sibling's ahead/behind (branch), never its local b
   }
 });
 
-test("only branch creation invalidates a sibling's local branch-name list", () => {
+test("only branch creation or deletion invalidates a sibling's local branch-name list", () => {
   for (const kind of ALL_KINDS) {
-    if (kind === "branch") assert.deepEqual(SIBLING_INVALIDATES[kind], ["branches"]);
+    if (kind === "branch" || kind === "deleteBranch")
+      assert.deepEqual(SIBLING_INVALIDATES[kind], ["branches"]);
     else assert.ok(!(SIBLING_INVALIDATES[kind] ?? []).includes("branches"), `"${kind}" must not`);
   }
 });
@@ -104,8 +107,17 @@ test("GRAPH_RESETS is exactly fetch/pull/pullRebase/pullMerge/commit -- narrower
   assert.ok(!GRAPH_RESETS.has("publish"));
 });
 
-test("GRAPH_RESETS never statically covers switch/branch/abort/stash -- none of them can add a commit", () => {
-  for (const kind of ["switch", "branch", "abort", "stash", "stashApply", "stashPop", "stashDrop"]) {
+test("GRAPH_RESETS never statically covers switch/branch/abort/stash/deleteBranch -- none of them can add a commit", () => {
+  for (const kind of [
+    "switch",
+    "branch",
+    "deleteBranch",
+    "abort",
+    "stash",
+    "stashApply",
+    "stashPop",
+    "stashDrop",
+  ]) {
     assert.ok(!GRAPH_RESETS.has(kind), `"${kind}" must not be in GRAPH_RESETS`);
   }
 });

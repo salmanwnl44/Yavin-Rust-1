@@ -94,6 +94,8 @@ async function panel(page: Page, scenario: Partial<Scenario> = {}) {
                 return "commit";
               case "switch":
                 return argv.includes("-c") ? "branch" : "switch";
+              case "branch":
+                return "deleteBranch";
               default:
                 return argv[0] ?? null;
             }
@@ -107,7 +109,12 @@ async function panel(page: Page, scenario: Partial<Scenario> = {}) {
           if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
           if (command === "git_repo_state") return state.state;
           if (command === "git_exec") {
-            const failure = action ? state.fail[action] : undefined;
+            const argvForFailure = (args.args as string[] | undefined) ?? [];
+            // A force delete (-D) always succeeds in this mock even if a plain -d
+            // was set up to fail (Git's own two-tier safety, not something this
+            // scenario needs a second, separate failure map to express).
+            const forcedBranchDelete = action === "deleteBranch" && argvForFailure.includes("-D");
+            const failure = action && !forcedBranchDelete ? state.fail[action] : undefined;
             if (failure) throw failure;
             if (action === "status") return ok(state.status);
             if (action === "branchInfo") return ok(state.branchInfo);
@@ -269,6 +276,70 @@ test("a branch with no remote says so instead of offering a dead button", async 
   await drawer(page);
   await expect(region.getByText(/No remote is configured/)).toBeVisible();
   await expect(region.getByRole("button", { name: "Publish branch" })).toHaveCount(0);
+});
+
+test("deleting a branch only re-fetches the branch list, not every sub-fetch a full refresh would run", async ({
+  page,
+}) => {
+  const region = await panel(page);
+  await drawer(page);
+  const before = {
+    status: await gitCalls(page, "status"),
+    branchInfo: await gitCalls(page, "branchInfo"),
+    branches: await gitCalls(page, "branches"),
+    remotes: await gitCalls(page, "remotes"),
+    state: await gitCalls(page, "state"),
+  };
+
+  await region.getByLabel("Delete feature").click();
+  await expect.poll(() => gitCalls(page, "deleteBranch")).toBe(1);
+
+  await expect.poll(() => gitCalls(page, "branches")).toBe(before.branches + 1);
+  expect(await gitCalls(page, "status")).toBe(before.status);
+  expect(await gitCalls(page, "branchInfo")).toBe(before.branchInfo);
+  expect(await gitCalls(page, "remotes")).toBe(before.remotes);
+  expect(await gitCalls(page, "state")).toBe(before.state);
+});
+
+test("deleting a branch checked out elsewhere shows a classified message, never raw stderr", async ({
+  page,
+}) => {
+  const region = await panel(page, {
+    fail: {
+      deleteBranch: "Git: error: cannot delete branch 'feature' used by worktree at '/wt'",
+    },
+  });
+  await drawer(page);
+
+  await region.getByLabel("Delete feature").click();
+  await expect(region.getByText(/checked out in another worktree/)).toBeVisible();
+});
+
+test("an unmerged branch offers a confirmed force-delete escalation, not a silent failure", async ({
+  page,
+}) => {
+  const region = await panel(page, {
+    fail: { deleteBranch: "Git: error: the branch 'feature' is not fully merged" },
+  });
+  await drawer(page);
+  page.once("dialog", (dialog) => void dialog.accept());
+
+  await region.getByLabel("Delete feature").click();
+  // The classified refusal is shown only transiently -- confirm() fires
+  // synchronously right after it, and the force call's own success notice
+  // immediately supersedes it -- so the durable proof is the actual argv of
+  // both calls below, not a race-prone intermediate visibility check.
+  await expect.poll(() => gitCalls(page, "deleteBranch")).toBe(2);
+  const calls = await page.evaluate(
+    () =>
+      (
+        window as unknown as {
+          __calls: { action: string | null; args: { args?: string[] } }[];
+        }
+      ).__calls.filter((c) => c.action === "deleteBranch"),
+  );
+  expect(calls[0].args.args).toContain("-d");
+  expect(calls[1].args.args).toContain("-D");
 });
 
 test("authentication failures say what to do and quote Git verbatim", async ({ page }) => {

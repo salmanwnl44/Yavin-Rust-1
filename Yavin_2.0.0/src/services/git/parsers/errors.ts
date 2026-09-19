@@ -64,6 +64,14 @@ const failures: [RegExp, string][] = [
     /patch does not apply|patch failed/i,
     "This change no longer matches the file. Refresh the diff and try again.",
   ],
+  [
+    /used by worktree|already checked out at/i,
+    "This branch is checked out in another worktree. Switch there, or choose a different branch.",
+  ],
+  [
+    /is not fully merged/i,
+    "This branch has commits not on any other branch. Force-delete only if you're sure you want to discard them.",
+  ],
 ];
 
 /**

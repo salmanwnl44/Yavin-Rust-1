@@ -190,6 +190,16 @@ export class Repository {
     return this.run(["switch", "-c", name]);
   }
 
+  /**
+   * `force` selects Git's own two-tier safety: `-d` refuses an unmerged branch,
+   * `-D` overrides that but never overrides Git's separate, unconditional refusal to
+   * delete a branch checked out in any worktree (including this one) -- no client-side
+   * pre-check is needed or added; Git's own refusal is authoritative (verified).
+   */
+  deleteBranch(name: string, force: boolean): Promise<string> {
+    return this.run(["branch", force ? "-D" : "-d", name]);
+  }
+
   fetch(): Promise<string> {
     return this.run(["fetch"]);
   }

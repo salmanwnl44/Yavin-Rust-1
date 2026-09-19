@@ -23,6 +23,7 @@ import {
   MoreIcon,
   PlusIcon,
   RefreshIcon,
+  TrashIcon,
   UndoIcon,
 } from "../ui/Icons";
 
@@ -308,6 +309,26 @@ export function SourceControlPanel({
       });
     } catch (error) {
       if (alive.current) activeRepo.store.setNotice(String(error));
+    }
+  };
+
+  const deleteBranch = async (name: string) => {
+    if (!activeRepo) return;
+    const ok = await guarded("deleteBranch", () =>
+      activeRepo.store.repository.deleteBranch(name, false),
+    );
+    if (ok) return;
+    // A safe (-d) delete's own refusal for "unmerged commits" is the one case with a
+    // clear, informed escalation (Section D.2/Q of the plan) -- every other refusal
+    // (checked out in another worktree, checked out here) has no override that would
+    // actually succeed, so no confirm is offered for those; the classified notice
+    // already explains why.
+    const notice = activeRepo.store.getSnapshot().notice;
+    if (
+      notice.includes("commits not on any other branch") &&
+      window.confirm(`"${name}" has commits not on any other branch. Delete it anyway?`)
+    ) {
+      await guarded("deleteBranch", () => activeRepo.store.repository.deleteBranch(name, true));
     }
   };
 
@@ -676,6 +697,29 @@ export function SourceControlPanel({
                               Create
                             </button>
                           </div>
+
+                          {branches.length > 0 && (
+                            <ul aria-label="Delete a branch" className="space-y-0.5">
+                              {branches.map((name) => (
+                                <li
+                                  key={name}
+                                  className="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-[#141414]"
+                                >
+                                  <span className="flex-1 min-w-0 truncate text-[11px] text-zinc-400 font-mono">
+                                    {name}
+                                  </span>
+                                  <button
+                                    aria-label={`Delete ${name}`}
+                                    title={`Delete ${name}`}
+                                    onClick={() => void deleteBranch(name)}
+                                    className="p-0.5 rounded text-zinc-600 hover:text-red-400 hover:bg-red-950/40 transition-colors shrink-0"
+                                  >
+                                    <TrashIcon size={11} />
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
 
                           {sync === "diverged" && (
                             <div className="rounded border border-zinc-800 bg-zinc-900/60 p-2 space-y-1.5">

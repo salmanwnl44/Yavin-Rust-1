@@ -79,6 +79,7 @@ const INVALIDATES: Readonly<Record<string, readonly RefreshField[]>> = {
   "discard-hunk": ["entries"],
   switch: ["entries", "branch"],
   branch: ["entries", "branch", "branches"],
+  deleteBranch: ["branches"],
   commit: ["entries", "branch", "operationInProgress"],
   abort: ["entries", "branch", "operationInProgress"],
   continue: ["entries", "branch", "operationInProgress"],

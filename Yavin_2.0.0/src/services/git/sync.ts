@@ -37,9 +37,16 @@ import type { GitChangeEvent } from "../native.ts";
  * what `entries` reflects) only ever touches the worktree the command actually ran
  * in -- a sibling's own index/working tree is untouched, so only the shared stash
  * list itself needs re-fetching on a sibling, exactly like `stashDrop`.
+ *
+ * `deleteBranch` maps to `"branches"` only, the mirror image of `branch` (create):
+ * it removes a name under `refs/heads/`, repository-shared and visible from every
+ * worktree, but (like creation) never touches a sibling's own `entries`/`branch`/
+ * `operationInProgress` -- Git's own worktree-exclusivity guarantee means the
+ * deleted branch could never have been checked out in a sibling to begin with.
  */
 export const SIBLING_INVALIDATES: Readonly<Record<string, readonly RefreshField[]>> = {
   branch: ["branches"],
+  deleteBranch: ["branches"],
   stash: ["stashes"],
   stashApply: ["stashes"],
   stashPop: ["stashes"],
@@ -59,10 +66,13 @@ export const SIBLING_INVALIDATES: Readonly<Record<string, readonly RefreshField[
  * Pull/Push regardless of which was actually clicked: `push`/`publish` never add
  * a commit (they only move a remote ref to match what's already local), so they
  * are correctly excluded here even though the pre-existing UI code reset on them.
- * `switch` (-c or not), `abort`, and the stash family never appear here: `switch`
- * moves HEAD to an *existing* commit already in the graph; `branch` (`switch -c`)
- * creates a ref at an existing commit; `abort` restores pre-operation state --
- * none of these make a new commit reachable. `commit` does (this worktree's own
+ * `switch` (-c or not), `abort`, `deleteBranch`, and the stash family never appear
+ * here: `switch` moves HEAD to an *existing* commit already in the graph; `branch`
+ * (`switch -c`) creates a ref at an existing commit; `abort` restores pre-operation
+ * state; `deleteBranch` removes a ref, never a commit object (its commits may
+ * become unreachable from any remaining ref, but the graph view only ever walks
+ * from currently-existing refs, so nothing needs evicting) -- none of these make a
+ * new commit reachable. `commit` does (this worktree's own
  * branch grows by one). `continue`'s case is genuinely conditional -- a
  * `merge`/`rebase`/`cherry-pick --continue` (or `revert --continue`) only creates
  * a commit when it actually *completes* the operation, not on a call that still

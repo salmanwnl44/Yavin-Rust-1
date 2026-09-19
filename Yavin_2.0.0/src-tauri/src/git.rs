@@ -638,6 +638,11 @@ const FOR_EACH_REF: &[FlagRule] = &[prefix_flag("--format=")];
 // `worktree list --porcelain`; nothing constructs `worktree add/remove/lock/prune`
 // yet, so there is nothing else to validate here today.
 const WORKTREE: &[FlagRule] = &[flag("--porcelain")];
+// Deletion only -- no rename/create flag, since `switch -c` already owns creation
+// (SWITCH above). `-d`/`-D` are Git's own two-tier safety (safe delete vs. force);
+// neither can bypass Git's separate, unconditional refusal to delete a branch
+// checked out in any worktree (verified empirically, not assumed).
+const BRANCH: &[FlagRule] = &[flag("-d"), flag("-D")];
 
 /// The declarative allow-list this whole design leans on: every subcommand
 /// TypeScript may run, and every flag it may pass before a literal `--`. Anything not
@@ -654,6 +659,7 @@ fn rules_for(subcommand: &str) -> Option<&'static [FlagRule]> {
         "rm" => RM,
         "commit" => COMMIT,
         "switch" => SWITCH,
+        "branch" => BRANCH,
         "remote" => NONE,
         "fetch" => NONE,
         "pull" => PULL,
@@ -1728,5 +1734,74 @@ mod tests {
 
         assert_eq!(after.code, 0);
         assert_eq!(after.stdout.trim(), "refs/remotes/origin/main");
+    }
+
+    #[test]
+    fn deleting_a_branch_checked_out_in_another_worktree_is_refused_even_with_force() {
+        let (dir, repo_a, _repo_b) = fixture_with_two_linked_worktrees();
+        // From the main worktree, try to delete the branch checked out in the linked
+        // "worktree-a" -- Git must refuse this unconditionally, even with -D.
+        let safe = exec(&repo_a, &args(&["branch", "-d", "worktree-b"]), None);
+        let force = exec(&repo_a, &args(&["branch", "-D", "worktree-b"]), None);
+        let _ = fs::remove_dir_all(&dir);
+
+        let safe = safe.unwrap();
+        let force = force.unwrap();
+        assert_ne!(safe.code, 0);
+        assert!(safe.stderr.contains("used by worktree"), "{}", safe.stderr);
+        assert_ne!(force.code, 0, "force delete must not bypass this refusal");
+        assert!(
+            force.stderr.contains("used by worktree"),
+            "{}",
+            force.stderr
+        );
+    }
+
+    #[test]
+    fn deleting_the_current_worktrees_own_branch_is_refused_the_same_way() {
+        let (dir, git) = fixture();
+        let repo = open(&dir);
+        assert!(git(&["switch", "-qc", "onlybranch"]));
+
+        let result = exec(&repo, &args(&["branch", "-d", "onlybranch"]), None).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_ne!(result.code, 0);
+        assert!(
+            result.stderr.contains("used by worktree"),
+            "deleting the current worktree's own checked-out branch must fail with the \
+             same 'used by worktree' error family as deleting one checked out \
+             elsewhere -- verified empirically, not a distinct restriction: {}",
+            result.stderr
+        );
+    }
+
+    #[test]
+    fn deleting_an_unmerged_branch_requires_force_and_a_bare_delete_refuses_cleanly() {
+        let (dir, git) = fixture();
+        let repo = open(&dir);
+        assert!(git(&["switch", "-qc", "other"]));
+        fs::write(dir.join("a.txt"), "unmerged change\n").unwrap();
+        assert!(git(&["add", "a.txt"]));
+        assert!(git(&["commit", "-qm", "unmerged"]));
+        assert!(git(&["switch", "-q", "-"]));
+
+        let safe = exec(&repo, &args(&["branch", "-d", "other"]), None).unwrap();
+        assert_ne!(safe.code, 0);
+        assert!(safe.stderr.contains("not fully merged"), "{}", safe.stderr);
+
+        let force = exec(&repo, &args(&["branch", "-D", "other"]), None).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(force.code, 0, "force delete must succeed: {}", force.stderr);
+    }
+
+    #[test]
+    fn an_unrelated_branch_flag_is_rejected() {
+        let (dir, _git) = fixture();
+        let repo = open(&dir);
+        let result = exec(&repo, &args(&["branch", "--move", "renamed"]), None);
+        let _ = fs::remove_dir_all(&dir);
+        let error = result.unwrap_err();
+        assert!(error.contains("not permitted"), "unexpected error: {error}");
     }
 }

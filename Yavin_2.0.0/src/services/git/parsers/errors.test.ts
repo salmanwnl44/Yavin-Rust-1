@@ -57,3 +57,19 @@ test("a stale hunk's apply failure is explained instead of showing raw patch std
   );
   assert.match(describeGitError("error: patch failed: a.ts:10"), /no longer matches the file/);
 });
+
+test("deleting a branch checked out elsewhere is explained instead of showing raw stderr", () => {
+  assert.match(
+    describeGitError(
+      "Git: error: cannot delete branch 'feature' used by worktree at '/repo/wt'",
+    ),
+    /checked out in another worktree/,
+  );
+});
+
+test("deleting an unmerged branch without force is explained with a clear escalation path", () => {
+  assert.match(
+    describeGitError("Git: error: the branch 'other' is not fully merged"),
+    /commits not on any other branch/,
+  );
+});
