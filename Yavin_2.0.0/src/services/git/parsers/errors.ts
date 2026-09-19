@@ -104,3 +104,66 @@ export function describeGitError(error: unknown): string {
   const match = failures.find(([pattern]) => pattern.test(raw));
   return match ? `${match[1]}\n\nGit said: ${raw}` : raw;
 }
+
+export type GitErrorCategory =
+  | "cancelled"
+  | "busy"
+  | "auth"
+  | "network"
+  | "remote-missing"
+  | "no-upstream"
+  | "non-fast-forward"
+  | "diverged"
+  | "dirty"
+  | "conflict"
+  | "operation-in-progress"
+  | "worktree-conflict"
+  | "unmerged-branch"
+  | "nothing-to-commit"
+  | "hook"
+  | "stale"
+  | "unclassified";
+
+// Machine-checkable counterpart of `failures` above, for consumers (e.g. an AI tool
+// layer) that must branch on the kind of failure instead of parsing display text.
+// Same ordering rule: first match wins, most specific first.
+const categories: [RegExp, GitErrorCategory][] = [
+  [/^Cancelled$/, "cancelled"],
+  [/Another Git operation is already running/i, "busy"],
+  [/Save or close unsaved editors/i, "dirty"],
+  [
+    /could not read (Username|Password)|Authentication failed|terminal prompts disabled|invalid credentials|Permission denied \(publickey|Please make sure you have the correct access rights|Host key verification failed|authenticity of host/i,
+    "auth",
+  ],
+  [
+    /does not appear to be a git repository|Could not read from remote repository|No such remote/i,
+    "remote-missing",
+  ],
+  [
+    /Could not resolve host|unable to access|Connection (timed out|refused)|Network is unreachable/i,
+    "network",
+  ],
+  [/no upstream|has no upstream branch|set-upstream/i, "no-upstream"],
+  [/non-fast-forward|Updates were rejected|fetch first|behind its remote/i, "non-fast-forward"],
+  [
+    /Not possible to fast-forward|diverged|need to specify how to reconcile|divergent branches/i,
+    "diverged",
+  ],
+  [/local changes .* would be overwritten|Your local changes to the following files/i, "dirty"],
+  [/you need to resolve your current index first|is already in progress/i, "operation-in-progress"],
+  [
+    /CONFLICT|fix conflicts|Automatic merge failed|Resolve all conflicts|needs merge|unmerged files|Committing is not possible/i,
+    "conflict",
+  ],
+  [/used by worktree|already checked out at/i, "worktree-conflict"],
+  [/is not fully merged/i, "unmerged-branch"],
+  [/nothing to commit|no changes added to commit|Nothing is staged/i, "nothing-to-commit"],
+  [/hook .* (failed|declined)|pre-commit|pre-push/i, "hook"],
+];
+
+export function categorizeGitError(error: unknown): GitErrorCategory {
+  const raw = String(error instanceof Error ? error.message : error)
+    .replace(/^Error:\s*/, "")
+    .trim();
+  return categories.find(([pattern]) => pattern.test(raw))?.[1] ?? "unclassified";
+}

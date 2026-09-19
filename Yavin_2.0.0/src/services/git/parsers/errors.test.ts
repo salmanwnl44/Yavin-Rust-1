@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { describeGitError } from "./errors.ts";
+import { describeGitError, categorizeGitError } from "./errors.ts";
+import type { GitErrorCategory } from "./errors.ts";
 
 test("Git failures are explained without hiding what Git said", () => {
   const auth = describeGitError(
@@ -51,18 +52,13 @@ test("a missing Git executable is explained instead of showing a raw OS error", 
 });
 
 test("a stale hunk's apply failure is explained instead of showing raw patch stderr", () => {
-  assert.match(
-    describeGitError("error: a.ts: patch does not apply"),
-    /no longer matches the file/,
-  );
+  assert.match(describeGitError("error: a.ts: patch does not apply"), /no longer matches the file/);
   assert.match(describeGitError("error: patch failed: a.ts:10"), /no longer matches the file/);
 });
 
 test("deleting a branch checked out elsewhere is explained instead of showing raw stderr", () => {
   assert.match(
-    describeGitError(
-      "Git: error: cannot delete branch 'feature' used by worktree at '/repo/wt'",
-    ),
+    describeGitError("Git: error: cannot delete branch 'feature' used by worktree at '/repo/wt'"),
     /checked out in another worktree/,
   );
 });
@@ -107,4 +103,26 @@ test("starting a new operation while one is already active is explained instead 
     describeGitError("Git: error: cherry-pick is already in progress"),
     /already in progress/,
   );
+});
+
+test("categorizeGitError maps real Git failure text to a machine-checkable category", () => {
+  const cases: [string, GitErrorCategory][] = [
+    ["Cancelled", "cancelled"],
+    ["Error: Another Git operation is already running for this worktree.", "busy"],
+    ["Save or close unsaved editors before changing the working tree.", "dirty"],
+    ["Git: fatal: Authentication failed for 'https://x'", "auth"],
+    ["Git: git@github.com: Permission denied (publickey).", "auth"],
+    ["Git: fatal: Could not resolve host: github.com", "network"],
+    ["Git: fatal: The current branch x has no upstream branch.", "no-upstream"],
+    ["Git: ! [rejected] main -> main (non-fast-forward)", "non-fast-forward"],
+    ["Git: fatal: Not possible to fast-forward, aborting.", "diverged"],
+    ["error: Committing is not possible because you have unmerged files.", "conflict"],
+    ["CONFLICT (content): Merge conflict in f.txt", "conflict"],
+    ["fatal: 'feature' is already used by worktree at '/x'", "worktree-conflict"],
+    ["error: the branch 'other' is not fully merged", "unmerged-branch"],
+    ["nothing to commit, working tree clean", "nothing-to-commit"],
+    ["error: you need to resolve your current index first", "operation-in-progress"],
+    ["something entirely unexpected", "unclassified"],
+  ];
+  for (const [text, category] of cases) assert.equal(categorizeGitError(text), category, text);
 });
