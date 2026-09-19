@@ -256,6 +256,64 @@ test("a staged renamed-and-modified file's diff shows the actual change, not a f
   await expect(diffView.getByText("diff --git a/a.ts b/b.ts")).toBeVisible();
 });
 
+test("a failed hunk stage shows a clear message and reloads the now-provably-stale diff", async ({
+  page,
+}) => {
+  await page.addInitScript((diff) => {
+    const ok = (stdout: string) => ({ stdout, stderr: "", code: 0, truncated: false });
+    let diffCalls = 0;
+    Object.assign(window, {
+      isTauri: true,
+      __diffCalls: () => diffCalls,
+      __TAURI_INTERNALS__: {
+        metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        invoke: async (command: string, args: Record<string, unknown> = {}) => {
+          if (command === "get_default_workspace") return "/work";
+          if (command === "list_workspace_files")
+            return {
+              path: "/work",
+              name: "work",
+              is_dir: true,
+              children: [{ path: "/work/a.ts", name: "a.ts", is_dir: false, children: null }],
+            };
+          if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
+          if (command === "git_repo_state") return "";
+          if (command === "git_exec") {
+            const argv = (args.args as string[] | undefined) ?? [];
+            if (argv[0] === "status" && argv.includes("--porcelain=v2"))
+              return ok("# branch.head main\n");
+            if (argv[0] === "status") return ok(" M a.ts\0");
+            if (argv[0] === "for-each-ref" || argv[0] === "remote") return ok("");
+            if (argv[0] === "diff") {
+              diffCalls++;
+              return ok(diff);
+            }
+            if (argv[0] === "apply") throw "error: a.ts: patch does not apply";
+            return ok("");
+          }
+          return null;
+        },
+      },
+      __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => {} },
+    });
+  }, FIRST_HUNK_ONLY);
+  await page.goto("/");
+  await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
+  const region = page.getByRole("complementary", { name: "Source control" });
+  await region.getByText("a.ts").click();
+
+  const diffView = page.locator("section[aria-label='Git diff editor']");
+  const callsBefore = await page.evaluate(() => (window as unknown as { __diffCalls: () => number }).__diffCalls());
+  await diffView.getByRole("button", { name: "Stage Hunk" }).first().click();
+
+  await expect(region.getByText(/no longer matches the file/)).toBeVisible();
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { __diffCalls: () => number }).__diffCalls()))
+    .toBeGreaterThan(callsBefore);
+});
+
 function assertPatchContainsOnlyFirstHunk(calls: { args: { args?: string[]; input?: string } }[]) {
   expect(calls.length).toBe(1);
   const patch = calls[0].args.input ?? "";

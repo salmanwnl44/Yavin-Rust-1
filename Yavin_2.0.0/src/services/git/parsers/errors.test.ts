@@ -49,3 +49,11 @@ test("a missing Git executable is explained instead of showing a raw OS error", 
     /Git was not found/,
   );
 });
+
+test("a stale hunk's apply failure is explained instead of showing raw patch stderr", () => {
+  assert.match(
+    describeGitError("error: a.ts: patch does not apply"),
+    /no longer matches the file/,
+  );
+  assert.match(describeGitError("error: patch failed: a.ts:10"), /no longer matches the file/);
+});

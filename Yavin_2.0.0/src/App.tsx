@@ -556,14 +556,20 @@ export default function App() {
       else await repo.discardHunks(targetText, [hunkIndex]);
       return "Hunk updated.";
     });
-    if (!ok) return;
+    if (ok) {
+      try {
+        await reconcileWorkspace();
+        setGitRevision((value) => value + 1);
+      } catch (error) {
+        entry.store.setNotice(String(error));
+      }
+    }
 
+    // Re-fetch on both success and failure: a failed apply means the hunk
+    // coordinates the user was looking at no longer matched the file (Git's own
+    // context-line matching refuses a stale patch cleanly), so the diff view is
+    // provably stale too and must not keep showing it as if nothing happened.
     try {
-      await reconcileWorkspace();
-      setGitRevision((value) => value + 1);
-
-      // Re-fetch so hunk indices/content reflect the new state; if nothing textual
-      // remains, the change is fully staged/discarded, so close the view.
       const refreshed = await repo.diff(targetPath, targetKind === "staged");
       setDiff(refreshed.trim() ? { ...diff, text: refreshed } : null);
     } catch (error) {

@@ -60,6 +60,10 @@ const failures: [RegExp, string][] = [
     /Cannot start tool/i,
     "Git was not found. Check that it is installed and available on your PATH, then try again.",
   ],
+  [
+    /patch does not apply|patch failed/i,
+    "This change no longer matches the file. Refresh the diff and try again.",
+  ],
 ];
 
 /**
