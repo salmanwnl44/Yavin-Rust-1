@@ -733,9 +733,14 @@ fn validate_args(subcommand: &str, rest: &[String]) -> Result<(), String> {
         .ok_or_else(|| format!("Git operation '{subcommand}' is not supported"))?;
     let mut i = 0;
     let mut positional_only = false;
+    // Everything that is not a flag (or a flag's value), and every flag that matched a rule.
+    // `validate_shape` needs both: which flags are present, and what the positionals are.
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut flags: Vec<&str> = Vec::new();
     while i < rest.len() {
         let arg = rest[i].as_str();
         if positional_only {
+            positionals.push(arg);
             i += 1;
             continue;
         }
@@ -745,6 +750,7 @@ fn validate_args(subcommand: &str, rest: &[String]) -> Result<(), String> {
             continue;
         }
         if !arg.starts_with('-') {
+            positionals.push(arg);
             i += 1;
             continue;
         }
@@ -762,6 +768,7 @@ fn validate_args(subcommand: &str, rest: &[String]) -> Result<(), String> {
                 ))
             }
             Some(r) => {
+                flags.push(arg);
                 i += 1;
                 if r.takes_value {
                     // The next token is this flag's value, whatever it looks like --
@@ -771,7 +778,76 @@ fn validate_args(subcommand: &str, rest: &[String]) -> Result<(), String> {
             }
         }
     }
-    Ok(())
+    validate_shape(subcommand, &flags, &positionals)
+}
+
+/// A refspec is `[+]<src>:<dst>` (`+` forces the update, an empty `<src>` deletes the
+/// remote ref). Yavin never passes one, and each of those forms would defeat a guarantee the
+/// flag allow-list otherwise gives: there is no `--force` or `--delete` flag, yet `push origin
+/// +main:main` and `push origin :branch` are both a positional away. Also rejects `::`
+/// (`ext::` remote helpers) and anything URL-shaped, since only configured remote *names* are
+/// ever used.
+fn looks_like_refspec_or_url(arg: &str) -> bool {
+    arg.starts_with('+') || arg.contains(':') || arg.contains("://")
+}
+
+/// The exact argument shapes Yavin's own `Repository` methods produce, for the subcommands
+/// where a permitted flag set alone leaves something dangerous reachable through positionals
+/// (see the table test `every_repository_argv_shape_still_validates`). Subcommands not listed
+/// here take ordinary pathspecs/revisions/names and are governed by their flag rules alone.
+fn validate_shape(subcommand: &str, flags: &[&str], positionals: &[&str]) -> Result<(), String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "'git {subcommand}' with these arguments is not permitted: {why}"
+        ))
+    };
+    match subcommand {
+        // fetch/pull only ever run against the branch's configured remote.
+        "fetch" | "pull" if !positionals.is_empty() => {
+            refuse("it takes no remote or refspec arguments")
+        }
+        // push: bare, or `--set-upstream <remote> <branch>` for publishing.
+        "push" => match positionals {
+            [] => Ok(()),
+            [remote, branch]
+                if flags.contains(&"--set-upstream")
+                    && !looks_like_refspec_or_url(remote)
+                    && !looks_like_refspec_or_url(branch) =>
+            {
+                Ok(())
+            }
+            _ => refuse("only a plain push, or --set-upstream <remote> <branch>, is allowed"),
+        },
+        // Only bare `git remote` (list names) is ever used; adding/removing/re-pointing a
+        // remote is not something the app does.
+        "remote" if !positionals.is_empty() => refuse("only listing remotes is allowed"),
+        "worktree" if positionals != ["list"] => refuse("only `worktree list` is allowed"),
+        "stash" => match positionals {
+            ["push" | "list"] => Ok(()),
+            ["pop" | "apply" | "drop"] => Ok(()),
+            ["pop" | "apply" | "drop", entry] if is_stash_ref(entry) => Ok(()),
+            _ => refuse("only push, list, pop, apply and drop of a stash@{n} entry are allowed"),
+        },
+        // Without the flag these would delete files / discard working-tree edits, bypassing
+        // the confirm-and-keep-a-recovery-copy flow the UI puts in front of discarding.
+        "rm" if !flags.contains(&"--cached") => refuse("only --cached (unstaging) is allowed"),
+        "restore" if !flags.contains(&"--staged") => refuse("only --staged (unstaging) is allowed"),
+        // Starting a merge/rebase/cherry-pick/revert rewrites history; the app only ever
+        // continues, skips or aborts one that already exists.
+        "merge" | "rebase" | "cherry-pick" | "revert"
+            if !positionals.is_empty() || flags.len() != 1 =>
+        {
+            refuse("only --abort, --continue or --skip on an existing operation is allowed")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `stash@{0}`, `stash@{12}` -- the only stash entry syntax `Repository` produces.
+fn is_stash_ref(arg: &str) -> bool {
+    arg.strip_prefix("stash@{")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Resolves which shared lock (if any) `args` requires against `repository_id`,
@@ -2113,24 +2189,18 @@ mod tests {
         assert!(git(&["commit", "-qam", "other1"]));
 
         assert!(!git(&["cherry-pick", "master~1"]));
-        // A genuinely unrelated operation (merge, not another cherry-pick) over an
-        // unresolved one -- no client-side pre-check exists or is needed, Git's own
-        // refusal is authoritative. (A *second* cherry-pick attempt produces a
-        // different, third message family -- "Cherry-picking is not possible
-        // because you have unmerged files" -- already covered by Gap 2's own
-        // "unmerged files" pattern, discovered while writing this test; this test
-        // exercises the genuinely distinct "already in progress" family instead.)
-        let result = exec(&repo, &args(&["merge", "master"]), None).unwrap();
+        // Starting a merge is not something the IPC boundary permits any more (only
+        // --abort/--continue/--skip of an existing operation is), so Git's own "already in
+        // progress" refusal can no longer be provoked through `exec`; its message text is
+        // classified by errors.test.ts against real Git output. What still matters here is that
+        // the boundary refuses, and that the in-progress cherry-pick remains abortable.
+        let result = exec(&repo, &args(&["merge", "master"]), None);
         let abort = exec(&repo, &args(&["cherry-pick", "--abort"]), None);
         let _ = fs::remove_dir_all(&dir);
 
-        assert_ne!(result.code, 0);
         assert!(
-            result.stderr.contains("already in progress")
-                || result.stderr.contains("resolve your current index")
-                || result.stderr.contains("unmerged files"),
-            "unexpected refusal text: {}",
-            result.stderr
+            result.as_ref().is_err_and(|e| e.contains("not permitted")),
+            "starting a merge must be refused before git runs: {result:?}"
         );
         assert!(abort.is_ok());
     }
@@ -2355,6 +2425,175 @@ mod tests {
 
         assert_eq!(normal_result.stdout.trim(), "false");
         assert_eq!(shallow_result.stdout.trim(), "true");
+    }
+
+    /// Every argv shape `repository.ts` actually sends. If someone tightens `validate_shape`
+    /// and breaks a real call, this fails here instead of in front of a user.
+    #[test]
+    fn every_repository_argv_shape_still_validates() {
+        let shapes: &[&[&str]] = &[
+            &["status", "--porcelain=v1", "-z", "-uall", "--", "."],
+            &[
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "--untracked-files=no",
+                "--",
+                ".",
+            ],
+            &["rev-parse", "--git-common-dir"],
+            &["rev-parse", "--is-shallow-repository"],
+            &["rev-parse", "--verify", "HEAD"],
+            &["worktree", "list", "--porcelain"],
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+            &["remote"],
+            &["cat-file", "--filters", ":a.txt"],
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "-M",
+                "--cached",
+                "--",
+                "a",
+                "b",
+            ],
+            &["diff", "--name-only", "--diff-filter=U"],
+            &["apply", "--cached", "-R"],
+            &["add", "--", "a.txt"],
+            &["restore", "--staged", "--", "a.txt"],
+            &["rm", "--cached", "--", "a.txt"],
+            &["commit", "-m", "a message"],
+            &["commit", "-m", "--not-a-flag"],
+            &["switch", "--", "main"],
+            &["switch", "-c", "feature"],
+            &["check-ref-format", "--branch", "feature"],
+            &["branch", "-d", "feature"],
+            &["branch", "-D", "feature"],
+            &["fetch", "--prune"],
+            &["symbolic-ref", "refs/remotes/origin/HEAD"],
+            &["symbolic-ref", "--short", "HEAD"],
+            &["pull", "--ff-only"],
+            &["pull", "--rebase", "--no-autostash"],
+            &["pull", "--no-rebase", "--no-autostash", "--no-edit"],
+            &["push"],
+            &["push", "--set-upstream", "origin", "feature/x"],
+            &["merge", "--abort"],
+            &["merge", "--continue"],
+            &["rebase", "--abort"],
+            &["rebase", "--continue"],
+            &["rebase", "--skip"],
+            &["cherry-pick", "--abort"],
+            &["cherry-pick", "--continue"],
+            &["cherry-pick", "--skip"],
+            &["revert", "--abort"],
+            &["revert", "--continue"],
+            &["revert", "--skip"],
+            &["show", "--numstat", "--pretty=format:%H", "abc123"],
+            &[
+                "show",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "-M",
+                "--pretty=format:",
+                "abc123",
+                "--",
+                "a.txt",
+            ],
+            &[
+                "log",
+                "--topo-order",
+                "--skip",
+                "0",
+                "-n",
+                "300",
+                "--pretty=format:%H",
+                "--date=format:%B",
+            ],
+            &["stash", "push", "-u"],
+            &["stash", "push", "-u", "-m", "a message"],
+            &["stash", "list"],
+            &["stash", "pop"],
+            &["stash", "pop", "stash@{0}"],
+            &["stash", "apply", "stash@{12}"],
+            &["stash", "drop", "stash@{3}"],
+            &["tag", "-l"],
+        ];
+        for shape in shapes {
+            let a = args(shape);
+            let result = validate_args(&a[0], &a[1..]);
+            assert!(result.is_ok(), "{shape:?} must validate, got {result:?}");
+        }
+    }
+
+    /// The guarantee "Yavin has no force-push, no remote-branch delete, no remote editing and
+    /// never starts a history rewrite" is only true if none of these reach git. Each one passed
+    /// the flag allow-list before, as an ordinary positional.
+    #[test]
+    fn positional_arguments_cannot_reintroduce_what_the_flag_list_forbids() {
+        let refused: &[&[&str]] = &[
+            // force push and remote-branch deletion via refspec
+            &["push", "origin", "+main:main"],
+            &["push", "origin", ":some-branch"],
+            &["push", "origin", "main:main"],
+            &["push", "origin", "main"],
+            &["push", "--set-upstream", "origin", "+main"],
+            &["push", "--set-upstream", "origin", ":main"],
+            // pushing to a URL / remote helper instead of a configured remote
+            &[
+                "push",
+                "--set-upstream",
+                "https://evil.example/r.git",
+                "main",
+            ],
+            &["push", "--set-upstream", "ext::sh -c touch pwned", "main"],
+            &["push", "https://evil.example/r.git"],
+            // fetching or pulling from an arbitrary place
+            &["fetch", "origin"],
+            &["fetch", "ext::sh -c touch pwned"],
+            &["fetch", "https://evil.example/r.git"],
+            &["pull", "origin", "main"],
+            &["pull", "--ff-only", "https://evil.example/r.git"],
+            // editing remotes / worktrees
+            &["remote", "add", "x", "https://evil.example/r.git"],
+            &["remote", "remove", "origin"],
+            &["remote", "set-url", "origin", "https://evil.example/r.git"],
+            &["worktree", "add", "../escape"],
+            &["worktree", "remove", "--force", "x"],
+            &["worktree"],
+            // stash forms the app does not use
+            &["stash", "clear"],
+            &["stash"],
+            &["stash", "branch", "b"],
+            &["stash", "create"],
+            &["stash", "pop", "--index"],
+            &["stash", "drop", "stash@{}"],
+            &["stash", "drop", "stash@{x}"],
+            &["stash", "drop", "HEAD"],
+            &["stash", "drop", "stash@{0}", "stash@{1}"],
+            // deleting files / discarding working-tree edits without the safe flag
+            &["rm", "--", "a.txt"],
+            &["restore", "--", "a.txt"],
+            &["restore", "a.txt"],
+            // starting (rather than continuing) a history-rewriting operation
+            &["merge", "other"],
+            &["merge", "--abort", "other"],
+            &["merge", "--abort", "--continue"],
+            &["rebase", "main"],
+            &["cherry-pick", "abc123"],
+            &["revert", "HEAD"],
+            &["revert"],
+        ];
+        for shape in refused {
+            let a = args(shape);
+            let result = validate_args(&a[0], &a[1..]);
+            assert!(
+                result.is_err(),
+                "{shape:?} must be refused before git runs, but validated"
+            );
+        }
     }
 
     fn scope_of(argv: &[&str]) -> Scope {
