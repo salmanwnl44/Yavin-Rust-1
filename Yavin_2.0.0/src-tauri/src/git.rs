@@ -2088,4 +2088,124 @@ mod tests {
         );
         assert!(abort.is_ok());
     }
+
+    #[test]
+    fn a_rebase_conflict_is_detected_and_can_be_continued_after_resolving() {
+        let (dir, git) = fixture();
+        assert!(git(&["branch", "feature"]));
+        assert!(git(&["switch", "-q", "feature"]));
+        fs::write(dir.join("a.txt"), "feat1\n").unwrap();
+        assert!(git(&["commit", "-qam", "feat1"]));
+        assert!(git(&["switch", "-q", "-"]));
+        fs::write(dir.join("a.txt"), "m1\n").unwrap();
+        assert!(git(&["commit", "-qam", "m1"]));
+
+        assert!(!git(&["rebase", "feature"]));
+        let repo = open(&dir);
+        let during = repo_state(&repo).unwrap();
+        fs::write(dir.join("a.txt"), "resolved\n").unwrap();
+        assert!(git(&["add", "a.txt"]));
+        let cont = exec(&repo, &args(&["rebase", "--continue"]), None);
+        let after = repo_state(&repo).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(during, "rebase");
+        assert!(cont.is_ok(), "continue failed: {:?}", cont.err());
+        assert_eq!(after, "");
+    }
+
+    #[test]
+    fn a_cherry_pick_conflict_is_detected_and_can_be_continued_after_resolving() {
+        let (dir, git) = fixture();
+        fs::write(dir.join("a.txt"), "c1\n").unwrap();
+        assert!(git(&["commit", "-qam", "c1"]));
+        assert!(git(&["switch", "-qc", "other", "HEAD~1"]));
+        fs::write(dir.join("a.txt"), "other1\n").unwrap();
+        assert!(git(&["commit", "-qam", "other1"]));
+
+        assert!(!git(&["cherry-pick", "master"]));
+        let repo = open(&dir);
+        let during = repo_state(&repo).unwrap();
+        fs::write(dir.join("a.txt"), "resolved\n").unwrap();
+        assert!(git(&["add", "a.txt"]));
+        let cont = exec(&repo, &args(&["cherry-pick", "--continue"]), None);
+        let after = repo_state(&repo).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(during, "cherry-pick");
+        assert!(cont.is_ok(), "continue failed: {:?}", cont.err());
+        assert_eq!(after, "");
+    }
+
+    #[test]
+    fn a_multi_commit_revert_conflict_uses_the_sequencer_and_can_be_continued_twice() {
+        let (dir, git) = fixture();
+        fs::write(dir.join("a.txt"), "c1\n").unwrap();
+        assert!(git(&["commit", "-qam", "c1"]));
+        fs::write(dir.join("a.txt"), "c2\n").unwrap();
+        assert!(git(&["commit", "-qam", "c2"]));
+
+        // Two commits to revert, oldest first -- verified (this plan's own empirical
+        // session) to produce a real conflict on each in turn.
+        assert!(!git(&["revert", "--no-edit", "HEAD~1", "HEAD"]));
+        let repo = open(&dir);
+        let during_round1 = repo_state(&repo).unwrap();
+        let sequencer_todo = fs::read_to_string(dir.join(".git/sequencer/todo")).unwrap();
+
+        fs::write(dir.join("a.txt"), "resolved1\n").unwrap();
+        assert!(git(&["add", "a.txt"]));
+        let cont1 = exec(&repo, &args(&["revert", "--continue"]), None);
+        let during_round2 = repo_state(&repo).unwrap();
+
+        fs::write(dir.join("a.txt"), "resolved2\n").unwrap();
+        assert!(git(&["add", "a.txt"]));
+        let cont2 = exec(&repo, &args(&["revert", "--continue"]), None);
+        let after = repo_state(&repo).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(during_round1, "revert");
+        assert!(sequencer_todo.contains("revert"));
+        assert!(cont1.is_ok(), "first continue failed: {:?}", cont1.err());
+        assert_eq!(
+            during_round2, "revert",
+            "the second commit must still conflict"
+        );
+        assert!(cont2.is_ok(), "second continue failed: {:?}", cont2.err());
+        assert_eq!(after, "");
+    }
+
+    #[test]
+    fn a_single_commit_revert_conflict_can_be_skipped_completing_the_operation() {
+        let (dir, git) = fixture();
+        fs::write(dir.join("a.txt"), "c1\n").unwrap();
+        assert!(git(&["commit", "-qam", "c1"]));
+        fs::write(dir.join("a.txt"), "c2\n").unwrap();
+        assert!(git(&["commit", "-qam", "c2"]));
+
+        // Reverting the OLDER commit alone conflicts: undoing "base"->"c1" needs the
+        // file to currently read "c1", but the later c2 commit already moved it on.
+        assert!(!git(&["revert", "--no-edit", "HEAD~1"]));
+        let repo = open(&dir);
+        let during = repo_state(&repo).unwrap();
+        let skip = exec(&repo, &args(&["revert", "--skip"]), None);
+        let after = repo_state(&repo).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(during, "revert");
+        assert!(skip.is_ok(), "skip failed: {:?}", skip.err());
+        assert_eq!(
+            after, "",
+            "skipping the only remaining commit must complete the operation"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_skip_flag_is_rejected_for_a_subcommand_that_never_gets_it() {
+        let (dir, _git) = fixture();
+        let repo = open(&dir);
+        let result = exec(&repo, &args(&["status", "--skip"]), None);
+        let _ = fs::remove_dir_all(&dir);
+        let error = result.unwrap_err();
+        assert!(error.contains("not permitted"), "unexpected error: {error}");
+    }
 }

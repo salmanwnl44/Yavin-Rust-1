@@ -397,6 +397,24 @@ test("an interrupted merge must be resolved or aborted before it can continue", 
   await expect.poll(() => gitCalls(page, "continue")).toBe(1);
 });
 
+test("an interrupted rebase must be resolved or aborted before it can continue, exactly like a merge", async ({
+  page,
+}) => {
+  const region = await panel(page, { state: "rebase", status: "UU conflict.ts\0" });
+
+  const banner = region.getByRole("alert").filter({ hasText: "in progress" });
+  await expect(banner).toContainText(/rebase in progress/i);
+  await expect(banner).toContainText("Resolve 1 conflicted file, stage each one, then continue.");
+  await expect(banner.getByRole("button", { name: "Continue" })).toBeDisabled();
+  await expect(banner.getByRole("button", { name: "Abort" })).toBeEnabled();
+  await expect(banner.getByRole("button", { name: "Skip" })).toBeEnabled();
+
+  await update(page, { status: "M  conflict.ts\0" });
+  await expect(banner.getByRole("button", { name: "Continue" })).toBeEnabled();
+  await banner.getByRole("button", { name: "Continue" }).click();
+  await expect.poll(() => gitCalls(page, "continue")).toBe(1);
+});
+
 test("a continue that actually completes the merge resets the commit graph", async ({ page }) => {
   const region = await panel(page, { state: "merge", status: "M  conflict.ts\0" });
   const logCalls = () =>
