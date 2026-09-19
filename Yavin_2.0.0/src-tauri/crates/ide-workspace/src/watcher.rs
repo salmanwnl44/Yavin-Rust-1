@@ -360,4 +360,71 @@ mod tests {
             "{seen:?}"
         );
     }
+
+    /// Performance verification (the Git State & Synchronization plan's Section
+    /// W): `objects/` is never watched at all, not merely unclassified-if-seen --
+    /// a real repository with any history has thousands of object files, and this
+    /// is the one path category that would scale with repository size if watched.
+    #[test]
+    fn objects_directory_changes_produce_no_events_at_all() {
+        let root = temp_dir("git-objects");
+        fs::create_dir_all(root.join("refs/heads")).unwrap();
+        fs::create_dir_all(root.join("objects/ab")).unwrap();
+        fs::write(root.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let watcher = start_git_watcher(&root, &[root.clone()], move |_kind| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+
+        for i in 0..10 {
+            fs::write(root.join(format!("objects/ab/{i:040x}")), "object data").unwrap();
+        }
+        std::thread::sleep(SETTLE * 4);
+
+        let reported = hits.load(Ordering::SeqCst);
+        drop(watcher);
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(
+            reported, 0,
+            "writes under objects/ must never be watched, let alone reported"
+        );
+    }
+
+    /// A rapid burst of ref changes (e.g. several quick commits, or an external
+    /// tool rewriting refs in a loop) must coalesce into a bounded number of
+    /// events, never one per individual write -- the same guarantee
+    /// `a_burst_of_writes_reports_at_least_once` already proves for the general
+    /// workspace watcher, verified here for the narrower Git-ref watcher too.
+    #[test]
+    fn a_rapid_burst_of_ref_changes_coalesces_instead_of_reporting_once_per_write() {
+        let root = temp_dir("git-burst");
+        fs::create_dir_all(root.join("refs/heads")).unwrap();
+        fs::write(root.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let watcher = start_git_watcher(&root, &[root.clone()], move |kind| {
+            if kind == GitChangeKind::Refs {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .unwrap();
+
+        for i in 0..10 {
+            fs::write(root.join(format!("refs/heads/branch-{i}")), "abc123\n").unwrap();
+        }
+        std::thread::sleep(SETTLE * 5);
+
+        let reported = hits.load(Ordering::SeqCst);
+        drop(watcher);
+        fs::remove_dir_all(&root).ok();
+        assert!(
+            (1..=3).contains(&reported),
+            "expected a small, bounded number of coalesced 'refs' reports for 10 rapid \
+             writes, got {reported}"
+        );
+    }
 }
