@@ -2027,4 +2027,65 @@ mod tests {
             "a merge conflict in worktree A must never appear as a merge in worktree B"
         );
     }
+
+    #[test]
+    fn attempting_continue_before_resolving_a_conflict_is_refused_cleanly() {
+        let (dir, git) = fixture();
+        let repo = open(&dir);
+        assert!(git(&["branch", "other"]));
+        assert!(git(&["switch", "-q", "other"]));
+        fs::write(dir.join("a.txt"), "theirs\n").unwrap();
+        assert!(git(&["commit", "-qam", "theirs"]));
+        assert!(git(&["switch", "-q", "-"]));
+        fs::write(dir.join("a.txt"), "ours\n").unwrap();
+        assert!(git(&["commit", "-qam", "ours"]));
+        assert!(!git(&["merge", "other"]));
+
+        let result = exec(&repo, &args(&["merge", "--continue"]), None).unwrap();
+        let abort = exec(&repo, &args(&["merge", "--abort"]), None);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_ne!(result.code, 0);
+        assert!(
+            result.stderr.contains("unmerged files") || result.stderr.contains("needs merge"),
+            "unexpected refusal text: {}",
+            result.stderr
+        );
+        assert!(abort.is_ok());
+    }
+
+    #[test]
+    fn starting_an_unrelated_operation_while_one_is_unresolved_is_refused_by_git_itself() {
+        let (dir, git) = fixture();
+        let repo = open(&dir);
+        fs::write(dir.join("a.txt"), "c1\n").unwrap();
+        assert!(git(&["commit", "-qam", "c1"]));
+        fs::write(dir.join("a.txt"), "c2\n").unwrap();
+        assert!(git(&["commit", "-qam", "c2"]));
+        assert!(git(&["switch", "-qc", "other", "HEAD~2"]));
+        fs::write(dir.join("a.txt"), "other1\n").unwrap();
+        assert!(git(&["commit", "-qam", "other1"]));
+
+        assert!(!git(&["cherry-pick", "master~1"]));
+        // A genuinely unrelated operation (merge, not another cherry-pick) over an
+        // unresolved one -- no client-side pre-check exists or is needed, Git's own
+        // refusal is authoritative. (A *second* cherry-pick attempt produces a
+        // different, third message family -- "Cherry-picking is not possible
+        // because you have unmerged files" -- already covered by Gap 2's own
+        // "unmerged files" pattern, discovered while writing this test; this test
+        // exercises the genuinely distinct "already in progress" family instead.)
+        let result = exec(&repo, &args(&["merge", "master"]), None).unwrap();
+        let abort = exec(&repo, &args(&["cherry-pick", "--abort"]), None);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_ne!(result.code, 0);
+        assert!(
+            result.stderr.contains("already in progress")
+                || result.stderr.contains("resolve your current index")
+                || result.stderr.contains("unmerged files"),
+            "unexpected refusal text: {}",
+            result.stderr
+        );
+        assert!(abort.is_ok());
+    }
 }

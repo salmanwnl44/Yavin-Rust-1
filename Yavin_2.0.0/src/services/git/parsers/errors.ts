@@ -72,6 +72,19 @@ const failures: [RegExp, string][] = [
     /is not fully merged/i,
     "This branch has commits not on any other branch. Force-delete only if you're sure you want to discard them.",
   ],
+  [
+    // Two real, distinct message families (verified against a real repository):
+    // rebase's apply-backend refusal usually also contains "conflict(s)" and is
+    // already caught by the CONFLICT pattern above; this covers the
+    // merge/revert/cherry-pick commit-backend refusal, plus rebase's own text on
+    // the rare chance it appears without the word "conflict" nearby.
+    /needs merge|unmerged files|Committing is not possible/i,
+    "Conflicts are still unresolved. Stage each resolved file, then continue.",
+  ],
+  [
+    /you need to resolve your current index first|is already in progress/i,
+    "Another Git operation is already in progress. Resolve or abort it before starting a new one.",
+  ],
 ];
 
 /**

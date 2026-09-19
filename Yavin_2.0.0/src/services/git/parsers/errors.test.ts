@@ -73,3 +73,38 @@ test("deleting an unmerged branch without force is explained with a clear escala
     /commits not on any other branch/,
   );
 });
+
+test("rebase's continue-before-resolving refusal is already covered by the existing CONFLICT pattern", () => {
+  // Verified against a real repository (Module 7's plan, Section D.5): rebase's
+  // apply-backend refusal text happens to contain "conflicts", so it was already
+  // matched by the pre-existing /CONFLICT/i pattern before this phase -- no new
+  // pattern was actually needed for this specific message, only for the
+  // commit-backend one below (a correction made while writing this test, not
+  // assumed from the plan's own text).
+  assert.match(
+    describeGitError(
+      "f.txt: needs merge\nYou must edit all merge conflicts and then\nmark them as resolved using git add",
+    ),
+    /Conflicts need resolving/,
+  );
+});
+
+test("merge/revert/cherry-pick's continue-before-resolving refusal is explained instead of raw stderr", () => {
+  // The one message family genuinely unclassified before this phase (verified,
+  // Section D.5/D.6): identical text for merge, revert, and cherry-pick.
+  assert.match(
+    describeGitError("error: Committing is not possible because you have unmerged files."),
+    /still unresolved/,
+  );
+});
+
+test("starting a new operation while one is already active is explained instead of showing raw stderr", () => {
+  assert.match(
+    describeGitError("Git: error: you need to resolve your current index first"),
+    /already in progress/,
+  );
+  assert.match(
+    describeGitError("Git: error: cherry-pick is already in progress"),
+    /already in progress/,
+  );
+});
