@@ -385,7 +385,13 @@ export function SourceControlPanel({
   };
 
   const entries = snapshot?.entries ?? [];
-  const branch = snapshot?.branch ?? { name: "", upstream: "", ahead: 0, behind: 0 };
+  const branch = snapshot?.branch ?? {
+    name: "",
+    detached: false,
+    upstream: "",
+    ahead: 0,
+    behind: 0,
+  };
   const branches = snapshot?.branches ?? [];
   const remotes = snapshot?.remotes ?? [];
   const operationInProgress = snapshot?.operationInProgress ?? "";

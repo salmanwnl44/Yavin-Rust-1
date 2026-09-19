@@ -7,7 +7,7 @@ import { parseGitEntries } from "./parsers/status.ts";
 import type { StashEntry } from "./parsers/stash.ts";
 import { parseStashList } from "./parsers/stash.ts";
 
-const EMPTY_BRANCH: Branch = { name: "", upstream: "", ahead: 0, behind: 0 };
+const EMPTY_BRANCH: Branch = { name: "", detached: false, upstream: "", ahead: 0, behind: 0 };
 
 // Actions that rewrite the working tree or HEAD are refused while an editor has
 // unsaved changes -- otherwise those edits could be silently overwritten or orphaned.
