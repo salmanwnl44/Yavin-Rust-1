@@ -7,8 +7,8 @@ mod git;
 mod terminal;
 mod workbench;
 use git::{
-    git_cancel, git_cancel_repo, git_close_repo, git_exec, git_open_repo, git_repo_state, GitJobs,
-    NetworkLocks, Repos, StashLocks,
+    git_cancel, git_cancel_repo, git_close_repo, git_exec, git_open_repo, git_repo_state,
+    git_unwatch_repo, git_watch_repo, GitJobs, GitWatches, NetworkLocks, Repos, StashLocks,
 };
 use terminal::{
     terminal_close, terminal_close_all, terminal_open, terminal_resize, terminal_shells,
@@ -188,6 +188,7 @@ pub fn run() {
         .manage(StashLocks::default())
         .manage(NetworkLocks::default())
         .manage(GitJobs::default())
+        .manage(GitWatches::default())
         .manage(Terminals::default())
         .invoke_handler(tauri::generate_handler![
             get_default_workspace,
@@ -212,6 +213,8 @@ pub fn run() {
             git_cancel,
             git_cancel_repo,
             git_repo_state,
+            git_watch_repo,
+            git_unwatch_repo,
             terminal_shells,
             terminal_open,
             terminal_write,

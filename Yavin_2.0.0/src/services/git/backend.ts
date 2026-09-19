@@ -51,3 +51,21 @@ export function cancelRepoOperations(repoId: string): Promise<void> {
 export async function repoState(repoId: string): Promise<GitOperation> {
   return (await native("git_repo_state", { repoId })) as GitOperation;
 }
+
+/**
+ * Starts (or, called again with an updated list, restarts) the narrow `.git`-ref
+ * watcher for one repository -- see the Git State & Synchronization plan's
+ * Section G/H. `worktreeRepoIds` is every currently-*opened* worktree of this
+ * repository (never `knownWorktrees`'s discovered-but-unopened entries, which
+ * must stay unwatched per Module 1's lazy-worktree invariant). Called again with
+ * the same repository id whenever that set changes (a worktree is opened or
+ * closed) rather than tracking "is this the first worktree" on the TS side.
+ */
+export function watchRepo(repositoryId: string, worktreeRepoIds: string[]): Promise<void> {
+  return native("git_watch_repo", { repositoryId, worktreeRepoIds });
+}
+
+/** Stops watching a repository -- called once its last open worktree closes. */
+export function unwatchRepo(repositoryId: string): Promise<void> {
+  return native("git_unwatch_repo", { repositoryId });
+}

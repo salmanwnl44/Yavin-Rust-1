@@ -32,6 +32,11 @@ interface Commands {
   git_cancel: { args: { id: string }; result: void };
   git_cancel_repo: { args: { repoId: string }; result: void };
   git_repo_state: { args: { repoId: string }; result: string };
+  git_watch_repo: {
+    args: { repositoryId: string; worktreeRepoIds: string[] };
+    result: void;
+  };
+  git_unwatch_repo: { args: { repositoryId: string }; result: void };
   terminal_shells: { args: undefined; result: Shell[] };
   terminal_open: {
     args: { id: string; shell?: string; cols: number; rows: number };

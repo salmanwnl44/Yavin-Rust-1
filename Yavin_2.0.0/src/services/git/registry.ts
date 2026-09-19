@@ -5,6 +5,7 @@ import { parsePersistedState } from "./persistence.ts";
 import type { PersistedGitState } from "./persistence.ts";
 import { parseWorktreeList } from "./parsers/worktree.ts";
 import type { WorktreeInfo } from "./parsers/worktree.ts";
+import { unwatchRepo, watchRepo } from "./backend.ts";
 
 /**
  * One open worktree. Kept under this name (rather than `WorktreeEntry`) so every
@@ -262,6 +263,15 @@ class GitRegistry {
         r.repositoryId === repositoryId ? { ...r, knownWorktrees } : r,
       );
 
+      // Re-registers with the now-expanded worktree list every time, rather than
+      // tracking "is this the first worktree of this repository" specially --
+      // `git_watch_repo` (Rust) already replaces (stopping and restarting) any
+      // existing watcher for this repositoryId. Fire-and-forget: losing live
+      // external-change detection is not fatal, the existing poll/focus refresh
+      // remains the permanent fallback (see the Git State & Synchronization plan).
+      const owner = repositories.find((r) => r.repositoryId === repositoryId);
+      if (owner) void watchRepo(repositoryId, owner.worktrees.map((w) => w.repoId));
+
       const shouldActivate = options.makeActive || !this.snapshot.activeWorktreePath;
       this.set(repositories, {
         repositoryId: shouldActivate ? repositoryId : this.snapshot.activeRepositoryId,
@@ -287,6 +297,17 @@ class GitRegistry {
           r === repository ? { ...r, worktrees: remainingWorktrees } : r,
         )
       : this.snapshot.repositories.filter((r) => r !== repository);
+
+    // Stop watching entirely once the last worktree of this repository closes;
+    // otherwise re-register with the narrower, still-open worktree list.
+    if (remainingWorktrees.length) {
+      void watchRepo(
+        repository.repositoryId,
+        remainingWorktrees.map((w) => w.repoId),
+      );
+    } else {
+      void unwatchRepo(repository.repositoryId);
+    }
 
     const activeRemoved = this.snapshot.activeWorktreePath === worktree.root;
     const fallback = flatten(repositories)[0] ?? null;

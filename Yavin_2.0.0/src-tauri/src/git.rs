@@ -9,6 +9,7 @@
 use ide_workspace::{
     file_tree::clean_path_str,
     process::{capture, ToolOutput},
+    watcher,
 };
 use serde::Serialize;
 use std::{
@@ -21,7 +22,7 @@ use std::{
     },
     time::Duration,
 };
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 /// One open repository: its canonical root, its shared-repository identity (see
 /// `discover_common_dir`), and a lock serializing Git invocations against this
@@ -373,6 +374,139 @@ pub fn git_close_repo(
     // A running (or lock-queued) operation against this worktree should not keep a
     // `git` process alive once Yavin no longer considers the repository open.
     cancel_jobs_for_repo(&jobs, &repo_id)?;
+    Ok(())
+}
+
+/// Every currently-active per-repository `.git` watcher (see
+/// `ide_workspace::watcher::start_git_watcher`), keyed by `repository_id` --
+/// mirrors `Repos`'s own shape. Registering a repository that's already watched
+/// replaces its entry (dropping, and so stopping, the old watcher first): this is
+/// how opening a second worktree of an already-watched repository re-registers
+/// with the expanded worktree list, without TypeScript needing to track "is this
+/// the first worktree" specially.
+#[derive(Default)]
+pub struct GitWatches(pub Mutex<HashMap<String, watcher::RecommendedWatcher>>);
+
+/// The payload `git-changed` carries -- a bare classification, no Git data of its
+/// own (TypeScript decides what to actually refresh; see the Git State &
+/// Synchronization plan's Section Z). `worktree_root` is only present for the two
+/// per-worktree kinds (`head`, `operation-state`); the three repository-shared
+/// kinds (`refs`, `remotes`, `stash`) apply to every worktree of the repository.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct GitChangeEvent {
+    repository_id: String,
+    kind: &'static str,
+    worktree_root: Option<String>,
+}
+
+/// Resolves each worktree's real, absolute gitdir via `rev-parse
+/// --absolute-git-dir` (needed so a `Head`/`OperationState` event, which
+/// `start_git_watcher` reports by gitdir, can be translated back to the worktree
+/// root TypeScript actually keys its `RepoEntry`s by). A worktree that fails to
+/// resolve (e.g. it was removed externally between being tracked and this call)
+/// is silently skipped, not fatal to the rest. Split out from `watch_repo` because
+/// `run()` spawns a blocking `git` process and must run off the async runtime's
+/// worker thread, exactly like every other git-invoking command in this file.
+fn resolve_worktree_gitdirs(roots: Vec<(PathBuf, String)>) -> Vec<(PathBuf, String)> {
+    roots
+        .into_iter()
+        .filter_map(|(root, repo_id)| {
+            let output = run(&root, &["rev-parse", "--absolute-git-dir"]).ok()?;
+            (output.code == 0).then(|| (PathBuf::from(output.stdout.trim()), repo_id))
+        })
+        .collect()
+}
+
+/// Starts (or restarts, if already watching) a narrow `.git`-ref watcher for one
+/// repository, covering exactly the worktrees named by `worktree_repo_ids`. The
+/// full logic behind the `git_watch_repo` command, taking `&Repos`/`&GitWatches`
+/// directly and a plain event callback instead of `State`/`AppHandle::emit` --
+/// mirrors how `exec_on` relates to `git_exec` (Module 2 Phase 5), so this can be
+/// exercised by a real test with real repositories and no Tauri app needed.
+async fn watch_repo(
+    repos: &Repos,
+    watches: &GitWatches,
+    on_event: impl Fn(GitChangeEvent) + Send + Sync + 'static,
+    repository_id: String,
+    worktree_repo_ids: Vec<String>,
+) -> Result<(), String> {
+    let roots: Vec<(PathBuf, String)> = worktree_repo_ids
+        .iter()
+        .filter_map(|id| repo_of(repos, id).ok())
+        .map(|repo| (repo.root.clone(), clean_path_str(&repo.root)))
+        .collect();
+
+    let gitdirs = tauri::async_runtime::spawn_blocking(move || resolve_worktree_gitdirs(roots))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let common_dir = PathBuf::from(&repository_id);
+    let worktree_gitdirs: Vec<PathBuf> = gitdirs.iter().map(|(dir, _)| dir.clone()).collect();
+    let gitdir_to_root: HashMap<PathBuf, String> = gitdirs.into_iter().collect();
+
+    let event_repository_id = repository_id.clone();
+    let watcher = watcher::start_git_watcher(&common_dir, &worktree_gitdirs, move |kind| {
+        let (kind_name, worktree_root): (&'static str, Option<String>) = match &kind {
+            watcher::GitChangeKind::Head(dir) => ("head", gitdir_to_root.get(dir).cloned()),
+            watcher::GitChangeKind::OperationState(dir) => {
+                ("operation-state", gitdir_to_root.get(dir).cloned())
+            }
+            watcher::GitChangeKind::Refs => ("refs", None),
+            watcher::GitChangeKind::Remotes => ("remotes", None),
+            watcher::GitChangeKind::Stash => ("stash", None),
+        };
+        on_event(GitChangeEvent {
+            repository_id: event_repository_id.clone(),
+            kind: kind_name,
+            worktree_root,
+        });
+    })
+    .map_err(|e| e.to_string())?;
+
+    watches
+        .0
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(repository_id, watcher);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn git_watch_repo(
+    app: AppHandle,
+    state: State<'_, Repos>,
+    watches: State<'_, GitWatches>,
+    repository_id: String,
+    worktree_repo_ids: Vec<String>,
+) -> Result<(), String> {
+    let handle = app.clone();
+    watch_repo(
+        &state,
+        &watches,
+        move |event| {
+            let _ = handle.emit("git-changed", event);
+        },
+        repository_id,
+        worktree_repo_ids,
+    )
+    .await
+}
+
+/// Stops watching one repository -- dropping its `RecommendedWatcher` ends the
+/// watch immediately. Called once the last worktree of a repository is closed;
+/// closing one of several open worktrees instead calls `git_watch_repo` again
+/// with the remaining, narrower worktree list.
+#[tauri::command]
+pub fn git_unwatch_repo(
+    watches: State<'_, GitWatches>,
+    repository_id: String,
+) -> Result<(), String> {
+    watches
+        .0
+        .lock()
+        .map_err(|e| e.to_string())?
+        .remove(&repository_id);
     Ok(())
 }
 
@@ -1337,6 +1471,143 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "took {elapsed:?} -- cancellation through the real job registry must stop \
              the process promptly, not wait for it to run its full course"
+        );
+    }
+
+    /// A `Repos` map containing every worktree returned by
+    /// `fixture_with_two_linked_worktrees`, keyed exactly like `register_repo`
+    /// would key them -- what `watch_repo` needs to resolve `worktree_repo_ids`
+    /// into real worktree roots.
+    fn repos_for(worktrees: &[&Repo]) -> Repos {
+        let repos = Repos::default();
+        let mut guard = repos.0.lock().unwrap();
+        for repo in worktrees {
+            guard.insert(
+                clean_path_str(&repo.root),
+                Arc::new(Repo {
+                    root: repo.root.clone(),
+                    repository_id: repo.repository_id.clone(),
+                    lock: Mutex::new(()),
+                }),
+            );
+        }
+        drop(guard);
+        repos
+    }
+
+    #[test]
+    fn watch_repo_reports_correctly_classified_and_attributed_events() {
+        let (dir, repo_a, repo_b) = fixture_with_two_linked_worktrees();
+        let repos = repos_for(&[&repo_a, &repo_b]);
+        let watches = GitWatches::default();
+        let events: Arc<std::sync::Mutex<Vec<GitChangeEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = Arc::clone(&events);
+
+        tauri::async_runtime::block_on(watch_repo(
+            &repos,
+            &watches,
+            move |event| collected.lock().unwrap().push(event),
+            repo_a.repository_id.clone(),
+            vec![clean_path_str(&repo_a.root), clean_path_str(&repo_b.root)],
+        ))
+        .unwrap();
+
+        // The same lookup `watch_repo` itself does internally, to find the exact
+        // paths a real Git action against worktree A would touch -- not guessed.
+        let common_dir = PathBuf::from(&repo_a.repository_id);
+        let a_gitdir = PathBuf::from(
+            run(&repo_a.root, &["rev-parse", "--absolute-git-dir"])
+                .unwrap()
+                .stdout
+                .trim(),
+        );
+
+        // A repository-shared change (a new local branch, visible from every
+        // worktree's shared common dir) ...
+        std::fs::write(common_dir.join("refs/heads/from-outside"), "abc123\n").unwrap();
+        // ... and a per-worktree change (A's own HEAD moving) -- bypassing `git`
+        // itself (a raw file write, not `git switch`) to isolate the watcher from
+        // any other side effect, matching `watcher.rs`'s own test convention.
+        std::fs::write(a_gitdir.join("HEAD"), "ref: refs/heads/from-outside\n").unwrap();
+        std::thread::sleep(Duration::from_millis(300 * 4));
+
+        watches.0.lock().unwrap().remove(&repo_a.repository_id);
+        let seen = events.lock().unwrap().clone();
+        let _ = fs::remove_dir_all(&repo_a.root);
+        let _ = fs::remove_dir_all(&repo_b.root);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            seen.iter()
+                .any(|e| e.kind == "refs" && e.worktree_root.is_none()),
+            "expected an unattributed repository-shared 'refs' event, got {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|e| e.kind == "head"
+                && e.worktree_root.as_deref() == Some(&clean_path_str(&repo_a.root))),
+            "expected a 'head' event attributed to worktree A's own root, got {seen:?}"
+        );
+    }
+
+    #[test]
+    fn unwatching_a_repository_stops_further_events() {
+        let (dir, _git) = fixture();
+        let repository_id = discover_common_dir(&dir)
+            .map(|p| clean_path_str(&p))
+            .unwrap();
+        let repo = Repo {
+            root: dir.clone(),
+            repository_id: repository_id.clone(),
+            lock: Mutex::new(()),
+        };
+        let repos = repos_for(&[&repo]);
+        let watches = GitWatches::default();
+        let events: Arc<std::sync::Mutex<Vec<GitChangeEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = Arc::clone(&events);
+
+        tauri::async_runtime::block_on(watch_repo(
+            &repos,
+            &watches,
+            move |event| collected.lock().unwrap().push(event),
+            repository_id.clone(),
+            vec![clean_path_str(&dir)],
+        ))
+        .unwrap();
+        assert!(watches.0.lock().unwrap().contains_key(&repository_id));
+
+        let common_dir = PathBuf::from(&repository_id);
+        std::fs::write(common_dir.join("refs/heads/before-unwatch"), "abc\n").unwrap();
+        std::thread::sleep(Duration::from_millis(300 * 3));
+        let before = events.lock().unwrap().len();
+        assert!(
+            before > 0,
+            "sanity: the watcher must have reported something before unwatching"
+        );
+
+        // Exactly what git_unwatch_repo does -- dropping the map entry drops (and so
+        // stops) the underlying RecommendedWatcher. A brief grace period covers the
+        // OS's own, not-necessarily-instantaneous unregistration (observed: a write
+        // issued immediately after drop() can still straggle in on some backends).
+        watches.0.lock().unwrap().remove(&repository_id);
+        std::thread::sleep(Duration::from_millis(100));
+
+        std::fs::write(common_dir.join("refs/heads/after-unwatch"), "def\n").unwrap();
+        std::thread::sleep(Duration::from_millis(300 * 3));
+        let after_first = events.lock().unwrap().len();
+        // A second post-unwatch write, further separated in time, must show no
+        // further growth -- distinguishing "truly stopped" from "one straggling
+        // event from an in-flight OS notification at the moment of the drop".
+        std::fs::write(common_dir.join("refs/heads/after-unwatch-2"), "ghi\n").unwrap();
+        std::thread::sleep(Duration::from_millis(300 * 3));
+        let after = events.lock().unwrap().len();
+
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            after, after_first,
+            "a second write, well after unwatching, must never add a further event"
         );
     }
 }
