@@ -26,9 +26,11 @@ interface Commands {
   git_open_repo: { args: { path: string }; result: { repoId: string; root: string } };
   git_close_repo: { args: { repoId: string }; result: void };
   git_exec: {
-    args: { repoId: string; args: string[]; input?: string };
+    args: { repoId: string; args: string[]; id: string; input?: string };
     result: ToolOutput;
   };
+  git_cancel: { args: { id: string }; result: void };
+  git_cancel_repo: { args: { repoId: string }; result: void };
   git_repo_state: { args: { repoId: string }; result: string };
   terminal_shells: { args: undefined; result: Shell[] };
   terminal_open: {

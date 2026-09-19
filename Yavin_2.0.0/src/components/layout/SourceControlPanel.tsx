@@ -352,6 +352,7 @@ export function SourceControlPanel({
   const busy = snapshot?.busy ?? false;
   const loading = snapshot?.loading ?? false;
   const notice = snapshot?.notice ?? "";
+  const cancelled = snapshot?.cancelled ?? false;
 
   const groups = [
     { name: "Conflicts", entries: entries.filter((e) => e.conflict), staged: false },
@@ -743,13 +744,26 @@ export function SourceControlPanel({
                 )}
 
                 {(notice || busy || loading) && (
-                  <p
-                    role="status"
-                    aria-live="polite"
-                    className="text-[11px] text-zinc-400 break-words leading-tight"
-                  >
-                    {busy ? "Running Git operation…" : loading ? "Refreshing…" : notice}
-                  </p>
+                  <div className="flex items-center gap-2">
+                    <p
+                      role="status"
+                      aria-live="polite"
+                      className={`flex-1 text-[11px] break-words leading-tight ${
+                        cancelled ? "text-zinc-500" : "text-zinc-400"
+                      }`}
+                    >
+                      {busy ? "Running Git operation…" : loading ? "Refreshing…" : notice}
+                    </p>
+                    {busy && (
+                      <button
+                        onClick={() => activeRepo?.store.cancel()}
+                        title="Cancel this Git operation"
+                        className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-zinc-400 hover:bg-[#1e1e1e] hover:text-zinc-200"
+                      >
+                        Cancel
+                      </button>
+                    )}
+                  </div>
                 )}
 
                 {recovery && (

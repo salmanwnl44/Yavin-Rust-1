@@ -57,6 +57,97 @@ pub struct StashLocks(pub Mutex<HashMap<String, Arc<Mutex<()>>>>);
 #[derive(Default)]
 pub struct NetworkLocks(pub Mutex<HashMap<String, Arc<Mutex<()>>>>);
 
+/// One registered, cancellable Git operation: which repository it belongs to (so
+/// `git_close_repo` can cancel every job still running against a repository being
+/// closed) and the flag `acquire_cancellable`/`capture` poll.
+pub(crate) struct JobEntry {
+    repo_id: String,
+    cancel: Arc<AtomicBool>,
+}
+
+/// Every currently in-flight (or not-yet-started) cancellable Git operation, keyed by
+/// an id the caller chooses -- mirrors `workbench::Jobs`, the identical pattern
+/// already shipped for search cancellation.
+#[derive(Default)]
+pub struct GitJobs(pub Mutex<HashMap<String, JobEntry>>);
+
+/// A small, purely defensive cap (mirroring `workbench::Jobs`'s own limit) against
+/// the one edge case that could otherwise leak entries unboundedly: a cancel call for
+/// an id that never goes on to register a real operation (see `cancel_job`). Ordinary
+/// concurrent-operation counts never approach this.
+const MAX_GIT_JOBS: usize = 64;
+
+/// Registers `id` as running against `repo_id` and returns the flag to pass through
+/// `exec_on`. If `id` was already pre-cancelled (see `cancel_job`), reuses that same
+/// already-`true` flag instead of creating a fresh one -- whichever call, register or
+/// cancel, happens to arrive first wins the map slot, closing the register/cancel
+/// ordering race without needing the two to coordinate explicitly.
+fn register_job(jobs: &GitJobs, id: &str, repo_id: &str) -> Result<Arc<AtomicBool>, String> {
+    let mut map = jobs.0.lock().map_err(|e| e.to_string())?;
+    if !map.contains_key(id) && map.len() >= MAX_GIT_JOBS {
+        return Err("Too many Git operations in flight; wait for one to finish".into());
+    }
+    Ok(map
+        .entry(id.to_string())
+        .or_insert_with(|| JobEntry {
+            repo_id: repo_id.to_string(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        })
+        .cancel
+        .clone())
+}
+
+/// Cancels the job registered under `id`, or -- if it hasn't registered yet, a
+/// narrow but real race between this call and `register_job`'s, since they're
+/// separate, concurrently-processed command invocations with no ordering guarantee
+/// between them -- pre-creates an already-cancelled entry for it to find. The
+/// repository this pre-cancelled entry belongs to is unknown at this point; that's
+/// fine, because the only consumer that needs `repo_id` (`cancel_jobs_for_repo`) only
+/// ever acts on already-registered jobs, never a pre-cancelled placeholder.
+fn cancel_job(jobs: &GitJobs, id: &str) -> Result<(), String> {
+    let mut map = jobs.0.lock().map_err(|e| e.to_string())?;
+    match map.get(id) {
+        Some(entry) => entry.cancel.store(true, Ordering::Relaxed),
+        None => {
+            map.insert(
+                id.to_string(),
+                JobEntry {
+                    repo_id: String::new(),
+                    cancel: Arc::new(AtomicBool::new(true)),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Cancels every job currently registered against `repo_id` -- used when that
+/// repository is closed, so a running operation doesn't keep a `git` process alive
+/// against a worktree Yavin no longer considers open.
+fn cancel_jobs_for_repo(jobs: &GitJobs, repo_id: &str) -> Result<(), String> {
+    let map = jobs.0.lock().map_err(|e| e.to_string())?;
+    for entry in map.values().filter(|entry| entry.repo_id == repo_id) {
+        entry.cancel.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Removes `id`'s entry from `jobs` on drop -- constructed right after
+/// `register_job` succeeds, so the entry is removed on every exit path (success,
+/// error, or early return) without relying on a manually-placed cleanup call that a
+/// future change to `git_exec` could accidentally skip.
+struct JobGuard<'a> {
+    jobs: &'a GitJobs,
+    id: String,
+}
+impl Drop for JobGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.jobs.0.lock() {
+            map.remove(&self.id);
+        }
+    }
+}
+
 /// Finds (or creates) the shared lock for `key` in `map`, without holding `map`'s own
 /// mutex any longer than the lookup itself -- the returned `Arc` is what callers
 /// actually wait on.
@@ -273,8 +364,15 @@ pub async fn git_open_repo(state: State<'_, Repos>, path: String) -> Result<Repo
 }
 
 #[tauri::command]
-pub fn git_close_repo(state: State<'_, Repos>, repo_id: String) -> Result<(), String> {
+pub fn git_close_repo(
+    state: State<'_, Repos>,
+    jobs: State<'_, GitJobs>,
+    repo_id: String,
+) -> Result<(), String> {
     state.0.lock().map_err(|e| e.to_string())?.remove(&repo_id);
+    // A running (or lock-queued) operation against this worktree should not keep a
+    // `git` process alive once Yavin no longer considers the repository open.
+    cancel_jobs_for_repo(&jobs, &repo_id)?;
     Ok(())
 }
 
@@ -537,24 +635,50 @@ fn exec_on(
     run_with_input(&repo.root, &args_ref, input, cancel)
 }
 
+// Every extra parameter here is a distinct piece of Tauri-managed state
+// (`State<'_, T>`), which is how Tauri commands receive them -- not something a
+// smaller helper struct could reduce without fighting that convention.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn git_exec(
     state: State<'_, Repos>,
     stash_locks: State<'_, StashLocks>,
     network_locks: State<'_, NetworkLocks>,
+    jobs: State<'_, GitJobs>,
     repo_id: String,
     args: Vec<String>,
     input: Option<String>,
+    id: String,
 ) -> Result<ToolOutput, String> {
     let repo = repo_of(&state, &repo_id)?;
     let scope_lock = resolve_scope_lock(&stash_locks, &network_locks, &repo.repository_id, &args)?;
-    // Real per-operation cancellation (an id-addressable flag a UI Cancel button can
-    // flip) lands in the next phase; this flag is never set, matching today's
-    // behavior exactly while the locking above is already fully in place.
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = register_job(&jobs, &id, &repo_id)?;
+    // Removes this job's entry on every exit path below, including the `?` on the
+    // next line -- `jobs` (a `State`, not `'static`) never crosses the
+    // `spawn_blocking` boundary; only the `cancel` flag clone does.
+    let _guard = JobGuard {
+        jobs: &jobs,
+        id: id.clone(),
+    };
     tauri::async_runtime::spawn_blocking(move || exec_on(&repo, scope_lock, &args, input, cancel))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn git_cancel(jobs: State<'_, GitJobs>, id: String) -> Result<(), String> {
+    cancel_job(&jobs, &id)
+}
+
+/// Cancels every operation currently registered against one repository -- what the
+/// Source Control panel's per-worktree Cancel button actually needs: since
+/// `RepoStore` only ever has one operation in flight at a time, "cancel this
+/// repository's operations" and "cancel the current operation" are the same thing,
+/// without TypeScript needing to track or thread individual operation ids through
+/// every `Repository` method just to address one back to `git_cancel`.
+#[tauri::command]
+pub fn git_cancel_repo(jobs: State<'_, GitJobs>, repo_id: String) -> Result<(), String> {
+    cancel_jobs_for_repo(&jobs, &repo_id)
 }
 
 #[cfg(test)]
@@ -998,5 +1122,106 @@ mod tests {
         // `git stash push` at all, which the fast, immediate Cancelled result above
         // already proves (it never touched the held lock).
         let _ = stash_list_after;
+    }
+
+    #[test]
+    fn register_job_returns_a_fresh_unset_flag_and_reuses_it_on_a_second_call() {
+        let jobs = GitJobs::default();
+        let flag = register_job(&jobs, "op-1", "/work").unwrap();
+        assert!(!flag.load(Ordering::Relaxed));
+
+        // The same id registering again (e.g. a stale retry) gets the same flag, not
+        // a fresh one that would forget an already-in-flight cancellation.
+        let same_flag = register_job(&jobs, "op-1", "/work").unwrap();
+        flag.store(true, Ordering::Relaxed);
+        assert!(same_flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cancel_job_flips_the_flag_of_an_already_registered_job() {
+        let jobs = GitJobs::default();
+        let flag = register_job(&jobs, "op-1", "/work").unwrap();
+        assert!(!flag.load(Ordering::Relaxed));
+        cancel_job(&jobs, "op-1").unwrap();
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cancelling_before_registration_pre_cancels_the_operation() {
+        let jobs = GitJobs::default();
+        // The cancel arrives first -- a real, if narrow, race between two separate
+        // command invocations with no ordering guarantee between them.
+        cancel_job(&jobs, "op-1").unwrap();
+        let flag = register_job(&jobs, "op-1", "/work").unwrap();
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "registering after a pre-cancel must find the operation already cancelled"
+        );
+    }
+
+    #[test]
+    fn cancel_jobs_for_repo_only_cancels_jobs_registered_against_that_repository() {
+        let jobs = GitJobs::default();
+        let flag_a = register_job(&jobs, "op-a", "/work-a").unwrap();
+        let flag_b = register_job(&jobs, "op-b", "/work-b").unwrap();
+        cancel_jobs_for_repo(&jobs, "/work-a").unwrap();
+        assert!(flag_a.load(Ordering::Relaxed));
+        assert!(!flag_b.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn job_guard_removes_its_entry_on_drop() {
+        let jobs = GitJobs::default();
+        register_job(&jobs, "op-1", "/work").unwrap();
+        assert!(jobs.0.lock().unwrap().contains_key("op-1"));
+        {
+            let _guard = JobGuard {
+                jobs: &jobs,
+                id: "op-1".to_string(),
+            };
+        }
+        assert!(
+            !jobs.0.lock().unwrap().contains_key("op-1"),
+            "the entry must be gone once the guard drops, without a manual removal call"
+        );
+    }
+
+    #[test]
+    fn a_git_operation_cancelled_through_the_real_job_registry_is_actually_stopped() {
+        let (dir, _git) = fixture();
+        let repository_id = discover_common_dir(&dir)
+            .map(|p| clean_path_str(&p))
+            .unwrap();
+        let jobs = GitJobs::default();
+        // The exact flag `git_exec` would register and `git_cancel` would flip.
+        let cancel = register_job(&jobs, "op-1", &repository_id).unwrap();
+        assert!(
+            !jobs.0.lock().unwrap().is_empty(),
+            "sanity: the job was registered"
+        );
+
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancel_job(&jobs, "op-1").unwrap();
+        });
+
+        // A long-running command in the same shape `run_with_input` spawns internally
+        // (via `capture`), so this exercises real process termination end-to-end,
+        // through the exact flag the job registry hands out.
+        let mut sleepy = Command::new("cmd");
+        sleepy.args(["/C", "timeout", "/t", "30"]);
+        let started = Instant::now();
+        let result = capture(sleepy, None, flag);
+        let elapsed = started.elapsed();
+
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(result.unwrap_err(), "Cancelled");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "took {elapsed:?} -- cancellation through the real job registry must stop \
+             the process promptly, not wait for it to run its full course"
+        );
     }
 }

@@ -37,3 +37,15 @@ test("Git failures are explained without hiding what Git said", () => {
   assert.equal(describeGitError("Git: some unmapped failure"), "some unmapped failure");
   assert.equal(describeGitError(""), "The Git operation failed.");
 });
+
+test("cancellation is reported as-is, never run through Git's own error phrasing", () => {
+  assert.equal(describeGitError("Cancelled"), "Cancelled");
+  assert.equal(describeGitError(new Error("Cancelled")), "Cancelled");
+});
+
+test("a missing Git executable is explained instead of showing a raw OS error", () => {
+  assert.match(
+    describeGitError("Cannot start tool: The system cannot find the file specified. (os error 2)"),
+    /Git was not found/,
+  );
+});

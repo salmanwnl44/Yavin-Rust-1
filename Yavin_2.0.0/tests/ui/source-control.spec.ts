@@ -96,7 +96,29 @@ async function panel(page: Page, scenario: Partial<Scenario> = {}) {
             if (action === "branches") return ok(state.branches);
             if (action === "remotes") return ok(state.remotes);
             if (action === "symbolic-ref") return ok("main\n");
+            // A "fetch" hangs until either the test resolves it or git_cancel_repo
+            // is called, simulating the real Rust cancellation path rejecting an
+            // in-flight/lock-queued call with the literal string "Cancelled".
+            if (
+              action === "fetch" &&
+              (window as unknown as { __holdFetch?: boolean }).__holdFetch
+            ) {
+              return new Promise((_resolve, reject) => {
+                (
+                  window as unknown as { __pendingFetch?: (reason: unknown) => void }
+                ).__pendingFetch = reject;
+              });
+            }
             return ok("");
+          }
+          if (command === "git_cancel_repo") {
+            const pending = (window as unknown as { __pendingFetch?: (reason: unknown) => void })
+              .__pendingFetch;
+            if (pending) {
+              pending("Cancelled");
+              (window as unknown as { __pendingFetch?: unknown }).__pendingFetch = undefined;
+            }
+            return null;
           }
           return null;
         },
@@ -290,4 +312,33 @@ test("unsaved editors block every action that rewrites the working tree", async 
   await expect(region.getByRole("button", { name: "Rebase" })).toBeDisabled();
   await expect(region.getByRole("button", { name: "Merge" })).toBeDisabled();
   await expect(region.getByLabel("Switch branch")).toBeDisabled();
+});
+
+test("a Cancel button stops a running Git operation and reports it distinctly from a failure", async ({
+  page,
+}) => {
+  const region = await panel(page);
+  await page.evaluate(() => {
+    (window as unknown as { __holdFetch: boolean }).__holdFetch = true;
+  });
+  await drawer(page);
+  await region.getByRole("button", { name: "Fetch" }).click();
+
+  const status = region.getByRole("status").filter({ hasText: /Running Git operation|Cancel/ });
+  await expect(status).toContainText("Running Git operation");
+  const cancel = region.getByRole("button", { name: "Cancel", exact: true });
+  await expect(cancel).toBeVisible();
+  await cancel.click();
+
+  // Cancellation is reported plainly, not styled or worded like a real failure.
+  await expect(status).toContainText("Cancelled");
+  await expect(region.getByRole("button", { name: "Cancel", exact: true })).toHaveCount(0);
+
+  const cancelCalls = await page.evaluate(() =>
+    (
+      window as unknown as { __calls: { command: string; args: Record<string, unknown> }[] }
+    ).__calls.filter((c) => c.command === "git_cancel_repo"),
+  );
+  expect(cancelCalls).toHaveLength(1);
+  expect(cancelCalls[0].args.repoId).toBe("/work");
 });

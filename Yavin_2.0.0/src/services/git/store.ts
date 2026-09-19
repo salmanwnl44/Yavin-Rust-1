@@ -31,6 +31,9 @@ export interface RepoSnapshot {
   loading: boolean;
   busy: boolean;
   notice: string;
+  /** Set when `notice` is the current operation being cancelled, not a real
+   * failure -- the UI renders this distinctly (informational, not an error). */
+  cancelled: boolean;
 }
 
 const initialSnapshot: RepoSnapshot = {
@@ -43,6 +46,7 @@ const initialSnapshot: RepoSnapshot = {
   loading: false,
   busy: false,
   notice: "",
+  cancelled: false,
 };
 
 /**
@@ -123,7 +127,7 @@ export class RepoStore {
       return false;
     }
     this.inFlight = true;
-    this.patch({ busy: true, notice: "" });
+    this.patch({ busy: true, notice: "", cancelled: false });
     this.generation++;
     let ok = false;
     try {
@@ -131,7 +135,11 @@ export class RepoStore {
       this.patch({ notice: output.trim() || "Operation completed." });
       ok = true;
     } catch (error) {
-      this.patch({ notice: String(error) });
+      // Rust's cancellation path (see the Git Operation Engine plan) reports this
+      // exact string, never wrapped in Git's own stderr phrasing -- distinguishing
+      // it lets the UI show "Cancelled" as informational rather than as a failure.
+      const message = String(error);
+      this.patch({ notice: message, cancelled: message === "Cancelled" });
     } finally {
       this.inFlight = false;
       this.patch({ busy: false });
@@ -140,8 +148,20 @@ export class RepoStore {
     return ok;
   }
 
+  /**
+   * Stops whatever operation `guarded()` currently has running or lock-queued for
+   * this worktree. Since only one can ever be in flight per store (`inFlight`
+   * above), there is never more than one candidate to address -- no operation id
+   * needs to be tracked here at all; `Repository.cancel()` addresses it by
+   * repository on the Rust side instead (see the Git Operation Engine plan).
+   */
+  cancel(): void {
+    if (!this.inFlight) return;
+    void this.repository.cancel().catch((error) => this.setNotice(String(error)));
+  }
+
   setNotice(notice: string): void {
-    this.patch({ notice });
+    this.patch({ notice, cancelled: false });
   }
 
   dispose(): void {

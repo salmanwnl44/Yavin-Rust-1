@@ -1,4 +1,4 @@
-import { closeRepo, gitExec, openRepo, repoState } from "./backend.ts";
+import { cancelRepoOperations, closeRepo, gitExec, openRepo, repoState } from "./backend.ts";
 import type { GitOperation, RepoInfo } from "./backend.ts";
 import { describeGitError } from "./parsers/errors.ts";
 import { buildPatch, parseUnifiedDiff } from "./diffHunks.ts";
@@ -44,10 +44,17 @@ export class Repository {
     return closeRepo(this.repoId);
   }
 
+  /** Stops whatever Git operation is currently running or lock-queued for this
+   * worktree -- one still-spawned `git` process is actually killed, not merely
+   * ignored; one still-queued operation never acquires its lock or spawns at all. */
+  cancel(): Promise<void> {
+    return cancelRepoOperations(this.repoId);
+  }
+
   private async run(args: string[]): Promise<string> {
     let output;
     try {
-      output = await gitExec(this.repoId, args);
+      output = await gitExec(this.repoId, args, crypto.randomUUID());
     } catch (error) {
       throw new Error(describeGitError(error));
     }
@@ -57,7 +64,7 @@ export class Repository {
 
   private async ok(args: string[]): Promise<boolean> {
     try {
-      return (await gitExec(this.repoId, args)).code === 0;
+      return (await gitExec(this.repoId, args, crypto.randomUUID())).code === 0;
     } catch {
       return false;
     }
@@ -66,7 +73,7 @@ export class Repository {
   private async runWithInput(args: string[], input: string): Promise<string> {
     let output;
     try {
-      output = await gitExec(this.repoId, args, input);
+      output = await gitExec(this.repoId, args, crypto.randomUUID(), input);
     } catch (error) {
       throw new Error(describeGitError(error));
     }
@@ -209,7 +216,7 @@ export class Repository {
       throw new Error("Unknown remote. Add one with git remote add first.");
     let head;
     try {
-      head = await gitExec(this.repoId, ["symbolic-ref", "--short", "HEAD"]);
+      head = await gitExec(this.repoId, ["symbolic-ref", "--short", "HEAD"], crypto.randomUUID());
     } catch (error) {
       throw new Error(describeGitError(error));
     }

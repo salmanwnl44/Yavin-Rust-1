@@ -56,6 +56,10 @@ const failures: [RegExp, string][] = [
     /hook .* (failed|declined)|pre-commit|pre-push/i,
     "A Git hook rejected the operation. Fix what the hook reported, then try again — Yavin never bypasses hooks.",
   ],
+  [
+    /Cannot start tool/i,
+    "Git was not found. Check that it is installed and available on your PATH, then try again.",
+  ],
 ];
 
 /**
@@ -68,6 +72,10 @@ export function describeGitError(error: unknown): string {
     .replace(/^Git:\s*/, "")
     .trim();
   if (!raw) return "The Git operation failed.";
+  // Cancellation (see the Git Operation Engine plan) is reported as this exact,
+  // un-prefixed string -- never Git's own stderr -- so it's recognized before the
+  // regex table and returned completely unchanged, distinct from every real failure.
+  if (raw === "Cancelled") return raw;
   const match = failures.find(([pattern]) => pattern.test(raw));
   return match ? `${match[1]}\n\nGit said: ${raw}` : raw;
 }
