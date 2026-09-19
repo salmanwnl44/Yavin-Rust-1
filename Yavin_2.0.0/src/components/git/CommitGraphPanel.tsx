@@ -332,6 +332,11 @@ export function CommitGraphPanel({
           {!snapshot.hasMore && nodes.length === 0 && !snapshot.loading && (
             <p className="p-4 text-center text-zinc-500 text-[11px]">No commits yet.</p>
           )}
+          {!snapshot.hasMore && snapshot.shallow && (
+            <p className="p-2 text-center text-amber-400/80 text-[10.5px]">
+              History may be incomplete (this is a shallow clone).
+            </p>
+          )}
         </div>
       </div>
 

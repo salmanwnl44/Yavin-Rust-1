@@ -99,6 +99,14 @@ export class Repository {
     return this.run(["rev-parse", "--git-common-dir"]);
   }
 
+  /** Whether this repository's history has been truncated by a shallow clone --
+   * so a full page load-more reaching the end doesn't get silently presented as
+   * "this is really the first commit" when it's actually the shallow boundary. */
+  async isShallow(): Promise<boolean> {
+    const output = await this.run(["rev-parse", "--is-shallow-repository"]);
+    return output.trim() === "true";
+  }
+
   /** Raw `git worktree list --porcelain` output; see `parsers/worktree.ts` for parsing. */
   listWorktrees(): Promise<string> {
     return this.run(["worktree", "list", "--porcelain"]);

@@ -42,6 +42,7 @@ const EMPTY_GRAPH_SNAPSHOT: GraphSnapshot = {
   loading: false,
   hasMore: false,
   notice: "",
+  shallow: false,
 };
 const NO_GRAPH_SNAPSHOT = () => EMPTY_GRAPH_SNAPSHOT;
 

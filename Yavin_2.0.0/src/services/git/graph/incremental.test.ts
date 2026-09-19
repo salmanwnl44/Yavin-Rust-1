@@ -26,6 +26,7 @@ function fakeRepository(pages: string[][]): Repository {
       call++;
       return page.join("\n");
     },
+    isShallow: async () => false,
   } as unknown as Repository;
 }
 
@@ -72,6 +73,7 @@ test("a failed page surfaces its error without crashing the loader", async () =>
     graphLog: async () => {
       throw new Error("Git: fatal: bad revision");
     },
+    isShallow: async () => false,
   } as unknown as Repository);
   await loader.loadMore();
   assert.match(loader.getSnapshot().notice, /bad revision/);
@@ -107,6 +109,7 @@ test("reset racing an in-flight loadMore discards the stale page instead of corr
       }
       return [line("fresh-head")].join("\n");
     },
+    isShallow: async () => false,
   } as unknown as Repository;
   const loader = new GraphLoader(repository);
 
@@ -121,6 +124,40 @@ test("reset racing an in-flight loadMore discards the stale page instead of corr
     loader.getSnapshot().commits.map((c) => c.fullHash),
     ["fresh-head"],
   );
+});
+
+test("isShallow is checked once, on the first page, and never re-queried on later pages or resets", async () => {
+  const fullPage = Array.from({ length: GRAPH_PAGE_SIZE }, (_, i) => line(`full-${i}`));
+  const shortPage = [line("last")];
+  let shallowCalls = 0;
+  let call = 0;
+  const repository = {
+    graphLog: async () => {
+      const page = [fullPage, shortPage, shortPage][call] ?? [];
+      call++;
+      return page.join("\n");
+    },
+    isShallow: async () => {
+      shallowCalls++;
+      return true;
+    },
+  } as unknown as Repository;
+  const loader = new GraphLoader(repository);
+
+  await loader.loadMore();
+  assert.equal(loader.getSnapshot().shallow, true);
+  assert.equal(shallowCalls, 1);
+
+  await loader.loadMore();
+  assert.equal(shallowCalls, 1, "a later page must not re-check shallow-ness");
+
+  await loader.reset();
+  assert.equal(
+    loader.getSnapshot().shallow,
+    true,
+    "shallow-ness must survive a reset, not revert to the default",
+  );
+  assert.equal(shallowCalls, 1, "a reset must not re-check shallow-ness either");
 });
 
 test("dispose stops further notifications", async () => {

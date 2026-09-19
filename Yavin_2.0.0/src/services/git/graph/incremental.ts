@@ -12,6 +12,10 @@ export interface GraphSnapshot {
   loading: boolean;
   hasMore: boolean;
   notice: string;
+  /** Whether this repository's history has been truncated by a shallow clone --
+   * checked once, on the first page load, since a repository's shallow-ness cannot
+   * change without an explicit deepen operation Yavin doesn't currently expose. */
+  shallow: boolean;
 }
 
 const EMPTY_LAYOUT: GraphLayout = { nodes: [], edges: [], laneCount: 0 };
@@ -32,10 +36,12 @@ export class GraphLoader {
     loading: false,
     hasMore: true,
     notice: "",
+    shallow: false,
   };
   private listeners = new Set<() => void>();
   private loadingMore = false;
   private disposed = false;
+  private shallowChecked = false;
   // Bumped by reset() so a loadMore() that was already in flight -- and whose
   // `skip`/accumulated commits are now stale -- discards its result on resolution
   // instead of appending onto the freshly-cleared snapshot.
@@ -69,12 +75,16 @@ export class GraphLoader {
     // rather than leaving it held by a request whose result is about to be discarded.
     this.generation++;
     this.loadingMore = false;
+    // shallow/shallowChecked deliberately survive a reset -- a repository's
+    // shallow-ness doesn't change just because its history is being reloaded, and
+    // there is no deepen operation Yavin exposes that would invalidate it.
     this.snapshot = {
       commits: [],
       layout: EMPTY_LAYOUT,
       loading: false,
       hasMore: true,
       notice: "",
+      shallow: this.snapshot.shallow,
     };
     for (const listener of this.listeners) listener();
     await this.loadMore();
@@ -87,7 +97,12 @@ export class GraphLoader {
     this.patch({ loading: true, notice: "" });
     try {
       const skip = this.snapshot.commits.length;
-      const raw = await this.repository.graphLog(skip, GRAPH_PAGE_SIZE);
+      const checkShallow = !this.shallowChecked;
+      if (checkShallow) this.shallowChecked = true;
+      const [raw, shallow] = await Promise.all([
+        this.repository.graphLog(skip, GRAPH_PAGE_SIZE),
+        checkShallow ? this.repository.isShallow() : Promise.resolve(this.snapshot.shallow),
+      ]);
       if (generation !== this.generation) return;
       const page = parseGraphLog(raw);
       const commits = [...this.snapshot.commits, ...page];
@@ -96,6 +111,7 @@ export class GraphLoader {
         layout: buildCommitGraph(commits),
         hasMore: page.length === GRAPH_PAGE_SIZE,
         loading: false,
+        shallow,
       });
     } catch (error) {
       if (generation !== this.generation) return;

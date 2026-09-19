@@ -15,6 +15,8 @@ interface Scenario {
   numstat?: Record<string, string[]>;
   /** hash -> unified-diff text for commitFileDiff() lookups, keyed loosely by hash only. */
   fileDiffs?: Record<string, string>;
+  /** Simulates `git rev-parse --is-shallow-repository`'s report. */
+  shallow?: boolean;
 }
 
 async function panel(page: Page, scenario: Scenario) {
@@ -53,6 +55,8 @@ async function panel(page: Page, scenario: Scenario) {
             if (argv[0] === "status") return ok("");
             if (argv[0] === "for-each-ref") return ok("");
             if (argv[0] === "remote") return ok("");
+            if (argv[0] === "rev-parse" && argv.includes("--is-shallow-repository"))
+              return ok(s.shallow ? "true" : "false");
             if (argv[0] === "log" && argv.includes("--topo-order")) {
               const skipIndex = argv.indexOf("--skip");
               const nIndex = argv.indexOf("-n");
@@ -181,6 +185,27 @@ test("a repository with more history than one page offers to load older commits"
   await graph.getByText("Load older commits").click();
   await expect.poll(() => logCallCount(page)).toBeGreaterThan(before);
   await expect(graph.getByText("Load older commits")).toHaveCount(0);
+});
+
+test("a shallow clone's exhausted history says so instead of looking complete", async ({
+  page,
+}) => {
+  const graph = await panel(page, {
+    commits: [{ hash: "c1", subject: "Only commit this clone has" }],
+    shallow: true,
+  });
+  await expect(graph.getByText(/History may be incomplete/)).toBeVisible();
+  await expect(graph.getByText("Load older commits")).toHaveCount(0);
+});
+
+test("a normal (non-shallow) repository's exhausted history shows no incomplete-history notice", async ({
+  page,
+}) => {
+  const graph = await panel(page, {
+    commits: [{ hash: "c1", subject: "Only commit" }],
+    shallow: false,
+  });
+  await expect(graph.getByText(/History may be incomplete/)).toHaveCount(0);
 });
 
 test("closing the graph returns to the editor", async ({ page }) => {

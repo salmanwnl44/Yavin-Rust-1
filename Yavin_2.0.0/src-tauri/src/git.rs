@@ -586,6 +586,7 @@ const REV_PARSE: &[FlagRule] = &[
     flag("--verify"),
     flag("--absolute-git-dir"),
     flag("--git-common-dir"),
+    flag("--is-shallow-repository"),
 ];
 const CAT_FILE: &[FlagRule] = &[flag("--filters")];
 const DIFF: &[FlagRule] = &[
@@ -2260,5 +2261,61 @@ mod tests {
             "unchanged lines must not appear as removed: {}",
             output.stdout
         );
+    }
+
+    #[test]
+    fn is_shallow_repository_distinguishes_a_real_shallow_clone_from_a_normal_one() {
+        let (origin_dir, git) = fixture();
+        fs::write(origin_dir.join("a.txt"), "two\n").unwrap();
+        assert!(git(&["commit", "-qam", "second commit"]));
+
+        let normal_clone = temp_dir();
+        assert!(Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                origin_dir.to_str().unwrap(),
+                normal_clone.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let shallow_clone = temp_dir();
+        // Git ignores --depth for a plain local-path clone ("--depth is ignored in
+        // local clones; use file:// instead") -- verified empirically -- so a real
+        // shallow clone requires the file:// URL form specifically.
+        assert!(Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                &format!("file://{}", origin_dir.to_str().unwrap().replace('\\', "/")),
+                shallow_clone.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success());
+
+        let normal_repo = open(&normal_clone);
+        let shallow_repo = open(&shallow_clone);
+        let normal_result = exec(
+            &normal_repo,
+            &args(&["rev-parse", "--is-shallow-repository"]),
+            None,
+        )
+        .unwrap();
+        let shallow_result = exec(
+            &shallow_repo,
+            &args(&["rev-parse", "--is-shallow-repository"]),
+            None,
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&origin_dir);
+        let _ = fs::remove_dir_all(&normal_clone);
+        let _ = fs::remove_dir_all(&shallow_clone);
+
+        assert_eq!(normal_result.stdout.trim(), "false");
+        assert_eq!(shallow_result.stdout.trim(), "true");
     }
 }
