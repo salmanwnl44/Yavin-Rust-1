@@ -36,6 +36,51 @@ export interface RepoSnapshot {
   cancelled: boolean;
 }
 
+/** One of `refresh()`'s independently-fetchable pieces of worktree state. */
+type RefreshField = "entries" | "branch" | "branches" | "remotes" | "stashes" | "operationInProgress";
+
+const ALL_REFRESH_FIELDS: readonly RefreshField[] = [
+  "entries",
+  "branch",
+  "branches",
+  "remotes",
+  "stashes",
+  "operationInProgress",
+];
+
+/**
+ * Which of `refresh()`'s six independent fetches can actually go stale after each
+ * `kind` of mutation -- derived from the Git Operation Engine plan's Section H
+ * matrix (which ref category each operation actually touches), not "run everything,
+ * always". `remotes` never appears here: nothing in the current Git API adds or
+ * removes a remote, so nothing ever invalidates the name list. A `kind` with no
+ * entry here (a future mutation this table hasn't been taught about yet) falls back
+ * to a full refresh -- the safe default.
+ */
+const INVALIDATES: Readonly<Record<string, readonly RefreshField[]>> = {
+  stage: ["entries"],
+  unstage: ["entries"],
+  discard: ["entries"],
+  "stage-hunk": ["entries"],
+  "unstage-hunk": ["entries"],
+  "discard-hunk": ["entries"],
+  switch: ["entries", "branch"],
+  branch: ["entries", "branch", "branches"],
+  commit: ["entries", "branch", "operationInProgress"],
+  abort: ["entries", "branch", "operationInProgress"],
+  continue: ["entries", "branch", "operationInProgress"],
+  stash: ["entries", "stashes"],
+  stashApply: ["entries", "stashes"],
+  stashPop: ["entries", "stashes"],
+  stashDrop: ["stashes"],
+  fetch: ["branch"],
+  pull: ["entries", "branch", "operationInProgress"],
+  pullRebase: ["entries", "branch", "operationInProgress"],
+  pullMerge: ["entries", "branch", "operationInProgress"],
+  push: ["branch"],
+  publish: ["branch"],
+};
+
 const initialSnapshot: RepoSnapshot = {
   entries: [],
   branch: EMPTY_BRANCH,
@@ -86,29 +131,35 @@ export class RepoStore {
     this.onAnyChange?.();
   }
 
-  async refresh(): Promise<void> {
+  /**
+   * Re-fetches only `fields` (everything, by default -- used for the initial load
+   * and the panel's periodic/focus-triggered poll). `guarded()` passes the narrower
+   * set `INVALIDATES` implies for its `kind`, so e.g. staging one file spawns one
+   * `git` process here instead of five.
+   */
+  async refresh(fields: readonly RefreshField[] = ALL_REFRESH_FIELDS): Promise<void> {
     const current = ++this.generation;
+    const wants = (field: RefreshField) => fields.includes(field);
     this.patch({ loading: true });
     try {
       const [status, branchInfo, branches, remotes, stashList, operationInProgress] =
         await Promise.all([
-          this.repository.status(),
-          this.repository.branchInfo(),
-          this.repository.branches(),
-          this.repository.remotes(),
-          this.repository.stashList(),
-          this.repository.state(),
+          wants("entries") ? this.repository.status() : undefined,
+          wants("branch") ? this.repository.branchInfo() : undefined,
+          wants("branches") ? this.repository.branches() : undefined,
+          wants("remotes") ? this.repository.remotes() : undefined,
+          wants("stashes") ? this.repository.stashList() : undefined,
+          wants("operationInProgress") ? this.repository.state() : undefined,
         ]);
       if (this.generation !== current) return;
-      this.patch({
-        entries: parseGitEntries(status, this.repository.root),
-        branch: parseBranch(branchInfo),
-        branches,
-        remotes,
-        stashes: parseStashList(stashList),
-        operationInProgress,
-        loading: false,
-      });
+      const next: Partial<RepoSnapshot> = { loading: false };
+      if (status !== undefined) next.entries = parseGitEntries(status, this.repository.root);
+      if (branchInfo !== undefined) next.branch = parseBranch(branchInfo);
+      if (branches !== undefined) next.branches = branches;
+      if (remotes !== undefined) next.remotes = remotes;
+      if (stashList !== undefined) next.stashes = parseStashList(stashList);
+      if (operationInProgress !== undefined) next.operationInProgress = operationInProgress;
+      this.patch(next);
     } catch (error) {
       if (this.generation !== current) return;
       this.patch({ notice: String(error), loading: false });
@@ -152,7 +203,7 @@ export class RepoStore {
     } finally {
       this.inFlight = false;
       this.patch({ busy: false });
-      await this.refresh();
+      await this.refresh(INVALIDATES[kind] ?? ALL_REFRESH_FIELDS);
     }
     return ok;
   }

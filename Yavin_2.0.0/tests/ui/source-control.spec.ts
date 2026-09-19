@@ -314,6 +314,51 @@ test("unsaved editors block every action that rewrites the working tree", async 
   await expect(region.getByLabel("Switch branch")).toBeDisabled();
 });
 
+test("staging a file only re-fetches status, not every sub-fetch a full refresh would run", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: " M a.ts\0" });
+  const before = {
+    status: await gitCalls(page, "status"),
+    branchInfo: await gitCalls(page, "branchInfo"),
+    branches: await gitCalls(page, "branches"),
+    remotes: await gitCalls(page, "remotes"),
+    state: await gitCalls(page, "state"),
+  };
+
+  await region.getByLabel("Stage /work/a.ts").click();
+  await expect.poll(() => gitCalls(page, "stage")).toBe(1);
+
+  await expect.poll(() => gitCalls(page, "status")).toBe(before.status + 1);
+  expect(await gitCalls(page, "branchInfo")).toBe(before.branchInfo);
+  expect(await gitCalls(page, "branches")).toBe(before.branches);
+  expect(await gitCalls(page, "remotes")).toBe(before.remotes);
+  expect(await gitCalls(page, "state")).toBe(before.state);
+});
+
+test("committing re-fetches status, branch and operation state, still skipping branches/remotes", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: "M  a.ts\0" });
+  const before = {
+    status: await gitCalls(page, "status"),
+    branchInfo: await gitCalls(page, "branchInfo"),
+    branches: await gitCalls(page, "branches"),
+    remotes: await gitCalls(page, "remotes"),
+    state: await gitCalls(page, "state"),
+  };
+
+  await region.getByLabel("Commit message").fill("a commit");
+  await region.getByRole("button", { name: /Commit Staged/ }).click();
+  await expect.poll(() => gitCalls(page, "commit")).toBe(1);
+
+  await expect.poll(() => gitCalls(page, "status")).toBe(before.status + 1);
+  await expect.poll(() => gitCalls(page, "branchInfo")).toBe(before.branchInfo + 1);
+  await expect.poll(() => gitCalls(page, "state")).toBe(before.state + 1);
+  expect(await gitCalls(page, "branches")).toBe(before.branches);
+  expect(await gitCalls(page, "remotes")).toBe(before.remotes);
+});
+
 test("a Cancel button stops a running Git operation and reports it distinctly from a failure", async ({
   page,
 }) => {
