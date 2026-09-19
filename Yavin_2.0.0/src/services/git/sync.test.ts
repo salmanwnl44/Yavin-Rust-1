@@ -95,25 +95,22 @@ test("switch/commit/abort/continue/skip never invalidate a sibling's RepoSnapsho
   }
 });
 
-test("GRAPH_RESETS is exactly fetch/pull/pullRebase/pullMerge/commit -- narrower than the pre-Module-3 behavior", () => {
-  // The pre-existing InlineGraphSection code reset unconditionally on Fetch, Pull,
-  // AND Push -- but push never adds a commit (it only moves a remote ref to match
-  // what's already local), so it is correctly excluded here. `commit` was added
-  // in Phase 6 (it grows this worktree's own branch's history by one).
+test("GRAPH_RESETS is every kind that adds a commit or moves HEAD -- and never push/publish", () => {
+  // Push never adds a commit (it only moves a remote ref to match what's already
+  // local), so it is excluded. `switch`/`abort` move HEAD, and the graph is
+  // HEAD-relative (`git log` with no revision).
   assert.deepEqual(
     [...GRAPH_RESETS].sort(),
-    ["commit", "fetch", "pull", "pullMerge", "pullRebase"].sort(),
+    ["abort", "commit", "fetch", "pull", "pullMerge", "pullRebase", "switch"].sort(),
   );
   assert.ok(!GRAPH_RESETS.has("push"));
   assert.ok(!GRAPH_RESETS.has("publish"));
 });
 
-test("GRAPH_RESETS never statically covers switch/branch/abort/stash/deleteBranch -- none of them can add a commit", () => {
+test("GRAPH_RESETS never covers branch-create/deleteBranch/stash -- HEAD stays on the same history", () => {
   for (const kind of [
-    "switch",
     "branch",
     "deleteBranch",
-    "abort",
     "stash",
     "stashApply",
     "stashPop",
@@ -145,7 +142,7 @@ function fakeWorktree(root: string): { entry: RepoEntry; refreshCalls: unknown[]
 
 test("WATCHER_INVALIDATES maps every event kind to the fields Section H's watcher-path table specifies", () => {
   const expected: Record<GitChangeEvent["kind"], { fields: readonly string[]; graphReset: boolean }> = {
-    head: { fields: ["entries", "branch"], graphReset: false },
+    head: { fields: ["entries", "branch"], graphReset: true },
     "operation-state": { fields: ["entries", "branch", "operationInProgress"], graphReset: false },
     refs: { fields: ["branches"], graphReset: true },
     remotes: { fields: ["branch"], graphReset: true },

@@ -141,8 +141,24 @@ export class RepoStore {
    * what's in flight (e.g. a full refresh while only `["entries"]` is pending)
    * simply runs as its own independent call, same as today.
    */
-  private inFlightRefresh: { fields: ReadonlySet<RefreshField>; promise: Promise<void> } | null =
-    null;
+  private inFlightRefresh: {
+    fields: ReadonlySet<RefreshField>;
+    promise: Promise<void>;
+    epoch: number;
+  } | null = null;
+  /**
+   * Bumped when a mutation starts and again when it finishes. A refresh may only be
+   * shared with an in-flight one from the same epoch: one that began before (or during)
+   * a mutation can have read pre-mutation state, so adopting it as the post-mutation
+   * refresh would leave the snapshot stale (reads run lock-free, so this overlap is real).
+   */
+  private mutationEpoch = 0;
+  /** Refreshes currently running; `loading` stays true until the last one settles, even
+   * when an older one is superseded and its result discarded. */
+  private activeRefreshes = 0;
+  /** The `notice` text a failed refresh produced, so a later success can clear exactly
+   * that text without wiping an operation's own message. */
+  private refreshError: string | null = null;
   /** Set on every successful `refresh()` completion, whatever triggered it --
    * read by `SourceControlPanel.tsx` to skip a redundant refresh right after
    * switching to a worktree whose cached snapshot is already fresh enough. */
@@ -181,11 +197,15 @@ export class RepoStore {
   async refresh(fields: readonly RefreshField[] = ALL_REFRESH_FIELDS): Promise<void> {
     const requested = new Set(fields);
     const inFlight = this.inFlightRefresh;
-    if (inFlight && isSubsetOf(requested, inFlight.fields)) {
+    if (
+      inFlight &&
+      inFlight.epoch === this.mutationEpoch &&
+      isSubsetOf(requested, inFlight.fields)
+    ) {
       return inFlight.promise;
     }
     const promise = this.doRefresh(fields);
-    this.inFlightRefresh = { fields: requested, promise };
+    this.inFlightRefresh = { fields: requested, promise, epoch: this.mutationEpoch };
     try {
       await promise;
     } finally {
@@ -196,7 +216,22 @@ export class RepoStore {
   private async doRefresh(fields: readonly RefreshField[]): Promise<void> {
     const current = ++this.generation;
     const wants = (field: RefreshField) => fields.includes(field);
+    this.activeRefreshes++;
     this.patch({ loading: true });
+    try {
+      await this.fetchAndApply(current, wants);
+    } finally {
+      this.activeRefreshes--;
+      // A superseded refresh discards its data, but must still hand `loading` back
+      // once nothing newer is running (the newer one may already have finished).
+      if (this.activeRefreshes === 0 && this.snapshot.loading) this.patch({ loading: false });
+    }
+  }
+
+  private async fetchAndApply(
+    current: number,
+    wants: (field: RefreshField) => boolean,
+  ): Promise<void> {
     try {
       const [status, branchInfo, branches, remotes, stashList, operationInProgress] =
         await Promise.all([
@@ -208,7 +243,12 @@ export class RepoStore {
           wants("operationInProgress") ? this.repository.state() : undefined,
         ]);
       if (this.generation !== current) return;
-      const next: Partial<RepoSnapshot> = { loading: false, stale: false };
+      const next: Partial<RepoSnapshot> = { stale: false };
+      // A notice that only reported this store's own failed refresh is obsolete now.
+      if (this.refreshError !== null && this.snapshot.notice === this.refreshError) {
+        next.notice = "";
+      }
+      this.refreshError = null;
       if (status !== undefined) next.entries = parseGitEntries(status, this.repository.root);
       if (branchInfo !== undefined) next.branch = parseBranch(branchInfo);
       if (branches !== undefined) next.branches = branches;
@@ -219,7 +259,8 @@ export class RepoStore {
       this.lastRefreshedAt = Date.now();
     } catch (error) {
       if (this.generation !== current) return;
-      this.patch({ notice: String(error), loading: false, stale: true });
+      this.refreshError = String(error);
+      this.patch({ notice: this.refreshError, stale: true });
     }
   }
 
@@ -246,6 +287,7 @@ export class RepoStore {
     this.inFlight = true;
     this.patch({ busy: true, notice: "", cancelled: false });
     this.generation++;
+    this.mutationEpoch++;
     let ok = false;
     try {
       const output = await operation();
@@ -259,6 +301,7 @@ export class RepoStore {
       this.patch({ notice: message, cancelled: message === "Cancelled" });
     } finally {
       this.inFlight = false;
+      this.mutationEpoch++;
       this.patch({ busy: false });
       await this.refresh(INVALIDATES[kind] ?? ALL_REFRESH_FIELDS);
     }

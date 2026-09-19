@@ -75,6 +75,7 @@ pub fn capture(
     // observed in that same tick: killing an already-exited child is a harmless
     // no-op, but reporting a real, successful exit as "Cancelled" would not be.
     let mut kill_reason: Option<&'static str> = None;
+    let mut killed = false;
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             break status;
@@ -84,11 +85,18 @@ pub fn capture(
             overflow.load(Ordering::Relaxed),
             start.elapsed() > Duration::from_secs(120),
         );
-        if kill_reason.is_some() {
-            let _ = child.kill();
+        if kill_reason.is_some() && !killed {
+            killed = true;
+            kill_tree(&mut child);
         }
         std::thread::sleep(poll_interval(start.elapsed()));
     };
+    // A cancelled or timed-out run has nothing worth waiting for. Joining the readers
+    // here waits for EOF on the pipes, which any surviving descendant (a network
+    // helper git spawned, say) keeps open -- a cancel measured at 40 s with one
+    // orphaned `git-remote-http`, all of it while the worktree/network locks stay
+    // held. The detached readers finish on their own when the pipes finally close.
+    outcome(kill_reason, overflow.load(Ordering::Relaxed))?;
     let bytes = reader
         .join()
         .map_err(|_| "Output reader failed")?
@@ -102,11 +110,10 @@ pub fn capture(
     }
     let truncated = overflow.load(Ordering::Relaxed);
     // `outcome` only ever sees `kill_reason` -- a value already fixed during the loop
-    // above -- never the live `cancel`/`overflow` flags directly. That is what makes
-    // it structurally impossible for a cancel flag flipping true *after* the process
-    // already finished (while these reader threads above are still being joined) to
-    // turn an otherwise-successful result into a reported cancellation: there is no
-    // code path left that re-reads the flag at this point.
+    // above -- never the live `cancel` flag. That is what makes it structurally
+    // impossible for a cancel flag flipping true *after* the process already finished
+    // to turn an otherwise-successful result into a reported cancellation. (Called
+    // once more here only because `truncated` is final once the readers are joined.)
     outcome(kill_reason, truncated)?;
     Ok(ToolOutput {
         stdout: String::from_utf8(bytes)
@@ -115,6 +122,27 @@ pub fn capture(
         code: status.code().unwrap_or(-1),
         truncated,
     })
+}
+
+/// Terminates the child and everything it started. `Child::kill()` maps to
+/// `TerminateProcess`, which ends only that one process: on Windows `git.exe` runs
+/// `git-remote-http`/`ssh`/hooks as children (and some installs put a launcher in
+/// front of the real `git.exe`), so killing just the parent leaves the network
+/// process alive and its pipes open. `taskkill /T` walks the tree.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .creation_flags(0x08000000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    // Still needed off Windows, and as a fallback if `taskkill` was unavailable.
+    let _ = child.kill();
 }
 
 /// How long to sleep between checks on a running process (or a lock being waited
@@ -229,6 +257,32 @@ mod tests {
         // Ok either way keeps the two functions independently correct.
         assert!(outcome(Some("truncated"), true).is_ok());
         assert!(outcome(Some("truncated"), false).is_ok());
+    }
+
+    /// The bug the final audit reproduced: killing only the direct child left a
+    /// descendant holding the output pipe, and `capture()` then waited for it (40 s
+    /// against a stalled `git-remote-http`). `ping` is a grandchild of `cmd` here, the
+    /// same shape as `git.exe` -> `git-remote-http`.
+    #[cfg(windows)]
+    #[test]
+    fn cancelling_does_not_wait_for_a_descendant_that_keeps_the_pipes_open() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::Relaxed);
+        });
+
+        let mut command = Command::new("cmd");
+        command.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
+        let start = Instant::now();
+        let result = capture(command, None, cancel);
+        assert_eq!(result.unwrap_err(), "Cancelled");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cancel took {:?}; it must not wait for the grandchild to exit",
+            start.elapsed()
+        );
     }
 
     /// A real, end-to-end proof that cancellation still actually terminates a

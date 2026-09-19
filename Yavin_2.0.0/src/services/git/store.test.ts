@@ -198,3 +198,71 @@ test("three simultaneous full-refresh calls (mutation completion, watcher, focus
   await Promise.all([fromMutation, fromWatcher, fromFocus]);
   assert.equal(store.getSnapshot().entries.length, 1);
 });
+
+test("a refresh already running when a mutation starts is not adopted as the post-mutation refresh", async () => {
+  const calls: string[] = [];
+  const resolvers: Array<(value: string) => void> = [];
+  const repo = fakeRepository(calls, {
+    status: () => new Promise<string>((resolve) => resolvers.push(resolve)),
+  });
+  const store = new RepoStore(repo);
+
+  const poll = store.refresh(["entries"]); // reads pre-mutation state
+  const staged = store.guarded("stage", false, async () => "");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(resolvers.length, 2, "the post-mutation refresh must run its own status()");
+
+  resolvers[0](" M a.ts\0"); // the older poll finishes late with pre-mutation data
+  resolvers[1]("M  a.ts\0"); // the post-mutation read
+  await Promise.all([poll, staged]);
+
+  const [entry] = store.getSnapshot().entries;
+  assert.equal(entry.index, "M", "the snapshot must reflect the state after the mutation");
+  assert.equal(store.getSnapshot().loading, false);
+});
+
+test("a superseded refresh never leaves loading stuck", async () => {
+  const calls: string[] = [];
+  const resolvers: Array<(value: string) => void> = [];
+  const repo = fakeRepository(calls, {
+    status: () => new Promise<string>((resolve) => resolvers.push(resolve)),
+  });
+  const store = new RepoStore(repo);
+
+  const poll = store.refresh(["entries"]);
+  const staged = store.guarded("stage", false, async () => "");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  resolvers[1]("M  a.ts\0"); // the newer refresh settles first
+  await staged;
+  resolvers[0](" M a.ts\0"); // the superseded one settles last and is discarded
+  await poll;
+
+  assert.equal(store.getSnapshot().loading, false);
+  assert.equal(store.getSnapshot().entries[0].index, "M");
+});
+
+test("a successful refresh clears the error text an earlier failed refresh left behind", async () => {
+  const calls: string[] = [];
+  let fail = true;
+  const repo = fakeRepository(calls, {
+    status: () => (fail ? Promise.reject(new Error("index.lock exists")) : Promise.resolve("")),
+  });
+  const store = new RepoStore(repo);
+
+  await store.refresh(["entries"]);
+  assert.match(store.getSnapshot().notice, /index\.lock/);
+  assert.equal(store.getSnapshot().stale, true);
+
+  fail = false;
+  await store.refresh(["entries"]);
+  assert.equal(store.getSnapshot().notice, "");
+  assert.equal(store.getSnapshot().stale, false);
+});
+
+test("a refresh success does not erase an operation's own notice", async () => {
+  const calls: string[] = [];
+  const store = new RepoStore(fakeRepository(calls));
+  await store.guarded("stage", false, async () => "Staged 1 file");
+  await store.refresh(["entries"]);
+  assert.equal(store.getSnapshot().notice, "Staged 1 file");
+});

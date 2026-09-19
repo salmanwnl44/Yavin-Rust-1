@@ -88,6 +88,13 @@ export const GRAPH_RESETS: ReadonlySet<string> = new Set([
   "pullRebase",
   "pullMerge",
   "commit",
+  // `graphLog` runs `git log` with no revision, so the visible history is whatever
+  // HEAD reaches. `switch` moves HEAD to a different history; `abort` restores the
+  // original tip after an interrupted rebase/merge. Without a reset the graph kept
+  // showing the previous branch, and "Load older" (`--skip N` against the new HEAD)
+  // spliced two histories together. `branch` (create) leaves HEAD on the same commit.
+  "switch",
+  "abort",
 ]);
 
 /**
@@ -167,7 +174,8 @@ export async function guardedAffecting(
 export const WATCHER_INVALIDATES: Readonly<
   Record<GitChangeEvent["kind"], { fields: readonly RefreshField[]; graphReset: boolean }>
 > = {
-  head: { fields: ["entries", "branch"], graphReset: false },
+  // HEAD moved (an external switch/checkout/reset): the HEAD-relative graph is stale.
+  head: { fields: ["entries", "branch"], graphReset: true },
   "operation-state": {
     fields: ["entries", "branch", "operationInProgress"],
     graphReset: false,
