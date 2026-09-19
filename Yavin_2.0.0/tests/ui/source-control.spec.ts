@@ -35,15 +35,33 @@ async function panel(page: Page, scenario: Partial<Scenario> = {}) {
       children: null as unknown,
     });
     const ok = (stdout: string) => ({ stdout, stderr: "", code: 0, truncated: false });
+    // Real native-event plumbing (mirrors terminal.spec.ts's/multi-repo.spec.ts's
+    // proven pattern) -- needed to simulate a "workspace-changed" event from the
+    // general filesystem watcher.
+    const callbacks: Record<number, (event: unknown) => void> = {};
+    const listeners: Record<string, number[]> = {};
+    let nextId = 1;
     Object.assign(window, {
       __calls: calls,
       __scenario: state,
+      __emit: (event: string, payload: unknown) => {
+        for (const id of listeners[event] ?? []) callbacks[id]?.({ event, id, payload });
+      },
       isTauri: true,
       __TAURI_INTERNALS__: {
         metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
-        transformCallback: () => 1,
-        unregisterCallback: () => {},
+        transformCallback: (callback: (event: unknown) => void) => {
+          const id = nextId++;
+          callbacks[id] = callback;
+          return id;
+        },
+        unregisterCallback: (id: number) => delete callbacks[id],
         invoke: async (command: string, args: Record<string, unknown> = {}) => {
+          if (command === "plugin:event|listen") {
+            const event = args.event as string;
+            (listeners[event] ??= []).push(args.handler as number);
+            return nextId++;
+          }
           const actionOfInline = (cmd: string, a: Record<string, unknown>): string | null => {
             if (cmd === "git_repo_state") return "state";
             if (cmd !== "git_exec") return null;
@@ -143,6 +161,16 @@ async function panel(page: Page, scenario: Partial<Scenario> = {}) {
 async function drawer(page: Page) {
   await page.getByTitle("Branches and remotes").click();
 }
+
+const emit = (page: Page, event: string, payload: unknown) =>
+  page.evaluate(
+    ([name, data]) =>
+      (window as unknown as { __emit: (e: string, p: unknown) => void }).__emit(
+        name as string,
+        data,
+      ),
+    [event, payload] as const,
+  );
 
 const gitCalls = (page: Page, action: string) =>
   page.evaluate(
@@ -353,6 +381,33 @@ test("staging a file only re-fetches status, not every sub-fetch a full refresh 
 
   await region.getByLabel("Stage /work/a.ts").click();
   await expect.poll(() => gitCalls(page, "stage")).toBe(1);
+
+  await expect.poll(() => gitCalls(page, "status")).toBe(before.status + 1);
+  expect(await gitCalls(page, "branchInfo")).toBe(before.branchInfo);
+  expect(await gitCalls(page, "branches")).toBe(before.branches);
+  expect(await gitCalls(page, "remotes")).toBe(before.remotes);
+  expect(await gitCalls(page, "state")).toBe(before.state);
+});
+
+test("an external filesystem change only re-fetches status, not every sub-fetch a full refresh would run", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: " M a.ts\0" });
+  await expect(region.getByLabel("Commit message")).toBeVisible();
+  const before = {
+    status: await gitCalls(page, "status"),
+    branchInfo: await gitCalls(page, "branchInfo"),
+    branches: await gitCalls(page, "branches"),
+    remotes: await gitCalls(page, "remotes"),
+    state: await gitCalls(page, "state"),
+  };
+
+  // Simulates the general workspace watcher noticing a save/create/delete/
+  // rename it didn't itself trigger (an external edit, or the fallback path
+  // for Yavin's own writes) -- a plain filesystem change can only ever affect
+  // this worktree's own status entries, never branch/branches/remotes/
+  // stashes/operation state.
+  await emit(page, "workspace-changed", undefined);
 
   await expect.poll(() => gitCalls(page, "status")).toBe(before.status + 1);
   expect(await gitCalls(page, "branchInfo")).toBe(before.branchInfo);

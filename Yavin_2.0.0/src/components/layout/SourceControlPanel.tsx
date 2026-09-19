@@ -174,21 +174,31 @@ export function SourceControlPanel({
     callbacks.current.onEntries(workspaceSnapshot?.entries ?? []);
   }, [workspaceSnapshot?.entries]);
 
-  // `revision` bumps always force a refresh (it means something in the workspace
-  // genuinely changed). Switching *which worktree* is active does not, by itself,
-  // mean anything changed -- the target's own RepoStore has already been polled
-  // every 5s in the background (see the loop below) even while it wasn't active,
-  // so its cached snapshot is already at most that fresh. Skipping a redundant
-  // refresh right after a switch when that cache is still fresh enough avoids an
-  // extra round of `git` processes without ever showing staler data than the
-  // existing 5s poll already tolerates elsewhere.
+  // `revision` bumps always force a refresh (it means something in the
+  // workspace genuinely changed) -- but a plain filesystem file
+  // change/create/delete/rename can only ever affect this worktree's own
+  // status entries (see the Filesystem Watcher & Invalidation Architecture
+  // plan's Section D), never branch/branches/remotes/stashes/operation state,
+  // so that case is scoped to just `entries` instead of the six-field refresh
+  // every trigger used to request. Switching *which worktree* is active is a
+  // different kind of event -- any field could be stale after a switch, not
+  // just entries -- so that case still requests a full refresh, unless the
+  // target's own RepoStore has already been polled every 5s in the background
+  // (see the loop below) recently enough that it's already at most that fresh.
   const lastActiveRepoRef = useRef<typeof activeRepo>(null);
+  const lastRevisionRef = useRef(revision);
   useEffect(() => {
     if (!activeRepo) return;
     const switchedWorktree = lastActiveRepoRef.current !== activeRepo;
+    const revisionChanged = lastRevisionRef.current !== revision;
     lastActiveRepoRef.current = activeRepo;
-    if (switchedWorktree && Date.now() - activeRepo.store.lastRefreshedAt < 5000) return;
-    void activeRepo.store.refresh();
+    lastRevisionRef.current = revision;
+    if (switchedWorktree) {
+      if (Date.now() - activeRepo.store.lastRefreshedAt < 5000) return;
+      void activeRepo.store.refresh();
+    } else if (revisionChanged) {
+      void activeRepo.store.refresh(["entries"]);
+    }
   }, [activeRepo, revision]);
 
   // Re-fetches the active repository's knownWorktrees (which worktree/lock/prune
