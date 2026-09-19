@@ -357,7 +357,7 @@ mod tests {
 
         let events: Arc<Mutex<Vec<GitChangeKind>>> = Arc::new(Mutex::new(Vec::new()));
         let collected = Arc::clone(&events);
-        let watcher = start_git_watcher(&root, &[root.clone()], move |kind| {
+        let watcher = start_git_watcher(&root, std::slice::from_ref(&root), move |kind| {
             collected.lock().unwrap().push(kind);
         })
         .unwrap();
@@ -397,7 +397,7 @@ mod tests {
 
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&hits);
-        let watcher = start_git_watcher(&root, &[root.clone()], move |_kind| {
+        let watcher = start_git_watcher(&root, std::slice::from_ref(&root), move |_kind| {
             counter.fetch_add(1, Ordering::SeqCst);
         })
         .unwrap();
@@ -429,7 +429,7 @@ mod tests {
 
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&hits);
-        let watcher = start_git_watcher(&root, &[root.clone()], move |kind| {
+        let watcher = start_git_watcher(&root, std::slice::from_ref(&root), move |kind| {
             if kind == GitChangeKind::Refs {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
@@ -464,7 +464,7 @@ mod tests {
 
         let first_hits = Arc::new(AtomicUsize::new(0));
         let first_counter = Arc::clone(&first_hits);
-        let first_watcher = start_git_watcher(&root, &[root.clone()], move |_kind| {
+        let first_watcher = start_git_watcher(&root, std::slice::from_ref(&root), move |_kind| {
             first_counter.fetch_add(1, Ordering::SeqCst);
         })
         .unwrap();
@@ -479,7 +479,7 @@ mod tests {
         // pair, sharing nothing with the dropped one.
         let second_hits = Arc::new(AtomicUsize::new(0));
         let second_counter = Arc::clone(&second_hits);
-        let second_watcher = start_git_watcher(&root, &[root.clone()], move |kind| {
+        let second_watcher = start_git_watcher(&root, std::slice::from_ref(&root), move |kind| {
             if kind == GitChangeKind::Refs {
                 second_counter.fetch_add(1, Ordering::SeqCst);
             }
