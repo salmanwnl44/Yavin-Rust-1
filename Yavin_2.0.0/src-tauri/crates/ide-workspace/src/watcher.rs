@@ -450,4 +450,53 @@ mod tests {
              writes, got {reported}"
         );
     }
+
+    /// Race H (the Filesystem Watcher & Invalidation Architecture plan's
+    /// Section R): a watcher restarted while a prior burst is still in flight
+    /// must never leak that burst into the new watcher's own count -- the two
+    /// don't share a channel or thread, so this verifies that structural
+    /// independence empirically rather than only reasoning about it.
+    #[test]
+    fn a_watcher_restart_never_leaks_a_prior_bursts_pending_events() {
+        let root = temp_dir("git-restart");
+        fs::create_dir_all(root.join("refs/heads")).unwrap();
+        fs::write(root.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let first_hits = Arc::new(AtomicUsize::new(0));
+        let first_counter = Arc::clone(&first_hits);
+        let first_watcher = start_git_watcher(&root, &[root.clone()], move |_kind| {
+            first_counter.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+
+        // Trigger a burst, then drop the watcher well before its own SETTLE
+        // window would close -- an in-flight, not-yet-reported burst.
+        fs::write(root.join("refs/heads/from-first"), "abc\n").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        drop(first_watcher);
+
+        // A fresh watcher on the exact same paths -- its own channel/thread
+        // pair, sharing nothing with the dropped one.
+        let second_hits = Arc::new(AtomicUsize::new(0));
+        let second_counter = Arc::clone(&second_hits);
+        let second_watcher = start_git_watcher(&root, &[root.clone()], move |kind| {
+            if kind == GitChangeKind::Refs {
+                second_counter.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .unwrap();
+
+        fs::write(root.join("refs/heads/from-second"), "def\n").unwrap();
+        std::thread::sleep(SETTLE * 4);
+
+        let second_reported = second_hits.load(Ordering::SeqCst);
+        drop(second_watcher);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            second_reported, 1,
+            "the fresh watcher must report exactly the one change made after its \
+             own creation, never anything leaked from the previous, dropped watcher"
+        );
+    }
 }

@@ -709,7 +709,8 @@ export default function App() {
       disabled: !desktop || !hasUnsavedChanges,
       run: async () => {
         if (saving.current.size) throw new Error("A save is already in progress.");
-        for (const tab of tabs.filter((tab) => tab.dirty)) {
+        const dirtyTabs = tabs.filter((tab) => tab.dirty);
+        for (const tab of dirtyTabs) {
           const content = contentsRef.current[tab.path];
           saving.current.add(tab.path);
           try {
@@ -730,6 +731,11 @@ export default function App() {
             saving.current.delete(tab.path);
           }
         }
+        // Every other write path (single save, hunk reconcile, every Explorer
+        // op) already bumps this once its own writes settle; Save All omitted
+        // it, leaving Git status to fall back entirely on the ~300ms watcher
+        // latency instead of the immediate trigger every other path gets.
+        if (dirtyTabs.length) setGitRevision((value) => value + 1);
       },
     },
     {

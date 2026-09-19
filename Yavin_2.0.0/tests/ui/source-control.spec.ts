@@ -416,6 +416,30 @@ test("an external filesystem change only re-fetches status, not every sub-fetch 
   expect(await gitCalls(page, "state")).toBe(before.state);
 });
 
+test("Save All bumps the active repository's revision, not just individual saves", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: "" });
+
+  // Make the workspace dirty through a real editor buffer, matching the
+  // "unsaved editors block..." test's own convention for editing file.ts.
+  await page.getByTitle("Explorer (Ctrl+Shift+E)").click();
+  await page.getByLabel("file.ts", { exact: true }).click();
+  const editor = page.getByRole("textbox", { name: "file.ts", exact: true });
+  await editor.click();
+  await editor.fill("edited content");
+
+  await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
+  await expect(region.getByLabel("Commit message")).toBeVisible();
+  const before = await gitCalls(page, "status");
+
+  await page.keyboard.press("Control+Shift+S");
+
+  // Save All's write_file_guarded call resolving is what the revision bump
+  // depends on; poll for it rather than asserting synchronously.
+  await expect.poll(() => gitCalls(page, "status")).toBeGreaterThan(before);
+});
+
 test("committing re-fetches status, branch and operation state, still skipping branches/remotes", async ({
   page,
 }) => {
