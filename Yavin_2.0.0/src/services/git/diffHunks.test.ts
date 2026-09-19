@@ -110,3 +110,90 @@ test("staging only the selected hunk leaves the other hunk's change unstaged", (
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+function freshRepo(): string {
+  const dir = mkdtempSync(join(tmpdir(), "yavin-diffhunks-"));
+  git(dir, ["init", "-q"]);
+  git(dir, ["config", "user.email", "test@example.invalid"]);
+  git(dir, ["config", "user.name", "Yavin Test"]);
+  git(dir, ["config", "commit.gpgsign", "false"]);
+  git(dir, ["config", "core.autocrlf", "false"]);
+  return dir;
+}
+
+test("a renamed file's diff header survives buildPatch's reconstruction unmodified", () => {
+  const dir = freshRepo();
+  try {
+    writeFileSync(join(dir, "old.txt"), "line1\nline2\nline3\n");
+    git(dir, ["add", "old.txt"]);
+    git(dir, ["commit", "-qm", "base"]);
+    git(dir, ["mv", "old.txt", "new.txt"]);
+    writeFileSync(join(dir, "new.txt"), "line1\nCHANGED\nline3\n");
+    git(dir, ["add", "new.txt"]);
+
+    const diffText = git(dir, ["diff", "--cached", "-M", "--", "new.txt", "old.txt"]);
+    const parsed = parseUnifiedDiff(diffText);
+    const rebuilt = buildPatch(parsed, new Set(parsed.hunks.map((_, i) => i)));
+    assert.equal(rebuilt, diffText, "reconstruction with every hunk selected must be lossless");
+    assert.ok(rebuilt.includes("rename from old.txt"));
+    assert.ok(rebuilt.includes("rename to new.txt"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a deleted file's diff parses as a single all-deletion hunk", () => {
+  const dir = freshRepo();
+  try {
+    writeFileSync(join(dir, "gone.txt"), "line1\nline2\n");
+    git(dir, ["add", "gone.txt"]);
+    git(dir, ["commit", "-qm", "base"]);
+    git(dir, ["rm", "-q", "gone.txt"]);
+
+    const diffText = git(dir, ["diff", "--cached", "--", "gone.txt"]);
+    const parsed = parseUnifiedDiff(diffText);
+    assert.equal(parsed.hunks.length, 1);
+    assert.equal(parsed.hunks[0].additions, 0);
+    assert.equal(parsed.hunks[0].deletions, 2);
+    assert.ok(parsed.headerLines.some((line) => line.includes("deleted file mode")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a file with no trailing newline preserves Git's own marker in the hunk", () => {
+  const dir = freshRepo();
+  try {
+    writeFileSync(join(dir, "a.txt"), "one\ntwo");
+    git(dir, ["add", "a.txt"]);
+    git(dir, ["commit", "-qm", "base"]);
+    writeFileSync(join(dir, "a.txt"), "one\nTWO");
+
+    const diffText = git(dir, ["diff", "--", "a.txt"]);
+    const parsed = parseUnifiedDiff(diffText);
+    assert.equal(parsed.hunks.length, 1);
+    assert.ok(
+      parsed.hunks[0].lines.some((line) => line.includes("No newline at end of file")),
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a binary file's diff is safely non-hunked, never throws", () => {
+  const dir = freshRepo();
+  try {
+    writeFileSync(join(dir, "img.bin"), Buffer.from([0, 1, 2, 0, 255, 254]));
+    git(dir, ["add", "img.bin"]);
+    git(dir, ["commit", "-qm", "base"]);
+    writeFileSync(join(dir, "img.bin"), Buffer.from([9, 9, 9, 0, 0, 0]));
+
+    const diffText = git(dir, ["diff", "--", "img.bin"]);
+    assert.ok(diffText.includes("Binary files"));
+    const parsed = parseUnifiedDiff(diffText);
+    assert.equal(parsed.hunks.length, 0);
+    assert.ok(parsed.headerLines.some((line) => line.includes("Binary files")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

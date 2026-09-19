@@ -22,3 +22,46 @@ test("decorations cover every status, use workspace casing and mark ancestor fol
   assert.deepEqual([...folders].sort(), ["C:/Work/d", "C:/Work/src"]);
   assert.equal(files.has("C:/Work/SRC/a.ts"), false);
 });
+
+test("a copy record consumes its source path, just like a rename", () => {
+  const entries = parseGitEntries("C  new.ts\0old.ts\0", "/work");
+  assert.deepEqual(entries, [
+    {
+      path: "/work/new.ts",
+      originalPath: "/work/old.ts",
+      index: "C",
+      worktree: " ",
+      untracked: false,
+      conflict: false,
+    },
+  ]);
+});
+
+test("a plain deletion has no original path and is not a conflict", () => {
+  const entries = parseGitEntries(" D gone.ts\0", "/work");
+  assert.deepEqual(entries, [
+    {
+      path: "/work/gone.ts",
+      index: " ",
+      worktree: "D",
+      untracked: false,
+      conflict: false,
+    },
+  ]);
+});
+
+test("a malformed record without the porcelain separator is rejected", () => {
+  assert.throws(() => parseGitEntries("MMa.ts\0", "/work"), /Invalid Git status record/);
+});
+
+test("a truncated rename record with no following path is rejected", () => {
+  assert.throws(() => parseGitEntries("R  new.ts\0", "/work"), /Incomplete Git rename record/);
+});
+
+test("non-ASCII filenames pass through untouched, needing no escaping logic", () => {
+  const entries = parseGitEntries(" M \u00e9\u00e9\u00e9.ts\0?? \u65e5\u672c\u8a9e.ts\0", "/work");
+  assert.deepEqual(
+    entries.map((e) => e.path),
+    ["/work/\u00e9\u00e9\u00e9.ts", "/work/\u65e5\u672c\u8a9e.ts"],
+  );
+});
