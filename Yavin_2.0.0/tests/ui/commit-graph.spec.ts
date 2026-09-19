@@ -13,6 +13,8 @@ interface Scenario {
   commits: RawLine[];
   /** hash -> numstat body lines (tab-separated) for commit-detail lookups. */
   numstat?: Record<string, string[]>;
+  /** hash -> unified-diff text for commitFileDiff() lookups, keyed loosely by hash only. */
+  fileDiffs?: Record<string, string>;
 }
 
 async function panel(page: Page, scenario: Scenario) {
@@ -67,6 +69,13 @@ async function panel(page: Page, scenario: Scenario) {
               const hash = argv[argv.length - 1];
               const lines = s.numstat?.[hash] ?? [];
               return ok([`${hash}\x1fSubject for ${hash}`, ...lines].join("\n"));
+            }
+            if (argv[0] === "show" && argv.includes("-M")) {
+              // commitFileDiff()'s exact call shape: show --no-ext-diff --no-textconv
+              // --no-color -M --pretty=format: <hash> -- <path>
+              const dashDash = argv.indexOf("--");
+              const hash = argv[dashDash - 1];
+              return ok(s.fileDiffs?.[hash] ?? "");
             }
             return ok("");
           }
@@ -129,6 +138,32 @@ test("selecting a commit shows its file changes", async ({ page }) => {
   await expect(fileRow).toBeVisible();
   await expect(detail.getByText("image.png")).toBeVisible();
   await expect(fileRow.getByText("+5")).toBeVisible();
+});
+
+test("clicking a changed file opens its diff and closes the graph view", async ({ page }) => {
+  const diffText = [
+    "diff --git a/src/a.ts b/src/a.ts",
+    "index abc..def 100644",
+    "--- a/src/a.ts",
+    "+++ b/src/a.ts",
+    "@@ -1,2 +1,2 @@",
+    " one",
+    "-two",
+    "+TWO",
+  ].join("\n");
+  const graph = await panel(page, {
+    commits: [{ hash: "c1", subject: "Add a file" }],
+    numstat: { c1: ["5\t2\tsrc/a.ts"] },
+    fileDiffs: { c1: diffText },
+  });
+  await graph.getByText("Add a file").click();
+  const detail = page.getByRole("complementary").filter({ hasText: "Commit" });
+  await detail.getByText("src/a.ts").click();
+
+  const diffView = page.locator("section[aria-label='Git diff editor']");
+  await expect(diffView).toBeVisible();
+  await expect(diffView.getByText("TWO", { exact: true })).toBeVisible();
+  await expect(graph).toHaveCount(0);
 });
 
 test("a repository with more history than one page offers to load older commits", async ({

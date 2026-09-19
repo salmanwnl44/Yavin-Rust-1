@@ -615,6 +615,13 @@ const SHOW: &[FlagRule] = &[
     flag("--oneline"),
     prefix_flag("--pretty="),
     flag("--numstat"),
+    // Added for Repository.commitFileDiff() -- a single historical commit's diff for
+    // one file, matching the exact flag set `diff()` already uses for a working-tree/
+    // index comparison (Module 9).
+    flag("--no-ext-diff"),
+    flag("--no-textconv"),
+    flag("--no-color"),
+    flag("-M"),
 ];
 const STASH: &[FlagRule] = &[flag("-u"), value_flag("-m")];
 const TAG: &[FlagRule] = &[flag("-l")];
@@ -2207,5 +2214,51 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let error = result.unwrap_err();
         assert!(error.contains("not permitted"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn a_historical_commits_file_diff_is_reachable_through_the_guarded_executor() {
+        let (dir, git) = fixture();
+        let repo = open(&dir);
+        fs::write(dir.join("a.txt"), "line1\nline2\nline3\n").unwrap();
+        assert!(git(&["commit", "-qam", "five lines... two"]));
+        fs::write(dir.join("a.txt"), "line1\nCHANGED\nline3\n").unwrap();
+        assert!(git(&["commit", "-qam", "change line2"]));
+        let head = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+
+        let output = exec(
+            &repo,
+            &args(&[
+                "show",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "-M",
+                "--pretty=format:",
+                head.trim(),
+                "--",
+                "a.txt",
+            ]),
+            None,
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(output.code, 0);
+        assert!(output.stdout.contains("-line2"), "{}", output.stdout);
+        assert!(output.stdout.contains("+CHANGED"), "{}", output.stdout);
+        assert!(
+            !output.stdout.contains("-line1") && !output.stdout.contains("-line3"),
+            "unchanged lines must not appear as removed: {}",
+            output.stdout
+        );
     }
 }

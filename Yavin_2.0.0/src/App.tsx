@@ -1170,6 +1170,7 @@ export default function App() {
                 key={activeRepo.repoId}
                 repository={activeRepo.store.repository}
                 onClose={() => setShowGraph(false)}
+                onDiff={setDiff}
               />
             ) : diff ? (
               <DiffEditor

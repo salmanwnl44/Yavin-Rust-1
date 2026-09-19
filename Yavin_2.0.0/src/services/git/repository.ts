@@ -318,6 +318,32 @@ export class Repository {
     return this.run(["show", "--numstat", "--pretty=format:%H\x1f%s", hash]);
   }
 
+  /**
+   * The diff a single file underwent in one commit, against that commit's own
+   * (first) parent -- the same "what changed here" question `diff()` answers for the
+   * working tree/index, asked instead about a historical commit. `path` is already
+   * repo-relative, exactly as `parseCommitDetails`'s own `CommitFileChange.path`
+   * reports it (no `relativeToRoot` conversion needed, unlike `diff()`'s absolute-path
+   * callers). Reuses the identical unified-diff format `diff()` produces -- the
+   * output is parsed by the same `parseUnifiedDiff`/`DiffEditor` pipeline, no new
+   * parser is introduced. Merge commits produce Git's own combined-diff format,
+   * which this method does not special-case (see the plan's own deferred-scope note).
+   */
+  commitFileDiff(hash: string, path: string): Promise<string> {
+    if (!hash.trim()) throw new Error("Commit hash required");
+    return this.run([
+      "show",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-color",
+      "-M",
+      "--pretty=format:",
+      hash,
+      "--",
+      path,
+    ]);
+  }
+
   stash(message?: string): Promise<string> {
     const args = ["stash", "push", "-u"];
     if (message?.trim()) args.push("-m", message.trim());

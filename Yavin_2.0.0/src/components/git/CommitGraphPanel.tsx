@@ -5,6 +5,7 @@ import type { GraphNode } from "../../services/git/graph/model";
 import { GRAPH_COLOR_COUNT } from "../../services/git/graph/model";
 import { parseCommitDetails } from "../../services/git/parsers/log";
 import type { CommitDetailedInfo } from "../../services/git/parsers/log";
+import type { DiffDocument } from "../layout/DiffEditor";
 import { CloseIcon, GitCommitIcon } from "../ui/Icons";
 
 const ROW_HEIGHT = 28;
@@ -43,14 +44,31 @@ function CommitDetail({
   node,
   repository,
   onClose,
+  onDiff,
 }: {
   node: GraphNode;
   repository: Repository;
   onClose: () => void;
+  onDiff: (document: DiffDocument) => void;
 }) {
   const [detail, setDetail] = useState<CommitDetailedInfo | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [diffError, setDiffError] = useState("");
+
+  const openFileDiff = (path: string) => {
+    setDiffError("");
+    repository
+      .commitFileDiff(node.commit.fullHash, path)
+      .then((text) => {
+        onDiff({
+          path,
+          title: `${node.commit.hash} — ${path}`,
+          text: text || "No textual differences. The change may be metadata or binary only.",
+        });
+      })
+      .catch((reason) => setDiffError(String(reason)));
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -96,6 +114,7 @@ function CommitDetail({
 
         {loading && <p className="text-zinc-500 text-[11px] animate-pulse">Loading changes…</p>}
         {error && <p className="text-red-400 text-[11px]">{error}</p>}
+        {diffError && <p className="text-red-400 text-[11px]">{diffError}</p>}
         {detail && (
           <>
             <p className="text-zinc-400 text-[11px] pt-1">
@@ -105,20 +124,23 @@ function CommitDetail({
             </p>
             <ul className="divide-y divide-[#101010] border-t border-[#141414]">
               {detail.files.map((file) => (
-                <li
-                  key={file.path}
-                  className="flex items-center gap-1.5 py-1 text-[11px] text-zinc-300"
-                >
-                  <span className="font-mono text-[10px] text-zinc-500 w-3 shrink-0">
-                    {file.status}
-                  </span>
-                  <span className="truncate flex-1">{file.path}</span>
-                  {!file.binary && (
-                    <span className="shrink-0 font-mono text-[10px]">
-                      <span className="text-emerald-400">+{file.insertions}</span>{" "}
-                      <span className="text-rose-400">-{file.deletions}</span>
+                <li key={file.path}>
+                  <button
+                    onClick={() => openFileDiff(file.path)}
+                    title={`Show the diff for ${file.path} in this commit`}
+                    className="flex w-full items-center gap-1.5 py-1 text-[11px] text-zinc-300 hover:bg-[#121212] rounded px-0.5 -mx-0.5"
+                  >
+                    <span className="font-mono text-[10px] text-zinc-500 w-3 shrink-0">
+                      {file.status}
                     </span>
-                  )}
+                    <span className="truncate flex-1 text-left">{file.path}</span>
+                    {!file.binary && (
+                      <span className="shrink-0 font-mono text-[10px]">
+                        <span className="text-emerald-400">+{file.insertions}</span>{" "}
+                        <span className="text-rose-400">-{file.deletions}</span>
+                      </span>
+                    )}
+                  </button>
                 </li>
               ))}
             </ul>
@@ -132,9 +154,11 @@ function CommitDetail({
 export function CommitGraphPanel({
   repository,
   onClose,
+  onDiff,
 }: {
   repository: Repository;
   onClose: () => void;
+  onDiff: (document: DiffDocument) => void;
 }) {
   const { snapshot, loadMore } = useCommitGraph(repository);
   const [selected, setSelected] = useState<GraphNode | null>(null);
@@ -312,7 +336,18 @@ export function CommitGraphPanel({
       </div>
 
       {selected && (
-        <CommitDetail repository={repository} node={selected} onClose={() => setSelected(null)} />
+        <CommitDetail
+          repository={repository}
+          node={selected}
+          onClose={() => setSelected(null)}
+          onDiff={(document) => {
+            // Switches to the same DiffEditor slot every other diff already renders
+            // in (App.tsx's existing diff/showGraph mutual-exclusion branch) --
+            // closing the graph view rather than trying to show both at once.
+            onDiff(document);
+            onClose();
+          }}
+        />
       )}
     </div>
   );
