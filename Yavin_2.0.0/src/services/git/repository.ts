@@ -125,10 +125,11 @@ export class Repository {
     return this.run(["cat-file", "--filters", `:${relativeToRoot(this.root, absolutePath)}`]);
   }
 
-  diff(absolutePath: string, staged: boolean): Promise<string> {
-    const args = ["diff", "--no-ext-diff", "--no-textconv", "--no-color"];
+  diff(absolutePath: string, staged: boolean, oldAbsolutePath?: string): Promise<string> {
+    const args = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "-M"];
     if (staged) args.push("--cached");
     args.push("--", relativeToRoot(this.root, absolutePath));
+    if (oldAbsolutePath) args.push(relativeToRoot(this.root, oldAbsolutePath));
     return this.run(args);
   }
 

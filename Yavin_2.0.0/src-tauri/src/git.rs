@@ -594,6 +594,7 @@ const DIFF: &[FlagRule] = &[
     flag("--no-color"),
     flag("--cached"),
     flag("--name-only"),
+    flag("-M"),
     prefix_flag("--diff-filter="),
 ];
 const NONE: &[FlagRule] = &[];
@@ -1626,6 +1627,66 @@ mod tests {
         assert_eq!(
             after, after_first,
             "a second write, well after unwatching, must never add a further event"
+        );
+    }
+
+    #[test]
+    fn a_staged_rename_with_a_content_change_diffs_as_a_compact_rename_not_a_full_add() {
+        let (dir, git) = fixture();
+        let repo = open(&dir);
+
+        std::fs::write(dir.join("a.txt"), "line1\nline2\nline3\nline4\nline5\n").unwrap();
+        assert!(git(&["add", "a.txt"]));
+        assert!(git(&["commit", "-qm", "five lines"]));
+        assert!(git(&["mv", "a.txt", "b.txt"]));
+        std::fs::write(
+            dir.join("b.txt"),
+            "line1\nline2-changed\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        assert!(git(&["add", "b.txt"]));
+
+        // -M must be permitted by the allow-list, and both the old and new path
+        // must be passed as pathspecs together for Git to recognize the rename
+        // relationship (Module 5 Section B/D's verified fix).
+        let output = exec(
+            &repo,
+            &args(&[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "-M",
+                "--cached",
+                "--",
+                "b.txt",
+                "a.txt",
+            ]),
+            None,
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            output.stdout.contains("rename from a.txt")
+                && output.stdout.contains("rename to b.txt"),
+            "expected a rename diff, got: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("new file mode"),
+            "must not be reported as a brand-new file: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("-line2") && output.stdout.contains("+line2-changed"),
+            "expected only the single changed line, got: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("+line1\n"),
+            "unchanged lines must not appear as additions: {}",
+            output.stdout
         );
     }
 }

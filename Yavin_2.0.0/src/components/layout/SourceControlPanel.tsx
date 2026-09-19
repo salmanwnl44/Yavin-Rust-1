@@ -289,7 +289,7 @@ export function SourceControlPanel({
     try {
       const text = entry.untracked
         ? await native("read_file_content", { path: entry.path })
-        : await activeRepo.store.repository.diff(entry.path, staged);
+        : await activeRepo.store.repository.diff(entry.path, staged, entry.originalPath);
       if (!alive.current || current !== diffGeneration.current) return;
       const hasUnsavedEdits = buffers[entry.path] !== undefined;
       // Hunk-level staging needs the raw diff text untouched by the warning banner
