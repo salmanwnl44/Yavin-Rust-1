@@ -11,7 +11,7 @@ export interface WordDiff {
 
 /** Splits a line into words, runs of whitespace, and individual punctuation characters. */
 function tokenize(line: string): string[] {
-  return line.match(/\w+|\s+|[^\w\s]/g) ?? [];
+  return line.match(/[\p{L}\p{N}_]+|\s+|[^\s]/gu) ?? [];
 }
 
 /**

@@ -38,3 +38,20 @@ test("diffWords handles an appended suffix without touching the shared prefix", 
   assert.equal(text(next), "foo bar");
   assert.equal(next.find((segment) => segment.type === "add")?.text, " ");
 });
+
+test("diffWords treats non-ASCII scripts as whole word runs, not one segment per character", () => {
+  const { old, new: next } = diffWords("café 日本語 test", "café 中文 test");
+  // Word-granularity (the fix): each script run is one changed token, not
+  // several single-character segments the old ASCII-only \w regex would
+  // have produced for non-Latin text.
+  assert.deepEqual(
+    old.filter((s) => s.type !== "same").map((s) => s.text),
+    ["日本語"],
+  );
+  assert.deepEqual(
+    next.filter((s) => s.type !== "same").map((s) => s.text),
+    ["中文"],
+  );
+  assert.equal(text(old), "café 日本語 test");
+  assert.equal(text(next), "café 中文 test");
+});
