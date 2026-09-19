@@ -1689,4 +1689,44 @@ mod tests {
             output.stdout
         );
     }
+
+    #[test]
+    fn remote_head_is_readable_locally_once_set_and_a_clean_failure_before_then() {
+        let bare = temp_dir();
+        fs::create_dir_all(&bare).unwrap();
+        assert!(Command::new("git")
+            .current_dir(&bare)
+            .args(["init", "-q", "--bare"])
+            .status()
+            .unwrap()
+            .success());
+        let (dir, git) = fixture();
+        let repo = open(&dir);
+        let remote_url = clean_path_str(&bare);
+        assert!(git(&["remote", "add", "origin", &remote_url]));
+        assert!(git(&["push", "-q", "origin", "HEAD:main"]));
+
+        // Before `remote set-head` ever runs, refs/remotes/origin/HEAD does not exist --
+        // this must be a clean, non-panicking failure, not a crash.
+        let before = exec(
+            &repo,
+            &args(&["symbolic-ref", "refs/remotes/origin/HEAD"]),
+            None,
+        )
+        .unwrap();
+        assert_ne!(before.code, 0, "must fail cleanly before HEAD is ever set");
+
+        assert!(git(&["remote", "set-head", "origin", "main"]));
+        let after = exec(
+            &repo,
+            &args(&["symbolic-ref", "refs/remotes/origin/HEAD"]),
+            None,
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&bare);
+
+        assert_eq!(after.code, 0);
+        assert_eq!(after.stdout.trim(), "refs/remotes/origin/main");
+    }
 }
