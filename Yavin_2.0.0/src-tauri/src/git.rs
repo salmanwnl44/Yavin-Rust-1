@@ -950,6 +950,24 @@ mod tests {
         assert!(result.unwrap_err().contains("not supported"));
     }
 
+    /// The Git State & Synchronization plan's Race 6/7 -- a worktree directory
+    /// disappearing externally (deleted, or moved out from under Yavin) mid-
+    /// session -- must degrade to a clean Git-level error, never a panic or a
+    /// silently-corrupted result.
+    #[test]
+    fn a_worktree_deleted_out_from_under_an_open_repo_fails_cleanly_not_a_panic() {
+        let (dir, _git) = fixture();
+        let repo = open(&dir);
+        fs::remove_dir_all(&dir).unwrap();
+
+        let result = exec(&repo, &args(&["status", "--porcelain=v1", "-z"]), None);
+
+        assert!(
+            result.is_err(),
+            "a deleted worktree must fail, not silently return an empty (falsely-clean) status"
+        );
+    }
+
     #[test]
     fn opening_a_nested_subfolder_resolves_to_the_true_toplevel() {
         let (dir, git) = fixture();

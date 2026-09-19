@@ -586,3 +586,42 @@ test("regaining window focus re-fetches the active repository's knownWorktrees",
   await expect.poll(worktreeListCalls).toBeGreaterThan(before);
   await expect(region.getByText("1 more worktree")).toBeVisible();
 });
+
+test("a rapid burst of 'git-changed' events (analogous to a burst of file saves) dedupes to one Git process, not one per event", async ({
+  page,
+}) => {
+  const region = await panel(page, {
+    workspace: "/work",
+    repos: { "/work": { ...repo("main"), commonDir: "/work/.git" } },
+  });
+  await expect(region.getByLabel("Commit message")).toBeVisible();
+
+  const stashCalls = () =>
+    page.evaluate(
+      () =>
+        (
+          window as unknown as { __calls: { command: string; args: { args?: string[] } }[] }
+        ).__calls.filter((c) => c.command === "git_exec" && c.args.args?.[0] === "stash").length,
+    );
+  const before = await stashCalls();
+
+  // Five external stash changes landing back-to-back, all within a single
+  // synchronous browser-side loop (not five separate round trips, which would
+  // give each refresh() call time to fully settle before the next event fires)
+  // -- the watcher's own 300ms debounce would normally coalesce these into one
+  // Rust-side event already; this proves the TS-side in-flight guard
+  // independently dedupes them too, even in the worst case where the Rust side
+  // reported them separately.
+  await page.evaluate(() => {
+    const win = window as unknown as { __emit: (e: string, p: unknown) => void };
+    for (let i = 0; i < 5; i++) {
+      win.__emit("git-changed", { repositoryId: "/work/.git", kind: "stash" });
+    }
+  });
+
+  await expect.poll(() => stashCalls()).toBeGreaterThan(before);
+  // Give any would-be extra processes a moment to have fired, then confirm the
+  // burst landed as one dedup'd fetch, not five independent ones.
+  await page.waitForTimeout(200);
+  expect(await stashCalls()).toBe(before + 1);
+});

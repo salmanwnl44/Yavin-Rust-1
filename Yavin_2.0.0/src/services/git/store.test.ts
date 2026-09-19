@@ -147,3 +147,54 @@ test("lastRefreshedAt only advances on a successful refresh", async () => {
   await store.refresh(["entries"]);
   assert.ok(store.lastRefreshedAt > 0, "a successful refresh must advance lastRefreshedAt");
 });
+
+// Section 24's Race 1: "refresh A starts, switch to B, refresh B, A completes
+// late" -- two different RepoStore instances (one per worktree) share no
+// mutable state at all, so a late-resolving refresh on one can never touch the
+// other's snapshot. Not a generation-guard scenario (that protects a store
+// against ITS OWN stale results); this is a structural property of the class
+// having no static/shared fields, verified directly rather than merely asserted.
+test("two different RepoStore instances never share generation state -- a late refresh on one cannot affect the other", async () => {
+  const callsA: string[] = [];
+  let resolveA!: (value: string) => void;
+  const storeA = new RepoStore(
+    fakeRepository(callsA, { status: () => new Promise<string>((resolve) => (resolveA = resolve)) }),
+  );
+  const callsB: string[] = [];
+  const storeB = new RepoStore(fakeRepository(callsB, { status: () => Promise.resolve(" M b.ts\0") }));
+
+  const pendingA = storeA.refresh(["entries"]); // "switch to B" happens conceptually here
+  await storeB.refresh(["entries"]); // B's own refresh completes first
+  assert.equal(storeB.getSnapshot().entries.length, 1);
+
+  resolveA(" M a.ts\0"); // "A completes late"
+  await pendingA;
+  assert.equal(storeA.getSnapshot().entries.length, 1, "A's own result still applies to A");
+  assert.equal(storeB.getSnapshot().entries.length, 1, "B's snapshot is untouched by A's late completion");
+});
+
+// Race 3: "operation completion + watcher event + focus refresh, all near-
+// simultaneous" -- extends the two-caller dedup tests above to three
+// simultaneous callers requesting the same (full) field set, proving the dedupe
+// guard scales beyond the minimal two-caller case.
+test("three simultaneous full-refresh calls (mutation completion, watcher, focus) dedupe into one Git process", async () => {
+  const calls: string[] = [];
+  let resolveStatus!: (value: string) => void;
+  const repo = fakeRepository(calls, {
+    status: () => new Promise<string>((resolve) => (resolveStatus = resolve)),
+  });
+  const store = new RepoStore(repo);
+
+  const fromMutation = store.refresh();
+  const fromWatcher = store.refresh();
+  const fromFocus = store.refresh();
+  assert.equal(
+    calls.filter((c) => c === "status").length,
+    1,
+    "all three overlapping full refreshes must share the same single Git process",
+  );
+
+  resolveStatus(" M a.ts\0");
+  await Promise.all([fromMutation, fromWatcher, fromFocus]);
+  assert.equal(store.getSnapshot().entries.length, 1);
+});
