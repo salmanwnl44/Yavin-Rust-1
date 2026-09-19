@@ -15,20 +15,112 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::Command,
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, TryLockError,
+    },
+    time::Duration,
 };
 use tauri::State;
 
-/// One open repository: its canonical root and a lock serializing Git invocations
-/// against it. Each repository has its own lock, so work in one repo never blocks
-/// another -- unlike the single global lock the previous single-repo design used.
+/// One open repository: its canonical root, its shared-repository identity (see
+/// `discover_common_dir`), and a lock serializing Git invocations against this
+/// worktree specifically. Each worktree has its own lock, so work in one worktree
+/// never blocks another -- unlike the single global lock the previous single-repo
+/// design used. `repository_id` is what lets two *different* worktrees of the same
+/// repository still coordinate on the state they genuinely share (see `StashLocks`/
+/// `NetworkLocks`) without serializing everything else against each other.
 pub struct Repo {
     root: PathBuf,
+    repository_id: String,
     lock: Mutex<()>,
 }
 
 #[derive(Default)]
 pub struct Repos(pub Mutex<HashMap<String, Arc<Repo>>>);
+
+/// Serializes Git's stash-family operations (`push`/`apply`/`pop`/`drop`) across
+/// every worktree of one repository, keyed by `repository_id`. `refs/stash` is the
+/// one ref with no per-worktree partitioning at all (confirmed empirically -- a
+/// stash pushed from one worktree is visible via `stash list` from every other), so
+/// unlike almost every other mutation (which Git's own worktree-exclusivity
+/// guarantee already keeps collision-free per branch), this genuinely needs
+/// cross-worktree coordination. See the Git Operation Engine plan's empirical
+/// verification section.
+#[derive(Default)]
+pub struct StashLocks(pub Mutex<HashMap<String, Arc<Mutex<()>>>>);
+
+/// Serializes `fetch`/`pull`/`push` across every worktree of one repository, keyed by
+/// `repository_id` -- remote-tracking refs are likewise not partitioned by worktree.
+/// Scoped to the whole repository rather than per-remote: a deliberate simplification
+/// (see the plan), not a correctness gap.
+#[derive(Default)]
+pub struct NetworkLocks(pub Mutex<HashMap<String, Arc<Mutex<()>>>>);
+
+/// Finds (or creates) the shared lock for `key` in `map`, without holding `map`'s own
+/// mutex any longer than the lookup itself -- the returned `Arc` is what callers
+/// actually wait on.
+fn lock_for(
+    map: &Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    key: &str,
+) -> Result<Arc<Mutex<()>>, String> {
+    Ok(map
+        .lock()
+        .map_err(|e| e.to_string())?
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone())
+}
+
+/// Polls for the lock instead of blocking on it, so an operation queued behind
+/// another is actually cancellable *before* it ever runs -- the same 20ms cadence
+/// `ide_workspace::process::capture` already uses to poll a running process for
+/// cancellation, so a cancel request is honored within one tick whether the
+/// operation is waiting for a lock or already spawned. A poisoned lock (a previous
+/// holder panicked while holding it) is recovered rather than left permanently
+/// deadlocked -- safe here because every lock this guards is a plain `Mutex<()>`
+/// with no data of its own that a panic could have left inconsistent.
+fn acquire_cancellable<'a>(
+    lock: &'a Mutex<()>,
+    cancel: &AtomicBool,
+) -> Result<MutexGuard<'a, ()>, String> {
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Cancelled".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Which shared lock (if any) an operation needs beyond its own worktree's lock,
+/// decided from the same already-validated subcommand/args `exec_on` has in hand --
+/// never supplied by the TypeScript caller. Only the operations empirically confirmed
+/// to touch state with no per-worktree partitioning take a `Stash`/`Network` scope;
+/// everything else (including commit, branch creation, and every merge-family
+/// operation) is `WorktreeLocal`, because Git itself refuses to let two worktrees
+/// reference the same branch, so their ref-moving side effects can never collide
+/// across worktrees to begin with.
+enum Scope {
+    WorktreeLocal,
+    Stash,
+    Network,
+}
+
+fn operation_scope(subcommand: &str, rest: &[String]) -> Scope {
+    match subcommand {
+        "stash" => match rest.first().map(String::as_str) {
+            Some("push") | Some("apply") | Some("pop") | Some("drop") => Scope::Stash,
+            _ => Scope::WorktreeLocal,
+        },
+        "fetch" | "pull" | "push" => Scope::Network,
+        _ => Scope::WorktreeLocal,
+    }
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,14 +143,23 @@ fn repo_of(state: &Repos, repo_id: &str) -> Result<Arc<Repo>, String> {
 /// literal pathspecs, no interactive credential/editor prompts, and the same 16 MB
 /// output cap the previous single-repo design enforced.
 fn run(root: &Path, args: &[&str]) -> Result<ToolOutput, String> {
-    run_with_input(root, args, None)
+    run_with_input(root, args, None, Arc::new(AtomicBool::new(false)))
 }
 
 /// Like `run`, but pipes `input` to Git's stdin -- the only current use is feeding a
-/// patch to `git apply` for hunk-level staging/unstaging/discarding. The patch is
-/// data Git parses, not a command or shell input, so it needs no extra validation
-/// beyond the argv allow-list `apply` (like every subcommand) already goes through.
-fn run_with_input(root: &Path, args: &[&str], input: Option<String>) -> Result<ToolOutput, String> {
+/// patch to `git apply` for hunk-level staging/unstaging/discarding -- and accepts a
+/// real cancellation flag for use by `exec_on`, where an operation is actually
+/// cancellable; internal bookkeeping calls (toplevel/common-dir discovery, repo
+/// state) go through `run` above with a flag that's never set, since those aren't
+/// user-cancellable operations. The patch is data Git parses, not a command or shell
+/// input, so it needs no extra validation beyond the argv allow-list `apply` (like
+/// every subcommand) already goes through.
+fn run_with_input(
+    root: &Path,
+    args: &[&str],
+    input: Option<String>,
+    cancel: Arc<AtomicBool>,
+) -> Result<ToolOutput, String> {
     let mut command = Command::new("git");
     command
         .current_dir(root)
@@ -72,7 +173,7 @@ fn run_with_input(root: &Path, args: &[&str], input: Option<String>) -> Result<T
         // produce, silently defeating both matchers.
         .env("LC_ALL", "C")
         .env("LANGUAGE", "C");
-    let result = capture(command, input, Arc::new(AtomicBool::new(false)))?;
+    let result = capture(command, input, cancel)?;
     if result.truncated {
         return Err("Git output exceeded 16 MB; narrow the operation".into());
     }
@@ -106,10 +207,9 @@ fn discover_toplevel(path: &Path) -> Result<PathBuf, String> {
 /// to that repository's *shared* Git directory (`--git-common-dir`). Unlike
 /// `discover_toplevel`, which returns a different, worktree-specific root for each
 /// linked worktree, this value is identical from every worktree of the same
-/// repository, which is what makes it the correct repository-identity key (a linked
-/// worktree must never be mistaken for an independent repository). Not yet used by
-/// any production code path -- see the Repository & Worktree Architecture plan.
-#[allow(dead_code)]
+/// repository, which is what makes it the correct key for `StashLocks`/
+/// `NetworkLocks`: a linked worktree must never be mistaken for an independent
+/// repository when deciding whether two operations share a lock.
 fn discover_common_dir(path: &Path) -> Result<PathBuf, String> {
     if !path.is_dir() {
         return Err("Not a directory".into());
@@ -140,17 +240,23 @@ fn discover_common_dir(path: &Path) -> Result<PathBuf, String> {
 /// Registers (or reuses) a repository whose top-level has already been resolved.
 fn register_repo(repos: &Repos, toplevel: PathBuf) -> Result<RepoInfo, String> {
     let repo_id = clean_path_str(&toplevel);
-    repos
-        .0
-        .lock()
-        .map_err(|e| e.to_string())?
-        .entry(repo_id.clone())
-        .or_insert_with(|| {
-            Arc::new(Repo {
-                root: toplevel.clone(),
-                lock: Mutex::new(()),
-            })
-        });
+    let mut guard = repos.0.lock().map_err(|e| e.to_string())?;
+    if let std::collections::hash_map::Entry::Vacant(entry) = guard.entry(repo_id.clone()) {
+        // Best-effort: fall back to this worktree's own root as its own repository
+        // identity if the common-dir lookup somehow fails. That only means this
+        // worktree's stash/network operations won't be coordinated with any sibling
+        // worktree of the same repository -- every other guarantee in this file
+        // (the security allow-list, this worktree's own lock) is unaffected.
+        let repository_id = discover_common_dir(&toplevel)
+            .map(|p| clean_path_str(&p))
+            .unwrap_or_else(|_| repo_id.clone());
+        entry.insert(Arc::new(Repo {
+            root: toplevel.clone(),
+            repository_id,
+            lock: Mutex::new(()),
+        }));
+    }
+    drop(guard);
     Ok(RepoInfo {
         repo_id,
         root: clean_path_str(&toplevel),
@@ -382,25 +488,71 @@ fn validate_args(subcommand: &str, rest: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// The full path an actual `git_exec` call takes: validate, then run under the
-/// repository's own lock. Shared by the Tauri command and its tests.
-fn exec_on(repo: &Repo, args: &[String], input: Option<String>) -> Result<ToolOutput, String> {
+/// Resolves which shared lock (if any) `args` requires against `repository_id`,
+/// against real lock maps. Split out from `exec_on` because `git_exec` (the Tauri
+/// command) must resolve this *before* handing off to `spawn_blocking` -- a
+/// `tauri::State` borrow cannot cross that boundary (it isn't `'static`), unlike the
+/// owned `Arc<Mutex<()>>` this returns, which can.
+fn resolve_scope_lock(
+    stash_locks: &StashLocks,
+    network_locks: &NetworkLocks,
+    repository_id: &str,
+    args: &[String],
+) -> Result<Option<Arc<Mutex<()>>>, String> {
+    let Some(subcommand) = args.first() else {
+        return Ok(None);
+    };
+    match operation_scope(subcommand, &args[1..]) {
+        Scope::Stash => Ok(Some(lock_for(&stash_locks.0, repository_id)?)),
+        Scope::Network => Ok(Some(lock_for(&network_locks.0, repository_id)?)),
+        Scope::WorktreeLocal => Ok(None),
+    }
+}
+
+/// The full path an actual `git_exec` call takes: validate, then take whichever
+/// shared lock this operation's scope required (already resolved by the caller via
+/// `resolve_scope_lock`) before this worktree's own lock -- a fixed order every call
+/// site uses, so no operation ever needs two locks acquired in different orders,
+/// which is what would be needed to deadlock -- then run. Both lock acquisitions are
+/// cancellable (`acquire_cancellable`): an operation cancelled while queued behind
+/// another never acquires anything or spawns `git` at all. Shared by the Tauri
+/// command and its tests.
+fn exec_on(
+    repo: &Repo,
+    scope_lock: Option<Arc<Mutex<()>>>,
+    args: &[String],
+    input: Option<String>,
+    cancel: Arc<AtomicBool>,
+) -> Result<ToolOutput, String> {
     let subcommand = args.first().ok_or("Missing Git subcommand")?;
     validate_args(subcommand, &args[1..])?;
-    let _guard = repo.lock.lock().map_err(|e| e.to_string())?;
+
+    let _scope_guard = scope_lock
+        .as_ref()
+        .map(|lock| acquire_cancellable(lock, &cancel))
+        .transpose()?;
+    let _worktree_guard = acquire_cancellable(&repo.lock, &cancel)?;
+
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_with_input(&repo.root, &args_ref, input)
+    run_with_input(&repo.root, &args_ref, input, cancel)
 }
 
 #[tauri::command]
 pub async fn git_exec(
     state: State<'_, Repos>,
+    stash_locks: State<'_, StashLocks>,
+    network_locks: State<'_, NetworkLocks>,
     repo_id: String,
     args: Vec<String>,
     input: Option<String>,
 ) -> Result<ToolOutput, String> {
     let repo = repo_of(&state, &repo_id)?;
-    tauri::async_runtime::spawn_blocking(move || exec_on(&repo, &args, input))
+    let scope_lock = resolve_scope_lock(&stash_locks, &network_locks, &repo.repository_id, &args)?;
+    // Real per-operation cancellation (an id-addressable flag a UI Cancel button can
+    // flip) lands in the next phase; this flag is never set, matching today's
+    // behavior exactly while the locking above is already fully in place.
+    let cancel = Arc::new(AtomicBool::new(false));
+    tauri::async_runtime::spawn_blocking(move || exec_on(&repo, scope_lock, &args, input, cancel))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -408,11 +560,22 @@ pub async fn git_exec(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, time::UNIX_EPOCH};
+    use std::{
+        fs,
+        sync::atomic::AtomicU64,
+        time::{Instant, UNIX_EPOCH},
+    };
 
+    /// A nanosecond timestamp alone is not unique enough: this module's tests now
+    /// create several temp dirs per test (a main fixture plus linked worktrees) and
+    /// run in parallel, and Windows' clock resolution is coarser than a nanosecond --
+    /// two threads calling `SystemTime::now()` can observe the same value. Mixing in
+    /// a process-wide monotonic counter closes that collision window.
     fn temp_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "yavin_git_native_test_{}",
+            "yavin_git_native_test_{}_{sequence}",
             std::time::SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -446,8 +609,12 @@ mod tests {
 
     fn open(dir: &Path) -> Repo {
         let toplevel = discover_toplevel(dir).unwrap();
+        let repository_id = discover_common_dir(&toplevel)
+            .map(|p| clean_path_str(&p))
+            .unwrap_or_else(|_| clean_path_str(&toplevel));
         Repo {
             root: toplevel,
+            repository_id,
             lock: Mutex::new(()),
         }
     }
@@ -456,13 +623,31 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Test convenience matching `exec_on`'s old (pre-scope-lock) call shape: fresh,
+    /// throwaway lock maps every call, correct for every test that isn't itself
+    /// exercising cross-call lock sharing (those construct `StashLocks`/
+    /// `NetworkLocks` explicitly and share them across threads instead).
+    fn exec(repo: &Repo, args: &[String], input: Option<String>) -> Result<ToolOutput, String> {
+        let stash_locks = StashLocks::default();
+        let network_locks = NetworkLocks::default();
+        let scope_lock =
+            resolve_scope_lock(&stash_locks, &network_locks, &repo.repository_id, args).unwrap();
+        exec_on(
+            repo,
+            scope_lock,
+            args,
+            input,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
     #[test]
     fn a_disallowed_flag_is_rejected_before_git_ever_runs() {
         let (dir, _git) = fixture();
         let repo = open(&dir);
         // This is exactly the option-injection shape a malicious "remote name" or
         // "branch name" could try to smuggle in; it must never reach `git push`.
-        let result = exec_on(
+        let result = exec(
             &repo,
             &args(&["push", "--upload-pack=touch pwned", "origin", "main"]),
             None,
@@ -477,9 +662,9 @@ mod tests {
         let (dir, _git) = fixture();
         let repo = open(&dir);
         fs::write(dir.join("a.txt"), "changed\n").unwrap();
-        exec_on(&repo, &args(&["add", "a.txt"]), None).unwrap();
+        exec(&repo, &args(&["add", "a.txt"]), None).unwrap();
         // A commit message that happens to start with '-' is still just a message.
-        let result = exec_on(&repo, &args(&["commit", "-m", "-not a flag"]), None);
+        let result = exec(&repo, &args(&["commit", "-m", "-not a flag"]), None);
         let _ = fs::remove_dir_all(&dir);
         assert!(result.is_ok());
     }
@@ -489,7 +674,7 @@ mod tests {
         let (dir, _git) = fixture();
         let repo = open(&dir);
         fs::write(dir.join("-weird.txt"), "x\n").unwrap();
-        let result = exec_on(&repo, &args(&["add", "--", "-weird.txt"]), None);
+        let result = exec(&repo, &args(&["add", "--", "-weird.txt"]), None);
         let _ = fs::remove_dir_all(&dir);
         assert!(result.is_ok());
     }
@@ -498,7 +683,7 @@ mod tests {
     fn an_unsupported_subcommand_is_rejected() {
         let (dir, _git) = fixture();
         let repo = open(&dir);
-        let result = exec_on(
+        let result = exec(
             &repo,
             &args(&["config", "--global", "user.name", "x"]),
             None,
@@ -571,9 +756,9 @@ mod tests {
         ]));
 
         let repo = open(&dir);
-        let output = exec_on(&repo, &args(&["worktree", "list", "--porcelain"]), None);
+        let output = exec(&repo, &args(&["worktree", "list", "--porcelain"]), None);
         // Only `--porcelain` is allow-listed; an unrelated flag must still be refused.
-        let rejected = exec_on(&repo, &args(&["worktree", "list", "--bogus-flag"]), None);
+        let rejected = exec(&repo, &args(&["worktree", "list", "--bogus-flag"]), None);
 
         let _ = fs::remove_dir_all(&linked);
         let _ = fs::remove_dir_all(&dir);
@@ -589,7 +774,7 @@ mod tests {
         fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
         assert!(git(&["add", "a.txt"]));
         let repo = open(&dir);
-        let output = exec_on(&repo, &args(&["cat-file", "--filters", ":a.txt"]), None);
+        let output = exec(&repo, &args(&["cat-file", "--filters", ":a.txt"]), None);
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(output.unwrap().stdout, "one\r\ntwo\r\n");
     }
@@ -618,7 +803,7 @@ mod tests {
 
         let repo = open(&dir);
         let during = repo_state(&repo);
-        let abort = exec_on(&repo, &args(&["merge", "--abort"]), None);
+        let abort = exec(&repo, &args(&["merge", "--abort"]), None);
         let after = repo_state(&repo);
         let content = fs::read_to_string(dir.join("a.txt")).unwrap();
         let _ = fs::remove_dir_all(&dir);
@@ -637,17 +822,181 @@ mod tests {
         let (dir, _git) = fixture();
         let repo = open(&dir);
         fs::write(dir.join("a.txt"), "base\nchanged\n").unwrap();
-        let diff = exec_on(&repo, &args(&["diff", "--", "a.txt"]), None).unwrap();
+        let diff = exec(&repo, &args(&["diff", "--", "a.txt"]), None).unwrap();
 
-        let apply = exec_on(&repo, &args(&["apply", "--cached"]), Some(diff.stdout));
-        let staged = exec_on(&repo, &args(&["diff", "--cached", "--", "a.txt"]), None);
+        let apply = exec(&repo, &args(&["apply", "--cached"]), Some(diff.stdout));
+        let staged = exec(&repo, &args(&["diff", "--cached", "--", "a.txt"]), None);
         // --cached only touches the index; since the working tree already matched the
         // patch, the index now matches the working tree too, so the unstaged diff empties.
-        let worktree_diff = exec_on(&repo, &args(&["diff", "--", "a.txt"]), None);
+        let worktree_diff = exec(&repo, &args(&["diff", "--", "a.txt"]), None);
         let _ = fs::remove_dir_all(&dir);
 
         assert!(apply.is_ok(), "apply failed: {:?}", apply.err());
         assert!(staged.unwrap().stdout.contains("+changed"));
         assert_eq!(worktree_diff.unwrap().stdout, "");
+    }
+
+    /// A main worktree plus two linked worktrees, each on its own branch (Git itself
+    /// refuses two worktrees on the same branch -- see the plan's empirical
+    /// verification), for the cross-worktree locking tests below.
+    fn fixture_with_two_linked_worktrees() -> (PathBuf, Repo, Repo) {
+        let (dir, git) = fixture();
+        let a = temp_dir();
+        let b = temp_dir();
+        assert!(git(&[
+            "worktree",
+            "add",
+            a.to_str().unwrap(),
+            "-b",
+            "worktree-a"
+        ]));
+        assert!(git(&[
+            "worktree",
+            "add",
+            b.to_str().unwrap(),
+            "-b",
+            "worktree-b"
+        ]));
+        (dir, open(&a), open(&b))
+    }
+
+    #[test]
+    fn stash_pushes_from_different_worktrees_of_the_same_repository_do_not_corrupt_shared_state() {
+        let (dir, repo_a, repo_b) = fixture_with_two_linked_worktrees();
+        let (root_a, root_b) = (repo_a.root.clone(), repo_b.root.clone());
+        fs::write(root_a.join("a.txt"), "change from A\n").unwrap();
+        fs::write(root_b.join("a.txt"), "change from B\n").unwrap();
+        assert_eq!(
+            repo_a.repository_id, repo_b.repository_id,
+            "both worktrees must resolve to the same repository identity for this \
+             test to actually exercise the stash lock"
+        );
+
+        let stash_locks = Arc::new(StashLocks::default());
+        let network_locks = Arc::new(NetworkLocks::default());
+        let repo_a = Arc::new(repo_a);
+        let repo_b = Arc::new(repo_b);
+
+        let run_stash = |repo: Arc<Repo>, message: &'static str| {
+            let stash_locks = stash_locks.clone();
+            let network_locks = network_locks.clone();
+            std::thread::spawn(move || {
+                let call = args(&["stash", "push", "-u", "-m", message]);
+                let scope_lock =
+                    resolve_scope_lock(&stash_locks, &network_locks, &repo.repository_id, &call)
+                        .unwrap();
+                exec_on(
+                    &repo,
+                    scope_lock,
+                    &call,
+                    None,
+                    Arc::new(AtomicBool::new(false)),
+                )
+            })
+        };
+        let handle_a = run_stash(repo_a, "from-a");
+        let handle_b = run_stash(repo_b, "from-b");
+        let result_a = handle_a.join().unwrap();
+        let result_b = handle_b.join().unwrap();
+
+        let list = Command::new("git")
+            .current_dir(&dir)
+            .args(["stash", "list"])
+            .output()
+            .unwrap();
+        let list = String::from_utf8_lossy(&list.stdout).into_owned();
+
+        let _ = fs::remove_dir_all(&root_a);
+        let _ = fs::remove_dir_all(&root_b);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(result_a.is_ok(), "{:?}", result_a.err());
+        assert!(result_b.is_ok(), "{:?}", result_b.err());
+        assert_eq!(
+            list.lines().count(),
+            2,
+            "both concurrent stashes must land intact on the one shared refs/stash \
+             -- neither corrupted nor silently dropped:\n{list}"
+        );
+    }
+
+    #[test]
+    fn worktree_local_operations_across_different_worktrees_are_not_serialized() {
+        let (dir, repo_a, repo_b) = fixture_with_two_linked_worktrees();
+        let (root_a, root_b) = (repo_a.root.clone(), repo_b.root.clone());
+        fs::write(root_b.join("a.txt"), "change from B\n").unwrap();
+
+        let repo_a = Arc::new(repo_a);
+        let repo_b = Arc::new(repo_b);
+        let a_for_thread = repo_a.clone();
+
+        let started = Instant::now();
+        // A does nothing but read; B stages and commits. If the new locks
+        // accidentally serialized worktree-local operations across worktrees (the
+        // exact regression this design exists to avoid), A would have to wait for
+        // B's whole stage+commit before running at all.
+        let handle_b = std::thread::spawn(move || {
+            exec(&repo_b, &args(&["add", "a.txt"]), None).unwrap();
+            exec(&repo_b, &args(&["commit", "-m", "from b"]), None)
+        });
+        let status_a = exec(
+            &a_for_thread,
+            &args(&["status", "--porcelain=v1", "-z"]),
+            None,
+        );
+        let a_finished_at = started.elapsed();
+        let result_b = handle_b.join().unwrap();
+
+        let _ = fs::remove_dir_all(&root_a);
+        let _ = fs::remove_dir_all(&root_b);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(status_a.is_ok());
+        assert!(result_b.is_ok(), "{:?}", result_b.err());
+        assert!(
+            a_finished_at < Duration::from_secs(2),
+            "A's read took {a_finished_at:?} -- it should never have to wait on B's \
+             unrelated worktree-local commit"
+        );
+    }
+
+    #[test]
+    fn cancelling_an_operation_queued_behind_a_held_stash_lock_never_lets_it_run() {
+        let (dir, git) = fixture();
+        let repository_id = discover_common_dir(&dir)
+            .map(|p| clean_path_str(&p))
+            .unwrap();
+        let repo = open(&dir);
+        assert_eq!(repo.repository_id, repository_id);
+
+        let stash_locks = StashLocks::default();
+        // Hold the stash lock ourselves, simulating another operation already
+        // running, so the call below has to queue for it.
+        let held = lock_for(&stash_locks.0, &repository_id).unwrap();
+        let _held_guard = held.lock().unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let network_locks = NetworkLocks::default();
+        let call = args(&["stash", "push", "-u", "-m", "should never run"]);
+        let scope_lock =
+            resolve_scope_lock(&stash_locks, &network_locks, &repo.repository_id, &call).unwrap();
+        let started = Instant::now();
+        let result = exec_on(&repo, scope_lock, &call, None, cancel);
+        let elapsed = started.elapsed();
+
+        let stash_list_after = git(&["stash", "list"]);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(result.unwrap_err(), "Cancelled");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "cancellation while waiting for the lock must not wait for the lock to \
+             free up; took {elapsed:?}"
+        );
+        // `git` returns true/false for success in this fixture's closure, not stash
+        // output -- the real assertion is that `exec_on` never got far enough to run
+        // `git stash push` at all, which the fast, immediate Cancelled result above
+        // already proves (it never touched the held lock).
+        let _ = stash_list_after;
     }
 }

@@ -6,7 +6,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 mod git;
 mod terminal;
 mod workbench;
-use git::{git_close_repo, git_exec, git_open_repo, git_repo_state, Repos};
+use git::{
+    git_close_repo, git_exec, git_open_repo, git_repo_state, NetworkLocks, Repos, StashLocks,
+};
 use terminal::{
     terminal_close, terminal_close_all, terminal_open, terminal_resize, terminal_shells,
     terminal_write, Terminals,
@@ -182,6 +184,8 @@ pub fn run() {
         .manage(Watch::default())
         .manage(workbench::Jobs::default())
         .manage(Repos::default())
+        .manage(StashLocks::default())
+        .manage(NetworkLocks::default())
         .manage(Terminals::default())
         .invoke_handler(tauri::generate_handler![
             get_default_workspace,
