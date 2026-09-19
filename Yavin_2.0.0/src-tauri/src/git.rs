@@ -1186,6 +1186,121 @@ mod tests {
         );
     }
 
+    /// A main worktree plus one linked worktree, sharing two already-committed
+    /// tracked files (`a.txt`, `b.txt`) and a third branch ("elsewhere") that is
+    /// never checked out anywhere -- everything Section H.1's execution-context
+    /// proof needs, built once so each assertion below stays about the invariant,
+    /// not fixture plumbing.
+    fn fixture_for_execution_context_proof() -> (PathBuf, PathBuf, Repo, Repo) {
+        let (dir, git) = fixture();
+        fs::write(dir.join("b.txt"), "base\n").unwrap();
+        assert!(git(&["add", "b.txt"]));
+        assert!(git(&["commit", "-qm", "add b.txt"]));
+        assert!(git(&["branch", "elsewhere"]));
+
+        let linked = temp_dir();
+        assert!(git(&[
+            "worktree",
+            "add",
+            linked.to_str().unwrap(),
+            "-b",
+            "linked-worktree",
+        ]));
+
+        // Unique, non-overlapping uncommitted changes: main only touches a.txt,
+        // the linked worktree only touches b.txt.
+        fs::write(dir.join("a.txt"), "changed in main\n").unwrap();
+        fs::write(linked.join("b.txt"), "changed in linked\n").unwrap();
+
+        let main_repo = open(&dir);
+        let linked_repo = open(&linked);
+        assert_eq!(
+            main_repo.repository_id, linked_repo.repository_id,
+            "both worktrees must share one repository identity for this proof to \
+             mean anything"
+        );
+        (dir, linked, main_repo, linked_repo)
+    }
+
+    #[test]
+    fn a_command_never_executes_against_a_worktree_other_than_the_one_it_was_issued_for() {
+        let (dir, linked, main_repo, linked_repo) = fixture_for_execution_context_proof();
+
+        let status_args = args(&["status", "--porcelain=v1", "-z", "-uall"]);
+        let diff_args = |file: &str| {
+            args(&[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--",
+                file,
+            ])
+        };
+        let branch_args = args(&["symbolic-ref", "--short", "HEAD"]);
+        let head_args = args(&["rev-parse", "HEAD"]);
+
+        // 1. status only reports the change actually made in that worktree.
+        let status_main = exec(&main_repo, &status_args, None).unwrap();
+        let status_linked = exec(&linked_repo, &status_args, None).unwrap();
+        assert!(status_main.stdout.contains("a.txt"));
+        assert!(!status_main.stdout.contains("b.txt"));
+        assert!(status_linked.stdout.contains("b.txt"));
+        assert!(!status_linked.stdout.contains("a.txt"));
+
+        // 2. diff only shows that worktree's own uncommitted content change.
+        let diff_main = exec(&main_repo, &diff_args("a.txt"), None).unwrap();
+        let diff_linked = exec(&linked_repo, &diff_args("b.txt"), None).unwrap();
+        assert!(diff_main.stdout.contains("changed in main"));
+        assert!(!diff_main.stdout.contains("changed in linked"));
+        assert!(diff_linked.stdout.contains("changed in linked"));
+        assert!(!diff_linked.stdout.contains("changed in main"));
+
+        // 3. staging + committing in main advances only main's HEAD, and never
+        // disturbs the linked worktree's own still-uncommitted change.
+        let linked_head_before = exec(&linked_repo, &head_args, None).unwrap().stdout;
+        let main_head_before = exec(&main_repo, &head_args, None).unwrap().stdout;
+        exec(&main_repo, &args(&["add", "a.txt"]), None).unwrap();
+        exec(
+            &main_repo,
+            &args(&["commit", "-m", "commit from main"]),
+            None,
+        )
+        .unwrap();
+        let main_head_after = exec(&main_repo, &head_args, None).unwrap().stdout;
+        let linked_head_after = exec(&linked_repo, &head_args, None).unwrap().stdout;
+        let linked_diff_after = exec(&linked_repo, &diff_args("b.txt"), None).unwrap();
+        assert_ne!(
+            main_head_before, main_head_after,
+            "committing in main must move main's own HEAD"
+        );
+        assert_eq!(
+            linked_head_before, linked_head_after,
+            "committing in main must never move the linked worktree's HEAD"
+        );
+        assert!(
+            linked_diff_after.stdout.contains("changed in linked"),
+            "the linked worktree's own uncommitted change must survive a commit \
+             made in a different worktree"
+        );
+
+        // 4. switching main to a branch checked out nowhere else changes only
+        // main's own current branch.
+        let linked_branch_before = exec(&linked_repo, &branch_args, None).unwrap().stdout;
+        exec(&main_repo, &args(&["switch", "elsewhere"]), None).unwrap();
+        let main_branch_after = exec(&main_repo, &branch_args, None).unwrap().stdout;
+        let linked_branch_after = exec(&linked_repo, &branch_args, None).unwrap().stdout;
+        assert_eq!(main_branch_after.trim(), "elsewhere");
+        assert_eq!(
+            linked_branch_before, linked_branch_after,
+            "switching main's branch must never change the linked worktree's \
+             current branch"
+        );
+
+        let _ = fs::remove_dir_all(&linked);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_git_operation_cancelled_through_the_real_job_registry_is_actually_stopped() {
         let (dir, _git) = fixture();
