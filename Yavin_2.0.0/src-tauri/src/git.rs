@@ -18,9 +18,8 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, MutexGuard, TryLockError,
+        Arc, Mutex, MutexGuard, OnceLock, TryLockError,
     },
-    time::Duration,
 };
 use tauri::{AppHandle, Emitter, State};
 
@@ -35,6 +34,10 @@ pub struct Repo {
     root: PathBuf,
     repository_id: String,
     lock: Mutex<()>,
+    /// This worktree's absolute git dir, resolved once (`rev-parse --absolute-git-dir`
+    /// never changes for an open worktree) instead of spawning a process per
+    /// `repo_state()` call -- one of the six processes every refresh used to launch.
+    git_dir: OnceLock<PathBuf>,
 }
 
 #[derive(Default)]
@@ -176,6 +179,7 @@ fn acquire_cancellable<'a>(
     lock: &'a Mutex<()>,
     cancel: &AtomicBool,
 ) -> Result<MutexGuard<'a, ()>, String> {
+    let start = std::time::Instant::now();
     loop {
         match lock.try_lock() {
             Ok(guard) => return Ok(guard),
@@ -185,7 +189,7 @@ fn acquire_cancellable<'a>(
         if cancel.load(Ordering::Relaxed) {
             return Err("Cancelled".into());
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(ide_workspace::process::poll_interval(start.elapsed()));
     }
 }
 
@@ -198,6 +202,12 @@ fn acquire_cancellable<'a>(
 /// reference the same branch, so their ref-moving side effects can never collide
 /// across worktrees to begin with.
 enum Scope {
+    /// A pure read: takes no worktree lock (so a refresh's parallel reads really run
+    /// in parallel, and a diff/graph/status read is never stuck behind a running
+    /// fetch/push/pull) and runs with `GIT_OPTIONAL_LOCKS=0` so it can never take
+    /// `index.lock` from a concurrent mutation. Deliberately narrow: only argv shapes
+    /// that cannot write anything, decided here -- anything not listed is not a read.
+    Read,
     WorktreeLocal,
     Stash,
     Network,
@@ -207,8 +217,14 @@ fn operation_scope(subcommand: &str, rest: &[String]) -> Scope {
     match subcommand {
         "stash" => match rest.first().map(String::as_str) {
             Some("push") | Some("apply") | Some("pop") | Some("drop") => Scope::Stash,
+            Some("list") => Scope::Read,
             _ => Scope::WorktreeLocal,
         },
+        "status" | "log" | "show" | "diff" | "for-each-ref" | "rev-parse" | "cat-file"
+        | "check-ref-format" => Scope::Read,
+        // `git remote <verb> ...` can add/remove/rename; only the bare listing is a read.
+        "remote" if rest.is_empty() => Scope::Read,
+        "worktree" if rest.first().map(String::as_str) == Some("list") => Scope::Read,
         "fetch" | "pull" | "push" => Scope::Network,
         _ => Scope::WorktreeLocal,
     }
@@ -235,7 +251,7 @@ fn repo_of(state: &Repos, repo_id: &str) -> Result<Arc<Repo>, String> {
 /// literal pathspecs, no interactive credential/editor prompts, and the same 16 MB
 /// output cap the previous single-repo design enforced.
 fn run(root: &Path, args: &[&str]) -> Result<ToolOutput, String> {
-    run_with_input(root, args, None, Arc::new(AtomicBool::new(false)))
+    run_command(root, args, None, Arc::new(AtomicBool::new(false)), false)
 }
 
 /// Like `run`, but pipes `input` to Git's stdin -- the only current use is feeding a
@@ -246,11 +262,12 @@ fn run(root: &Path, args: &[&str]) -> Result<ToolOutput, String> {
 /// user-cancellable operations. The patch is data Git parses, not a command or shell
 /// input, so it needs no extra validation beyond the argv allow-list `apply` (like
 /// every subcommand) already goes through.
-fn run_with_input(
+fn run_command(
     root: &Path,
     args: &[&str],
     input: Option<String>,
     cancel: Arc<AtomicBool>,
+    read_only: bool,
 ) -> Result<ToolOutput, String> {
     let mut command = Command::new("git");
     command
@@ -265,6 +282,9 @@ fn run_with_input(
         // produce, silently defeating both matchers.
         .env("LC_ALL", "C")
         .env("LANGUAGE", "C");
+    if read_only {
+        command.env("GIT_OPTIONAL_LOCKS", "0");
+    }
     let result = capture(command, input, cancel)?;
     if result.truncated {
         return Err("Git output exceeded 16 MB; narrow the operation".into());
@@ -346,6 +366,7 @@ fn register_repo(repos: &Repos, toplevel: PathBuf) -> Result<RepoInfo, String> {
             root: toplevel.clone(),
             repository_id,
             lock: Mutex::new(()),
+            git_dir: OnceLock::new(),
         }));
     }
     drop(guard);
@@ -511,12 +532,21 @@ pub fn git_unwatch_repo(
 }
 
 /// The interrupted operation the repository is sitting in, or "" when it is idle.
-fn repo_state(repo: &Repo) -> Result<String, String> {
-    let dir = run(&repo.root, &["rev-parse", "--absolute-git-dir"])?;
-    if dir.code != 0 {
-        return Err(dir.stderr.trim().to_string());
+fn git_dir_of(repo: &Repo) -> Result<PathBuf, String> {
+    if let Some(dir) = repo.git_dir.get() {
+        return Ok(dir.clone());
     }
-    let dir = PathBuf::from(dir.stdout.trim());
+    let output = run(&repo.root, &["rev-parse", "--absolute-git-dir"])?;
+    if output.code != 0 {
+        return Err(output.stderr.trim().to_string());
+    }
+    let dir = PathBuf::from(output.stdout.trim());
+    let _ = repo.git_dir.set(dir.clone());
+    Ok(dir)
+}
+
+fn repo_state(repo: &Repo) -> Result<String, String> {
+    let dir = git_dir_of(repo)?;
     let has = |name: &str| dir.join(name).exists();
     Ok(if has("rebase-merge") || has("rebase-apply") {
         "rebase"
@@ -761,7 +791,7 @@ fn resolve_scope_lock(
     match operation_scope(subcommand, &args[1..]) {
         Scope::Stash => Ok(Some(lock_for(&stash_locks.0, repository_id)?)),
         Scope::Network => Ok(Some(lock_for(&network_locks.0, repository_id)?)),
-        Scope::WorktreeLocal => Ok(None),
+        Scope::Read | Scope::WorktreeLocal => Ok(None),
     }
 }
 
@@ -787,10 +817,15 @@ fn exec_on(
         .as_ref()
         .map(|lock| acquire_cancellable(lock, &cancel))
         .transpose()?;
-    let _worktree_guard = acquire_cancellable(&repo.lock, &cancel)?;
+    let read_only = matches!(operation_scope(subcommand, &args[1..]), Scope::Read);
+    let _worktree_guard = if read_only {
+        None
+    } else {
+        Some(acquire_cancellable(&repo.lock, &cancel)?)
+    };
 
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_with_input(&repo.root, &args_ref, input, cancel)
+    run_command(&repo.root, &args_ref, input, cancel, read_only)
 }
 
 // Every extra parameter here is a distinct piece of Tauri-managed state
@@ -845,7 +880,7 @@ mod tests {
     use std::{
         fs,
         sync::atomic::AtomicU64,
-        time::{Instant, UNIX_EPOCH},
+        time::{Duration, Instant, UNIX_EPOCH},
     };
 
     /// A nanosecond timestamp alone is not unique enough: this module's tests now
@@ -898,6 +933,7 @@ mod tests {
             root: toplevel,
             repository_id,
             lock: Mutex::new(()),
+            git_dir: OnceLock::new(),
         }
     }
 
@@ -1497,7 +1533,7 @@ mod tests {
             cancel_job(&jobs, "op-1").unwrap();
         });
 
-        // A long-running command in the same shape `run_with_input` spawns internally
+        // A long-running command in the same shape `run_command` spawns internally
         // (via `capture`), so this exercises real process termination end-to-end,
         // through the exact flag the job registry hands out.
         let mut sleepy = Command::new("cmd");
@@ -1530,6 +1566,7 @@ mod tests {
                     root: repo.root.clone(),
                     repository_id: repo.repository_id.clone(),
                     lock: Mutex::new(()),
+                    git_dir: OnceLock::new(),
                 }),
             );
         }
@@ -1602,6 +1639,7 @@ mod tests {
             root: dir.clone(),
             repository_id: repository_id.clone(),
             lock: Mutex::new(()),
+            git_dir: OnceLock::new(),
         };
         let repos = repos_for(&[&repo]);
         let watches = GitWatches::default();
@@ -2317,5 +2355,123 @@ mod tests {
 
         assert_eq!(normal_result.stdout.trim(), "false");
         assert_eq!(shallow_result.stdout.trim(), "true");
+    }
+
+    fn scope_of(argv: &[&str]) -> Scope {
+        let args = args(argv);
+        operation_scope(&args[0], &args[1..])
+    }
+
+    #[test]
+    fn only_argv_shapes_that_cannot_write_are_reads() {
+        for read in [
+            &["status", "--porcelain=v1", "-z"][..],
+            &["log", "-n", "5"],
+            &["show", "abc"],
+            &["diff", "--cached"],
+            &["for-each-ref", "refs/heads/"],
+            &["rev-parse", "--absolute-git-dir"],
+            &["cat-file", "--filters", ":a"],
+            &["check-ref-format", "--branch", "x"],
+            &["remote"],
+            &["stash", "list"],
+            &["worktree", "list", "--porcelain"],
+        ] {
+            assert!(
+                matches!(scope_of(read), Scope::Read),
+                "{read:?} should be a read"
+            );
+        }
+        // Everything that can change the repository, index or working tree must keep
+        // the worktree lock (or its stash/network scope) -- including the shapes of
+        // subcommands that ALSO have a read form.
+        for write in [
+            &["add", "a"][..],
+            &["restore", "--staged", "a"],
+            &["rm", "--cached", "a"],
+            &["apply", "--cached"],
+            &["commit", "-m", "x"],
+            &["switch", "x"],
+            &["branch", "-d", "x"],
+            &["remote", "add", "x", "url"],
+            &["tag", "v1"],
+            &["symbolic-ref", "HEAD", "refs/heads/x"],
+            &["stash", "push"],
+            &["stash", "drop"],
+            &["worktree", "add", "../x"],
+            &["merge", "--abort"],
+            &["rebase", "--continue"],
+            &["cherry-pick", "--skip"],
+            &["revert", "--abort"],
+            &["fetch"],
+            &["pull"],
+            &["push"],
+        ] {
+            assert!(
+                !matches!(scope_of(write), Scope::Read),
+                "{write:?} must not be a read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_completes_while_the_worktree_lock_is_held() {
+        let (dir, _git) = fixture();
+        let repo = open(&dir);
+        let _held = repo.lock.lock().unwrap();
+        let started = Instant::now();
+        let status = exec(&repo, &args(&["status", "--porcelain=v1"]), None);
+        assert!(status.is_ok(), "{:?}", status.err());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a read must not queue behind whoever holds the worktree lock"
+        );
+    }
+
+    #[test]
+    fn a_mutation_still_waits_for_the_worktree_lock() {
+        let (dir, _git) = fixture();
+        let repo = Arc::new(open(&dir));
+        let held = repo.lock.lock().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let repo = repo.clone();
+            let cancel = cancel.clone();
+            std::thread::spawn(move || exec_on(&repo, None, &args(&["add", "."]), None, cancel))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !waiter.is_finished(),
+            "a mutation must serialize behind the lock"
+        );
+        cancel.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        let result = waiter.join().unwrap();
+        assert_eq!(result.err().as_deref(), Some("Cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held);
+    }
+
+    #[test]
+    fn repo_state_resolves_the_git_dir_once_and_reuses_it() {
+        let (dir, _git) = fixture();
+        let repo = open(&dir);
+        assert!(repo.git_dir.get().is_none());
+        assert_eq!(repo_state(&repo).unwrap(), "");
+        let first = repo.git_dir.get().cloned().expect("resolved on first use");
+        assert_eq!(repo_state(&repo).unwrap(), "");
+        assert_eq!(repo.git_dir.get(), Some(&first));
+        assert!(first.is_absolute());
+    }
+
+    #[test]
+    fn poll_interval_starts_short_and_never_exceeds_the_old_ceiling() {
+        use ide_workspace::process::poll_interval;
+        assert_eq!(poll_interval(Duration::ZERO), Duration::from_millis(1));
+        assert!(poll_interval(Duration::from_millis(80)) < Duration::from_millis(20));
+        assert_eq!(
+            poll_interval(Duration::from_secs(60)),
+            Duration::from_millis(20)
+        );
     }
 }

@@ -87,7 +87,7 @@ pub fn capture(
         if kill_reason.is_some() {
             let _ = child.kill();
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(poll_interval(start.elapsed()));
     };
     let bytes = reader
         .join()
@@ -115,6 +115,15 @@ pub fn capture(
         code: status.code().unwrap_or(-1),
         truncated,
     })
+}
+
+/// How long to sleep between checks on a running process (or a lock being waited
+/// for): ~1 ms at first, growing to the original 20 ms ceiling after ~150 ms. Git
+/// commands are mostly short, and a fixed 20 ms quantum measurably added ~14 ms of
+/// dead time to every one of them; cancel/timeout latency stays bounded by the
+/// ceiling because long-running work reaches it quickly.
+pub fn poll_interval(elapsed: Duration) -> Duration {
+    Duration::from_millis((1 + elapsed.as_millis() as u64 / 8).min(20))
 }
 
 /// Which reason (if any) the still-running process should be killed for, given the
