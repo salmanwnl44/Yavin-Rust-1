@@ -36,16 +36,33 @@ async function panel(page: Page, scenario: Scenario) {
       localStorage.setItem("yavin.git.repos", JSON.stringify(s.seedStorage));
     const calls: { command: string; args: Record<string, unknown> }[] = [];
     const ok = (stdout: string) => ({ stdout, stderr: "", code: 0, truncated: false });
+    // Real native-event plumbing (mirrors terminal.spec.ts's proven pattern) --
+    // needed to simulate a "git-changed" event from the new .git watcher.
+    const callbacks: Record<number, (event: unknown) => void> = {};
+    const listeners: Record<string, number[]> = {};
+    let nextId = 1;
     Object.assign(window, {
       __calls: calls,
+      __emit: (event: string, payload: unknown) => {
+        for (const id of listeners[event] ?? []) callbacks[id]?.({ event, id, payload });
+      },
       __pick: s.pick ?? null,
       isTauri: true,
       __TAURI_INTERNALS__: {
         metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
-        transformCallback: () => 1,
-        unregisterCallback: () => {},
+        transformCallback: (callback: (event: unknown) => void) => {
+          const id = nextId++;
+          callbacks[id] = callback;
+          return id;
+        },
+        unregisterCallback: (id: number) => delete callbacks[id],
         invoke: async (command: string, args: Record<string, unknown> = {}) => {
           calls.push({ command, args });
+          if (command === "plugin:event|listen") {
+            const event = args.event as string;
+            (listeners[event] ??= []).push(args.handler as number);
+            return nextId++;
+          }
           if (command === "get_default_workspace") return s.workspace;
           if (command === "list_workspace_files")
             return {
@@ -96,6 +113,16 @@ async function panel(page: Page, scenario: Scenario) {
   await expect(region).toBeVisible();
   return region;
 }
+
+const emit = (page: Page, event: string, payload: unknown) =>
+  page.evaluate(
+    ([name, data]) =>
+      (window as unknown as { __emit: (e: string, p: unknown) => void }).__emit(
+        name as string,
+        data,
+      ),
+    [event, payload] as const,
+  );
 
 test("the workspace repository is tracked and shown without adding anything", async ({ page }) => {
   const region = await panel(page, {
@@ -409,4 +436,110 @@ test("switching rapidly back and forth between two just-refreshed worktrees does
   const featureAfter = await statusCallsFor("/work-feature");
   expect(workAfter).toBe(workBefore);
   expect(featureAfter).toBe(featureBefore);
+});
+
+test("a 'git-changed' stash event from the .git watcher refreshes every worktree of that repository", async ({
+  page,
+}) => {
+  const worktreeList = [
+    "worktree /work",
+    "HEAD abc123",
+    "branch refs/heads/main",
+    "",
+    "worktree /work-feature",
+    "HEAD abc123",
+    "branch refs/heads/feature",
+    "",
+  ].join("\n");
+  const region = await panel(page, {
+    workspace: "/work",
+    repos: {
+      "/work": { ...repo("main"), commonDir: "/work/.git", worktreeList },
+      "/work-feature": { ...repo("feature"), commonDir: "/work/.git" },
+    },
+  });
+  await region.getByText("1 more worktree").click();
+  await region.getByRole("button", { name: "Open worktree /work-feature" }).click();
+  await expect(region.getByLabel("Commit message")).toBeVisible();
+
+  const stashCallsFor = (repoId: string) =>
+    page.evaluate(
+      (id) =>
+        (
+          window as unknown as {
+            __calls: { command: string; args: { repoId?: string; args?: string[] } }[];
+          }
+        ).__calls.filter(
+          (c) => c.command === "git_exec" && c.args.repoId === id && c.args.args?.[0] === "stash",
+        ).length,
+      repoId,
+    );
+  const workBefore = await stashCallsFor("/work");
+  const featureBefore = await stashCallsFor("/work-feature");
+
+  // Simulates the real Rust watcher (git.rs's watch_repo) reporting an external
+  // `git stash push` run from a terminal, another IDE, or a GUI client -- neither
+  // worktree ran this through Yavin itself.
+  await emit(page, "git-changed", { repositoryId: "/work/.git", kind: "stash" });
+
+  await expect.poll(() => stashCallsFor("/work")).toBeGreaterThan(workBefore);
+  await expect.poll(() => stashCallsFor("/work-feature")).toBeGreaterThan(featureBefore);
+});
+
+test("a 'git-changed' head event from the .git watcher refreshes only the worktree it names", async ({
+  page,
+}) => {
+  const worktreeList = [
+    "worktree /work",
+    "HEAD abc123",
+    "branch refs/heads/main",
+    "",
+    "worktree /work-feature",
+    "HEAD abc123",
+    "branch refs/heads/feature",
+    "",
+  ].join("\n");
+  const region = await panel(page, {
+    workspace: "/work",
+    repos: {
+      "/work": { ...repo("main"), commonDir: "/work/.git", worktreeList },
+      "/work-feature": { ...repo("feature"), commonDir: "/work/.git" },
+    },
+  });
+  await region.getByText("1 more worktree").click();
+  await region.getByRole("button", { name: "Open worktree /work-feature" }).click();
+  await expect(region.getByLabel("Commit message")).toBeVisible();
+
+  const branchInfoCallsFor = (repoId: string) =>
+    page.evaluate(
+      (id) =>
+        (
+          window as unknown as {
+            __calls: { command: string; args: { repoId?: string; args?: string[] } }[];
+          }
+        ).__calls.filter(
+          (c) =>
+            c.command === "git_exec" &&
+            c.args.repoId === id &&
+            c.args.args?.[0] === "status" &&
+            c.args.args?.includes("--porcelain=v2"),
+        ).length,
+      repoId,
+    );
+  const workBefore = await branchInfoCallsFor("/work");
+  const featureBefore = await branchInfoCallsFor("/work-feature");
+
+  // Simulates an external `git switch`/`checkout`/commit moving /work's own HEAD
+  // -- a per-worktree event, so only /work should refresh, never /work-feature.
+  await emit(page, "git-changed", {
+    repositoryId: "/work/.git",
+    kind: "head",
+    worktreeRoot: "/work",
+  });
+
+  await expect.poll(() => branchInfoCallsFor("/work")).toBeGreaterThan(workBefore);
+  // Give the (intentionally absent) sibling refresh a moment to have happened if
+  // it were going to, then confirm it didn't.
+  await page.waitForTimeout(200);
+  expect(await branchInfoCallsFor("/work-feature")).toBe(featureBefore);
 });

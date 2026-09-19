@@ -336,6 +336,13 @@ class GitRegistry {
   repositoryFor(repoId: string): RepositoryEntry | undefined {
     return this.findWorktree(repoId)?.repository;
   }
+
+  /** Looks up a tracked repository by its own identity (the value `git_watch_repo`'s
+   * events carry), as opposed to `repositoryFor`, which looks one up by a worktree's
+   * native id. `undefined` once every worktree of it has been closed. */
+  repositoryById(repositoryId: string): RepositoryEntry | undefined {
+    return this.snapshot.repositories.find((r) => r.repositoryId === repositoryId);
+  }
 }
 
 export const gitRegistry = new GitRegistry();

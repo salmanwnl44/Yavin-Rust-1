@@ -84,6 +84,32 @@ export function onWorkspaceChanged(handler: () => void): () => void {
   };
 }
 
+/** The payload `git_watch_repo`'s Rust-side watcher emits -- see the Git State &
+ * Synchronization plan's Section H/Z. `worktreeRoot` is only present for the two
+ * per-worktree kinds; the three repository-shared kinds apply to every worktree. */
+export interface GitChangeEvent {
+  repositoryId: string;
+  kind: "head" | "operation-state" | "refs" | "remotes" | "stash";
+  worktreeRoot?: string;
+}
+
+/**
+ * Subscribes to external Git ref changes reported by the per-repository `.git`
+ * watcher (see `backend.ts`'s `watchRepo`/`unwatchRepo`). Mirrors
+ * `onWorkspaceChanged`'s exact shape.
+ */
+export function onGitChanged(handler: (event: GitChangeEvent) => void): () => void {
+  if (!isTauri()) return () => {};
+  let cancelled = false;
+  const pending = listen<GitChangeEvent>("git-changed", (event) => {
+    if (!cancelled) handler(event.payload);
+  }).catch(() => undefined);
+  return () => {
+    cancelled = true;
+    void pending.then((unlisten) => unlisten?.());
+  };
+}
+
 export function native<K extends keyof Commands>(
   command: K,
   ...parameters: Commands[K]["args"] extends undefined ? [] : [Commands[K]["args"]]

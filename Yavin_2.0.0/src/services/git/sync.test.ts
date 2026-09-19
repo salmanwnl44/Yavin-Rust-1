@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { GRAPH_RESETS, SIBLING_INVALIDATES } from "./sync.ts";
+import { applyGitChangeEvent, GRAPH_RESETS, SIBLING_INVALIDATES, WATCHER_INVALIDATES } from "./sync.ts";
+import type { RepoEntry, RepositoryEntry } from "./registry.ts";
+import type { GitChangeEvent } from "../native.ts";
 
 // Every `kind` string Module 2's own INVALIDATES table and the various guarded()
 // call sites actually use -- kept as a flat list here (rather than importing
@@ -114,5 +116,81 @@ test("GRAPH_RESETS does not yet cover commit/switch/branch/abort/continue/stash 
     "stashDrop",
   ]) {
     assert.ok(!GRAPH_RESETS.has(kind), `"${kind}" must not be in GRAPH_RESETS yet`);
+  }
+});
+
+function fakeWorktree(root: string): { entry: RepoEntry; refreshCalls: unknown[][] } {
+  const refreshCalls: unknown[][] = [];
+  const entry = {
+    repoId: root,
+    root,
+    store: {
+      refresh: (...args: unknown[]) => {
+        refreshCalls.push(args);
+        return Promise.resolve();
+      },
+    },
+  } as unknown as RepoEntry;
+  return { entry, refreshCalls };
+}
+
+test("WATCHER_INVALIDATES maps every event kind to the fields Section H's watcher-path table specifies", () => {
+  const expected: Record<GitChangeEvent["kind"], { fields: readonly string[]; graphReset: boolean }> = {
+    head: { fields: ["entries", "branch"], graphReset: false },
+    "operation-state": { fields: ["entries", "branch", "operationInProgress"], graphReset: false },
+    refs: { fields: ["branches"], graphReset: true },
+    remotes: { fields: ["branch"], graphReset: true },
+    stash: { fields: ["entries", "stashes"], graphReset: false },
+  };
+  for (const kind of Object.keys(expected) as GitChangeEvent["kind"][]) {
+    assert.deepEqual(WATCHER_INVALIDATES[kind], expected[kind], `mismatch for "${kind}"`);
+  }
+});
+
+test("a 'head'/'operation-state' event refreshes only the worktree it names, never a sibling", () => {
+  const a = fakeWorktree("/work/a");
+  const b = fakeWorktree("/work/b");
+  const repository: RepositoryEntry = {
+    repositoryId: "/work/.git",
+    worktrees: [a.entry, b.entry],
+    knownWorktrees: [],
+  };
+
+  applyGitChangeEvent(repository, { repositoryId: "/work/.git", kind: "head", worktreeRoot: "/work/a" });
+
+  assert.deepEqual(a.refreshCalls, [[["entries", "branch"]]]);
+  assert.deepEqual(b.refreshCalls, [], "the sibling must not be refreshed by a per-worktree event");
+});
+
+test("an unresolvable worktreeRoot on a per-worktree event is a silent no-op, not a throw", () => {
+  const a = fakeWorktree("/work/a");
+  const repository: RepositoryEntry = {
+    repositoryId: "/work/.git",
+    worktrees: [a.entry],
+    knownWorktrees: [],
+  };
+  assert.doesNotThrow(() =>
+    applyGitChangeEvent(repository, {
+      repositoryId: "/work/.git",
+      kind: "head",
+      worktreeRoot: "/work/removed-worktree",
+    }),
+  );
+  assert.deepEqual(a.refreshCalls, []);
+});
+
+test("'refs'/'remotes'/'stash' events refresh every worktree of the repository", () => {
+  for (const kind of ["refs", "remotes", "stash"] as const) {
+    const a = fakeWorktree("/work/a");
+    const b = fakeWorktree("/work/b");
+    const repository: RepositoryEntry = {
+      repositoryId: "/work/.git",
+      worktrees: [a.entry, b.entry],
+      knownWorktrees: [],
+    };
+    applyGitChangeEvent(repository, { repositoryId: "/work/.git", kind });
+    assert.equal(a.refreshCalls.length, 1, `worktree A must refresh for "${kind}"`);
+    assert.equal(b.refreshCalls.length, 1, `worktree B must refresh for "${kind}"`);
+    assert.deepEqual(a.refreshCalls[0], b.refreshCalls[0], `both worktrees get the same fields for "${kind}"`);
   }
 });

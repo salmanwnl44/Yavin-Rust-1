@@ -1,7 +1,9 @@
 import { gitRegistry } from "./registry.ts";
-import type { RepoEntry } from "./registry.ts";
+import type { RepoEntry, RepositoryEntry } from "./registry.ts";
 import type { RefreshField } from "./store.ts";
 import { resetSharedGraphLoader } from "./hooks.ts";
+import { onGitChanged } from "../native.ts";
+import type { GitChangeEvent } from "../native.ts";
 
 /**
  * Which of a *sibling* worktree's (same repository, different `RepoEntry`)
@@ -104,3 +106,79 @@ export async function guardedAffecting(
   }
   return ok;
 }
+
+/**
+ * Which `RepoSnapshot` fields go stale for each `.git`-watcher event kind, and
+ * whether it's per-worktree (only the worktree named by `worktreeRoot`) or
+ * repository-shared (every worktree of the repository) -- see the Git State &
+ * Synchronization plan's Section H. An *external* ref change invalidates exactly
+ * the same Yavin-side state a Yavin-caused one touching that same ref category
+ * would (Git doesn't know or care who moved the ref), so this table's shape
+ * mirrors `SIBLING_INVALIDATES`/Module 2's `INVALIDATES`, not a new taxonomy.
+ *
+ * `operation-state` deliberately has no graph-reset entry here: distinguishing a
+ * merge/rebase/cherry-pick/revert *completing* (which can add a commit) from one
+ * merely *starting* (which never does) needs the before/after `repo_state()`
+ * comparison the plan's Section S scopes to Phase 6, not this phase.
+ */
+export const WATCHER_INVALIDATES: Readonly<
+  Record<GitChangeEvent["kind"], { fields: readonly RefreshField[]; graphReset: boolean }>
+> = {
+  head: { fields: ["entries", "branch"], graphReset: false },
+  "operation-state": {
+    fields: ["entries", "branch", "operationInProgress"],
+    graphReset: false,
+  },
+  refs: { fields: ["branches"], graphReset: true },
+  remotes: { fields: ["branch"], graphReset: true },
+  stash: { fields: ["entries", "stashes"], graphReset: false },
+};
+
+const PER_WORKTREE_KINDS: ReadonlySet<GitChangeEvent["kind"]> = new Set([
+  "head",
+  "operation-state",
+]);
+
+/**
+ * Applies one `git-changed` event to an already-resolved `RepositoryEntry`:
+ * refreshes exactly the worktree(s) and fields `WATCHER_INVALIDATES` says can
+ * have gone stale, and resets the repository's shared graph if warranted. Split
+ * out from `handleGitChangeEvent` (which resolves `event.repositoryId` against
+ * the real `gitRegistry` singleton) purely so this routing logic -- given a
+ * `RepositoryEntry`, do the right thing -- can be exercised directly in a test
+ * with duck-typed fake worktrees, the same convention `store.test.ts` already
+ * uses for a fake `Repository`, without needing the real registry populated.
+ */
+export function applyGitChangeEvent(repository: RepositoryEntry, event: GitChangeEvent): void {
+  const spec = WATCHER_INVALIDATES[event.kind];
+
+  if (PER_WORKTREE_KINDS.has(event.kind)) {
+    const worktree = repository.worktrees.find((w) => w.root === event.worktreeRoot);
+    void worktree?.store.refresh(spec.fields);
+  } else {
+    for (const worktree of repository.worktrees) void worktree.store.refresh(spec.fields);
+  }
+  if (spec.graphReset) resetSharedGraphLoader(repository.repositoryId);
+}
+
+/**
+ * Routes one `git-changed` event (an external Git ref change the new `.git`
+ * watcher detected -- see `backend.ts`'s `watchRepo`) to the repository it
+ * belongs to. A repository the registry no longer tracks (closed between the
+ * event firing and this handler running) is a silent no-op -- the watcher itself
+ * is torn down on close, so this is only a narrow, harmless race window, never a
+ * routing bug. A `worktreeRoot` that no longer resolves to a tracked worktree is
+ * likewise a silent no-op, handled inside `applyGitChangeEvent`.
+ */
+export function handleGitChangeEvent(event: GitChangeEvent): void {
+  const repository = gitRegistry.repositoryById(event.repositoryId);
+  if (repository) applyGitChangeEvent(repository, event);
+}
+
+// Subscribed once, at module load: `sync.ts` is the single home for every piece
+// of watcher-driven synchronization policy (mirrors how `guardedAffecting` above
+// is where Yavin's own mutations' cross-worktree/graph effects live), so nothing
+// else needs to remember to wire this up. A no-op outside Tauri (`onGitChanged`'s
+// own guard) and while no repository is being watched (`handleGitChangeEvent`'s
+// own no-op above).
+onGitChanged(handleGitChangeEvent);
