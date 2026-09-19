@@ -625,3 +625,55 @@ test("a rapid burst of 'git-changed' events (analogous to a burst of file saves)
   await page.waitForTimeout(200);
   expect(await stashCalls()).toBe(before + 1);
 });
+
+test("switching the active repository closes a diff view from the previously-active repository", async ({
+  page,
+}) => {
+  const region = await panel(page, {
+    workspace: "/work",
+    repos: {
+      "/work": repo("main", " M a.ts\0"),
+      "/other": repo("feature", " M b.ts\0"),
+    },
+    pick: "/other",
+  });
+
+  await region.getByText("a.ts").click();
+  const diffView = page.locator("section[aria-label='Git diff editor']");
+  await expect(diffView).toBeVisible();
+
+  // Add and switch to a second repository -- this must not leave the first
+  // repository's diff (with its live, functioning hunk-staging buttons)
+  // displayed and operable while every other surface shows the new repository.
+  await region.getByTitle("Add Repository Folder").click();
+  await expect(region.getByRole("group", { name: "other" })).toBeVisible();
+
+  await expect(diffView).toHaveCount(0);
+});
+
+test("switching the active repository clears a pending discard-undo offer", async ({ page }) => {
+  const region = await panel(page, {
+    workspace: "/work",
+    repos: {
+      "/work": repo("main", " M a.ts\0"),
+      "/other": repo("feature", " M b.ts\0"),
+    },
+    pick: "/other",
+  });
+  await page.evaluate(() => {
+    window.confirm = () => true;
+  });
+
+  await region.getByRole("button", { name: /Discard \/work\/a\.ts/ }).click();
+
+  await expect(region.getByText("Undo last discard")).toBeVisible();
+
+  // Switching to a different repository must clear the offer -- its own "Undo"
+  // button resolves the active repository fresh at click time, so leaving it
+  // set here risks applying the previous repository's recovered content
+  // against whichever repository is now active.
+  await region.getByTitle("Add Repository Folder").click();
+  await expect(region.getByRole("group", { name: "other" })).toBeVisible();
+
+  await expect(region.getByText("Undo last discard")).toHaveCount(0);
+});

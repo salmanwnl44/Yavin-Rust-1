@@ -37,6 +37,7 @@ async function panel(page: Page, scenario: Scenario) {
       ].join("\x1f");
     Object.assign(window, {
       __calls: calls,
+      __scenario: s,
       isTauri: true,
       __TAURI_INTERNALS__: {
         metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
@@ -212,4 +213,32 @@ test("closing the graph returns to the editor", async ({ page }) => {
   const graph = await panel(page, { commits: [{ hash: "c1", subject: "Only commit" }] });
   await page.getByTitle("Close graph").click();
   await expect(graph).toHaveCount(0);
+});
+
+test("a graph reset that removes the selected commit clears its detail panel", async ({
+  page,
+}) => {
+  const graph = await panel(page, {
+    commits: [
+      { hash: "c2", parents: ["c1"], subject: "Second commit" },
+      { hash: "c1", parents: [], subject: "First commit" },
+    ],
+  });
+  await graph.getByText("Second commit").click();
+  const detail = page.getByRole("complementary").filter({ has: page.getByTitle("Close commit details") });
+  await expect(detail).toBeVisible();
+
+  // Simulate a same-repository history rewrite (an amend, a rebase, or an
+  // external rewrite the .git watcher picked up): the previously-selected
+  // commit no longer exists once the graph reloads.
+  await page.evaluate(() => {
+    (
+      window as unknown as { __scenario: { commits: unknown[] } }
+    ).__scenario.commits = [{ hash: "c3", parents: [], subject: "Rewritten commit" }];
+  });
+  await page.getByTitle("Refresh Graph").click();
+
+  await expect(graph.getByText("Rewritten commit")).toBeVisible();
+  await expect(graph.getByText("Second commit")).toHaveCount(0);
+  await expect(detail).toHaveCount(0);
 });

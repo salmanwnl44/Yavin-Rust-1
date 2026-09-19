@@ -195,6 +195,13 @@ export function SourceControlPanel({
     lastActiveRepoRef.current = activeRepo;
     lastRevisionRef.current = revision;
     if (switchedWorktree) {
+      // A pending "Undo last discard" offer resolves `activeRepo` fresh at click
+      // time -- if left set across a repository switch, clicking Undo after
+      // switching would apply the previous repository's recovered content against
+      // whichever repository is now active (see the Git UI Architecture plan's
+      // Gap 1). Clearing it here, on the same signal that already detects a
+      // genuine worktree switch, closes that window.
+      setRecovery(null);
       if (Date.now() - activeRepo.store.lastRefreshedAt < 5000) return;
       void activeRepo.store.refresh();
     } else if (revisionChanged) {

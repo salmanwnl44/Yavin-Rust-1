@@ -44,6 +44,7 @@ import {
   gitRegistry,
   guardedAffecting,
   useActiveRepo,
+  useGitRegistry,
   useRepoSnapshot,
   useTotalChanges,
 } from "./services/git";
@@ -145,6 +146,21 @@ export default function App() {
   const totalGitChanges = useTotalChanges();
   const activeRepo = useActiveRepo();
   const activeRepoSnapshot = useRepoSnapshot(activeRepo?.store);
+  const activeRepoId = useGitRegistry().activeRepoId;
+
+  // A diff view has no identity of its own tying it to the repository it came
+  // from (DiffEditor is keyed only by diff content, never by repository -- see
+  // the Git UI Architecture plan's Gap 1), so switching the active repository
+  // without clearing it would leave a previous repository's diff -- including
+  // its live, functioning hunk-staging buttons -- displayed and operable while
+  // every other visible surface shows the newly-active repository.
+  const lastActiveRepoIdRef = useRef(activeRepoId);
+  useEffect(() => {
+    if (lastActiveRepoIdRef.current !== activeRepoId) {
+      lastActiveRepoIdRef.current = activeRepoId;
+      setDiff(null);
+    }
+  }, [activeRepoId]);
 
   useEffect(() => {
     if (!hasUnsavedChanges) return;

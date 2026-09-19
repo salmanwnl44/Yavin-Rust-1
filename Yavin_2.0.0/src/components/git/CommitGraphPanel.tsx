@@ -175,6 +175,20 @@ export function CommitGraphPanel({
     return () => observer.disconnect();
   }, []);
 
+  // A commit selected before a same-repository history rewrite (an amend, a
+  // rebase, or an external rewrite the .git watcher picked up) can vanish from
+  // the freshly-reloaded snapshot -- reconcile the selection against it so
+  // CommitDetail never keeps querying a hash Git no longer has. A genuine
+  // repository/worktree switch already clears `selected` for free, since this
+  // component itself is remounted (keyed by repoId) in that case.
+  useEffect(() => {
+    setSelected((current) =>
+      current && !snapshot.commits.some((c) => c.fullHash === current.commit.fullHash)
+        ? null
+        : current,
+    );
+  }, [snapshot.commits]);
+
   const { nodes, edges } = snapshot.layout;
   const totalHeight = nodes.length * ROW_HEIGHT;
   const gutterWidth = Math.max(1, Math.min(snapshot.layout.laneCount, 12)) * LANE_WIDTH + 8;
