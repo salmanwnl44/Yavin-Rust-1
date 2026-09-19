@@ -427,7 +427,9 @@ test("switching rapidly back and forth between two just-refreshed worktrees does
   // state immediately, not issue a redundant full refresh for either. Clicking
   // the row itself (not its Sync button, which stops propagation) fires the
   // row's onSelect -> gitRegistry.setActive.
-  await region.getByRole("group", { name: "work", exact: true }).click({ position: { x: 5, y: 5 } });
+  await region
+    .getByRole("group", { name: "work", exact: true })
+    .click({ position: { x: 5, y: 5 } });
   await region.getByTitle("Branches and remotes").click();
   await expect(region.getByLabel("Switch branch")).toHaveValue("main"); // confirms the switch actually landed
   await region.getByRole("group", { name: "work-feature" }).click({ position: { x: 5, y: 5 } });
@@ -545,7 +547,9 @@ test("a 'git-changed' head event from the .git watcher refreshes only the worktr
   expect(await branchInfoCallsFor("/work-feature")).toBe(featureBefore);
 });
 
-test("regaining window focus re-fetches the active repository's knownWorktrees", async ({ page }) => {
+test("regaining window focus re-fetches the active repository's knownWorktrees", async ({
+  page,
+}) => {
   const region = await panel(page, {
     workspace: "/work",
     repos: {
@@ -565,7 +569,10 @@ test("regaining window focus re-fetches the active repository's knownWorktrees",
         (
           window as unknown as { __calls: { command: string; args: { args?: string[] } }[] }
         ).__calls.filter(
-          (c) => c.command === "git_exec" && c.args.args?.[0] === "worktree" && c.args.args?.[1] === "list",
+          (c) =>
+            c.command === "git_exec" &&
+            c.args.args?.[0] === "worktree" &&
+            c.args.args?.[1] === "list",
         ).length,
     );
   const before = await worktreeListCalls();
@@ -676,4 +683,50 @@ test("switching the active repository clears a pending discard-undo offer", asyn
   await expect(region.getByRole("group", { name: "other" })).toBeVisible();
 
   await expect(region.getByText("Undo last discard")).toHaveCount(0);
+});
+
+test("the poll refreshes the active repository fully but a background one with a single status", async ({
+  page,
+}) => {
+  const region = await panel(page, {
+    workspace: "/work",
+    repos: {
+      "/work": repo("main", " M a.ts\0"),
+      "/other": repo("feature", " M b.ts\0"),
+    },
+    pick: "/other",
+  });
+  await region.getByTitle("Add Repository Folder").click();
+  // "/other" is now active; "/work" is a background repository.
+  await expect(region.getByRole("group", { name: "other" })).toBeVisible();
+
+  const tally = () =>
+    page.evaluate(() => {
+      const calls = (
+        window as unknown as {
+          __calls: { command: string; args: { repoId?: string; args?: string[] } }[];
+        }
+      ).__calls;
+      const count = (repoId: string, sub: string) =>
+        calls.filter(
+          (c) => c.command === "git_exec" && c.args.repoId === repoId && c.args.args?.[0] === sub,
+        ).length;
+      return {
+        workStatus: count("/work", "status"),
+        workRefs: count("/work", "for-each-ref"),
+        otherStatus: count("/other", "status"),
+        otherRefs: count("/other", "for-each-ref"),
+      };
+    });
+
+  const before = await tally();
+  await page.waitForTimeout(5600);
+  const after = await tally();
+
+  // Background: only the porcelain-v1 status; nothing else.
+  expect(after.workRefs).toBe(before.workRefs);
+  expect(after.workStatus - before.workStatus).toBe(1);
+  // Active: the full six-field refresh (two status calls plus branches).
+  expect(after.otherRefs - before.otherRefs).toBe(1);
+  expect(after.otherStatus - before.otherStatus).toBe(2);
 });

@@ -98,7 +98,8 @@ function RepoRow({
   entry,
   active,
   dirty,
-  message,
+  hasMessage,
+  getMessage,
   onSelect,
   onRemove,
   onCommitted,
@@ -107,7 +108,8 @@ function RepoRow({
   entry: RepoEntry;
   active: boolean;
   dirty: boolean;
-  message: string;
+  hasMessage: boolean;
+  getMessage: () => string;
   onSelect: () => void;
   onRemove: () => void;
   onCommitted: () => void;
@@ -152,7 +154,14 @@ function RepoRow({
           icon={<MoreIcon size={14} />}
           label={`${repoName(entry.root)} actions`}
           buttonClassName="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#1e1e1e]"
-          items={buildGitCommandMenu({ entry, dirty, message, onCommitted, onOpenBranches })}
+          items={buildGitCommandMenu({
+            entry,
+            dirty,
+            hasMessage,
+            getMessage,
+            onCommitted,
+            onOpenBranches,
+          })}
         />
       </div>
       <button
@@ -181,7 +190,8 @@ export function RepositoriesSection({
   repositories,
   activeRepoId,
   dirty,
-  message,
+  hasMessage,
+  getMessage,
   collapsed,
   onToggleCollapse,
   onSelect,
@@ -196,7 +206,8 @@ export function RepositoriesSection({
   repositories: RepositoryEntry[];
   activeRepoId: string | null;
   dirty: boolean;
-  message: string;
+  hasMessage: boolean;
+  getMessage: () => string;
   collapsed: boolean;
   onToggleCollapse: () => void;
   onSelect: (repoId: string) => void;
@@ -265,7 +276,8 @@ export function RepositoriesSection({
                   entry={entry}
                   active={entry.repoId === activeRepoId}
                   dirty={dirty}
-                  message={message}
+                  hasMessage={hasMessage}
+                  getMessage={getMessage}
                   onSelect={() => onSelect(entry.repoId)}
                   onRemove={() => onRemove(entry.repoId)}
                   onCommitted={onCommitted}

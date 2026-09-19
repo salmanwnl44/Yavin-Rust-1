@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { native } from "../../services/native";
 import { divergence } from "../../services/git/parsers/branch";
 import type { GitEntry } from "../../services/git/parsers/status";
@@ -6,7 +6,10 @@ import type { GitOperation } from "../../services/git/backend";
 import { gitRegistry } from "../../services/git/registry";
 import { useActiveRepo, useGitRegistry, useRepoSnapshot } from "../../services/git/hooks";
 import { guardedAffecting } from "../../services/git/sync";
+import type { RefreshField } from "../../services/git/store";
 import { RepositoriesSection } from "../git/RepositoriesSection";
+import { CommitBox } from "../git/CommitBox";
+import type { CommitBoxHandle } from "../git/CommitBox";
 import { InlineGraphSection } from "../git/InlineGraphSection";
 import { StashesSection } from "../git/StashesSection";
 import { GitMenu } from "../git/GitMenu";
@@ -71,6 +74,14 @@ function rootContains(root: string, path: string): boolean {
   return lowerPath === lowerRoot || lowerPath.startsWith(`${lowerRoot}/`);
 }
 
+/**
+ * Rows drawn per group before "Show more". Every row is ~22 DOM nodes and measured
+ * ~0.5 ms to mount: 1,000 rows took ~1 s, 5,000 took 3.3 s and 10,000 took 6.2 s in a
+ * production build. Counts, Stage All and the other bulk actions always cover the
+ * whole group -- only how many rows are drawn is capped, never what is acted on.
+ */
+const ROWS_PER_PAGE = 500;
+
 interface SectionVisibility {
   repositories: boolean;
   changes: boolean;
@@ -116,11 +127,21 @@ export function SourceControlPanel({
   const workspaceSnapshot = useRepoSnapshot(workspaceRepo?.store);
 
   const [openError, setOpenError] = useState("");
-  const [message, setMessage] = useState("");
+  // The commit draft itself lives in <CommitBox>; the panel keeps only whether one
+  // exists (re-rendering only when that flips) and a ref for click-time reads.
+  const [hasMessage, setHasMessage] = useState(false);
+  const messageRef = useRef("");
+  const commitBoxRef = useRef<CommitBoxHandle>(null);
+  const onMessageChange = useCallback((next: string) => {
+    messageRef.current = next;
+    setHasMessage(next.trim().length > 0);
+  }, []);
+  const getMessage = useCallback(() => messageRef.current, []);
   const [newBranch, setNewBranch] = useState("");
   const [chosenRemote, setChosenRemote] = useState("");
   const [branchesOpen, setBranchesOpen] = useState(false);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const [rowLimits, setRowLimits] = useState<Record<string, number>>({});
   const [recovery, setRecovery] = useState<Replacement[] | null>(null);
   const [sectionVisible, setSectionVisible] = useState<SectionVisibility>({
     repositories: true,
@@ -202,6 +223,7 @@ export function SourceControlPanel({
       // Gap 1). Clearing it here, on the same signal that already detects a
       // genuine worktree switch, closes that window.
       setRecovery(null);
+      setRowLimits({});
       if (Date.now() - activeRepo.store.lastRefreshedAt < 5000) return;
       void activeRepo.store.refresh();
     } else if (revisionChanged) {
@@ -225,36 +247,31 @@ export function SourceControlPanel({
     return () => window.removeEventListener("focus", update);
   }, [activeRepo]);
 
-  // Refreshes every open repo (not just the active one) so the Repositories section
-  // and the aggregated activity-bar count stay live while this panel is visible.
+  // Keeps every open repo's status live (the Repositories section and the activity-bar
+  // count) while this panel is visible. Focus refreshes every repo fully. The timer
+  // refreshes the active repo fully but every other repo's `entries` only: nothing
+  // watches a background worktree's working tree, so status is the one thing the poll
+  // must cover, while the per-repository `.git` watcher already reports its
+  // branch/refs/stash/operation-state changes. Measured: 10 open worktrees cost 60
+  // Git processes (1.85 s of wall time) per 5 s tick when every field was polled.
   useEffect(() => {
     if (!visible) return;
-    const update = () => {
-      for (const entry of registrySnapshot.repos) void entry.store.refresh();
+    const update = (fields?: RefreshField[]) => {
+      for (const entry of registrySnapshot.repos) {
+        const background = fields && entry.repoId !== registrySnapshot.activeRepoId;
+        void entry.store.refresh(background ? fields : undefined);
+      }
     };
-    window.addEventListener("focus", update);
+    const onFocus = () => update();
+    window.addEventListener("focus", onFocus);
     const timer = setInterval(() => {
-      if (document.visibilityState === "visible") update();
+      if (document.visibilityState === "visible") update(["entries"]);
     }, 5000);
     return () => {
-      window.removeEventListener("focus", update);
+      window.removeEventListener("focus", onFocus);
       clearInterval(timer);
     };
-  }, [visible, registrySnapshot.repos]);
-
-  useEffect(() => {
-    if (!activeRepo) return;
-    setMessage(localStorage.getItem(`yavin.commit:${activeRepo.root}`) ?? "");
-  }, [activeRepo]);
-
-  useEffect(() => {
-    if (!activeRepo) return;
-    try {
-      localStorage.setItem(`yavin.commit:${activeRepo.root}`, message);
-    } catch {
-      /* Draft remains in memory when storage is unavailable. */
-    }
-  }, [activeRepo, message]);
+  }, [visible, registrySnapshot.repos, registrySnapshot.activeRepoId]);
 
   useEffect(() => {
     if (!snapshot) return;
@@ -452,19 +469,7 @@ export function SourceControlPanel({
 
   const stagedCount = groups[1].entries.length;
   const conflictCount = groups[0].entries.length;
-  const canCommit = message.trim().length > 0 && stagedCount > 0 && conflictCount === 0;
   const sync = divergence(branch);
-
-  const handleCommitKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-      e.preventDefault();
-      if (canCommit && !busy && !loading && activeRepo) {
-        void guarded("commit", () => activeRepo.store.repository.commit(message)).then(
-          (ok) => ok && setMessage(""),
-        );
-      }
-    }
-  };
 
   const toggleSection = (name: keyof SectionVisibility) =>
     setSectionVisible((prev) => ({ ...prev, [name]: !prev[name] }));
@@ -534,14 +539,15 @@ export function SourceControlPanel({
             repositories={registrySnapshot.repositories}
             activeRepoId={registrySnapshot.activeRepoId}
             dirty={dirty}
-            message={message}
+            hasMessage={hasMessage}
+            getMessage={getMessage}
             collapsed={sectionCollapsed.repositories}
             onToggleCollapse={() => toggleCollapsed("repositories")}
             onSelect={selectRepository}
             onSelectWorktree={(path) => void selectWorktree(path)}
             onRemove={removeRepository}
             onAdd={() => void addRepository()}
-            onCommitted={() => setMessage("")}
+            onCommitted={() => commitBoxRef.current?.clear()}
             onOpenBranches={() => setBranchesOpen(true)}
           />
         )}
@@ -583,8 +589,9 @@ export function SourceControlPanel({
                     items={buildGitCommandMenu({
                       entry: activeRepo,
                       dirty,
-                      message,
-                      onCommitted: () => setMessage(""),
+                      hasMessage,
+                      getMessage,
+                      onCommitted: () => commitBoxRef.current?.clear(),
                       includeViewOptions: true,
                       onOpenBranches: () => setBranchesOpen(true),
                     })}
@@ -661,28 +668,18 @@ export function SourceControlPanel({
                     )}
 
                     <fieldset disabled={busy || loading} className="space-y-2 disabled:opacity-60">
-                      <textarea
-                        aria-label="Commit message"
-                        placeholder="Message (Ctrl+Enter to commit)"
-                        rows={3}
-                        value={message}
-                        onChange={(e) => setMessage(e.target.value)}
-                        onKeyDown={handleCommitKeyDown}
-                        className="w-full rounded border border-[#222222] bg-[#0a0a0a] p-2 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-indigo-500 focus:outline-none resize-none transition-colors"
-                      />
-
-                      <button
-                        disabled={!canCommit}
-                        onClick={() =>
-                          void guarded("commit", () =>
-                            activeRepo.store.repository.commit(message),
-                          ).then((ok) => ok && setMessage(""))
+                      <CommitBox
+                        ref={commitBoxRef}
+                        draftKey={activeRepo.root}
+                        stagedCount={stagedCount}
+                        conflictCount={conflictCount}
+                        busy={busy}
+                        loading={loading}
+                        onChange={onMessageChange}
+                        onCommit={(message) =>
+                          guarded("commit", () => activeRepo.store.repository.commit(message))
                         }
-                        className="w-full rounded bg-indigo-600 hover:bg-indigo-500 py-1.5 px-3 text-xs font-medium text-white flex items-center justify-center gap-1.5 transition-colors shadow-sm disabled:opacity-40 disabled:hover:bg-indigo-600"
-                      >
-                        <CheckIcon size={13} />
-                        <span>Commit Staged ({stagedCount})</span>
-                      </button>
+                      />
 
                       {branchesOpen && (
                         <div className="space-y-2 pt-1 border-t border-[#181818]">
@@ -999,123 +996,145 @@ export function SourceControlPanel({
 
                       {!isCollapsed && (
                         <div className="divide-y divide-[#0c0c0c]">
-                          {group.entries.map((entry) => {
-                            const root = activeRepo.root;
-                            const relativePath = entry.path.startsWith(root)
-                              ? entry.path.slice(root.length + 1)
-                              : entry.path;
-                            const parts = relativePath.split(/[/\\]/);
-                            const fileName = parts.pop() || relativePath;
-                            const dirPath = parts.join("/");
-                            const status = getStatusInfo(entry, group.staged);
-                            const isActiveDiff = activeDiffPath === entry.path;
+                          {group.entries
+                            .slice(0, rowLimits[group.name] ?? ROWS_PER_PAGE)
+                            .map((entry) => {
+                              const root = activeRepo.root;
+                              const relativePath = entry.path.startsWith(root)
+                                ? entry.path.slice(root.length + 1)
+                                : entry.path;
+                              const parts = relativePath.split(/[/\\]/);
+                              const fileName = parts.pop() || relativePath;
+                              const dirPath = parts.join("/");
+                              const status = getStatusInfo(entry, group.staged);
+                              const isActiveDiff = activeDiffPath === entry.path;
 
-                            return (
-                              <div
-                                key={entry.path}
-                                role="button"
-                                tabIndex={0}
-                                aria-label={`Open diff for ${entry.path}`}
-                                className={`flex items-center gap-1.5 px-2.5 py-1.5 hover:bg-[#121212] group/row transition-colors cursor-pointer ${
-                                  isActiveDiff ? "bg-[#161a24]" : ""
-                                }`}
-                                onClick={() => void showDiff(entry, group.staged)}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter" || e.key === " ") {
-                                    e.preventDefault();
-                                    void showDiff(entry, group.staged);
-                                  }
-                                }}
-                              >
-                                <FileIcon
-                                  name={fileName}
-                                  isDir={false}
-                                  className="size-3.5 shrink-0"
-                                />
-
-                                <div className="flex items-baseline min-w-0 flex-1 truncate">
-                                  <span
-                                    className={`text-xs font-medium truncate ${status.style.text}`}
-                                    title={
-                                      entry.originalPath
-                                        ? `${entry.originalPath} → ${entry.path}`
-                                        : entry.path
-                                    }
-                                  >
-                                    {fileName}
-                                  </span>
-                                  {dirPath && (
-                                    <span className="text-zinc-500 text-[10.5px] ml-1.5 truncate">
-                                      {dirPath}
-                                    </span>
-                                  )}
-                                </div>
-
-                                <span
-                                  title={`Status: ${status.letter}`}
-                                  className={`px-1 py-0.2 rounded text-[10px] font-mono font-bold border shrink-0 ${status.style.badge}`}
-                                >
-                                  {status.letter}
-                                </span>
-
+                              return (
                                 <div
-                                  className="flex items-center gap-0.5 opacity-0 group-hover/row:opacity-100 transition-opacity shrink-0"
-                                  onClick={(e) => e.stopPropagation()}
+                                  key={entry.path}
+                                  role="button"
+                                  tabIndex={0}
+                                  aria-label={`Open diff for ${entry.path}`}
+                                  className={`flex items-center gap-1.5 px-2.5 py-1.5 hover:bg-[#121212] group/row transition-colors cursor-pointer ${
+                                    isActiveDiff ? "bg-[#161a24]" : ""
+                                  }`}
+                                  onClick={() => void showDiff(entry, group.staged)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter" || e.key === " ") {
+                                      e.preventDefault();
+                                      void showDiff(entry, group.staged);
+                                    }
+                                  }}
                                 >
-                                  <button
-                                    disabled={busy}
-                                    title="Open Diff"
-                                    aria-label="Open Diff"
-                                    onClick={() => void showDiff(entry, group.staged)}
-                                    className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
-                                  >
-                                    <DiffIcon size={12} />
-                                  </button>
+                                  <FileIcon
+                                    name={fileName}
+                                    isDir={false}
+                                    className="size-3.5 shrink-0"
+                                  />
 
-                                  {!group.staged && entry.worktree === "M" && !entry.conflict && (
+                                  <div className="flex items-baseline min-w-0 flex-1 truncate">
+                                    <span
+                                      className={`text-xs font-medium truncate ${status.style.text}`}
+                                      title={
+                                        entry.originalPath
+                                          ? `${entry.originalPath} → ${entry.path}`
+                                          : entry.path
+                                      }
+                                    >
+                                      {fileName}
+                                    </span>
+                                    {dirPath && (
+                                      <span className="text-zinc-500 text-[10.5px] ml-1.5 truncate">
+                                        {dirPath}
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  <span
+                                    title={`Status: ${status.letter}`}
+                                    className={`px-1 py-0.2 rounded text-[10px] font-mono font-bold border shrink-0 ${status.style.badge}`}
+                                  >
+                                    {status.letter}
+                                  </span>
+
+                                  <div
+                                    className="flex items-center gap-0.5 opacity-0 group-hover/row:opacity-100 transition-opacity shrink-0"
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
                                     <button
-                                      disabled={busy || loading}
-                                      aria-label={`Discard ${entry.path}`}
-                                      title={`Discard changes in ${fileName}`}
-                                      onClick={() => void discard(entry)}
+                                      disabled={busy}
+                                      title="Open Diff"
+                                      aria-label="Open Diff"
+                                      onClick={() => void showDiff(entry, group.staged)}
                                       className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
                                     >
-                                      <UndoIcon size={12} />
+                                      <DiffIcon size={12} />
                                     </button>
-                                  )}
 
-                                  <button
-                                    disabled={busy || loading}
-                                    aria-label={`${group.staged ? "Unstage" : "Stage"} ${entry.path}`}
-                                    title={
-                                      group.staged ? `Unstage ${fileName}` : `Stage ${fileName}`
-                                    }
-                                    onClick={() => {
-                                      if (
-                                        entry.conflict &&
-                                        !window.confirm(
-                                          "Stage this file as resolved? Review and remove conflict markers first.",
-                                        )
-                                      )
-                                        return;
-                                      void guarded(group.staged ? "unstage" : "stage", () =>
-                                        group.staged
-                                          ? activeRepo.store.repository.unstage(entry.path)
-                                          : activeRepo.store.repository.stage(entry.path),
-                                      );
-                                    }}
-                                    className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
-                                  >
-                                    {group.staged ? (
-                                      <MinusIcon size={12} />
-                                    ) : (
-                                      <PlusIcon size={12} />
+                                    {!group.staged && entry.worktree === "M" && !entry.conflict && (
+                                      <button
+                                        disabled={busy || loading}
+                                        aria-label={`Discard ${entry.path}`}
+                                        title={`Discard changes in ${fileName}`}
+                                        onClick={() => void discard(entry)}
+                                        className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
+                                      >
+                                        <UndoIcon size={12} />
+                                      </button>
                                     )}
-                                  </button>
+
+                                    <button
+                                      disabled={busy || loading}
+                                      aria-label={`${group.staged ? "Unstage" : "Stage"} ${entry.path}`}
+                                      title={
+                                        group.staged ? `Unstage ${fileName}` : `Stage ${fileName}`
+                                      }
+                                      onClick={() => {
+                                        if (
+                                          entry.conflict &&
+                                          !window.confirm(
+                                            "Stage this file as resolved? Review and remove conflict markers first.",
+                                          )
+                                        )
+                                          return;
+                                        void guarded(group.staged ? "unstage" : "stage", () =>
+                                          group.staged
+                                            ? activeRepo.store.repository.unstage(entry.path)
+                                            : activeRepo.store.repository.stage(entry.path),
+                                        );
+                                      }}
+                                      className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-[#1e1e1e] transition-colors"
+                                    >
+                                      {group.staged ? (
+                                        <MinusIcon size={12} />
+                                      ) : (
+                                        <PlusIcon size={12} />
+                                      )}
+                                    </button>
+                                  </div>
                                 </div>
-                              </div>
-                            );
-                          })}
+                              );
+                            })}
+                          {group.entries.length > (rowLimits[group.name] ?? ROWS_PER_PAGE) && (
+                            <button
+                              onClick={() =>
+                                setRowLimits((prev) => ({
+                                  ...prev,
+                                  [group.name]: (prev[group.name] ?? ROWS_PER_PAGE) + ROWS_PER_PAGE,
+                                }))
+                              }
+                              className="w-full py-1.5 text-[11px] text-zinc-400 hover:bg-[#121212] hover:text-zinc-200"
+                            >
+                              Show{" "}
+                              {Math.min(
+                                ROWS_PER_PAGE,
+                                group.entries.length - (rowLimits[group.name] ?? ROWS_PER_PAGE),
+                              )}{" "}
+                              more of{" "}
+                              {group.entries.length - (rowLimits[group.name] ?? ROWS_PER_PAGE)}{" "}
+                              remaining
+                            </button>
+                          )}
                         </div>
                       )}
                     </section>

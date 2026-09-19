@@ -338,13 +338,12 @@ test("an unmerged branch offers a confirmed force-delete escalation, not a silen
   // immediately supersedes it -- so the durable proof is the actual argv of
   // both calls below, not a race-prone intermediate visibility check.
   await expect.poll(() => gitCalls(page, "deleteBranch")).toBe(2);
-  const calls = await page.evaluate(
-    () =>
-      (
-        window as unknown as {
-          __calls: { action: string | null; args: { args?: string[] } }[];
-        }
-      ).__calls.filter((c) => c.action === "deleteBranch"),
+  const calls = await page.evaluate(() =>
+    (
+      window as unknown as {
+        __calls: { action: string | null; args: { args?: string[] } }[];
+      }
+    ).__calls.filter((c) => c.action === "deleteBranch"),
   );
   expect(calls[0].args.args).toContain("-d");
   expect(calls[1].args.args).toContain("-D");
@@ -658,4 +657,46 @@ test("a changed file's diff can be opened with the keyboard alone", async ({ pag
 
   const diffView = page.locator("section[aria-label='Git diff editor']");
   await expect(diffView).toBeVisible();
+});
+
+test("a huge change set draws a page of rows at a time but still counts and acts on every file", async ({
+  page,
+}) => {
+  let status = "";
+  for (let i = 0; i < 1200; i++) status += ` M file${i}.ts\0`;
+  const region = await panel(page, { status });
+
+  const rows = region.getByRole("button", { name: /^Open diff for / });
+  await expect(rows).toHaveCount(500);
+  const changes = region.getByRole("region", { name: "Changes" });
+  await expect(changes.getByText("1200", { exact: true })).toBeVisible();
+
+  await region.getByRole("button", { name: /Show 500 more of 700 remaining/ }).click();
+  await expect(rows).toHaveCount(1000);
+  await region.getByRole("button", { name: /Show 200 more of 200 remaining/ }).click();
+  await expect(rows).toHaveCount(1200);
+  await expect(region.getByRole("button", { name: /more of .* remaining/ })).toHaveCount(0);
+
+  // Stage All covers the whole group, not just the rows that were drawn.
+  await region.getByLabel("Stage All Changes").click();
+  await expect.poll(() => gitCalls(page, "stage")).toBe(1200);
+});
+
+test("typing a commit message does not lose the draft or the Commit button state", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: "M  a.ts\0" });
+  const box = region.getByLabel("Commit message");
+  const commit = region.getByRole("button", { name: /Commit Staged/ });
+  await expect(commit).toBeDisabled();
+  await box.fill("first line");
+  await expect(commit).toBeEnabled();
+  await box.fill("   ");
+  await expect(commit).toBeDisabled();
+  await box.fill("draft survives reload");
+  await page.reload();
+  await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
+  await expect(
+    page.getByRole("complementary", { name: "Source control" }).getByLabel("Commit message"),
+  ).toHaveValue("draft survives reload");
 });

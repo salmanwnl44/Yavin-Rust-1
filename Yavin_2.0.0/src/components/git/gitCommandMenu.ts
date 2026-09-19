@@ -12,7 +12,8 @@ import type { MenuEntry } from "./GitMenu";
 export function buildGitCommandMenu({
   entry,
   dirty,
-  message,
+  hasMessage,
+  getMessage,
   onCommitted,
   includeViewOptions,
   onOpenBranches,
@@ -21,8 +22,10 @@ export function buildGitCommandMenu({
 }: {
   entry: RepoEntry;
   dirty: boolean;
-  /** The commit message currently typed in the Changes section, if any. */
-  message: string;
+  /** Whether a commit message is currently typed in the Changes section. */
+  hasMessage: boolean;
+  /** Reads the message at click time, so the menu never commits stale text. */
+  getMessage: () => string;
   onCommitted: () => void;
   includeViewOptions?: boolean;
   onOpenBranches: () => void;
@@ -36,7 +39,7 @@ export function buildGitCommandMenu({
   const hasUpstream = !!snapshot.branch.upstream;
   const staged = snapshot.entries.filter((e) => !e.conflict && !e.untracked && e.index !== " ");
   const modified = snapshot.entries.filter((e) => !e.conflict && e.worktree !== " ");
-  const canCommit = message.trim().length > 0 && staged.length > 0;
+  const canCommit = hasMessage && staged.length > 0;
 
   const items: MenuEntry[] = [];
 
@@ -82,7 +85,7 @@ export function buildGitCommandMenu({
           disabled: !canCommit,
           onSelect: () => {
             void entry.store
-              .guarded("commit", dirty, () => repo.commit(message))
+              .guarded("commit", dirty, () => repo.commit(getMessage()))
               .then((ok) => {
                 if (ok) onCommitted();
               });
