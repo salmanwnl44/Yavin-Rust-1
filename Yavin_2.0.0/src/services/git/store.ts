@@ -34,6 +34,13 @@ export interface RepoSnapshot {
   /** Set when `notice` is the current operation being cancelled, not a real
    * failure -- the UI renders this distinctly (informational, not an error). */
   cancelled: boolean;
+  /**
+   * Set when the most recent `refresh()` failed, so every field above is
+   * last-known-good rather than freshly confirmed -- never cleared to `[]`/empty
+   * on failure (see `refresh()`'s `catch`, which never touches the data fields on
+   * error), only flagged. Cleared on the next successful `refresh()`.
+   */
+  stale: boolean;
 }
 
 /** One of `refresh()`'s independently-fetchable pieces of worktree state. */
@@ -87,6 +94,11 @@ const INVALIDATES: Readonly<Record<string, readonly RefreshField[]>> = {
   publish: ["branch"],
 };
 
+function isSubsetOf<T>(a: ReadonlySet<T>, b: ReadonlySet<T>): boolean {
+  for (const item of a) if (!b.has(item)) return false;
+  return true;
+}
+
 const initialSnapshot: RepoSnapshot = {
   entries: [],
   branch: EMPTY_BRANCH,
@@ -98,6 +110,7 @@ const initialSnapshot: RepoSnapshot = {
   busy: false,
   notice: "",
   cancelled: false,
+  stale: false,
 };
 
 /**
@@ -112,6 +125,25 @@ export class RepoStore {
   private listeners = new Set<() => void>();
   private generation = 0;
   private inFlight = false;
+  /**
+   * The currently-running bare `refresh()` call (if any), and exactly which
+   * fields it's fetching -- lets a second, overlapping `refresh()` call (e.g. a
+   * watcher event landing right after the 5s poll fires) that asks for a subset
+   * of what's already in flight share that same call instead of spawning
+   * duplicate `git` processes for fields already being fetched. Not a
+   * correctness mechanism (the existing `generation` guard already prevents a
+   * stale result from ever being applied) -- purely avoids wasted process spawns
+   * for the specific overlapping-refresh race the Git State & Synchronization
+   * plan's Section N/Race 2 identifies. A request that isn't fully covered by
+   * what's in flight (e.g. a full refresh while only `["entries"]` is pending)
+   * simply runs as its own independent call, same as today.
+   */
+  private inFlightRefresh: { fields: ReadonlySet<RefreshField>; promise: Promise<void> } | null =
+    null;
+  /** Set on every successful `refresh()` completion, whatever triggered it --
+   * read by `SourceControlPanel.tsx` to skip a redundant refresh right after
+   * switching to a worktree whose cached snapshot is already fresh enough. */
+  lastRefreshedAt = 0;
 
   // Not a parameter-property shorthand -- see the matching note in repository.ts.
   constructor(repository: Repository, onAnyChange?: () => void) {
@@ -144,6 +176,21 @@ export class RepoStore {
    * `git` process here instead of five.
    */
   async refresh(fields: readonly RefreshField[] = ALL_REFRESH_FIELDS): Promise<void> {
+    const requested = new Set(fields);
+    const inFlight = this.inFlightRefresh;
+    if (inFlight && isSubsetOf(requested, inFlight.fields)) {
+      return inFlight.promise;
+    }
+    const promise = this.doRefresh(fields);
+    this.inFlightRefresh = { fields: requested, promise };
+    try {
+      await promise;
+    } finally {
+      if (this.inFlightRefresh?.promise === promise) this.inFlightRefresh = null;
+    }
+  }
+
+  private async doRefresh(fields: readonly RefreshField[]): Promise<void> {
     const current = ++this.generation;
     const wants = (field: RefreshField) => fields.includes(field);
     this.patch({ loading: true });
@@ -158,7 +205,7 @@ export class RepoStore {
           wants("operationInProgress") ? this.repository.state() : undefined,
         ]);
       if (this.generation !== current) return;
-      const next: Partial<RepoSnapshot> = { loading: false };
+      const next: Partial<RepoSnapshot> = { loading: false, stale: false };
       if (status !== undefined) next.entries = parseGitEntries(status, this.repository.root);
       if (branchInfo !== undefined) next.branch = parseBranch(branchInfo);
       if (branches !== undefined) next.branches = branches;
@@ -166,9 +213,10 @@ export class RepoStore {
       if (stashList !== undefined) next.stashes = parseStashList(stashList);
       if (operationInProgress !== undefined) next.operationInProgress = operationInProgress;
       this.patch(next);
+      this.lastRefreshedAt = Date.now();
     } catch (error) {
       if (this.generation !== current) return;
-      this.patch({ notice: String(error), loading: false });
+      this.patch({ notice: String(error), loading: false, stale: true });
     }
   }
 

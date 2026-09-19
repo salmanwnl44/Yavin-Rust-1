@@ -174,8 +174,21 @@ export function SourceControlPanel({
     callbacks.current.onEntries(workspaceSnapshot?.entries ?? []);
   }, [workspaceSnapshot?.entries]);
 
+  // `revision` bumps always force a refresh (it means something in the workspace
+  // genuinely changed). Switching *which worktree* is active does not, by itself,
+  // mean anything changed -- the target's own RepoStore has already been polled
+  // every 5s in the background (see the loop below) even while it wasn't active,
+  // so its cached snapshot is already at most that fresh. Skipping a redundant
+  // refresh right after a switch when that cache is still fresh enough avoids an
+  // extra round of `git` processes without ever showing staler data than the
+  // existing 5s poll already tolerates elsewhere.
+  const lastActiveRepoRef = useRef<typeof activeRepo>(null);
   useEffect(() => {
-    if (activeRepo) void activeRepo.store.refresh();
+    if (!activeRepo) return;
+    const switchedWorktree = lastActiveRepoRef.current !== activeRepo;
+    lastActiveRepoRef.current = activeRepo;
+    if (switchedWorktree && Date.now() - activeRepo.store.lastRefreshedAt < 5000) return;
+    void activeRepo.store.refresh();
   }, [activeRepo, revision]);
 
   // Refreshes every open repo (not just the active one) so the Repositories section

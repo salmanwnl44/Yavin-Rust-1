@@ -351,3 +351,62 @@ test("fetching in one worktree refreshes the shared branch list in a sibling wor
   // and `sync.ts`'s SIBLING_INVALIDATES maps "fetch" to ["branch"] for siblings.
   await expect.poll(() => branchInfoCallsFor("/work")).toBeGreaterThan(before);
 });
+
+test("switching rapidly back and forth between two just-refreshed worktrees does not re-issue a full refresh for either", async ({
+  page,
+}) => {
+  const worktreeList = [
+    "worktree /work",
+    "HEAD abc123",
+    "branch refs/heads/main",
+    "",
+    "worktree /work-feature",
+    "HEAD abc123",
+    "branch refs/heads/feature",
+    "",
+  ].join("\n");
+  const region = await panel(page, {
+    workspace: "/work",
+    repos: {
+      "/work": { ...repo("main"), commonDir: "/work/.git", worktreeList },
+      "/work-feature": { ...repo("feature"), commonDir: "/work/.git" },
+    },
+  });
+
+  const statusCallsFor = (repoId: string) =>
+    page.evaluate(
+      (id) =>
+        (
+          window as unknown as {
+            __calls: { command: string; args: { repoId?: string; args?: string[] } }[];
+          }
+        ).__calls.filter(
+          (c) => c.command === "git_exec" && c.args.repoId === id && c.args.args?.[0] === "status",
+        ).length,
+      repoId,
+    );
+
+  // /work is active and refreshed on open; open /work-feature too (becomes active).
+  await region.getByText("1 more worktree").click();
+  await region.getByRole("button", { name: "Open worktree /work-feature" }).click();
+  await expect(region.getByLabel("Commit message")).toBeVisible();
+
+  const workBefore = await statusCallsFor("/work");
+  const featureBefore = await statusCallsFor("/work-feature");
+
+  // Both worktrees were refreshed moments ago (well under the 5s freshness
+  // window) -- switching back and forth should show their already-fresh cached
+  // state immediately, not issue a redundant full refresh for either. Clicking
+  // the row itself (not its Sync button, which stops propagation) fires the
+  // row's onSelect -> gitRegistry.setActive.
+  await region.getByRole("group", { name: "work", exact: true }).click({ position: { x: 5, y: 5 } });
+  await region.getByTitle("Branches and remotes").click();
+  await expect(region.getByLabel("Switch branch")).toHaveValue("main"); // confirms the switch actually landed
+  await region.getByRole("group", { name: "work-feature" }).click({ position: { x: 5, y: 5 } });
+  await expect(region.getByLabel("Switch branch")).toHaveValue("feature");
+
+  const workAfter = await statusCallsFor("/work");
+  const featureAfter = await statusCallsFor("/work-feature");
+  expect(workAfter).toBe(workBefore);
+  expect(featureAfter).toBe(featureBefore);
+});
