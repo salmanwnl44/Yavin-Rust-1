@@ -20,6 +20,10 @@ export interface GraphSnapshot {
 
 const EMPTY_LAYOUT: GraphLayout = { nodes: [], edges: [], laneCount: 0 };
 
+/** Git's message for `git log` on a branch that has no commits yet. */
+export const isUnbornHistory = (error: unknown): boolean =>
+  /does not have any commits yet|bad default revision 'HEAD'/i.test(String(error));
+
 /**
  * Loads one repository's commit history a page at a time and rebuilds the graph
  * layout over the full accumulated list each time. Recomputing from scratch (rather
@@ -115,6 +119,12 @@ export class GraphLoader {
       });
     } catch (error) {
       if (generation !== this.generation) return;
+      // A repository with no commits yet (a freshly created one) makes `git log` exit
+      // non-zero -- that is an empty history, not a failure worth showing the user.
+      if (isUnbornHistory(error)) {
+        this.patch({ hasMore: false, loading: false });
+        return;
+      }
       this.patch({ notice: String(error), loading: false });
     } finally {
       if (generation === this.generation) this.loadingMore = false;

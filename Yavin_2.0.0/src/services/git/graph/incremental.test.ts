@@ -168,3 +168,33 @@ test("dispose stops further notifications", async () => {
   await loader.loadMore();
   assert.equal(notifications, 0);
 });
+
+test("a repository with no commits yet loads as an empty history, not an error", async () => {
+  // Exactly what git prints for `git log` on a freshly created repository.
+  const unborn = {
+    graphLog: async () => {
+      throw new Error("fatal: your current branch 'main' does not have any commits yet");
+    },
+    isShallow: async () => false,
+  } as unknown as Repository;
+  const loader = new GraphLoader(unborn);
+  await loader.loadMore();
+  const snapshot = loader.getSnapshot();
+  assert.equal(snapshot.notice, "", "no raw git error is shown for an empty repository");
+  assert.equal(snapshot.hasMore, false, "there is nothing more to page through");
+  assert.equal(snapshot.loading, false);
+  assert.equal(snapshot.commits.length, 0);
+});
+
+test("a real git failure is still shown, and does not pretend the history ended", async () => {
+  const broken = {
+    graphLog: async () => {
+      throw new Error("fatal: not a git repository");
+    },
+    isShallow: async () => false,
+  } as unknown as Repository;
+  const loader = new GraphLoader(broken);
+  await loader.loadMore();
+  assert.match(loader.getSnapshot().notice, /not a git repository/);
+  assert.equal(loader.getSnapshot().hasMore, true);
+});
