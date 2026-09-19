@@ -31,7 +31,10 @@ function MenuRow({ item, onDone }: { item: MenuItemDef; onDone: () => void }) {
         disabled={item.disabled}
         onClick={() => {
           if (hasChildren) {
-            setSubOpen((open) => !open);
+            // Clicking never closes the flyout: hovering already opened it, so a toggle here
+            // made a mouse user's click on "Stash" shut the submenu they were reaching for.
+            // It closes when the pointer leaves the row, or with the whole menu.
+            setSubOpen(true);
             return;
           }
           item.onSelect?.();

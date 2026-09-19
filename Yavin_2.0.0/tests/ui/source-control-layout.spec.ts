@@ -156,3 +156,14 @@ test("the inline graph lists commits without colliding with the branch drawer's 
   // without Playwright treating them as ambiguous.
   await expect(region.getByRole("button", { name: "Fetch", exact: true })).toBeVisible();
 });
+
+test("clicking a menu item that has a submenu keeps the submenu open", async ({ page }) => {
+  const region = await panel(page);
+  await region.getByLabel("Changes actions").click();
+  const stash = page.getByRole("menuitem", { name: /^Stash ›$/ });
+  // A mouse user hovers the item (which opens its flyout) and then clicks it.
+  await stash.hover();
+  await expect(page.getByRole("menuitem", { name: "Stash Changes" })).toBeVisible();
+  await stash.click();
+  await expect(page.getByRole("menuitem", { name: "Stash Changes" })).toBeVisible();
+});
