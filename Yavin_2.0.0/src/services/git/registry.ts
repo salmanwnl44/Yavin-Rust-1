@@ -310,6 +310,11 @@ class GitRegistry {
     const found = this.findWorktree(repoId);
     if (found) this.makeActive(found.worktree);
   }
+
+  /** The repository a worktree belongs to, or `undefined` if `repoId` isn't tracked. */
+  repositoryFor(repoId: string): RepositoryEntry | undefined {
+    return this.findWorktree(repoId)?.repository;
+  }
 }
 
 export const gitRegistry = new GitRegistry();

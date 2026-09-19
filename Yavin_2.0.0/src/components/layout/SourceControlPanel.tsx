@@ -5,6 +5,7 @@ import type { GitEntry } from "../../services/git/parsers/status";
 import type { GitOperation } from "../../services/git/backend";
 import { gitRegistry } from "../../services/git/registry";
 import { useActiveRepo, useGitRegistry, useRepoSnapshot } from "../../services/git/hooks";
+import { guardedAffecting } from "../../services/git/sync";
 import { RepositoriesSection } from "../git/RepositoriesSection";
 import { InlineGraphSection } from "../git/InlineGraphSection";
 import { StashesSection } from "../git/StashesSection";
@@ -240,7 +241,7 @@ export function SourceControlPanel({
 
   const guarded = (kind: string, operation: () => Promise<string>) => {
     if (!activeRepo) return Promise.resolve(false);
-    return activeRepo.store.guarded(kind, dirty, operation);
+    return guardedAffecting(activeRepo, kind, dirty, operation);
   };
 
   const showDiff = async (entry: GitEntry, staged: boolean) => {

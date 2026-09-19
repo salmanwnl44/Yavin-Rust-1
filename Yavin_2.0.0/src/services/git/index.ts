@@ -30,6 +30,8 @@ export { RepoStore, DIRTY_BLOCKED } from "./store.ts";
 export type { RepoEntry } from "./registry.ts";
 export { gitRegistry } from "./registry.ts";
 
+export { guardedAffecting, SIBLING_INVALIDATES, GRAPH_RESETS } from "./sync.ts";
+
 export {
   useGitRegistry,
   useActiveRepo,

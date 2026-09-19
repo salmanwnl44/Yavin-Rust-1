@@ -37,7 +37,13 @@ export interface RepoSnapshot {
 }
 
 /** One of `refresh()`'s independently-fetchable pieces of worktree state. */
-type RefreshField = "entries" | "branch" | "branches" | "remotes" | "stashes" | "operationInProgress";
+export type RefreshField =
+  | "entries"
+  | "branch"
+  | "branches"
+  | "remotes"
+  | "stashes"
+  | "operationInProgress";
 
 const ALL_REFRESH_FIELDS: readonly RefreshField[] = [
   "entries",

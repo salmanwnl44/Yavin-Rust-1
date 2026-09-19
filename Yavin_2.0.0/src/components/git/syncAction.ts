@@ -1,5 +1,6 @@
 import type { RepoEntry } from "../../services/git/registry";
 import { divergence } from "../../services/git/parsers/branch";
+import { guardedAffecting } from "../../services/git/sync";
 
 /**
  * The single "sync" action VS Code's repo-row icon performs: fetch when even,
@@ -28,9 +29,9 @@ export function syncAction(entry: RepoEntry, dirty: boolean) {
       onDiverged();
       return;
     }
-    if (state === "ahead") void entry.store.guarded("push", dirty, () => repo.push());
-    else if (state === "behind") void entry.store.guarded("pull", dirty, () => repo.pull());
-    else void entry.store.guarded("fetch", dirty, () => repo.fetch());
+    if (state === "ahead") void guardedAffecting(entry, "push", dirty, () => repo.push());
+    else if (state === "behind") void guardedAffecting(entry, "pull", dirty, () => repo.pull());
+    else void guardedAffecting(entry, "fetch", dirty, () => repo.fetch());
   };
 
   return { title, run, state };

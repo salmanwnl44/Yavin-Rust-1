@@ -1,4 +1,5 @@
 import type { RepoEntry } from "../../services/git/registry";
+import { guardedAffecting } from "../../services/git/sync";
 import type { MenuEntry } from "./GitMenu";
 
 /**
@@ -31,7 +32,7 @@ export function buildGitCommandMenu({
   const repo = entry.store.repository;
   const snapshot = entry.store.getSnapshot();
   const run = (kind: string, op: () => Promise<string>) =>
-    void entry.store.guarded(kind, dirty, op);
+    void guardedAffecting(entry, kind, dirty, op);
   const hasUpstream = !!snapshot.branch.upstream;
   const staged = snapshot.entries.filter((e) => !e.conflict && !e.untracked && e.index !== " ");
   const modified = snapshot.entries.filter((e) => !e.conflict && e.worktree !== " ");

@@ -42,6 +42,7 @@ import {
 import {
   buildDecorations,
   gitRegistry,
+  guardedAffecting,
   useActiveRepo,
   useRepoSnapshot,
   useTotalChanges,
@@ -549,7 +550,7 @@ export default function App() {
     // Routed through the shared `guarded()` (same as commit/stage/pull/push) so a
     // hunk action sets the repo's busy flag, blocks conflicting concurrent
     // operations, and reports failures through the store's shared notice.
-    const ok = await entry.store.guarded(`${action}-hunk`, false, async () => {
+    const ok = await guardedAffecting(entry, `${action}-hunk`, false, async () => {
       if (action === "stage") await repo.stageHunks(targetText, [hunkIndex]);
       else if (action === "unstage") await repo.unstageHunks(targetText, [hunkIndex]);
       else await repo.discardHunks(targetText, [hunkIndex]);

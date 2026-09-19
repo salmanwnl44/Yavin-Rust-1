@@ -289,3 +289,65 @@ test("the activity bar badge aggregates changes across every open repository", a
     .click();
   await expect(gitTab).toContainText("3");
 });
+
+test("fetching in one worktree refreshes the shared branch list in a sibling worktree of the same repository", async ({
+  page,
+}) => {
+  const worktreeList = [
+    "worktree /work",
+    "HEAD abc123",
+    "branch refs/heads/main",
+    "",
+    "worktree /work-feature",
+    "HEAD abc123",
+    "branch refs/heads/feature",
+    "",
+  ].join("\n");
+  const region = await panel(page, {
+    workspace: "/work",
+    repos: {
+      "/work": { ...repo("main"), commonDir: "/work/.git", worktreeList },
+      "/work-feature": { ...repo("feature"), commonDir: "/work/.git" },
+    },
+  });
+
+  // Open the sibling worktree too -- opening it via the switcher makes it active,
+  // so the fetch below runs against /work-feature while /work sits in the
+  // background, unopened-tab-wise but still tracked (this is the sibling case
+  // the Git State & Synchronization plan's Section E/L targets).
+  await region.getByText("1 more worktree").click();
+  await region.getByRole("button", { name: "Open worktree /work-feature" }).click();
+  await expect(region.getByLabel("Commit message")).toBeVisible();
+
+  // "branchInfo" (status --porcelain=v2 --branch) is what carries ahead/behind --
+  // the field a fetch's remote-tracking-ref update actually affects (fetch never
+  // writes refs/heads/, so the separate local-branch-NAME-list call, for-each-ref,
+  // is correctly NOT expected to increase here).
+  const branchInfoCallsFor = (repoId: string) =>
+    page.evaluate(
+      (id) =>
+        (
+          window as unknown as {
+            __calls: { command: string; args: { repoId?: string; args?: string[] } }[];
+          }
+        ).__calls.filter(
+          (c) =>
+            c.command === "git_exec" &&
+            c.args.repoId === id &&
+            c.args.args?.[0] === "status" &&
+            c.args.args?.includes("--porcelain=v2"),
+        ).length,
+      repoId,
+    );
+  const before = await branchInfoCallsFor("/work");
+
+  await region.getByTitle("Branches and remotes").click();
+  await region.getByRole("button", { name: "Fetch" }).click();
+
+  // /work-feature (the worktree that actually fetched) refreshing its own branch
+  // field is Module 2's existing, unchanged behavior -- the new assertion is that
+  // /work (a sibling of the same repository, never touched directly) also
+  // re-fetches its branch info, because remote-tracking refs are repository-shared
+  // and `sync.ts`'s SIBLING_INVALIDATES maps "fetch" to ["branch"] for siblings.
+  await expect.poll(() => branchInfoCallsFor("/work")).toBeGreaterThan(before);
+});

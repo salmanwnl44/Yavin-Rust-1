@@ -1,5 +1,6 @@
 import type { RepoEntry } from "../../services/git/registry";
 import { useCommitGraph } from "../../services/git/hooks";
+import { guardedAffecting } from "../../services/git/sync";
 import { GRAPH_COLOR_COUNT } from "../../services/git/graph/model";
 import { ChevronIcon } from "../ui/FileIcons";
 import {
@@ -52,8 +53,12 @@ export function InlineGraphSection({
   const gutterWidth = Math.max(1, Math.min(snapshot.layout.laneCount, 4)) * LANE_WIDTH + 6;
   const totalHeight = visible.length * ROW_HEIGHT;
 
-  const run = (kind: string, op: () => Promise<string>) =>
-    void entry.store.guarded(kind, dirty, op).then(() => reset());
+  // guardedAffecting resets the repository's shared GraphLoader itself, correctly
+  // scoped to fetch/pull/pullRebase/pullMerge -- not push, which never adds a
+  // commit (see sync.ts's GRAPH_RESETS) but was reset unconditionally here before.
+  // Since the loader is shared, that reset is visible through this same `reset`/
+  // `snapshot` pair without an extra manual call.
+  const run = (kind: string, op: () => Promise<string>) => void guardedAffecting(entry, kind, dirty, op);
 
   return (
     <section aria-label="Graph" className="text-xs flex flex-col min-h-0">

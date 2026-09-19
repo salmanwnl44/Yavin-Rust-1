@@ -1,4 +1,5 @@
 import type { RepoEntry } from "../../services/git/registry";
+import { guardedAffecting } from "../../services/git/sync";
 import type { StashEntry } from "../../services/git/parsers/stash";
 import { ChevronIcon } from "../ui/FileIcons";
 import { ArrowDownIcon, TrashIcon, UndoIcon } from "../ui/Icons";
@@ -19,7 +20,7 @@ export function StashesSection({
   if (!entry) return null;
 
   const run = (kind: string, op: () => Promise<string>) =>
-    void entry.store.guarded(kind, dirty, op);
+    void guardedAffecting(entry, kind, dirty, op);
 
   const drop = (index: number, message: string) => {
     if (!window.confirm(`Drop the stash "${message}"? This cannot be undone.`)) return;
