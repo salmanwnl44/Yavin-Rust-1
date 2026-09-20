@@ -675,6 +675,8 @@ const SHOW: &[FlagRule] = &[
     flag("--oneline"),
     prefix_flag("--pretty="),
     flag("--numstat"),
+    // NUL-terminated records so paths need no unquoting (see `parseCommitDetails`).
+    flag("-z"),
     // Added for Repository.commitFileDiff() -- a single historical commit's diff for
     // one file, matching the exact flag set `diff()` already uses for a working-tree/
     // index comparison (Module 9).
@@ -2519,7 +2521,26 @@ mod tests {
             &["revert", "--abort"],
             &["revert", "--continue"],
             &["revert", "--skip"],
-            &["show", "--numstat", "--pretty=format:%H", "abc123"],
+            &[
+                "show",
+                "--numstat",
+                "-z",
+                "-M",
+                "--pretty=format:%H",
+                "abc123",
+            ],
+            &[
+                "show",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "-M",
+                "--pretty=format:",
+                "abc123",
+                "--",
+                "old.txt",
+                "new.txt",
+            ],
             &[
                 "show",
                 "--no-ext-diff",

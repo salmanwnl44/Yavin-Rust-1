@@ -4,7 +4,7 @@ import { useCommitGraph } from "../../services/git/hooks";
 import type { GraphNode } from "../../services/git/graph/model";
 import { GRAPH_COLOR_COUNT } from "../../services/git/graph/model";
 import { parseCommitDetails } from "../../services/git/parsers/log";
-import type { CommitDetailedInfo } from "../../services/git/parsers/log";
+import type { CommitDetailedInfo, CommitFileChange } from "../../services/git/parsers/log";
 import type { DiffDocument } from "../layout/DiffEditor";
 import { CloseIcon, GitCommitIcon } from "../ui/Icons";
 
@@ -56,10 +56,10 @@ function CommitDetail({
   const [loading, setLoading] = useState(true);
   const [diffError, setDiffError] = useState("");
 
-  const openFileDiff = (path: string) => {
+  const openFileDiff = ({ path, oldPath }: CommitFileChange) => {
     setDiffError("");
     repository
-      .commitFileDiff(node.commit.fullHash, path)
+      .commitFileDiff(node.commit.fullHash, path, oldPath)
       .then((text) => {
         onDiff({
           path,
@@ -127,8 +127,8 @@ function CommitDetail({
               {detail.files.map((file) => (
                 <li key={file.path}>
                   <button
-                    onClick={() => openFileDiff(file.path)}
-                    title={`Show the diff for ${file.path} in this commit`}
+                    onClick={() => openFileDiff(file)}
+                    title={`Show the diff for ${file.oldPath ? `${file.oldPath} → ` : ""}${file.path} in this commit`}
                     className="flex w-full items-center gap-1.5 py-1 text-[11px] text-zinc-300 hover:bg-[#121212] rounded px-0.5 -mx-0.5"
                   >
                     <span className="font-mono text-[10px] text-zinc-500 w-3 shrink-0">

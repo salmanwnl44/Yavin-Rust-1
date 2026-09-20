@@ -2,14 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { parseCommitDetails, parseGraphLog, parseRefLabels } from "./log.ts";
 
-test("parseCommitDetails reads numstat's tab-separated per-file line counts", () => {
-  const output = [
-    "abc123\x1fFix the thing",
+/** Builds `git show --numstat -z` output: a header line, then NUL-terminated records. */
+const numstatZ = (header: string, records: string[]) => `${header}\n${records.join("\0")}\0`;
+
+test("parseCommitDetails reads numstat's per-file line counts", () => {
+  const output = numstatZ("abc123\x1fFix the thing", [
     "12\t5\tsrc/a.ts",
     "3\t0\tsrc/b.ts",
     "0\t2\tsrc/c.ts",
     "-\t-\timage.png",
-  ].join("\n");
+  ]);
   const details = parseCommitDetails(output);
   assert.equal(details.hash, "abc123");
   assert.equal(details.summary, "Fix the thing");
@@ -27,6 +29,30 @@ test("parseCommitDetails reads numstat's tab-separated per-file line counts", ()
   );
   // A binary file's line counts are genuinely unknown, not zero.
   assert.equal(details.files[3].insertions, undefined);
+});
+
+test("parseCommitDetails returns real paths for renames, spaces, non-ASCII and tabs", () => {
+  const details = parseCommitDetails(
+    numstatZ("abc123\x1fMixed", [
+      "1\t0\tcafé.txt",
+      "0\t0\t\0old name.txt\0new {a => b}.txt",
+      "2\t2\t\0dir/from.ts\0dir/to.ts",
+      "3\t1\ta\tb.txt",
+      "4\t0\t日本語/ファイル.md",
+    ]),
+  );
+  assert.deepEqual(
+    details.files.map((f) => [f.path, f.oldPath, f.status]),
+    [
+      ["café.txt", undefined, "A"],
+      ["new {a => b}.txt", "old name.txt", "R"],
+      ["dir/to.ts", "dir/from.ts", "R"],
+      ["a\tb.txt", undefined, "M"],
+      ["日本語/ファイル.md", undefined, "A"],
+    ],
+  );
+  assert.equal(details.insertions, 10);
+  assert.equal(details.deletions, 3);
 });
 
 test("parseCommitDetails handles a commit with no changed files", () => {

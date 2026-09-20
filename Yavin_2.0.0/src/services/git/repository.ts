@@ -290,7 +290,7 @@ export class Repository {
 
   commitDetails(hash: string): Promise<string> {
     if (!hash.trim()) throw new Error("Commit hash required");
-    return this.run(["show", "--numstat", "--pretty=format:%H\x1f%s", hash]);
+    return this.run(["show", "--numstat", "-z", "-M", "--pretty=format:%H\x1f%s", hash]);
   }
 
   /**
@@ -304,8 +304,11 @@ export class Repository {
    * parser is introduced. Merge commits produce Git's own combined-diff format,
    * which this method does not special-case (see the plan's own deferred-scope note).
    */
-  commitFileDiff(hash: string, path: string): Promise<string> {
+  commitFileDiff(hash: string, path: string, oldPath?: string): Promise<string> {
     if (!hash.trim()) throw new Error("Commit hash required");
+    // A rename needs both sides as pathspecs, or Git sees only the new name and shows
+    // the whole file as added.
+    const paths = oldPath && oldPath !== path ? [oldPath, path] : [path];
     return this.run([
       "show",
       "--no-ext-diff",
@@ -315,7 +318,7 @@ export class Repository {
       "--pretty=format:",
       hash,
       "--",
-      path,
+      ...paths,
     ]);
   }
 

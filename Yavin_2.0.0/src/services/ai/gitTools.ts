@@ -83,11 +83,14 @@ export function createGitReadTools(registry: WorktreeRegistry = gitRegistry) {
         return parseCommitDetails(await entry.store.repository.commitDetails(args.hash));
       }),
 
-    getCommitFileDiff: (ref: WorktreeRef, args: { hash: string; path: string }) =>
+    getCommitFileDiff: (ref: WorktreeRef, args: { hash: string; path: string; oldPath?: string }) =>
       withEntry(ref, async (entry) => {
         if (!HASH.test(args.hash)) throw new Error("Invalid commit hash.");
         if (!args.path || args.path.split(/[\\/]/).includes("..")) throw new Error("Invalid path.");
-        return truncate(await entry.store.repository.commitFileDiff(args.hash, args.path));
+        if (args.oldPath?.split(/[\\/]/).includes("..")) throw new Error("Invalid path.");
+        return truncate(
+          await entry.store.repository.commitFileDiff(args.hash, args.path, args.oldPath),
+        );
       }),
   };
 }

@@ -11,7 +11,7 @@ interface RawLine {
 interface Scenario {
   /** All commits, newest first -- sliced by `--skip`/`-n` like real `git log`. */
   commits: RawLine[];
-  /** hash -> numstat body lines (tab-separated) for commit-detail lookups. */
+  /** hash -> numstat records (tab-separated; the mock NUL-terminates them) for commit-detail lookups. */
   numstat?: Record<string, string[]>;
   /** hash -> unified-diff text for commitFileDiff() lookups, keyed loosely by hash only. */
   fileDiffs?: Record<string, string>;
@@ -73,7 +73,8 @@ async function panel(page: Page, scenario: Scenario) {
             if (argv[0] === "show" && argv.includes("--numstat")) {
               const hash = argv[argv.length - 1];
               const lines = s.numstat?.[hash] ?? [];
-              return ok([`${hash}\x1fSubject for ${hash}`, ...lines].join("\n"));
+              // `git show --numstat -z`: a header line, then NUL-terminated records.
+              return ok(`${hash}\x1fSubject for ${hash}\n${lines.map((l) => l + "\0").join("")}`);
             }
             if (argv[0] === "show" && argv.includes("-M")) {
               // commitFileDiff()'s exact call shape: show --no-ext-diff --no-textconv
