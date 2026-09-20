@@ -63,6 +63,17 @@ export function watchRepo(repositoryId: string, worktreeRepoIds: string[]): Prom
   return native("git_watch_repo", { repositoryId, worktreeRepoIds });
 }
 
+export type WorktreeStatus = "ready" | "missing" | "invalid";
+
+/**
+ * Whether an open worktree's folder can still be used: `missing` (deleted, moved, drive gone)
+ * or `invalid` (exists, but Git no longer treats it as this work tree). Cheap; called when a
+ * refresh fails so "Git said no" can be told apart from "the folder is gone".
+ */
+export function probeWorktree(repoId: string): Promise<WorktreeStatus> {
+  return native("git_probe_worktree", { repoId });
+}
+
 /** Stops watching a repository -- called once its last open worktree closes. */
 export function unwatchRepo(repositoryId: string): Promise<void> {
   return native("git_unwatch_repo", { repositoryId });

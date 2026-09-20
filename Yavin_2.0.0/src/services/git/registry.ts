@@ -5,7 +5,8 @@ import { parsePersistedState } from "./persistence.ts";
 import type { PersistedGitState } from "./persistence.ts";
 import { parseWorktreeList } from "./parsers/worktree.ts";
 import type { WorktreeInfo } from "./parsers/worktree.ts";
-import { unwatchRepo, watchRepo } from "./backend.ts";
+import { probeWorktree, unwatchRepo, watchRepo } from "./backend.ts";
+import type { WorktreeStatus } from "./backend.ts";
 
 /**
  * One open worktree. Kept under this name (rather than `WorktreeEntry`) so every
@@ -19,6 +20,14 @@ export interface RepoEntry {
   repoId: string;
   root: string;
   store: RepoStore;
+  /**
+   * Whether the folder can still be used as this worktree. Anything but `ready` means the
+   * store's data is the last state seen before the folder went away (`missing`: deleted,
+   * moved or its drive is gone; `invalid`: still there, but no longer this work tree), so the
+   * UI must not present it as current. Set from a probe after a refresh fails and cleared by
+   * the next successful refresh.
+   */
+  status: WorktreeStatus;
 }
 
 /**
@@ -70,6 +79,53 @@ function flatten(repositories: RepositoryEntry[]): RepoEntry[] {
   return repositories.flatMap((repository) => repository.worktrees);
 }
 
+const samePath = (a: string, b: string) =>
+  a.replace(/\\/g, "/").toLowerCase() === b.replace(/\\/g, "/").toLowerCase();
+
+/** A repository's preferred worktree: its main worktree if usable, else its first usable one. */
+function preferredWorktree(repository: RepositoryEntry): RepoEntry | undefined {
+  const usable = repository.worktrees.filter((w) => w.status === "ready");
+  const main = repository.knownWorktrees.find((k) => k.isMain);
+  return (main && usable.find((w) => samePath(w.root, main.path))) ?? usable[0];
+}
+
+/**
+ * Which worktree should be active, given what was remembered as active (from storage, or the
+ * one that just stopped being usable). In order:
+ * 1. the remembered worktree itself, if it is still usable;
+ * 2. otherwise its repository's main worktree, if open and usable;
+ * 3. otherwise that repository's first other usable worktree, in the order they were opened;
+ * 4. otherwise the same rule (main, else first) applied to the other repositories in order;
+ * 5. otherwise `null` -- nothing usable is open.
+ * Never an arbitrary "first entry": a missing or invalid worktree is skipped explicitly.
+ */
+export function chooseActiveWorktree(
+  repositories: RepositoryEntry[],
+  remembered: { repositoryId: string | null; worktreePath: string | null },
+): { repository: RepositoryEntry; worktree: RepoEntry } | null {
+  const rememberedPath = remembered.worktreePath;
+  const owner =
+    repositories.find((r) => r.repositoryId === remembered.repositoryId) ??
+    (rememberedPath
+      ? repositories.find((r) => r.worktrees.some((w) => samePath(w.root, rememberedPath)))
+      : undefined);
+
+  if (rememberedPath) {
+    for (const repository of repositories) {
+      const exact = repository.worktrees.find(
+        (w) => w.status === "ready" && samePath(w.root, rememberedPath),
+      );
+      if (exact) return { repository, worktree: exact };
+    }
+  }
+  const ordered = owner ? [owner, ...repositories.filter((r) => r !== owner)] : repositories;
+  for (const repository of ordered) {
+    const worktree = preferredWorktree(repository);
+    if (worktree) return { repository, worktree };
+  }
+  return null;
+}
+
 /**
  * The set of repositories (grouped by their real Git identity) Source Control tracks
  * in this window -- independent of whichever single folder the file explorer has
@@ -77,7 +133,7 @@ function flatten(repositories: RepositoryEntry[]): RepoEntry[] {
  * the main workspace folder) and is reachable from the repo switcher, the status
  * bar, and the activity bar badge alike.
  */
-class GitRegistry {
+export class GitRegistry {
   private snapshot: RegistrySnapshot = {
     repos: [],
     repositories: [],
@@ -90,6 +146,8 @@ class GitRegistry {
   private restorePromise: Promise<void> | null = null;
   /** Repositories whose `.git` watcher could not be (re)started: only polling covers them. */
   private watcherDown = new Set<string>();
+  /** Worktrees a status probe is already running for, so a failing poll does not stack probes. */
+  private probing = new Set<string>();
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -168,11 +226,20 @@ class GitRegistry {
         const rememberedRepository = persisted.repositories.find(
           (r) => r.commonDirHint === persisted.activeRepository,
         );
-        const rememberedWorktree = rememberedRepository?.activeWorktree;
-        if (rememberedWorktree) {
-          const found = this.findByRoot(rememberedWorktree);
-          if (found) this.makeActive(found);
-        }
+        // Explicit, not "whichever opened first": the remembered worktree if it still opens,
+        // else its repository's main worktree, else another usable one (`chooseActiveWorktree`).
+        const choice = chooseActiveWorktree(this.snapshot.repositories, {
+          repositoryId: persisted.activeRepository ?? null,
+          worktreePath: rememberedRepository?.activeWorktree ?? null,
+        });
+        // Always written back, so a worktree that no longer opens is pruned from storage even
+        // when none of them opened at all.
+        this.set(
+          this.snapshot.repositories,
+          choice
+            ? { repositoryId: choice.repository.repositoryId, worktreePath: choice.worktree.root }
+            : { repositoryId: null, worktreePath: null },
+        );
       })();
     }
     return this.restorePromise;
@@ -200,6 +267,46 @@ class GitRegistry {
         console.debug(`Git watcher ${worktreeRepoIds === null ? "stop" : "start"} failed`, error);
       },
     );
+  }
+
+  /**
+   * Called after each of a worktree's refreshes. A failure is the moment to ask whether the
+   * folder itself is gone (a Git error and a missing folder look the same to the store); a
+   * success means whatever was wrong is over.
+   */
+  private async refreshOutcome(repoId: string, ok: boolean): Promise<void> {
+    const found = this.findWorktree(repoId);
+    if (!found) return;
+    if (ok) {
+      this.setStatus(found.worktree, "ready");
+      return;
+    }
+    if (this.probing.has(repoId)) return;
+    this.probing.add(repoId);
+    try {
+      const status = await probeWorktree(repoId).catch(() => null);
+      // Closed while probing, or the probe itself failed: leave the status as it was.
+      if (status && this.findWorktree(repoId)) this.setStatus(found.worktree, status);
+    } finally {
+      this.probing.delete(repoId);
+    }
+  }
+
+  private setStatus(worktree: RepoEntry, status: WorktreeStatus): void {
+    if (worktree.status === status) return;
+    worktree.status = status;
+    let active = {
+      repositoryId: this.snapshot.activeRepositoryId,
+      worktreePath: this.snapshot.activeWorktreePath,
+    };
+    if (status !== "ready" && active.worktreePath === worktree.root) {
+      const next = chooseActiveWorktree(this.snapshot.repositories, active);
+      // With nothing else usable the unusable worktree stays selected, so the panel can
+      // explain what happened instead of showing an empty state.
+      if (next)
+        active = { repositoryId: next.repository.repositoryId, worktreePath: next.worktree.root };
+    }
+    this.set(this.snapshot.repositories, active);
   }
 
   /** Whether `repoId`'s repository has no working `.git` watcher, so polling must cover it. */
@@ -275,7 +382,12 @@ class GitRegistry {
       const worktree: RepoEntry = {
         repoId: repository.repoId,
         root: repository.root,
-        store: new RepoStore(repository, () => this.notifyChange()),
+        status: "ready",
+        store: new RepoStore(
+          repository,
+          () => this.notifyChange(),
+          (ok) => void this.refreshOutcome(repository.repoId, ok),
+        ),
       };
       void worktree.store.refresh();
 

@@ -564,6 +564,42 @@ fn repo_state(repo: &Repo) -> Result<String, String> {
     .to_string())
 }
 
+/// Whether an open worktree's folder can still be used as one:
+/// - `missing`: the folder no longer exists (deleted, moved, or its drive is gone);
+/// - `invalid`: it exists but Git no longer treats it as this work tree (its `.git` was
+///   removed, or a different repository now lives there);
+/// - `ready`: otherwise.
+///
+/// Cheap by design (one directory check, and one `rev-parse` only when the folder exists), so
+/// the UI can call it whenever a refresh fails to tell "Git said no" from "the folder is gone".
+fn probe_worktree(root: &Path) -> &'static str {
+    if !root.is_dir() {
+        return "missing";
+    }
+    let same_root = |reported: &str| match (
+        PathBuf::from(reported.trim()).canonicalize(),
+        root.canonicalize(),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    match run(root, &["rev-parse", "--show-toplevel"]) {
+        Ok(output) if output.code == 0 && same_root(&output.stdout) => "ready",
+        _ => "invalid",
+    }
+}
+
+#[tauri::command]
+pub async fn git_probe_worktree(
+    state: State<'_, Repos>,
+    repo_id: String,
+) -> Result<String, String> {
+    let repo = repo_of(&state, &repo_id)?;
+    tauri::async_runtime::spawn_blocking(move || probe_worktree(&repo.root).to_string())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn git_repo_state(state: State<'_, Repos>, repo_id: String) -> Result<String, String> {
     let repo = repo_of(&state, &repo_id)?;
@@ -1152,6 +1188,41 @@ mod tests {
             linked_toplevel.unwrap(),
             "a linked worktree's own toplevel must differ from the main worktree's"
         );
+    }
+
+    #[test]
+    fn a_worktree_is_ready_missing_or_invalid() {
+        let (dir, git) = fixture();
+        let linked = temp_dir();
+        assert!(git(&[
+            "worktree",
+            "add",
+            linked.to_str().unwrap(),
+            "-b",
+            "feature",
+        ]));
+
+        assert_eq!(probe_worktree(&dir), "ready");
+        assert_eq!(probe_worktree(&linked), "ready");
+
+        // The linked folder is deleted out from under the app.
+        fs::remove_dir_all(&linked).unwrap();
+        assert_eq!(probe_worktree(&linked), "missing");
+        // The main worktree is unaffected.
+        assert_eq!(probe_worktree(&dir), "ready");
+
+        // A folder that exists but is no longer a work tree (its `.git` is gone).
+        let plain = temp_dir();
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(probe_worktree(&plain), "invalid");
+
+        // A folder inside a *different* repository is not this worktree either.
+        let inner = dir.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        assert_eq!(probe_worktree(&inner), "invalid");
+
+        let _ = fs::remove_dir_all(&plain);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -9,6 +9,8 @@ interface Scenario {
   remotes: string;
   state: string;
   fail: Record<string, string>;
+  /** What `git_probe_worktree` reports: is the worktree's folder still usable? */
+  probe: "ready" | "missing" | "invalid";
 }
 
 const diverged = "# branch.head main\n# branch.upstream origin/main\n# branch.ab +2 -3\n";
@@ -24,6 +26,7 @@ async function panel(page: Page, scenario: Partial<Scenario> = {}) {
       remotes: "",
       state: "",
       fail: {},
+      probe: "ready",
       ...partial,
     };
     const calls: { command: string; args: Record<string, unknown>; action: string | null }[] = [];
@@ -109,6 +112,7 @@ async function panel(page: Page, scenario: Partial<Scenario> = {}) {
           if (command === "read_file_content") return "contents";
           if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
           if (command === "git_repo_state") return state.state;
+          if (command === "git_probe_worktree") return state.probe;
           if (command === "git_exec") {
             const argvForFailure = (args.args as string[] | undefined) ?? [];
             // A force delete (-D) always succeeds in this mock even if a plain -d
@@ -707,6 +711,46 @@ test("on a branch there is no detached or out-of-date label", async ({ page }) =
   const region = await panel(page);
   await expect(region.getByText("Detached HEAD", { exact: true })).toHaveCount(0);
   await expect(region.getByText("Out of date")).toHaveCount(0);
+});
+
+test("a worktree whose folder disappears says so instead of showing its last status, and recovers", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: "M  a.ts\0" });
+  const list = region.getByRole("list", { name: "Changed files" });
+  await expect(list.getByText("a.ts")).toBeVisible();
+
+  // Git can no longer run and the folder is gone.
+  await update(page, { fail: { status: "Git: cannot run in a missing folder" }, probe: "missing" });
+  const alert = region.getByRole("alert").filter({ hasText: "folder is missing" });
+  await expect(alert).toBeVisible();
+  await expect(alert).toContainText("Nothing below is current");
+  // Its old status is hidden, not presented as current, and no action is offered on it.
+  await expect(list).toHaveCount(0);
+  await expect(region.getByLabel("Commit message")).toHaveCount(0);
+  await expect(region.getByRole("button", { name: "Close this worktree" })).toBeVisible();
+
+  // The folder comes back: the next poll's successful refresh restores the normal view.
+  await page.evaluate(() => {
+    const scenario = (window as unknown as { __scenario: Scenario }).__scenario;
+    scenario.fail = {};
+    scenario.probe = "ready";
+  });
+  await expect(region.getByRole("list", { name: "Changed files" })).toBeVisible({
+    timeout: 20_000,
+  });
+  await expect(region.getByRole("alert").filter({ hasText: "folder is missing" })).toHaveCount(0);
+});
+
+test("a folder that is no longer this Git worktree is described differently from a missing one", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: "M  a.ts\0" });
+  await update(page, { fail: { status: "Git: fatal: not a git repository" }, probe: "invalid" });
+  await expect(
+    region.getByRole("alert").filter({ hasText: "no longer this Git worktree" }),
+  ).toBeVisible();
+  await expect(region.getByLabel("Commit message")).toHaveCount(0);
 });
 
 test("a Cancel button stops a running Git operation and reports it distinctly from a failure", async ({

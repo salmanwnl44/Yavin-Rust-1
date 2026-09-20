@@ -61,7 +61,7 @@ async function fixture(f: Fixture = {}) {
   } as unknown as Repository;
   const store = new RepoStore(repository);
   await store.refresh();
-  const entry: RepoEntry = { repoId: "/work", root: "/work", store };
+  const entry: RepoEntry = { repoId: "/work", root: "/work", status: "ready", store };
   const registry = { getSnapshot: () => ({ repos: [entry] }) };
   const dirty = { value: false };
   const tools = createGitMutatingTools({ isDirty: () => dirty.value, registry });

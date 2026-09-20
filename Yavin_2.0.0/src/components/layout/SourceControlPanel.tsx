@@ -525,6 +525,9 @@ export function SourceControlPanel({
   const notice = snapshot?.notice ?? "";
   const cancelled = snapshot?.cancelled ?? false;
   const stale = snapshot?.stale ?? false;
+  // A worktree whose folder was deleted, moved or emptied of its Git link is not shown as if
+  // it were current: no status, no actions, just what happened and how to move on.
+  const unusable = !!activeRepo && activeRepo.status !== "ready";
 
   // One list for everything: conflicts first, then every other changed file. Whether a
   // file is staged is shown by its checkbox, not by which section it sits in.
@@ -673,7 +676,7 @@ export function SourceControlPanel({
                 </span>
               )}
               <div className="flex-1" />
-              {activeRepo && (
+              {activeRepo && !unusable && (
                 <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
                   {stagedCount > 0 && (
                     <button
@@ -727,7 +730,32 @@ export function SourceControlPanel({
 
             {!sectionCollapsed.changes && (
               <div className="shrink-0 max-h-[60%] overflow-y-auto p-3 pt-1 space-y-2.5">
-                {!activeRepo ? (
+                {activeRepo && unusable ? (
+                  <div
+                    role="alert"
+                    className="space-y-2 rounded border border-yellow/30 bg-yellow/10 p-2"
+                  >
+                    <p className="text-[11px] font-medium text-ink">
+                      {activeRepo.status === "missing"
+                        ? "This worktree's folder is missing"
+                        : "This folder is no longer this Git worktree"}
+                    </p>
+                    <p className="break-all font-mono text-[10.5px] text-ink-3">
+                      {activeRepo.root}
+                    </p>
+                    <p className="text-[11px] leading-snug text-ink-2">
+                      {activeRepo.status === "missing"
+                        ? "It was deleted or moved, or its drive is not connected. Nothing below is current, so it is hidden. If it comes back, this updates by itself."
+                        : "The folder is still there, but Git no longer finds this worktree in it (its .git link was removed or points elsewhere). Nothing below is current, so it is hidden."}
+                    </p>
+                    <button
+                      onClick={() => removeRepository(activeRepo.repoId)}
+                      className="rounded bg-surface-hover px-2 py-1 text-[11px] text-ink hover:bg-border-strong"
+                    >
+                      Close this worktree
+                    </button>
+                  </div>
+                ) : !activeRepo ? (
                   registrySnapshot.repos.length > 0 ? (
                     <div className="space-y-1">
                       <p className="text-ink-3 text-[11px]">Choose a repository:</p>
@@ -1080,7 +1108,7 @@ export function SourceControlPanel({
               </div>
             )}
 
-            {!sectionCollapsed.changes && activeRepo && (
+            {!sectionCollapsed.changes && activeRepo && !unusable && (
               <>
                 <div
                   role="button"
@@ -1313,7 +1341,7 @@ export function SourceControlPanel({
 
         {sectionVisible.graph && (
           <InlineGraphSection
-            entry={activeRepo}
+            entry={unusable ? null : activeRepo}
             dirty={dirty}
             collapsed={sectionCollapsed.graph}
             onToggleCollapse={() => toggleCollapsed("graph")}
@@ -1323,7 +1351,7 @@ export function SourceControlPanel({
 
         {sectionVisible.stashes && (
           <StashesSection
-            entry={activeRepo}
+            entry={unusable ? null : activeRepo}
             stashes={snapshot?.stashes ?? []}
             dirty={dirty}
             collapsed={sectionCollapsed.stashes}

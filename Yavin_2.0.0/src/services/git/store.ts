@@ -119,6 +119,7 @@ const initialSnapshot: RepoSnapshot = {
 export class RepoStore {
   readonly repository: Repository;
   private readonly onAnyChange?: () => void;
+  private readonly onRefreshOutcome?: (ok: boolean) => void;
   private snapshot: RepoSnapshot = initialSnapshot;
   private listeners = new Set<() => void>();
   /**
@@ -175,9 +176,14 @@ export class RepoStore {
   lastRefreshedAt = 0;
 
   // Not a parameter-property shorthand -- see the matching note in repository.ts.
-  constructor(repository: Repository, onAnyChange?: () => void) {
+  constructor(
+    repository: Repository,
+    onAnyChange?: () => void,
+    onRefreshOutcome?: (ok: boolean) => void,
+  ) {
     this.repository = repository;
     this.onAnyChange = onAnyChange;
+    this.onRefreshOutcome = onRefreshOutcome;
   }
 
   subscribe = (listener: () => void): (() => void) => {
@@ -271,11 +277,13 @@ export class RepoStore {
       this.refreshError = null;
       this.patch(next);
       this.lastRefreshedAt = Date.now();
+      this.onRefreshOutcome?.(true);
     } catch (error) {
       // Only report a failure the current state still depends on.
       if (![...claimed.keys()].some(live)) return;
       this.refreshError = String(error);
       this.patch({ notice: this.refreshError, stale: true });
+      this.onRefreshOutcome?.(false);
     }
   }
 

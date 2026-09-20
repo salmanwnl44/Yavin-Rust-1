@@ -64,6 +64,17 @@ function install() {
         }
         case "git_repo_state":
           return "";
+        case "git_probe_worktree": {
+          // Mirrors `probe_worktree` in git.rs.
+          if (!cwd || !existsSync(cwd)) return "missing";
+          const top = spawnSync("git", ["rev-parse", "--show-toplevel"], {
+            cwd,
+            encoding: "utf8",
+          });
+          return top.status === 0 && top.stdout.trim().toLowerCase() === cwd.toLowerCase()
+            ? "ready"
+            : "invalid";
+        }
         case "git_watch_repo":
         case "git_unwatch_repo":
           return undefined;

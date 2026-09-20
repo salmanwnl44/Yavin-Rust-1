@@ -26,6 +26,7 @@ interface Commands {
   git_open_repo: { args: { path: string }; result: { repoId: string; root: string } };
   git_init_repo: { args: { path: string }; result: { repoId: string; root: string } };
   git_close_repo: { args: { repoId: string }; result: void };
+  git_probe_worktree: { args: { repoId: string }; result: "ready" | "missing" | "invalid" };
   git_exec: {
     args: { repoId: string; args: string[]; id: string; input?: string };
     result: ToolOutput;

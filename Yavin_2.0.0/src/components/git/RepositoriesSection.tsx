@@ -133,7 +133,11 @@ function RepoRow({
       <span className="flex-1 truncate text-ink">{repoName(entry.root)}</span>
       {(snapshot?.branch.name || snapshot?.branch.detached) && (
         <span className="shrink-0 text-ink-3 text-[11px] font-mono">
-          {snapshot.branch.detached ? "detached" : snapshot.branch.name}
+          {entry.status !== "ready"
+            ? entry.status
+            : snapshot.branch.detached
+              ? "detached"
+              : snapshot.branch.name}
           {hasChanges ? "*" : ""}
         </span>
       )}

@@ -23,7 +23,7 @@ test("normalizeCommonDir falls back to the worktree root when Git reports nothin
 });
 
 function worktree(root: string): RepoEntry {
-  return { repoId: root, root, store: {} as RepoEntry["store"] };
+  return { repoId: root, root, status: "ready", store: {} as RepoEntry["store"] };
 }
 
 test("attachWorktree groups two worktrees that share a repository identity", () => {
