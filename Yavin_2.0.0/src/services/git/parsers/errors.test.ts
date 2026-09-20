@@ -126,3 +126,15 @@ test("categorizeGitError maps real Git failure text to a machine-checkable categ
   ];
   for (const [text, category] of cases) assert.equal(categorizeGitError(text), category, text);
 });
+
+test("pulling a branch that is not on the remote yet says so plainly", () => {
+  // Real git output from pulling right after cloning an empty repository.
+  const raw =
+    "Your configuration specifies to merge with the ref 'refs/heads/main'\nfrom the remote, but no such ref was fetched.";
+  assert.match(describeGitError(raw), /does not have this branch yet/);
+  assert.equal(categorizeGitError(raw), "no-upstream");
+  assert.match(
+    describeGitError("fatal: couldn't find remote ref main"),
+    /does not have this branch/,
+  );
+});

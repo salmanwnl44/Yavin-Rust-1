@@ -21,6 +21,12 @@ const failures: [RegExp, string][] = [
     "Could not reach the remote. Check your network connection and try again.",
   ],
   [
+    // A fresh clone of an empty repository already names origin/main as its upstream, but the
+    // branch does not exist on the remote until the first push.
+    /no such ref was fetched|couldn't find remote ref/i,
+    "The remote does not have this branch yet. Push it first, then you can pull.",
+  ],
+  [
     /no upstream|has no upstream branch|set-upstream/i,
     "This branch has no upstream yet. Publish it to a remote to set one.",
   ],
@@ -143,6 +149,7 @@ const categories: [RegExp, GitErrorCategory][] = [
     /Could not resolve host|unable to access|Connection (timed out|refused)|Network is unreachable/i,
     "network",
   ],
+  [/no such ref was fetched|couldn't find remote ref/i, "no-upstream"],
   [/no upstream|has no upstream branch|set-upstream/i, "no-upstream"],
   [/non-fast-forward|Updates were rejected|fetch first|behind its remote/i, "non-fast-forward"],
   [

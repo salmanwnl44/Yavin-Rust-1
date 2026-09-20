@@ -216,30 +216,6 @@ export class Repository {
     return this.run(["fetch", "--prune"]);
   }
 
-  /**
-   * The remote's own recorded default branch (its `HEAD` symbolic ref), or null when
-   * none is known -- a local, network-free read (set at clone time, or by an explicit
-   * `git remote set-head`; a plain fetch never updates it). Not yet consumed by any
-   * store/UI -- added as a capability, like Module 1's `commonGitDir` before it had a
-   * caller.
-   */
-  async defaultBranch(remote: string): Promise<string | null> {
-    let output;
-    try {
-      output = await gitExec(
-        this.repoId,
-        ["symbolic-ref", `refs/remotes/${remote}/HEAD`],
-        crypto.randomUUID(),
-      );
-    } catch {
-      return null;
-    }
-    if (output.code !== 0) return null;
-    const ref = output.stdout.trim();
-    const prefix = `refs/remotes/${remote}/`;
-    return ref.startsWith(prefix) ? ref.slice(prefix.length) : ref;
-  }
-
   // Reconciling a divergence is always the user's explicit choice, and never
   // stashes their work: --no-autostash overrides any rebase.autoStash config.
   pull(): Promise<string> {
