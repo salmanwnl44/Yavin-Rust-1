@@ -286,13 +286,18 @@ export function SourceControlPanel({
   // refreshes the active repo fully but every other repo's `entries` only: nothing
   // watches a background worktree's working tree, so status is the one thing the poll
   // must cover, while the per-repository `.git` watcher already reports its
-  // branch/refs/stash/operation-state changes. Measured: 10 open worktrees cost 60
+  // branch/refs/stash/operation-state changes (unless the watcher failed to start). Measured: 10 open worktrees cost 60
   // Git processes (1.85 s of wall time) per 5 s tick when every field was polled.
   useEffect(() => {
     if (!visible) return;
     const update = (fields?: RefreshField[]) => {
       for (const entry of registrySnapshot.repos) {
-        const background = fields && entry.repoId !== registrySnapshot.activeRepoId;
+        // A repository whose watcher is down gets the full poll: nothing else would report
+        // its branch, ref, stash or operation-state changes.
+        const background =
+          fields &&
+          entry.repoId !== registrySnapshot.activeRepoId &&
+          !gitRegistry.isWatcherDown(entry.repoId);
         void entry.store.refresh(background ? fields : undefined);
       }
     };

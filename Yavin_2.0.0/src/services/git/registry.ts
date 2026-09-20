@@ -88,6 +88,8 @@ class GitRegistry {
   private listeners = new Set<() => void>();
   private opening = new Map<string, Promise<RepoEntry | null>>();
   private restorePromise: Promise<void> | null = null;
+  /** Repositories whose `.git` watcher could not be (re)started: only polling covers them. */
+  private watcherDown = new Set<string>();
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -174,6 +176,36 @@ class GitRegistry {
       })();
     }
     return this.restorePromise;
+  }
+
+  /**
+   * Starts, restarts or stops the repository's `.git` watcher without ever leaving a
+   * rejected promise behind. Losing the watcher is not fatal -- the poll and focus
+   * refresh still run -- but it is recorded so the poll can stop assuming the watcher
+   * reports branch/ref/stash changes (see `isWatcherDown`).
+   */
+  private syncWatcher(repositoryId: string, worktreeRepoIds: string[] | null): void {
+    const request =
+      worktreeRepoIds === null
+        ? unwatchRepo(repositoryId)
+        : watchRepo(repositoryId, worktreeRepoIds);
+    request.then(
+      () => {
+        this.watcherDown.delete(repositoryId);
+      },
+      (error) => {
+        // Stopping a watcher that failed is harmless; only a failed start/restart leaves
+        // a repository unwatched.
+        if (worktreeRepoIds !== null) this.watcherDown.add(repositoryId);
+        console.debug(`Git watcher ${worktreeRepoIds === null ? "stop" : "start"} failed`, error);
+      },
+    );
+  }
+
+  /** Whether `repoId`'s repository has no working `.git` watcher, so polling must cover it. */
+  isWatcherDown(repoId: string): boolean {
+    const repositoryId = this.findWorktree(repoId)?.repository.repositoryId;
+    return repositoryId !== undefined && this.watcherDown.has(repositoryId);
   }
 
   private findWorktree(
@@ -266,12 +298,13 @@ class GitRegistry {
       // Re-registers with the now-expanded worktree list every time, rather than
       // tracking "is this the first worktree of this repository" specially --
       // `git_watch_repo` (Rust) already replaces (stopping and restarting) any
-      // existing watcher for this repositoryId. Fire-and-forget: losing live
+      // existing watcher for this repositoryId. Not awaited: losing live
       // external-change detection is not fatal, the existing poll/focus refresh
-      // remains the permanent fallback (see the Git State & Synchronization plan).
+      // remains the permanent fallback (see the Git State & Synchronization plan);
+      // `syncWatcher` records a failure instead of leaving an unhandled rejection.
       const owner = repositories.find((r) => r.repositoryId === repositoryId);
       if (owner)
-        void watchRepo(
+        this.syncWatcher(
           repositoryId,
           owner.worktrees.map((w) => w.repoId),
         );
@@ -305,12 +338,13 @@ class GitRegistry {
     // Stop watching entirely once the last worktree of this repository closes;
     // otherwise re-register with the narrower, still-open worktree list.
     if (remainingWorktrees.length) {
-      void watchRepo(
+      this.syncWatcher(
         repository.repositoryId,
         remainingWorktrees.map((w) => w.repoId),
       );
     } else {
-      void unwatchRepo(repository.repositoryId);
+      this.syncWatcher(repository.repositoryId, null);
+      this.watcherDown.delete(repository.repositoryId);
     }
 
     const activeRemoved = this.snapshot.activeWorktreePath === worktree.root;

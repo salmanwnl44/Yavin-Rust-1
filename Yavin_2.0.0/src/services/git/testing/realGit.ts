@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Repository } from "../repository.ts";
@@ -19,6 +19,23 @@ interface Invoker {
 const roots = new Map<string, string>();
 let installed = false;
 
+/**
+ * Per-command replacements for tests that need a native command to misbehave (for
+ * example `git_watch_repo` rejecting). Cleared with `resetNativeOverrides()`.
+ */
+const overrides = new Map<string, (args: Record<string, unknown>) => unknown>();
+export function overrideNative(
+  command: string,
+  handler: (args: Record<string, unknown>) => unknown,
+) {
+  overrides.set(command, handler);
+}
+export function resetNativeOverrides() {
+  overrides.clear();
+}
+/** Every native command the code under test issued, in order. */
+export const nativeCalls: { command: string; args: Record<string, unknown> }[] = [];
+
 function install() {
   if (installed) return;
   installed = true;
@@ -27,11 +44,34 @@ function install() {
   g.window = globalThis;
   const internals: Invoker = {
     invoke: async (command, args) => {
+      nativeCalls.push({ command, args });
+      const override = overrides.get(command);
+      if (override) return override(args ?? {});
       const repoId = String(args?.repoId ?? "");
       const cwd = roots.get(repoId);
       switch (command) {
+        case "git_open_repo": {
+          // Like the Rust command: normalise to the work tree's top level.
+          const path = String(args.path);
+          const top = spawnSync("git", ["rev-parse", "--show-toplevel"], {
+            cwd: path,
+            encoding: "utf8",
+          });
+          if (top.status !== 0) throw new Error(`Not a Git repository: ${path}`);
+          const root = top.stdout.trim();
+          roots.set(root, root);
+          return { repoId: root, root };
+        }
+        case "git_repo_state":
+          return "";
+        case "git_watch_repo":
+        case "git_unwatch_repo":
+          return undefined;
         case "git_exec": {
           if (!cwd) throw new Error(`Unknown repository ${repoId}`);
+          // The real command fails to spawn when the folder is gone, it does not report a
+          // Git exit code.
+          if (!existsSync(cwd)) throw new Error(`Cannot run Git: ${cwd} does not exist`);
           const result = spawnSync("git", args.args as string[], {
             cwd,
             input: (args.input as string | undefined) ?? undefined,
