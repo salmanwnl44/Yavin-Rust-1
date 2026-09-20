@@ -154,7 +154,7 @@ test("push, branch create and branch delete really change what the graph's log s
     r.git("add", "-A");
     r.git("commit", "-qm", "one");
     r.git("remote", "add", "origin", remote.root);
-    const labels = async () => (await r.repository.graphLog(0, 10)).split("").pop();
+    const labels = async () => (await r.repository.graphLog(0, 10)).split("\x1f").pop();
     const before = await labels();
     r.git("branch", "feature");
     assert.notEqual(await labels(), before, "branch create must change the labels");

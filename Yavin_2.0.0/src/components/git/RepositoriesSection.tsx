@@ -131,9 +131,9 @@ function RepoRow({
     >
       <GitBranchIcon size={13} className="shrink-0 text-ink-3" />
       <span className="flex-1 truncate text-ink">{repoName(entry.root)}</span>
-      {snapshot?.branch.name && (
+      {(snapshot?.branch.name || snapshot?.branch.detached) && (
         <span className="shrink-0 text-ink-3 text-[11px] font-mono">
-          {snapshot.branch.name}
+          {snapshot.branch.detached ? "detached" : snapshot.branch.name}
           {hasChanges ? "*" : ""}
         </span>
       )}

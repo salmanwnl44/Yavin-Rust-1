@@ -631,7 +631,7 @@ test("committing resets the commit graph", async ({ page }) => {
 test("the Commit dropdown's Commit Staged goes through the same path: it resets the graph", async ({
   page,
 }) => {
-  const region = await panel(page, { status: "M  a.ts " });
+  const region = await panel(page, { status: "M  a.ts\0" });
   const logCalls = () =>
     page.evaluate(
       () =>
@@ -656,12 +656,57 @@ test("the Commit dropdown's Commit Staged goes through the same path: it resets 
 test("the Commit dropdown refuses to commit while a conflict is unresolved, like the Commit button", async ({
   page,
 }) => {
-  const region = await panel(page, { status: "M  a.ts UU b.ts " });
+  const region = await panel(page, { status: "M  a.ts\0UU b.ts\0" });
   await region.getByLabel("Commit message").fill("blocked");
   await expect(region.getByRole("button", { name: /^Commit( \d+)?$/ })).toBeDisabled();
   await region.getByRole("button", { name: "Commit actions" }).click();
   await page.getByRole("menuitem", { name: /^Commit ›/ }).click();
   await expect(page.getByRole("menuitem", { name: "Commit Staged" })).toBeDisabled();
+});
+
+test("a failed refresh marks the shown status as out of date, keeps it, and clears on the next success", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: "M  a.ts\0" });
+  const list = region.getByRole("list", { name: "Changed files" });
+  await expect(list.getByText("a.ts")).toBeVisible();
+  await expect(region.getByText("Out of date")).toHaveCount(0);
+
+  // Git fails: the last known list stays (never replaced by "clean"), flagged as old.
+  await update(page, { fail: { status: "Git: fatal: unable to read the index" } });
+  await expect(region.getByText("Out of date")).toBeVisible();
+  await expect(list.getByText("a.ts")).toBeVisible();
+  await expect(region.getByText("Working tree clean")).toHaveCount(0);
+
+  // The next successful refresh clears the flag.
+  await update(page, { fail: {}, status: "M  a.ts\0 M b.ts\0" });
+  await expect(region.getByText("Out of date")).toHaveCount(0);
+  await expect(list.getByText("b.ts")).toBeVisible();
+});
+
+test("a detached HEAD is labelled, not shown as an unnamed branch, and cannot be published", async ({
+  page,
+}) => {
+  const region = await panel(page, {
+    branchInfo: "# branch.oid 1234567890abcdef\n# branch.head (detached)\n",
+    remotes: "origin\n",
+  });
+  await expect(region.getByText("Detached HEAD", { exact: true }).first()).toBeVisible();
+  await expect(region.getByLabel("Commit message")).toHaveAttribute("placeholder", /detached HEAD/);
+
+  await drawer(page);
+  await expect(
+    region.getByText(/HEAD is detached, so there is no branch to publish/),
+  ).toBeVisible();
+  await expect(region.getByRole("button", { name: "Publish branch" })).toHaveCount(0);
+  // The switch box says why it has no current branch selected.
+  await expect(region.getByLabel("Switch branch")).toContainText("Detached HEAD: choose a branch");
+});
+
+test("on a branch there is no detached or out-of-date label", async ({ page }) => {
+  const region = await panel(page);
+  await expect(region.getByText("Detached HEAD", { exact: true })).toHaveCount(0);
+  await expect(region.getByText("Out of date")).toHaveCount(0);
 });
 
 test("a Cancel button stops a running Git operation and reports it distinctly from a failure", async ({

@@ -524,6 +524,7 @@ export function SourceControlPanel({
   const loading = snapshot?.loading ?? false;
   const notice = snapshot?.notice ?? "";
   const cancelled = snapshot?.cancelled ?? false;
+  const stale = snapshot?.stale ?? false;
 
   // One list for everything: conflicts first, then every other changed file. Whether a
   // file is staged is shown by its checkbox, not by which section it sits in.
@@ -655,6 +656,22 @@ export function SourceControlPanel({
             >
               <ChevronIcon isExpanded={!sectionCollapsed.changes} className="size-3" />
               <span className="font-semibold text-[12px] text-ink">Changes</span>
+              {branch.detached && (
+                <span
+                  title="HEAD is not on a branch. Commits made now belong to no branch until you switch to or create one."
+                  className="rounded bg-yellow/15 px-1.5 text-[10px] leading-4 text-yellow"
+                >
+                  Detached HEAD
+                </span>
+              )}
+              {stale && (
+                <span
+                  title="The last refresh failed, so this shows the last state Git reported. It updates after the next successful refresh."
+                  className="rounded bg-yellow/15 px-1.5 text-[10px] leading-4 text-yellow"
+                >
+                  Out of date
+                </span>
+              )}
               <div className="flex-1" />
               {activeRepo && (
                 <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
@@ -796,7 +813,7 @@ export function SourceControlPanel({
                       <CommitBox
                         ref={commitBoxRef}
                         draftKey={activeRepo.root}
-                        branchName={branch.name}
+                        branchName={branch.detached ? "detached HEAD" : branch.name}
                         menu={
                           <GitMenu
                             icon={<ChevronIcon isExpanded className="size-3.5" />}
@@ -836,7 +853,7 @@ export function SourceControlPanel({
                             }
                           >
                             <option value="" disabled>
-                              Choose branch
+                              {branch.detached ? "Detached HEAD: choose a branch" : "Choose branch"}
                             </option>
                             {branches.map((name) => (
                               <option key={name} value={name}>
@@ -962,7 +979,14 @@ export function SourceControlPanel({
                             )}
                           </div>
 
+                          {branch.detached && (
+                            <p className="text-ink-3 text-[11px]">
+                              HEAD is detached, so there is no branch to publish. Switch to a
+                              branch, or create one here first.
+                            </p>
+                          )}
                           {!branch.upstream &&
+                            !branch.detached &&
                             (remotes.length === 0 ? (
                               <p className="text-ink-3 text-[11px]">
                                 No remote is configured. Add one with `git remote add` to publish

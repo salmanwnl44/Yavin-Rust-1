@@ -18,13 +18,19 @@ export function StatusBar({ activeFile, onToggleTerminal, branch }: StatusBarPro
   return (
     <footer className="flex h-6 items-center justify-between border-t border-[#151515] bg-black px-3 text-[11px] text-zinc-400">
       <div className="flex min-w-0 items-center gap-3">
-        {branch?.name && (
+        {(branch?.name || branch?.detached) && (
           <span
             className="flex items-center gap-1 shrink-0"
-            title={branch.upstream ? `Tracking ${branch.upstream}` : branch.name}
+            title={
+              branch.detached
+                ? "HEAD is detached (not on a branch)"
+                : branch.upstream
+                  ? `Tracking ${branch.upstream}`
+                  : branch.name
+            }
           >
             <GitBranchIcon size={12} />
-            {branch.name}
+            {branch.detached ? "Detached HEAD" : branch.name}
             {(branch.ahead > 0 || branch.behind > 0) && (
               <span className="font-mono">
                 ↑{branch.ahead} ↓{branch.behind}
