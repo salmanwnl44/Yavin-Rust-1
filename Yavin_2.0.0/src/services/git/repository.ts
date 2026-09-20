@@ -107,9 +107,17 @@ export class Repository {
     return output.trim() === "true";
   }
 
-  /** Raw `git worktree list --porcelain` output; see `parsers/worktree.ts` for parsing. */
-  listWorktrees(): Promise<string> {
-    return this.run(["worktree", "list", "--porcelain"]);
+  /**
+   * Raw `git worktree list --porcelain` output; see `parsers/worktree.ts` for parsing.
+   * Asks for `-z` (Git 2.36+) so a path or lock reason containing a newline survives;
+   * an older Git rejects the flag, and the plain form is used instead.
+   */
+  async listWorktrees(): Promise<string> {
+    try {
+      return await this.run(["worktree", "list", "--porcelain", "-z"]);
+    } catch {
+      return this.run(["worktree", "list", "--porcelain"]);
+    }
   }
 
   async branches(): Promise<string[]> {

@@ -78,3 +78,39 @@ test("parseWorktreeList reads a single worktree with no trailing blank line", ()
   assert.equal(main.path, "/work/main");
   assert.equal(main.headHash, "abc123");
 });
+
+/** `git worktree list --porcelain -z`: attributes end in NUL, each worktree in an extra NUL. */
+const nul = (...blocks: string[][]) => blocks.map((b) => b.join("\0") + "\0\0").join("");
+
+test("parseWorktreeList reads the -z form, including a path or reason containing a newline", () => {
+  const output = nul(
+    ["worktree /work/main", "HEAD abc", "branch refs/heads/main"],
+    [
+      "worktree /work/odd\nname",
+      "HEAD abc",
+      "branch refs/heads/feature",
+      "locked two\nline reason",
+    ],
+    ["worktree /work/wt é", "HEAD abc", "detached", "prunable gitdir file points to nowhere"],
+  );
+  const [main, odd, unicode] = parseWorktreeList(output);
+  assert.equal(main.path, "/work/main");
+  assert.equal(main.isMain, true);
+  assert.equal(odd.path, "/work/odd\nname");
+  assert.equal(odd.branch, "feature");
+  assert.equal(odd.lockedReason, "two\nline reason");
+  assert.equal(odd.isMain, false);
+  assert.equal(unicode.path, "/work/wt é");
+  assert.equal(unicode.detached, true);
+  assert.equal(unicode.prunable, true);
+  assert.equal(parseWorktreeList(output).length, 3);
+});
+
+test("parseWorktreeList gives the same result for -z and the line form", () => {
+  const blocks = [
+    ["worktree /work/main", "HEAD abc", "branch refs/heads/main"],
+    ["worktree /work/linked", "HEAD def", "detached", "locked reason"],
+  ];
+  const lines = blocks.map((b) => b.join("\n")).join("\n\n") + "\n";
+  assert.deepEqual(parseWorktreeList(nul(...blocks)), parseWorktreeList(lines));
+});

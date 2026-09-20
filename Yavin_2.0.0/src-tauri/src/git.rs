@@ -684,7 +684,7 @@ const FOR_EACH_REF: &[FlagRule] = &[prefix_flag("--format=")];
 // allow-list only governs `--porcelain`), TypeScript currently only ever calls
 // `worktree list --porcelain`; nothing constructs `worktree add/remove/lock/prune`
 // yet, so there is nothing else to validate here today.
-const WORKTREE: &[FlagRule] = &[flag("--porcelain")];
+const WORKTREE: &[FlagRule] = &[flag("--porcelain"), flag("-z")];
 // Deletion only -- no rename/create flag, since `switch -c` already owns creation
 // (SWITCH above). `-d`/`-D` are Git's own two-tier safety (safe delete vs. force);
 // neither can bypass Git's separate, unconditional refusal to delete a branch
@@ -1168,13 +1168,21 @@ mod tests {
 
         let repo = open(&dir);
         let output = exec(&repo, &args(&["worktree", "list", "--porcelain"]), None);
-        // Only `--porcelain` is allow-listed; an unrelated flag must still be refused.
+        // `-z` (NUL-terminated records, what TypeScript asks for first) is reachable too.
+        let nul_output = exec(
+            &repo,
+            &args(&["worktree", "list", "--porcelain", "-z"]),
+            None,
+        );
+        // Only `--porcelain` and `-z` are allow-listed; an unrelated flag must still be refused.
         let rejected = exec(&repo, &args(&["worktree", "list", "--bogus-flag"]), None);
 
         let _ = fs::remove_dir_all(&linked);
         let _ = fs::remove_dir_all(&dir);
 
         assert!(output.unwrap().stdout.contains("branch refs/heads/feature"));
+        let nul_output = nul_output.unwrap().stdout;
+        assert!(nul_output.contains("branch refs/heads/feature\0"));
         assert!(rejected.unwrap_err().contains("not permitted"));
     }
 
@@ -2452,6 +2460,7 @@ mod tests {
             &["fetch", "--prune"],
             &["symbolic-ref", "refs/remotes/origin/HEAD"],
             &["symbolic-ref", "--short", "HEAD"],
+            &["worktree", "list", "--porcelain", "-z"],
             &["pull", "--ff-only"],
             &["pull", "--rebase", "--no-autostash"],
             &["pull", "--no-rebase", "--no-autostash", "--no-edit"],
