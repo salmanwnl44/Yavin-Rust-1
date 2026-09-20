@@ -17,6 +17,8 @@ export interface DiffDocument {
   repoId?: string;
   /** "unstaged": working tree vs index. "staged": index vs HEAD. */
   kind?: "unstaged" | "staged";
+  /** For a renamed file, its previous absolute path -- needed again whenever this diff is reloaded. */
+  originalPath?: string;
 }
 
 interface ParsedDiffLine {

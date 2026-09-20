@@ -562,6 +562,9 @@ export default function App() {
     const targetPath = diff.path;
     const targetKind = diff.kind;
     const targetText = diff.text;
+    // A renamed file's diff needs both paths again on every reload, or Git shows it as a
+    // whole new file.
+    const targetOriginalPath = diff.originalPath;
 
     // Routed through the shared `guarded()` (same as commit/stage/pull/push) so a
     // hunk action sets the repo's busy flag, blocks conflicting concurrent
@@ -586,7 +589,7 @@ export default function App() {
     // context-line matching refuses a stale patch cleanly), so the diff view is
     // provably stale too and must not keep showing it as if nothing happened.
     try {
-      const refreshed = await repo.diff(targetPath, targetKind === "staged");
+      const refreshed = await repo.diff(targetPath, targetKind === "staged", targetOriginalPath);
       setDiff(refreshed.trim() ? { ...diff, text: refreshed } : null);
     } catch (error) {
       entry.store.setNotice(String(error));

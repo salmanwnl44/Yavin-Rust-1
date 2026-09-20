@@ -385,6 +385,7 @@ export function SourceControlPanel({
         ...(hunkStagingSafe
           ? { repoId: activeRepo.repoId, kind: staged ? "staged" : "unstaged" }
           : {}),
+        ...(entry.originalPath ? { originalPath: entry.originalPath } : {}),
       });
     } catch (error) {
       if (alive.current) activeRepo.store.setNotice(String(error));
