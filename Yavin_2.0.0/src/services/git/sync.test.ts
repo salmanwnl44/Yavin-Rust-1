@@ -3,11 +3,15 @@ import test from "node:test";
 import {
   applyGitChangeEvent,
   GRAPH_RESETS,
+  PARTIAL_ON_FAILURE,
+  propagationFor,
   SIBLING_INVALIDATES,
   WATCHER_INVALIDATES,
 } from "./sync.ts";
 import type { RepoEntry, RepositoryEntry } from "./registry.ts";
 import type { GitChangeEvent } from "../native.ts";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 // Every `kind` string Module 2's own INVALIDATES table and the various guarded()
 // call sites actually use -- kept as a flat list here (rather than importing
@@ -100,21 +104,70 @@ test("switch/commit/abort/continue/skip never invalidate a sibling's RepoSnapsho
   }
 });
 
-test("GRAPH_RESETS is every kind that adds a commit or moves HEAD -- and never push/publish", () => {
-  // Push never adds a commit (it only moves a remote ref to match what's already
-  // local), so it is excluded. `switch`/`abort` move HEAD, and the graph is
-  // HEAD-relative (`git log` with no revision).
+test("GRAPH_RESETS is every kind that changes the commits or the ref labels the graph shows", () => {
+  // The graph is `git log` from HEAD plus each commit's `%D` labels. History changes:
+  // fetch/pull*/commit add commits, switch/abort move HEAD. Label changes: push and
+  // publish move origin/<branch>, branch and deleteBranch add and remove a label.
   assert.deepEqual(
     [...GRAPH_RESETS].sort(),
-    ["abort", "commit", "fetch", "pull", "pullMerge", "pullRebase", "switch"].sort(),
+    [
+      "abort",
+      "branch",
+      "commit",
+      "deleteBranch",
+      "fetch",
+      "publish",
+      "pull",
+      "pullMerge",
+      "pullRebase",
+      "push",
+      "switch",
+    ].sort(),
   );
-  assert.ok(!GRAPH_RESETS.has("push"));
-  assert.ok(!GRAPH_RESETS.has("publish"));
 });
 
-test("GRAPH_RESETS never covers branch-create/deleteBranch/stash -- HEAD stays on the same history", () => {
-  for (const kind of ["branch", "deleteBranch", "stash", "stashApply", "stashPop", "stashDrop"]) {
+test("GRAPH_RESETS never covers what cannot change a commit or a ref label", () => {
+  for (const kind of [
+    "stage",
+    "unstage",
+    "discard",
+    "stage-hunk",
+    "unstage-hunk",
+    "discard-hunk",
+    "stash",
+    "stashApply",
+    "stashPop",
+    "stashDrop",
+  ]) {
     assert.ok(!GRAPH_RESETS.has(kind), `"${kind}" must not be in GRAPH_RESETS`);
+  }
+});
+
+test("push, branch create and branch delete really change what the graph's log shows", async () => {
+  // Ground truth for the table above: the `%D` labels on the commits the graph draws.
+  const { realRepo, git } = await import("./testing/realGit.ts");
+  const remote = realRepo();
+  const r = realRepo();
+  try {
+    git(remote.root, "config", "receive.denyCurrentBranch", "ignore");
+    writeFileSync(join(r.root, "a.txt"), "a\n");
+    r.git("add", "-A");
+    r.git("commit", "-qm", "one");
+    r.git("remote", "add", "origin", remote.root);
+    const labels = async () => (await r.repository.graphLog(0, 10)).split("").pop();
+    const before = await labels();
+    r.git("branch", "feature");
+    assert.notEqual(await labels(), before, "branch create must change the labels");
+    const created = await labels();
+    r.git("push", "-q", "origin", "main");
+    r.git("fetch", "-q", "origin");
+    assert.notEqual(await labels(), created, "a push must move origin/main");
+    const pushed = await labels();
+    r.git("branch", "-D", "feature");
+    assert.notEqual(await labels(), pushed, "branch delete must change the labels");
+  } finally {
+    r.dispose();
+    remote.dispose();
   }
 });
 
@@ -208,4 +261,66 @@ test("'refs'/'remotes'/'stash' events refresh every worktree of the repository",
       `both worktrees get the same fields for "${kind}"`,
     );
   }
+});
+
+test("a failed operation that can have changed refs or HEAD still propagates, atomic ones do not", () => {
+  // Git does part of the work and then exits non-zero for these.
+  for (const kind of ["fetch", "pull", "pullRebase", "pullMerge"]) {
+    const effect = propagationFor(kind, false, true, "", "");
+    assert.deepEqual(effect.siblingFields, ["branch"], `${kind}: siblings`);
+    assert.equal(effect.graphReset, true, `${kind}: graph`);
+  }
+  assert.equal(propagationFor("publish", false, true, "", "").graphReset, true);
+  // A failed continue/skip may have created commits before stopping on the next conflict.
+  for (const kind of ["continue", "skip"]) {
+    assert.equal(propagationFor(kind, false, true, "rebase", "rebase").graphReset, true);
+  }
+  // Atomic, or nothing moves when they fail.
+  for (const kind of [
+    "push",
+    "switch",
+    "branch",
+    "deleteBranch",
+    "commit",
+    "stage",
+    "unstage",
+    "discard",
+    "abort",
+    "stashPop",
+    "stashApply",
+  ]) {
+    const effect = propagationFor(kind, false, true, "", "");
+    assert.deepEqual(effect, { siblingFields: undefined, graphReset: false }, `${kind} failed`);
+  }
+});
+
+test("a refused start (busy, dirty) propagates nothing, even for a partial-failure kind", () => {
+  for (const kind of PARTIAL_ON_FAILURE) {
+    assert.deepEqual(propagationFor(kind, false, false, "", ""), {
+      siblingFields: undefined,
+      graphReset: false,
+    });
+  }
+});
+
+test("a successful continue/skip resets the graph only when it completes the operation", () => {
+  for (const kind of ["continue", "skip"]) {
+    assert.equal(propagationFor(kind, true, true, "rebase", "").graphReset, true);
+    assert.equal(propagationFor(kind, true, true, "rebase", "rebase").graphReset, false);
+  }
+});
+
+test("a successful mutation propagates exactly its table entries", () => {
+  assert.deepEqual(propagationFor("fetch", true, true, "", ""), {
+    siblingFields: ["branch"],
+    graphReset: true,
+  });
+  assert.deepEqual(propagationFor("stage", true, true, "", ""), {
+    siblingFields: undefined,
+    graphReset: false,
+  });
+  assert.deepEqual(propagationFor("branch", true, true, "", ""), {
+    siblingFields: ["branches"],
+    graphReset: true,
+  });
 });

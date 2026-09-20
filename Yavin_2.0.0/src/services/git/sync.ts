@@ -58,29 +58,27 @@ export const SIBLING_INVALIDATES: Readonly<Record<string, readonly RefreshField[
 };
 
 /**
- * Which mutations can grow the repository's commit history (make a new commit
- * reachable from some branch or remote-tracking ref), and therefore require the
- * repository's shared `GraphLoader` (see `hooks.ts`) to reset and re-page from the
- * top. See the plan's Section S for the full per-mutation reasoning. Notably
- * narrower than the pre-Module-3 behavior, which reset on every one of Fetch/
- * Pull/Push regardless of which was actually clicked: `push`/`publish` never add
- * a commit (they only move a remote ref to match what's already local), so they
- * are correctly excluded here even though the pre-existing UI code reset on them.
- * `switch` (-c or not), `abort`, `deleteBranch`, and the stash family never appear
- * here: `switch` moves HEAD to an *existing* commit already in the graph; `branch`
- * (`switch -c`) creates a ref at an existing commit; `abort` restores pre-operation
- * state; `deleteBranch` removes a ref, never a commit object (its commits may
- * become unreachable from any remaining ref, but the graph view only ever walks
- * from currently-existing refs, so nothing needs evicting) -- none of these make a
- * new commit reachable. `commit` does (this worktree's own
- * branch grows by one). `continue`/`skip`'s case is genuinely conditional -- a
- * `merge`/`rebase`/`cherry-pick --continue` (or `revert --continue`) only creates
- * a commit when it actually *completes* the operation, not on a call that still
- * leaves conflicts (or more commits) remaining; `skip` itself never creates a
- * commit at all, but completing a multi-commit sequence via skip still needs the
- * graph reset that would otherwise only fire on a completing `continue` -- so
- * neither is a static table entry; see `guardedAffecting`'s own before/after
- * `operationInProgress` check below.
+ * Which mutations change what the repository's shared `GraphLoader` (see `hooks.ts`)
+ * would show, and therefore require it to reset and re-page from the top. The graph is
+ * `git log` with no revision (whatever HEAD reaches) plus each commit's `%D` ref
+ * labels, so two things can make it stale: the history itself (a new commit becomes
+ * reachable, or HEAD moves to a different history), and the *labels* on commits that
+ * are already there (a branch or remote-tracking ref appearing, moving or vanishing).
+ *
+ * - History: `fetch`, `pull*`, `commit`, `switch`, `abort`. `switch` and `abort` move
+ *   HEAD; without a reset the graph kept showing the previous branch and "Load older"
+ *   (`--skip N` against the new HEAD) spliced two histories together.
+ * - Labels: `push`/`publish` move `origin/<branch>`, `branch` (create) adds a label at
+ *   HEAD, `deleteBranch` removes one. No commit is added, but the row's pills change.
+ *   In the desktop app the `.git` watcher would report these too (`WATCHER_INVALIDATES`),
+ *   but only after its debounce and only while the watcher is running, so Yavin's own
+ *   mutations do not rely on it.
+ *
+ * `stage`/`unstage`/`discard`/hunk actions and the stash family are absent: none of them
+ * touches a commit or a ref the graph shows (`refs/stash` is not in `%D` without
+ * `--all`). `continue`/`skip` are conditional, not static entries: a `--continue` only
+ * creates a commit when it actually completes the operation, so `guardedAffecting`
+ * compares `operationInProgress` before and after (and see `PARTIAL_ON_FAILURE`).
  */
 export const GRAPH_RESETS: ReadonlySet<string> = new Set([
   "fetch",
@@ -88,21 +86,83 @@ export const GRAPH_RESETS: ReadonlySet<string> = new Set([
   "pullRebase",
   "pullMerge",
   "commit",
-  // `graphLog` runs `git log` with no revision, so the visible history is whatever
-  // HEAD reaches. `switch` moves HEAD to a different history; `abort` restores the
-  // original tip after an interrupted rebase/merge. Without a reset the graph kept
-  // showing the previous branch, and "Load older" (`--skip N` against the new HEAD)
-  // spliced two histories together. `branch` (create) leaves HEAD on the same commit.
   "switch",
   "abort",
+  "push",
+  "publish",
+  "branch",
+  "deleteBranch",
 ]);
+
+/**
+ * Operations that can change repository state even when they report failure, so a
+ * failed run still has to propagate its sibling/graph effects. Git reports these
+ * as an error exit after having done part of the work:
+ *
+ * - `fetch`: updates each ref independently; one rejected ref fails the command after
+ *   the others were written.
+ * - `pull`/`pullMerge`/`pullRebase`: fetch first, then merge or rebase. A conflict exits
+ *   non-zero with the fetch done and HEAD/index possibly already moved.
+ * - `publish`: `push` then `--set-upstream`; the ref can move before a later step fails.
+ * - `continue`/`skip`: a rebase or cherry-pick sequence can create commits and then stop
+ *   on the next conflict, moving HEAD.
+ *
+ * Deliberately not listed: `push` (a rejected push updates no ref), `switch`/`branch`
+ * (Git checks out or creates atomically), `commit`, `stage`/`unstage`/`discard`,
+ * `deleteBranch`, `abort` and the stash family (a stash pop that conflicts keeps the
+ * stash, so the shared list is unchanged). The operation's own worktree is always
+ * refreshed by `RepoStore.guarded()` whether or not it succeeded.
+ */
+export const PARTIAL_ON_FAILURE: ReadonlySet<string> = new Set([
+  "fetch",
+  "pull",
+  "pullRebase",
+  "pullMerge",
+  "publish",
+  "continue",
+  "skip",
+]);
+
+export interface Propagation {
+  /** Fields every sibling worktree must re-fetch, or `undefined` for none. */
+  siblingFields: readonly RefreshField[] | undefined;
+  graphReset: boolean;
+}
+
+/**
+ * What a finished `guarded()` call must propagate beyond its own worktree. Pure so the
+ * rules (success vs. partial failure vs. refused start) can be tested without a registry.
+ * `operationBefore`/`operationAfter` are the `operationInProgress` values around a
+ * `continue`/`skip`; both are ignored for every other kind.
+ */
+export function propagationFor(
+  kind: string,
+  ok: boolean,
+  started: boolean,
+  operationBefore: string,
+  operationAfter: string,
+): Propagation {
+  if (!ok && !(started && PARTIAL_ON_FAILURE.has(kind))) {
+    return { siblingFields: undefined, graphReset: false };
+  }
+  const sequenceStep = kind === "continue" || kind === "skip";
+  const operationJustCompleted = sequenceStep && operationBefore !== "" && operationAfter === "";
+  // A failed `continue`/`skip` may still have moved HEAD (commits created before the
+  // next conflict), so it resets like a completed one.
+  const failedButMoved = !ok && sequenceStep;
+  return {
+    siblingFields: SIBLING_INVALIDATES[kind],
+    graphReset: GRAPH_RESETS.has(kind) || operationJustCompleted || failedButMoved,
+  };
+}
 
 /**
  * Runs `entry.store.guarded(kind, dirty, operation)` exactly as before (own-worktree
  * behavior, including its refresh, is entirely Module 2's `RepoStore.guarded()`,
- * unchanged), then -- only on success, and only for a `kind` this module actually
- * knows affects something wider than one worktree -- propagates the two remaining
- * effects Module 2 correctly left out of scope:
+ * unchanged), then -- on success, or on failure for a `kind` in `PARTIAL_ON_FAILURE`
+ * that actually started, and only for a `kind` this module knows affects something
+ * wider than one worktree -- propagates the two remaining effects Module 2 correctly
+ * left out of scope:
  *
  * 1. Sibling worktrees of the same repository re-fetch whichever of their own
  *    fields `SIBLING_INVALIDATES[kind]` says can have gone stale (never a blanket
@@ -137,23 +197,28 @@ export async function guardedAffecting(
 ): Promise<boolean> {
   const operationBefore =
     kind === "continue" || kind === "skip" ? entry.store.getSnapshot().operationInProgress : "";
-  const ok = await entry.store.guarded(kind, dirty, operation);
-  if (!ok) return ok;
+  // `guarded()` also returns false when it refuses to start (busy, dirty); nothing ran
+  // then, so there is nothing to propagate.
+  let started = false;
+  const ok = await entry.store.guarded(kind, dirty, () => {
+    started = true;
+    return operation();
+  });
+  const effects = propagationFor(
+    kind,
+    ok,
+    started,
+    operationBefore,
+    entry.store.getSnapshot().operationInProgress,
+  );
 
   const repository = gitRegistry.repositoryFor(entry.repoId);
-  const siblingFields = SIBLING_INVALIDATES[kind];
-  if (repository && siblingFields) {
+  if (repository && effects.siblingFields) {
     for (const sibling of repository.worktrees) {
-      if (sibling !== entry) void sibling.store.refresh(siblingFields);
+      if (sibling !== entry) void sibling.store.refresh(effects.siblingFields);
     }
   }
-  const operationJustCompleted =
-    (kind === "continue" || kind === "skip") &&
-    operationBefore !== "" &&
-    entry.store.getSnapshot().operationInProgress === "";
-  if (repository && (GRAPH_RESETS.has(kind) || operationJustCompleted)) {
-    resetSharedGraphLoader(repository.repositoryId);
-  }
+  if (repository && effects.graphReset) resetSharedGraphLoader(repository.repositoryId);
   return ok;
 }
 

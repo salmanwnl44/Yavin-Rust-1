@@ -39,7 +39,10 @@ export function buildGitCommandMenu({
   const hasUpstream = !!snapshot.branch.upstream;
   const staged = snapshot.entries.filter((e) => !e.conflict && !e.untracked && e.index !== " ");
   const modified = snapshot.entries.filter((e) => !e.conflict && e.worktree !== " ");
-  const canCommit = hasMessage && staged.length > 0;
+  // The same gate as the Commit button (`CommitBox`): a message, something staged, and no
+  // unresolved conflicts.
+  const conflictCount = snapshot.entries.filter((e) => e.conflict).length;
+  const canCommit = hasMessage && staged.length > 0 && conflictCount === 0;
 
   const items: MenuEntry[] = [];
 
@@ -84,11 +87,13 @@ export function buildGitCommandMenu({
           label: "Commit Staged",
           disabled: !canCommit,
           onSelect: () => {
-            void entry.store
-              .guarded("commit", dirty, () => repo.commit(getMessage()))
-              .then((ok) => {
+            // Through `guardedAffecting`, like every other mutation, so the shared graph
+            // resets and siblings refresh exactly as after the Commit button.
+            void guardedAffecting(entry, "commit", dirty, () => repo.commit(getMessage())).then(
+              (ok) => {
                 if (ok) onCommitted();
-              });
+              },
+            );
           },
         },
       ],

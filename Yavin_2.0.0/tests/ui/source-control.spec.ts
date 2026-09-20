@@ -628,6 +628,42 @@ test("committing resets the commit graph", async ({ page }) => {
   await expect.poll(logCalls).toBeGreaterThan(before);
 });
 
+test("the Commit dropdown's Commit Staged goes through the same path: it resets the graph", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: "M  a.ts " });
+  const logCalls = () =>
+    page.evaluate(
+      () =>
+        (
+          window as unknown as { __calls: { command: string; args: { args?: string[] } }[] }
+        ).__calls.filter((c) => c.command === "git_exec" && c.args.args?.[0] === "log").length,
+    );
+  await expect.poll(logCalls).toBeGreaterThan(0);
+  const before = await logCalls();
+
+  await region.getByLabel("Commit message").fill("from the dropdown");
+  await region.getByRole("button", { name: "Commit actions" }).click();
+  await page.getByRole("menuitem", { name: /^Commit ›/ }).click();
+  await page.getByRole("menuitem", { name: "Commit Staged" }).click();
+
+  await expect.poll(() => gitCalls(page, "commit")).toBe(1);
+  await expect.poll(logCalls).toBeGreaterThan(before);
+  // The draft is cleared exactly as after the Commit button.
+  await expect(region.getByLabel("Commit message")).toHaveValue("");
+});
+
+test("the Commit dropdown refuses to commit while a conflict is unresolved, like the Commit button", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: "M  a.ts UU b.ts " });
+  await region.getByLabel("Commit message").fill("blocked");
+  await expect(region.getByRole("button", { name: /^Commit( \d+)?$/ })).toBeDisabled();
+  await region.getByRole("button", { name: "Commit actions" }).click();
+  await page.getByRole("menuitem", { name: /^Commit ›/ }).click();
+  await expect(page.getByRole("menuitem", { name: "Commit Staged" })).toBeDisabled();
+});
+
 test("a Cancel button stops a running Git operation and reports it distinctly from a failure", async ({
   page,
 }) => {
