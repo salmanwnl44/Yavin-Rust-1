@@ -67,7 +67,12 @@ function MenuRow({ item, onDone }: { item: MenuItemDef; onDone: () => void }) {
               }}
               className={itemClass(child.disabled)}
             >
-              <span className="truncate">{child.label}</span>
+              <span className="flex items-center gap-1.5 truncate">
+                {child.checked !== undefined && (
+                  <span className="w-3 shrink-0 text-[10px]">{child.checked ? "✓" : ""}</span>
+                )}
+                {child.label}
+              </span>
             </button>
           ))}
         </div>

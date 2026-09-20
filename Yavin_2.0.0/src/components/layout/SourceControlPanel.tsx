@@ -13,6 +13,13 @@ import type { CommitBoxHandle } from "../git/CommitBox";
 import { InlineGraphSection } from "../git/InlineGraphSection";
 import { StashesSection } from "../git/StashesSection";
 import { GitMenu } from "../git/GitMenu";
+import {
+  readChangesSort,
+  saveChangesSort,
+  sortChanges,
+  statusLetter,
+} from "../../services/git/changesSort";
+import type { ChangesSort } from "../../services/git/changesSort";
 import { buildGitCommandMenu } from "../git/gitCommandMenu";
 import type { DiffDocument } from "./DiffEditor";
 import type { Replacement } from "./SearchPanel";
@@ -44,16 +51,16 @@ const letterColor: Record<string, string> = {
 
 /** Whether the index holds a staged change for this entry (conflicts are never "staged"). */
 const hasStagedPart = (e: GitEntry) => !e.conflict && !e.untracked && e.index !== " ";
+/** What "Discard All" restores: tracked files modified in the working tree. Untracked,
+ * deleted, added, renamed-only, staged-only and conflicted files are never touched by it. */
+const isDiscardable = (e: GitEntry) => e.worktree === "M" && !e.conflict;
 /** Whether the working tree still has changes the index does not (untracked counts). */
 const hasUnstagedPart = (e: GitEntry) => e.untracked || e.worktree !== " ";
 
 /** One merged list, one letter per file: conflict, untracked, else the working-tree state
  * if any remains, else the staged state -- the same letter VS Code-style panels show. */
 function getStatusInfo(entry: GitEntry) {
-  let letter: string;
-  if (entry.conflict) letter = "!";
-  else if (entry.untracked) letter = "U";
-  else letter = entry.worktree !== " " ? entry.worktree : entry.index;
+  const letter = statusLetter(entry);
   return { letter, color: letterColor[letter] ?? "text-ink-2" };
 }
 
@@ -175,6 +182,11 @@ export function SourceControlPanel({
   const [branchesOpen, setBranchesOpen] = useState(false);
   const [rowLimits, setRowLimits] = useState<Record<string, number>>({});
   const [recovery, setRecovery] = useState<Replacement[] | null>(null);
+  // How the changed files are ordered. A view preference like the section toggles: it applies
+  // to whichever repository is shown, is remembered across restarts, and is not repository
+  // state -- switching repositories keeps it, and a refresh never resets it.
+  const [changesSort, setChangesSort] = useState<ChangesSort>(readChangesSort);
+  useEffect(() => saveChangesSort(changesSort), [changesSort]);
   const [sectionVisible, setSectionVisible] = useState<SectionVisibility>(readSectionVisibility);
   useEffect(() => {
     try {
@@ -461,9 +473,25 @@ export function SourceControlPanel({
 
   const discardAll = async (targetEntries: GitEntry[]) => {
     if (!activeRepo) return;
-    const modified = targetEntries.filter((e) => e.worktree === "M" && !e.conflict);
-    if (!modified.length) return;
-    if (!window.confirm(`Discard saved changes in all ${modified.length} files?`)) return;
+    const modified = targetEntries.filter(isDiscardable);
+    const untouched = targetEntries.length - modified.length;
+    const others = `${untouched} other file${untouched === 1 ? "" : "s"}`;
+    if (!modified.length) {
+      // Never a silent no-op: say what Discard All covers and why nothing happened.
+      activeRepo.store.setNotice(
+        "Nothing to discard. Discard All restores modified tracked files only; untracked, deleted, staged-only and conflicted files are left as they are.",
+      );
+      return;
+    }
+    const scope = untouched
+      ? `${others} (untracked, deleted, staged-only or in conflict) will not be touched. `
+      : "";
+    if (
+      !window.confirm(
+        `Discard saved changes in ${modified.length} modified file${modified.length === 1 ? "" : "s"}? ${scope}Staged changes are kept. A recovery copy is kept until the next discard or workspace close ("Undo last discard").`,
+      )
+    )
+      return;
     if (dirty) {
       activeRepo.store.setNotice("Save or close unsaved editors before discarding saved changes.");
       return;
@@ -476,10 +504,20 @@ export function SourceControlPanel({
         changes.push({ path: entry.path, before, after });
       }
       const outcome = await apply(changes);
-      if (outcome.errors.length) throw new Error(outcome.errors.join(" "));
-      setRecovery(changes);
-      await callbacks.current.onChanged();
-      return `Discarded changes in ${changes.length} files.`;
+      // Whatever was actually restored can be undone, even when other files failed: a
+      // partial failure must not also lose the recovery copy of the files that did change.
+      if (outcome.applied.length) {
+        setRecovery(outcome.applied);
+        await callbacks.current.onChanged();
+      }
+      if (outcome.errors.length) {
+        throw new Error(
+          `Discarded ${outcome.applied.length} of ${changes.length} files. ${outcome.errors.join(" ")}`,
+        );
+      }
+      return `Discarded changes in ${changes.length} file${changes.length === 1 ? "" : "s"}.${
+        untouched ? ` ${others} were not touched.` : ""
+      }`;
     });
   };
 
@@ -529,21 +567,24 @@ export function SourceControlPanel({
   // it were current: no status, no actions, just what happened and how to move on.
   const unusable = !!activeRepo && activeRepo.status !== "ready";
 
-  // One list for everything: conflicts first, then every other changed file. Whether a
-  // file is staged is shown by its checkbox, not by which section it sits in.
-  // Memoized on `entries` alone so typing a commit message never re-derives it.
-  const { listed, stagedCount, conflictCount, allStaged } = useMemo(() => {
+  // One list for everything: conflicts first, then every other changed file, ordered by the
+  // chosen "Sort Changes" mode. Whether a file is staged is shown by its checkbox, not by
+  // which section it sits in. Memoized on `entries` and the sort mode alone so typing a
+  // commit message never re-derives it.
+  const { listed, stagedCount, conflictCount, allStaged, discardable } = useMemo(() => {
     const conflicts = entries.filter((e) => e.conflict);
     const others = entries.filter((e) => !e.conflict);
     const stageable = others; // conflicts are resolved one at a time, never in bulk
     return {
-      listed: [...conflicts, ...others],
+      listed: sortChanges(entries, changesSort),
       stagedCount: entries.filter(hasStagedPart).length,
       conflictCount: conflicts.length,
       allStaged:
         stageable.length > 0 && stageable.every((e) => hasStagedPart(e) && !hasUnstagedPart(e)),
+      // What "Discard All" acts on: modified tracked files only (see `isDiscardable`).
+      discardable: entries.filter(isDiscardable).length,
     };
-  }, [entries]);
+  }, [entries, changesSort]);
   const sync = divergence(branch);
 
   const toggleSection = (name: keyof SectionVisibility) =>
@@ -721,6 +762,8 @@ export function SourceControlPanel({
                       getMessage,
                       onCommitted: () => commitBoxRef.current?.clear(),
                       includeViewOptions: true,
+                      changesSort,
+                      onSortChanges: setChangesSort,
                       onOpenBranches: () => setBranchesOpen(true),
                     })}
                   />
@@ -1131,8 +1174,12 @@ export function SourceControlPanel({
                     {entries.length > 0 && (
                       <>
                         <button
-                          disabled={busy || loading}
-                          title="Discard All Changes"
+                          disabled={busy || loading || discardable === 0}
+                          title={
+                            discardable === 0
+                              ? "Nothing to discard: Discard All restores modified tracked files only"
+                              : `Discard changes in ${discardable} modified file${discardable === 1 ? "" : "s"}. Untracked, deleted, staged-only and conflicted files are not affected.`
+                          }
                           aria-label="Discard All Changes"
                           onClick={() => void discardAll(entries)}
                           className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"

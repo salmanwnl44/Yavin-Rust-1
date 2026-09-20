@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import type { Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 
 /** What the fake Git reports; tests mutate it and refresh to move the repository on. */
 interface Scenario {
@@ -161,6 +161,12 @@ async function panel(page: Page, scenario: Partial<Scenario> = {}) {
               pending("Cancelled");
               (window as unknown as { __pendingFetch?: unknown }).__pendingFetch = undefined;
             }
+            return null;
+          }
+          if (command === "write_file_guarded") {
+            const w = window as unknown as { __writes?: string[]; __failWrite?: string[] };
+            (w.__writes ??= []).push(args.path as string);
+            if (w.__failWrite?.includes(args.path as string)) throw "Permission denied";
             return null;
           }
           return null;
@@ -751,6 +757,220 @@ test("a folder that is no longer this Git worktree is described differently from
     region.getByRole("alert").filter({ hasText: "no longer this Git worktree" }),
   ).toBeVisible();
   await expect(region.getByLabel("Commit message")).toHaveCount(0);
+});
+
+// ---- Sort Changes -------------------------------------------------------------------------
+
+const MIXED_STATUS = "M  z-staged.ts\0 M b.ts\0?? new.txt\0 D gone.ts\0UU clash.ts\0 M A.ts\0";
+
+async function shownOrder(region: Locator) {
+  return region
+    .getByRole("list", { name: "Changed files" })
+    .getByRole("button", { name: /^Open diff for/ })
+    .evaluateAll((rows) =>
+      rows.map((row) => (row.getAttribute("aria-label") ?? "").replace("Open diff for /work/", "")),
+    );
+}
+
+async function chooseSort(page: Page, region: Locator, name: "Discovery Time" | "Name" | "Status") {
+  await region.getByRole("button", { name: "Changes actions" }).click();
+  await page.getByRole("menuitem", { name: /^Sort Changes/ }).click();
+  await page.getByRole("menuitem", { name, exact: true }).click();
+}
+
+test("Sort Changes reorders the list by name and by status, and back to discovery order", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: MIXED_STATUS });
+  // Discovery: Git's order, conflicts first.
+  expect(await shownOrder(region)).toEqual([
+    "clash.ts",
+    "z-staged.ts",
+    "b.ts",
+    "new.txt",
+    "gone.ts",
+    "A.ts",
+  ]);
+
+  await chooseSort(page, region, "Name");
+  expect(await shownOrder(region)).toEqual([
+    "clash.ts", // a conflict is never sorted out of sight
+    "A.ts",
+    "b.ts",
+    "gone.ts",
+    "new.txt",
+    "z-staged.ts",
+  ]);
+
+  await chooseSort(page, region, "Status");
+  expect(await shownOrder(region)).toEqual([
+    "clash.ts",
+    "A.ts", // M (modified), then by path
+    "b.ts",
+    "z-staged.ts", // M (staged)
+    "gone.ts", // D
+    "new.txt", // U (untracked)
+  ]);
+
+  await chooseSort(page, region, "Discovery Time");
+  expect((await shownOrder(region))[1]).toBe("z-staged.ts");
+});
+
+test("the chosen sort survives a refresh and a reload, and re-applies when the files change", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: MIXED_STATUS });
+  await chooseSort(page, region, "Name");
+
+  await region.getByTitle("Refresh Status").click();
+  expect((await shownOrder(region))[1]).toBe("A.ts");
+
+  // A new file appears: it lands in sorted position without resetting the mode.
+  await update(page, { status: MIXED_STATUS + " M aa.ts\0" });
+  expect(await shownOrder(region)).toEqual([
+    "clash.ts",
+    "A.ts",
+    "aa.ts",
+    "b.ts",
+    "gone.ts",
+    "new.txt",
+    "z-staged.ts",
+  ]);
+
+  await page.reload();
+  await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
+  const again = page.getByRole("complementary", { name: "Source control" });
+  await expect(again.getByRole("list", { name: "Changed files" })).toBeVisible();
+  expect((await shownOrder(again))[1]).toBe("A.ts");
+});
+
+test("the menu marks the active sort and nothing else is offered", async ({ page }) => {
+  const region = await panel(page, { status: MIXED_STATUS });
+  await chooseSort(page, region, "Status");
+  await region.getByRole("button", { name: "Changes actions" }).click();
+  await page.getByRole("menuitem", { name: /^Sort Changes/ }).click();
+  const options = page.getByRole("menu", { name: "Changes actions" }).getByRole("menu");
+  await expect(options.getByRole("menuitem")).toHaveText([
+    /^Discovery Time$/,
+    /^Name$/,
+    /^✓Status$/,
+  ]);
+});
+
+// ---- Escape tooltip -----------------------------------------------------------------------
+
+test("the diff's close button does not advertise an Escape shortcut it does not have", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: " M a.ts\0" });
+  await region.getByRole("button", { name: /^Open diff for/ }).click();
+  const diffView = page.locator("section[aria-label='Git diff editor']");
+  await expect(diffView).toBeVisible();
+
+  const close = diffView.getByRole("button", { name: "Close Diff" });
+  await expect(close).toHaveAttribute("title", "Close Diff");
+
+  // Escape is not a close shortcut here, so nothing may claim it is.
+  await page.keyboard.press("Escape");
+  await expect(diffView).toBeVisible();
+
+  await close.click();
+  await expect(diffView).toHaveCount(0);
+});
+
+// ---- Discard All --------------------------------------------------------------------------
+
+async function writtenPaths(page: Page) {
+  return page.evaluate(() => (window as unknown as { __writes?: string[] }).__writes ?? []);
+}
+
+/** Accepts (or dismisses) the next confirm and records what it said. */
+function answerConfirm(page: Page, accept: boolean) {
+  const seen: string[] = [];
+  page.once("dialog", (dialog) => {
+    seen.push(dialog.message());
+    void (accept ? dialog.accept() : dialog.dismiss());
+  });
+  return seen;
+}
+
+test("Discard All restores every modified file, says so, and offers Undo", async ({ page }) => {
+  const region = await panel(page, { status: " M a.ts\0 M b.ts\0" });
+  const said = answerConfirm(page, true);
+  await region.getByRole("button", { name: "Discard All Changes" }).click();
+
+  await expect(region.getByRole("status")).toContainText("Discarded changes in 2 files.");
+  expect(said[0]).toContain("2 modified files");
+  expect(said[0]).toContain("Staged changes are kept");
+  expect(said[0]).not.toContain("will not be touched"); // nothing is being left out here
+  expect((await writtenPaths(page)).sort()).toEqual(["/work/a.ts", "/work/b.ts"]);
+  await expect(region.getByText("Undo last discard")).toBeVisible();
+});
+
+test("Discard All names what it will not touch, and leaves those files alone", async ({ page }) => {
+  const region = await panel(page, {
+    status: " M a.ts\0?? new.txt\0 D gone.ts\0M  staged.ts\0UU clash.ts\0",
+  });
+  const discard = region.getByRole("button", { name: "Discard All Changes" });
+  await expect(discard).toHaveAttribute("title", /1 modified file\./);
+  await expect(discard).toHaveAttribute("title", /Untracked, deleted, staged-only and conflicted/);
+
+  const said = answerConfirm(page, true);
+  await discard.click();
+
+  await expect(region.getByRole("status")).toContainText("4 other files were not touched.");
+  expect(said[0]).toContain("1 modified file?");
+  expect(said[0]).toContain("4 other files (untracked, deleted, staged-only or in conflict)");
+  expect(await writtenPaths(page)).toEqual(["/work/a.ts"]);
+});
+
+test("Discard All is off, with the reason, when nothing is eligible", async ({ page }) => {
+  const region = await panel(page, { status: "?? new.txt\0 D gone.ts\0M  staged.ts\0" });
+  const discard = region.getByRole("button", { name: "Discard All Changes" });
+  await expect(discard).toBeDisabled();
+  await expect(discard).toHaveAttribute("title", /Nothing to discard.*modified tracked files only/);
+  expect(await writtenPaths(page)).toEqual([]);
+});
+
+test("declining the Discard All confirmation changes nothing", async ({ page }) => {
+  const region = await panel(page, { status: " M a.ts\0 M b.ts\0" });
+  answerConfirm(page, false);
+  await region.getByRole("button", { name: "Discard All Changes" }).click();
+  expect(await writtenPaths(page)).toEqual([]);
+  await expect(region.getByText("Undo last discard")).toHaveCount(0);
+});
+
+test("a partly failed Discard All says how many files were restored, why the rest were not, and keeps Undo for the ones that were", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: " M a.ts\0 M b.ts\0 M c.ts\0" });
+  await page.evaluate(() => {
+    (window as unknown as { __failWrite: string[] }).__failWrite = ["/work/b.ts"];
+  });
+  answerConfirm(page, true);
+  await region.getByRole("button", { name: "Discard All Changes" }).click();
+
+  const status = region.getByRole("status");
+  await expect(status).toContainText("Discarded 2 of 3 files.");
+  await expect(status).toContainText("/work/b.ts");
+  await expect(status).toContainText("Permission denied");
+  await expect(status).not.toContainText("Discarded changes in 3 files");
+  // The two that did change can still be undone.
+  await expect(region.getByText("Undo last discard")).toBeVisible();
+});
+
+test("a Discard All where every file fails reports the failure and offers no Undo", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: " M a.ts\0 M b.ts\0" });
+  await page.evaluate(() => {
+    (window as unknown as { __failWrite: string[] }).__failWrite = ["/work/a.ts", "/work/b.ts"];
+  });
+  answerConfirm(page, true);
+  await region.getByRole("button", { name: "Discard All Changes" }).click();
+
+  await expect(region.getByRole("status")).toContainText("Discarded 0 of 2 files.");
+  await expect(region.getByText("Undo last discard")).toHaveCount(0);
 });
 
 test("a Cancel button stops a running Git operation and reports it distinctly from a failure", async ({

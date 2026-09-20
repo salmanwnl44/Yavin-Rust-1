@@ -469,7 +469,7 @@ export function DiffEditor({
 
           <button
             onClick={onClose}
-            title="Close Diff (Escape)"
+            title="Close Diff"
             aria-label="Close Diff"
             className="p-1 rounded text-zinc-400 hover:text-white hover:bg-[#1a1a1a] transition-colors ml-1"
           >
