@@ -30,7 +30,6 @@ interface Commands {
     args: { repoId: string; args: string[]; id: string; input?: string };
     result: ToolOutput;
   };
-  git_cancel: { args: { id: string }; result: void };
   git_cancel_repo: { args: { repoId: string }; result: void };
   git_repo_state: { args: { repoId: string }; result: string };
   git_watch_repo: {

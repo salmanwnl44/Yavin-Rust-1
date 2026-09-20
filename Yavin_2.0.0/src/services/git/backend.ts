@@ -21,11 +21,9 @@ export function closeRepo(repoId: string): Promise<void> {
 /**
  * Runs one Git subcommand in an already-open repository. `args[0]` is the
  * subcommand; `input` is piped to Git's stdin (used by `apply` for patch content).
- * `id` addresses this specific call for `cancelGitOperation` -- Rust registers it
- * (and cleans it up when the call finishes) regardless of whether anything ever
- * cancels it, the same as `search.ts` already does for every `search_project` call.
- * `Repository` generates a fresh one per call; nothing above it needs to track ids
- * individually, because `cancelRepoOperations` below cancels by repository instead.
+ * `id` is the key Rust registers this call under (removed when the call finishes) so
+ * `cancelRepoOperations` below can find and cancel it. `Repository` generates a fresh
+ * one per call; nothing above it tracks ids, because cancellation is by repository.
  */
 export function gitExec(
   repoId: string,

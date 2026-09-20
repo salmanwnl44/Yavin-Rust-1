@@ -75,17 +75,14 @@ pub(crate) struct JobEntry {
 #[derive(Default)]
 pub struct GitJobs(pub Mutex<HashMap<String, JobEntry>>);
 
-/// A small, purely defensive cap (mirroring `workbench::Jobs`'s own limit) against
-/// the one edge case that could otherwise leak entries unboundedly: a cancel call for
-/// an id that never goes on to register a real operation (see `cancel_job`). Ordinary
-/// concurrent-operation counts never approach this.
+/// A small, purely defensive cap (mirroring `workbench::Jobs`'s own limit) on how many
+/// Git operations may be registered at once. Ordinary concurrent-operation counts never
+/// approach this.
 const MAX_GIT_JOBS: usize = 64;
 
 /// Registers `id` as running against `repo_id` and returns the flag to pass through
-/// `exec_on`. If `id` was already pre-cancelled (see `cancel_job`), reuses that same
-/// already-`true` flag instead of creating a fresh one -- whichever call, register or
-/// cancel, happens to arrive first wins the map slot, closing the register/cancel
-/// ordering race without needing the two to coordinate explicitly.
+/// `exec_on`. The same id registering again reuses its existing flag, so a stale retry
+/// never forgets an already-requested cancellation.
 fn register_job(jobs: &GitJobs, id: &str, repo_id: &str) -> Result<Arc<AtomicBool>, String> {
     let mut map = jobs.0.lock().map_err(|e| e.to_string())?;
     if !map.contains_key(id) && map.len() >= MAX_GIT_JOBS {
@@ -99,30 +96,6 @@ fn register_job(jobs: &GitJobs, id: &str, repo_id: &str) -> Result<Arc<AtomicBoo
         })
         .cancel
         .clone())
-}
-
-/// Cancels the job registered under `id`, or -- if it hasn't registered yet, a
-/// narrow but real race between this call and `register_job`'s, since they're
-/// separate, concurrently-processed command invocations with no ordering guarantee
-/// between them -- pre-creates an already-cancelled entry for it to find. The
-/// repository this pre-cancelled entry belongs to is unknown at this point; that's
-/// fine, because the only consumer that needs `repo_id` (`cancel_jobs_for_repo`) only
-/// ever acts on already-registered jobs, never a pre-cancelled placeholder.
-fn cancel_job(jobs: &GitJobs, id: &str) -> Result<(), String> {
-    let mut map = jobs.0.lock().map_err(|e| e.to_string())?;
-    match map.get(id) {
-        Some(entry) => entry.cancel.store(true, Ordering::Relaxed),
-        None => {
-            map.insert(
-                id.to_string(),
-                JobEntry {
-                    repo_id: String::new(),
-                    cancel: Arc::new(AtomicBool::new(true)),
-                },
-            );
-        }
-    }
-    Ok(())
 }
 
 /// Cancels every job currently registered against `repo_id` -- used when that
@@ -965,17 +938,12 @@ pub async fn git_exec(
         .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-pub fn git_cancel(jobs: State<'_, GitJobs>, id: String) -> Result<(), String> {
-    cancel_job(&jobs, &id)
-}
-
 /// Cancels every operation currently registered against one repository -- what the
-/// Source Control panel's per-worktree Cancel button actually needs: since
-/// `RepoStore` only ever has one operation in flight at a time, "cancel this
-/// repository's operations" and "cancel the current operation" are the same thing,
-/// without TypeScript needing to track or thread individual operation ids through
-/// every `Repository` method just to address one back to `git_cancel`.
+/// Source Control panel's per-worktree Cancel button needs: since `RepoStore` only ever
+/// has one operation in flight at a time, "cancel this repository's operations" and
+/// "cancel the current operation" are the same thing, without TypeScript tracking
+/// individual operation ids. An operation still waiting for its scope lock is already
+/// registered here (before the lock is taken), so it is cancelled too and never runs.
 #[tauri::command]
 pub fn git_cancel_repo(jobs: State<'_, GitJobs>, repo_id: String) -> Result<(), String> {
     cancel_jobs_for_repo(&jobs, &repo_id)
@@ -1457,28 +1425,6 @@ mod tests {
     }
 
     #[test]
-    fn cancel_job_flips_the_flag_of_an_already_registered_job() {
-        let jobs = GitJobs::default();
-        let flag = register_job(&jobs, "op-1", "/work").unwrap();
-        assert!(!flag.load(Ordering::Relaxed));
-        cancel_job(&jobs, "op-1").unwrap();
-        assert!(flag.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn cancelling_before_registration_pre_cancels_the_operation() {
-        let jobs = GitJobs::default();
-        // The cancel arrives first -- a real, if narrow, race between two separate
-        // command invocations with no ordering guarantee between them.
-        cancel_job(&jobs, "op-1").unwrap();
-        let flag = register_job(&jobs, "op-1", "/work").unwrap();
-        assert!(
-            flag.load(Ordering::Relaxed),
-            "registering after a pre-cancel must find the operation already cancelled"
-        );
-    }
-
-    #[test]
     fn cancel_jobs_for_repo_only_cancels_jobs_registered_against_that_repository() {
         let jobs = GitJobs::default();
         let flag_a = register_job(&jobs, "op-a", "/work-a").unwrap();
@@ -1627,7 +1573,7 @@ mod tests {
             .map(|p| clean_path_str(&p))
             .unwrap();
         let jobs = GitJobs::default();
-        // The exact flag `git_exec` would register and `git_cancel` would flip.
+        // The exact flag `git_exec` would register and `git_cancel_repo` would flip.
         let cancel = register_job(&jobs, "op-1", &repository_id).unwrap();
         assert!(
             !jobs.0.lock().unwrap().is_empty(),
@@ -1635,9 +1581,10 @@ mod tests {
         );
 
         let flag = cancel.clone();
+        let repository_id_for_cancel = repository_id.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
-            cancel_job(&jobs, "op-1").unwrap();
+            cancel_jobs_for_repo(&jobs, &repository_id_for_cancel).unwrap();
         });
 
         // A long-running command in the same shape `run_command` spawns internally
