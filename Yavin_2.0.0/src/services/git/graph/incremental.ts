@@ -45,7 +45,13 @@ export class GraphLoader {
   private listeners = new Set<() => void>();
   private loadingMore = false;
   private disposed = false;
-  private shallowChecked = false;
+  /**
+   * Whether `snapshot.shallow` is an answer rather than the default. Set only once a
+   * result has actually been applied: a load superseded by `reset()` (or one whose
+   * `isShallow()` failed) leaves it false, so the next load asks again instead of
+   * keeping the default "not shallow" forever.
+   */
+  private shallowKnown = false;
   // Bumped by reset() so a loadMore() that was already in flight -- and whose
   // `skip`/accumulated commits are now stale -- discards its result on resolution
   // instead of appending onto the freshly-cleared snapshot.
@@ -79,7 +85,7 @@ export class GraphLoader {
     // rather than leaving it held by a request whose result is about to be discarded.
     this.generation++;
     this.loadingMore = false;
-    // shallow/shallowChecked deliberately survive a reset -- a repository's
+    // shallow/shallowKnown deliberately survive a reset -- a repository's
     // shallow-ness doesn't change just because its history is being reloaded, and
     // there is no deepen operation Yavin exposes that would invalidate it.
     this.snapshot = {
@@ -101,13 +107,19 @@ export class GraphLoader {
     this.patch({ loading: true, notice: "" });
     try {
       const skip = this.snapshot.commits.length;
-      const checkShallow = !this.shallowChecked;
-      if (checkShallow) this.shallowChecked = true;
-      const [raw, shallow] = await Promise.all([
+      const checkShallow = !this.shallowKnown;
+      // A failing `isShallow()` must not fail the page: history is still perfectly
+      // showable, and the check is simply retried by the next load.
+      const shallowResult: Promise<boolean | null> = checkShallow
+        ? this.repository.isShallow().catch(() => null)
+        : Promise.resolve(null);
+      const [raw, checked] = await Promise.all([
         this.repository.graphLog(skip, GRAPH_PAGE_SIZE),
-        checkShallow ? this.repository.isShallow() : Promise.resolve(this.snapshot.shallow),
+        shallowResult,
       ]);
       if (generation !== this.generation) return;
+      const shallow = checked ?? this.snapshot.shallow;
+      if (checked !== null) this.shallowKnown = true;
       const page = parseGraphLog(raw);
       const commits = [...this.snapshot.commits, ...page];
       this.patch({

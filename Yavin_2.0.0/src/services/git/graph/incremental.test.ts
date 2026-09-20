@@ -160,6 +160,59 @@ test("isShallow is checked once, on the first page, and never re-queried on late
   assert.equal(shallowCalls, 1, "a reset must not re-check shallow-ness either");
 });
 
+test("a first load superseded by reset() does not lose the shallow answer", async () => {
+  let releaseFirst: (() => void) | undefined;
+  let logCalls = 0;
+  let shallowCalls = 0;
+  const repository = {
+    graphLog: async () => {
+      logCalls++;
+      // Only the first call is held open, so reset() lands while it is in flight.
+      if (logCalls === 1) await new Promise<void>((resolve) => (releaseFirst = resolve));
+      return [line("a")].join("\n");
+    },
+    isShallow: async () => {
+      shallowCalls++;
+      return true;
+    },
+  } as unknown as Repository;
+  const loader = new GraphLoader(repository);
+
+  const first = loader.loadMore();
+  await new Promise((resolve) => setImmediate(resolve));
+  await loader.reset(); // e.g. a `git-changed` HEAD event arriving during startup
+  releaseFirst?.();
+  await first;
+
+  assert.equal(loader.getSnapshot().shallow, true, "a shallow clone must still be reported");
+  assert.equal(shallowCalls, 2, "the discarded first load's answer must not count as checked");
+
+  await loader.reset();
+  assert.equal(loader.getSnapshot().shallow, true);
+  assert.equal(shallowCalls, 2, "once answered, later pages and resets do not ask again");
+});
+
+test("a failing isShallow() neither fails the page nor stops a later retry", async () => {
+  let shallowCalls = 0;
+  const repository = {
+    graphLog: async () => [line("a")].join("\n"),
+    isShallow: async () => {
+      shallowCalls++;
+      if (shallowCalls === 1) throw new Error("rev-parse failed");
+      return true;
+    },
+  } as unknown as Repository;
+  const loader = new GraphLoader(repository);
+
+  await loader.loadMore();
+  assert.equal(loader.getSnapshot().commits.length, 1, "history still shows");
+  assert.equal(loader.getSnapshot().notice, "", "no error is shown for the failed check");
+  assert.equal(loader.getSnapshot().shallow, false, "unknown, so the default");
+
+  await loader.reset();
+  assert.equal(loader.getSnapshot().shallow, true, "the retry on the next load got the answer");
+});
+
 test("dispose stops further notifications", async () => {
   const loader = new GraphLoader(fakeRepository([[line("a")]]));
   let notifications = 0;

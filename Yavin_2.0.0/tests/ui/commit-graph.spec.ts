@@ -19,7 +19,7 @@ interface Scenario {
   shallow?: boolean;
 }
 
-async function panel(page: Page, scenario: Scenario) {
+async function panel(page: Page, scenario: Scenario, options: { inline?: boolean } = {}) {
   await page.addInitScript((s) => {
     const calls: { command: string; args: Record<string, unknown> }[] = [];
     const ok = (stdout: string) => ({ stdout, stderr: "", code: 0, truncated: false });
@@ -95,6 +95,7 @@ async function panel(page: Page, scenario: Scenario) {
   await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
   const region = page.getByRole("complementary", { name: "Source control" });
   await expect(region).toBeVisible();
+  if (options.inline) return region;
   await region.getByText("Open in full view").click();
   const graph = page.getByRole("grid", { name: "Commit history" });
   await expect(graph).toBeVisible();
@@ -198,6 +199,29 @@ test("a shallow clone's exhausted history says so instead of looking complete", 
   });
   await expect(graph.getByText(/History may be incomplete/)).toBeVisible();
   await expect(graph.getByText("Load older commits")).toHaveCount(0);
+});
+
+test("the sidebar's own graph says a shallow clone's history may be incomplete", async ({
+  page,
+}) => {
+  const region = await panel(
+    page,
+    { commits: [{ hash: "c1", subject: "Only commit this clone has" }], shallow: true },
+    { inline: true },
+  );
+  await expect(region.getByText(/History may be incomplete/)).toBeVisible();
+});
+
+test("the sidebar's graph shows no incomplete-history notice for a full clone", async ({
+  page,
+}) => {
+  const region = await panel(
+    page,
+    { commits: [{ hash: "c1", subject: "Only commit" }], shallow: false },
+    { inline: true },
+  );
+  await expect(region.getByText("Only commit")).toBeVisible();
+  await expect(region.getByText(/History may be incomplete/)).toHaveCount(0);
 });
 
 test("a normal (non-shallow) repository's exhausted history shows no incomplete-history notice", async ({

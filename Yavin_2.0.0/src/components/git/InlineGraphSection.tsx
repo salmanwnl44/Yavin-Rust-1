@@ -73,11 +73,10 @@ export function InlineGraphSection({
   const gutterWidth = Math.max(1, Math.min(snapshot.layout.laneCount, 4)) * LANE_WIDTH + 6;
   const totalHeight = visible.length * ROW_HEIGHT;
 
-  // guardedAffecting resets the repository's shared GraphLoader itself, correctly
-  // scoped to fetch/pull/pullRebase/pullMerge -- not push, which never adds a
-  // commit (see sync.ts's GRAPH_RESETS) but was reset unconditionally here before.
-  // Since the loader is shared, that reset is visible through this same `reset`/
-  // `snapshot` pair without an extra manual call.
+  // guardedAffecting resets the repository's shared GraphLoader itself for every operation
+  // that changes what the graph shows (see sync.ts's GRAPH_RESETS). Since the loader is
+  // shared, that reset is visible through this same `reset`/`snapshot` pair without an
+  // extra manual call.
   const run = (kind: string, op: () => Promise<string>) =>
     void guardedAffecting(entry, kind, dirty, op);
 
@@ -235,6 +234,11 @@ export function InlineGraphSection({
               </div>
             ))}
           </div>
+          {!snapshot.hasMore && snapshot.shallow && (
+            <p className="px-2 pt-1.5 text-center text-amber-400/80 text-[10.5px]">
+              History may be incomplete (this is a shallow clone).
+            </p>
+          )}
           <div className="flex items-center justify-center gap-3 py-1.5">
             {snapshot.hasMore && (
               <button
