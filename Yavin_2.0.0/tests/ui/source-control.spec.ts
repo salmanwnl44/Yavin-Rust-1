@@ -780,3 +780,29 @@ test("Repositories and Stashes are hidden by default and the choice is remembere
       .locator("section[aria-label='Repositories']"),
   ).toBeVisible();
 });
+
+test("the Graph toolbar's network buttons are disabled while an operation runs, not silently ignored", async ({
+  page,
+}) => {
+  const region = await panel(page);
+  await page.evaluate(() => {
+    (window as unknown as { __holdFetch: boolean }).__holdFetch = true;
+  });
+  const fetch = region.getByRole("button", { name: "Check for new commits" });
+  const pull = region.getByRole("button", { name: "Download new commits" });
+  const push = region.getByRole("button", { name: "Upload local commits" });
+  await expect(fetch).toBeEnabled();
+
+  await fetch.click();
+  await expect(region.getByRole("status")).toContainText("Running Git operation");
+  // A click now would be refused by the store and its notice overwritten by the running
+  // operation's result -- so the buttons say "not now" instead.
+  await expect(fetch).toBeDisabled();
+  await expect(pull).toBeDisabled();
+  await expect(push).toBeDisabled();
+
+  await region.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(fetch).toBeEnabled();
+  await expect(pull).toBeEnabled();
+  await expect(push).toBeEnabled();
+});

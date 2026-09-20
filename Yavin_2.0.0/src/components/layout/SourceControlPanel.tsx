@@ -1024,11 +1024,13 @@ export function SourceControlPanel({
             {!sectionCollapsed.changes && activeRepo && (
               <div role="list" aria-label="Changed files" className="pb-1">
                 {entries.length === 0 && !loading && (
-                  <div className="flex flex-col items-center justify-center p-8 text-center text-ink-3 gap-2">
-                    <CheckIcon size={24} className="text-ink-3" />
-                    <p className="text-xs">Working tree clean</p>
-                    <p className="text-[11px]">No changes detected in repository</p>
-                  </div>
+                  // One row tall, like a single file: a big centred empty state made everything
+                  // below it (the Graph) jump ~100 px the moment the last file was committed,
+                  // and a click aimed at the Graph toolbar then landed elsewhere.
+                  <p className="flex h-[22px] items-center gap-1.5 px-3 text-[11px] text-ink-3">
+                    <CheckIcon size={12} className="shrink-0" />
+                    Working tree clean
+                  </p>
                 )}
 
                 {listed.slice(0, rowLimits.Changes ?? ROWS_PER_PAGE).map((entry) => {

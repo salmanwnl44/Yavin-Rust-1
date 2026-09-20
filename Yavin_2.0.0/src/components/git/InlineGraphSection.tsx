@@ -1,5 +1,5 @@
 import type { RepoEntry } from "../../services/git/registry";
-import { useCommitGraph } from "../../services/git/hooks";
+import { useCommitGraph, useRepoSnapshot } from "../../services/git/hooks";
 import { guardedAffecting } from "../../services/git/sync";
 import { GRAPH_COLOR_COUNT } from "../../services/git/graph/model";
 import { ChevronIcon } from "../ui/FileIcons";
@@ -45,6 +45,11 @@ export function InlineGraphSection({
   onExpand?: () => void;
 }) {
   const { snapshot, loadMore, reset } = useCommitGraph(entry?.store.repository);
+  // A second operation on the same worktree is refused while one runs, and the refusal's notice
+  // is replaced by the first operation's own result a moment later -- so a click here during a
+  // commit vanished without a trace. Disable the network buttons instead of inviting that.
+  const repo = useRepoSnapshot(entry?.store);
+  const busy = repo?.busy ?? false;
 
   if (!entry) return null;
 
@@ -75,24 +80,27 @@ export function InlineGraphSection({
           <button
             title="Fetch"
             aria-label="Check for new commits"
+            disabled={busy}
             onClick={() => run("fetch", () => entry.store.repository.fetch())}
-            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
+            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover disabled:opacity-40"
           >
             <SyncIcon size={12} />
           </button>
           <button
             title="Pull"
             aria-label="Download new commits"
+            disabled={busy}
             onClick={() => run("pull", () => entry.store.repository.pull())}
-            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
+            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover disabled:opacity-40"
           >
             <ArrowDownIcon size={12} />
           </button>
           <button
             title="Push"
             aria-label="Upload local commits"
+            disabled={busy}
             onClick={() => run("push", () => entry.store.repository.push())}
-            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
+            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover disabled:opacity-40"
           >
             <ArrowUpIcon size={12} />
           </button>
