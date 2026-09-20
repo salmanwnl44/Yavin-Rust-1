@@ -385,6 +385,35 @@ pub async fn git_open_repo(state: State<'_, Repos>, path: String) -> Result<Repo
     register_repo(&state, toplevel)
 }
 
+/// Turns an existing folder into a Git repository (`git init`), for the "this folder is not a
+/// repository" page. Refuses a folder that is already inside a repository: initialising there
+/// would silently create a nested repository that shadows the real one.
+fn init_repository(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_dir() {
+        return Err("Not a directory".into());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("Invalid path: {e}"))?;
+    if discover_toplevel(&canonical).is_ok() {
+        return Err("This folder is already inside a Git repository.".into());
+    }
+    let init = run(&canonical, &["init"])?;
+    if init.code != 0 {
+        return Err(init.stderr.trim().to_string());
+    }
+    discover_toplevel(&canonical)
+}
+
+#[tauri::command]
+pub async fn git_init_repo(state: State<'_, Repos>, path: String) -> Result<RepoInfo, String> {
+    let candidate = PathBuf::from(path);
+    let toplevel = tauri::async_runtime::spawn_blocking(move || init_repository(&candidate))
+        .await
+        .map_err(|e| e.to_string())??;
+    register_repo(&state, toplevel)
+}
+
 #[tauri::command]
 pub fn git_close_repo(
     state: State<'_, Repos>,
@@ -2594,6 +2623,37 @@ mod tests {
                 "{shape:?} must be refused before git runs, but validated"
             );
         }
+    }
+
+    #[test]
+    fn a_plain_folder_can_be_initialised_as_a_repository() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        assert!(discover_toplevel(&dir).is_err(), "starts as a plain folder");
+        let root = init_repository(&dir).unwrap();
+        let is_repo = dir.join(".git").is_dir();
+        let discovered = discover_toplevel(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(is_repo);
+        assert_eq!(root, discovered);
+    }
+
+    #[test]
+    fn initialising_inside_an_existing_repository_is_refused() {
+        let (dir, _git) = fixture();
+        let inner = dir.join("nested");
+        fs::create_dir_all(&inner).unwrap();
+        let result = init_repository(&inner);
+        let created_nested = inner.join(".git").exists();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(result.is_err_and(|e| e.contains("already inside")));
+        assert!(!created_nested, "no nested repository may be created");
+    }
+
+    #[test]
+    fn initialising_something_that_is_not_a_folder_is_refused() {
+        let dir = temp_dir();
+        assert!(init_repository(&dir.join("does-not-exist")).is_err());
     }
 
     fn scope_of(argv: &[&str]) -> Scope {

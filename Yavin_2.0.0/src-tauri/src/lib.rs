@@ -7,8 +7,9 @@ mod git;
 mod terminal;
 mod workbench;
 use git::{
-    git_cancel, git_cancel_repo, git_close_repo, git_exec, git_open_repo, git_repo_state,
-    git_unwatch_repo, git_watch_repo, GitJobs, GitWatches, NetworkLocks, Repos, StashLocks,
+    git_cancel, git_cancel_repo, git_close_repo, git_exec, git_init_repo, git_open_repo,
+    git_repo_state, git_unwatch_repo, git_watch_repo, GitJobs, GitWatches, NetworkLocks, Repos,
+    StashLocks,
 };
 use terminal::{
     terminal_close, terminal_close_all, terminal_open, terminal_resize, terminal_shells,
@@ -208,6 +209,7 @@ pub fn run() {
             cancel_search,
             write_file_guarded,
             git_open_repo,
+            git_init_repo,
             git_close_repo,
             git_exec,
             git_cancel,

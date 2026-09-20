@@ -670,6 +670,10 @@ test("a changed file's diff can be opened with the keyboard alone", async ({ pag
 test("a huge change set draws a page of rows at a time but still counts and acts on every file", async ({
   page,
 }) => {
+  // A stress case (1,200 rows, then 1,200 sequential stage calls): it runs close to the 30 s
+  // default even on a lightly loaded machine, so give it room instead of failing whenever the
+  // box is busy.
+  test.setTimeout(120_000);
   let status = "";
   for (let i = 0; i < 1200; i++) status += ` M file${i}.ts\0`;
   const region = await panel(page, { status });

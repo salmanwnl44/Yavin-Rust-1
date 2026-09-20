@@ -156,6 +156,10 @@ export function SourceControlPanel({
   // tracked -- otherwise "not a Git repository" is noise next to a working repository.
   const [openError, setOpenError] = useState("");
   const [workspaceError, setWorkspaceError] = useState("");
+  const [initError, setInitError] = useState("");
+  const [initBusy, setInitBusy] = useState(false);
+  // The nested "Changes" group inside the Changes section can be folded on its own.
+  const [changesGroupCollapsed, setChangesGroupCollapsed] = useState(false);
   // The commit draft itself lives in <CommitBox>; the panel keeps only whether one
   // exists (re-rendering only when that flips) and a ref for click-time reads.
   const [hasMessage, setHasMessage] = useState(false);
@@ -330,6 +334,22 @@ export function SourceControlPanel({
     }
   };
 
+  /** `git init` in the open workspace folder, then track it like any other repository. */
+  const initializeWorkspace = async () => {
+    if (!workspace) return;
+    setInitError("");
+    setInitBusy(true);
+    try {
+      await native("git_init_repo", { path: workspace });
+      await gitRegistry.open(workspace, { makeActive: true });
+      setWorkspaceError("");
+    } catch (error) {
+      setInitError(String(error));
+    } finally {
+      setInitBusy(false);
+    }
+  };
+
   const removeRepository = (repoId: string) => void gitRegistry.close(repoId);
   const selectRepository = (repoId: string) => gitRegistry.setActive(repoId);
 
@@ -473,7 +493,16 @@ export function SourceControlPanel({
       return `Unstaged ${targetEntries.length} files.`;
     });
 
-  const shownError = openError || (registrySnapshot.repos.length === 0 ? workspaceError : "");
+  // Source Control follows the folder that is open. When that folder is not a repository (and
+  // nothing else is tracked or active), offer to make it one instead of an empty panel.
+  const showInit =
+    !!workspace &&
+    !activeRepo &&
+    registrySnapshot.repos.length === 0 &&
+    /not a Git repository/i.test(workspaceError);
+  const shownError = showInit
+    ? ""
+    : openError || (registrySnapshot.repos.length === 0 ? workspaceError : "");
   const entries = snapshot?.entries ?? [];
   const branch = snapshot?.branch ?? {
     name: "",
@@ -524,15 +553,6 @@ export function SourceControlPanel({
           Source Control
         </span>
         <div className="flex items-center gap-0.5">
-          <button
-            disabled={busy || loading}
-            onClick={() => void activeRepo?.store.refresh()}
-            title="Refresh Status"
-            aria-label="Refresh Status"
-            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover transition-colors disabled:opacity-30"
-          >
-            <RefreshIcon size={13} className={loading || busy ? "animate-spin" : ""} />
-          </button>
           <GitMenu
             icon={<MoreIcon size={14} />}
             label="Source Control view options"
@@ -568,7 +588,40 @@ export function SourceControlPanel({
         </p>
       )}
 
-      <div className="flex-1 overflow-y-auto min-h-0 flex flex-col">
+      {showInit && (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 p-5 text-center">
+          <GitBranchIcon size={28} className="text-ink-3" />
+          <p className="text-xs text-ink">The folder currently open is not a Git repository.</p>
+          <p className="text-[11px] text-ink-3">
+            Initialize a repository to turn on source control for{" "}
+            <span className="text-ink-2">
+              {workspace.split(/[/\\]/).filter(Boolean).pop() ?? workspace}
+            </span>
+            .
+          </p>
+          <button
+            aria-label="Initialize Repository"
+            disabled={initBusy}
+            onClick={() => void initializeWorkspace()}
+            className="w-full rounded bg-accent py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-40"
+          >
+            {initBusy ? "Initializing…" : "Initialize Repository"}
+          </button>
+          <button
+            onClick={() => void addRepository()}
+            className="text-[11px] text-ink-3 underline-offset-2 hover:text-ink hover:underline"
+          >
+            Or add an existing repository folder
+          </button>
+          {initError && (
+            <p role="status" className="text-[11px] break-words text-red-400">
+              {initError}
+            </p>
+          )}
+        </div>
+      )}
+
+      <div className={`flex-1 min-h-0 flex-col ${showInit ? "hidden" : "flex"}`}>
         {sectionVisible.repositories && (
           <RepositoriesSection
             repos={registrySnapshot.repos}
@@ -589,60 +642,36 @@ export function SourceControlPanel({
         )}
 
         {sectionVisible.changes && (
-          <section aria-label="Changes panel" className="text-xs shrink-0">
+          <section aria-label="Changes panel" className="flex min-h-0 flex-1 flex-col text-xs">
             <div
               onClick={() => toggleCollapsed("changes")}
               className="flex items-center gap-1.5 px-2 h-7 cursor-pointer hover:bg-surface-hover transition-colors"
             >
               <ChevronIcon isExpanded={!sectionCollapsed.changes} className="size-3" />
               <span className="font-semibold text-[12px] text-ink">Changes</span>
-              {entries.length > 0 && (
-                <span
-                  aria-label={`${entries.length} changed files`}
-                  className="px-1.5 rounded-full text-[10px] leading-4 bg-border-strong text-ink-2 font-mono"
-                >
-                  {entries.length}
-                </span>
-              )}
               <div className="flex-1" />
               {activeRepo && (
                 <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
-                  {entries.length > 0 && (
-                    <>
-                      <button
-                        disabled={busy || loading}
-                        title="Discard All Changes"
-                        aria-label="Discard All Changes"
-                        onClick={() => void discardAll(entries)}
-                        className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"
-                      >
-                        <UndoIcon size={12} />
-                      </button>
-                      {allStaged ? (
-                        <button
-                          disabled={busy || loading}
-                          title="Unstage All Changes"
-                          aria-label="Unstage All Changes"
-                          onClick={() => void unstageAll(entries.filter(hasStagedPart))}
-                          className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"
-                        >
-                          <MinusIcon size={12} />
-                        </button>
-                      ) : (
-                        <button
-                          disabled={busy || loading}
-                          title="Stage All Changes"
-                          aria-label="Stage All Changes"
-                          onClick={() =>
-                            void stageAll(entries.filter((e) => !e.conflict && hasUnstagedPart(e)))
-                          }
-                          className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"
-                        >
-                          <PlusIcon size={12} />
-                        </button>
-                      )}
-                    </>
+                  {stagedCount > 0 && (
+                    <button
+                      disabled={busy || loading || !hasMessage || conflictCount > 0}
+                      title={hasMessage ? "Commit staged changes" : "Enter a commit message first"}
+                      aria-label="Commit staged changes"
+                      onClick={() => commitBoxRef.current?.commit()}
+                      className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"
+                    >
+                      <CheckIcon size={13} />
+                    </button>
                   )}
+                  <button
+                    disabled={busy || loading}
+                    onClick={() => void activeRepo?.store.refresh()}
+                    title="Refresh Status"
+                    aria-label="Refresh Status"
+                    className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-30"
+                  >
+                    <RefreshIcon size={13} className={loading || busy ? "animate-spin" : ""} />
+                  </button>
                   <button
                     onClick={() => setBranchesOpen(!branchesOpen)}
                     title="Branches and remotes"
@@ -674,7 +703,7 @@ export function SourceControlPanel({
             </div>
 
             {!sectionCollapsed.changes && (
-              <div className="p-3 pt-1 space-y-2.5">
+              <div className="shrink-0 max-h-[60%] overflow-y-auto p-3 pt-1 space-y-2.5">
                 {!activeRepo ? (
                   registrySnapshot.repos.length > 0 ? (
                     <div className="space-y-1">
@@ -1022,155 +1051,232 @@ export function SourceControlPanel({
             )}
 
             {!sectionCollapsed.changes && activeRepo && (
-              <div role="list" aria-label="Changed files" className="pb-1">
-                {entries.length === 0 && !loading && (
-                  // One row tall, like a single file: a big centred empty state made everything
-                  // below it (the Graph) jump ~100 px the moment the last file was committed,
-                  // and a click aimed at the Graph toolbar then landed elsewhere.
-                  <p className="flex h-[22px] items-center gap-1.5 px-3 text-[11px] text-ink-3">
-                    <CheckIcon size={12} className="shrink-0" />
-                    Working tree clean
-                  </p>
-                )}
-
-                {listed.slice(0, rowLimits.Changes ?? ROWS_PER_PAGE).map((entry) => {
-                  const root = activeRepo.root;
-                  const relativePath = entry.path.startsWith(root)
-                    ? entry.path.slice(root.length + 1)
-                    : entry.path;
-                  const parts = relativePath.split(/[/\\]/);
-                  const fileName = parts.pop() || relativePath;
-                  const dirPath = parts.join("/");
-                  const status = getStatusInfo(entry);
-                  const staged = hasStagedPart(entry);
-                  const partial = staged && hasUnstagedPart(entry);
-                  const checked = staged && !partial;
-                  const isActiveDiff = activeDiffPath === entry.path;
-
-                  return (
-                    <div
-                      key={entry.path}
-                      role="button"
-                      tabIndex={0}
-                      aria-label={`Open diff for ${entry.path}`}
-                      className={`flex items-center gap-1.5 pl-2 pr-2.5 h-[22px] hover:bg-surface-hover group/row transition-colors cursor-pointer ${
-                        isActiveDiff ? "bg-accent/15" : ""
-                      }`}
-                      onClick={() => void openEntry(entry)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                          e.preventDefault();
-                          void openEntry(entry);
-                        }
-                      }}
-                    >
-                      <button
-                        role="checkbox"
-                        aria-checked={checked ? true : partial ? "mixed" : false}
-                        aria-label={`Stage ${entry.path}`}
-                        title={checked ? `Unstage ${fileName}` : `Stage ${fileName}`}
-                        disabled={busy || loading}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggleStage(entry);
-                        }}
-                        className={`flex size-3.5 shrink-0 items-center justify-center rounded-[3px] border transition-colors disabled:opacity-40 ${
-                          staged
-                            ? "bg-accent border-accent text-white"
-                            : "border-border-strong text-transparent hover:border-ink-3"
-                        }`}
-                      >
-                        {checked ? (
-                          <CheckIcon size={10} />
-                        ) : partial ? (
-                          <MinusIcon size={10} />
-                        ) : null}
-                      </button>
-
-                      <FileIcon name={fileName} isDir={false} className="size-3.5 shrink-0" />
-
-                      <div className="flex items-baseline min-w-0 flex-1 truncate">
-                        <span
-                          className={`text-xs truncate ${
-                            status.letter === "D" ? "line-through text-ink-3" : "text-ink"
-                          }`}
-                          title={
-                            entry.originalPath
-                              ? `${entry.originalPath} → ${entry.path}`
-                              : entry.path
-                          }
-                        >
-                          {fileName}
-                        </span>
-                        {dirPath && (
-                          <span className="text-ink-3 text-[10.5px] ml-1.5 truncate">
-                            {dirPath}
-                          </span>
-                        )}
-                      </div>
-
-                      <div
-                        className="flex items-center gap-0.5 opacity-0 group-hover/row:opacity-100 focus-within:opacity-100 transition-opacity shrink-0"
-                        onClick={(e) => e.stopPropagation()}
-                      >
+              <>
+                <div
+                  role="button"
+                  tabIndex={0}
+                  aria-expanded={!changesGroupCollapsed}
+                  aria-label="Changes group"
+                  onClick={() => setChangesGroupCollapsed((c) => !c)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      setChangesGroupCollapsed((c) => !c);
+                    }
+                  }}
+                  className="flex h-6 shrink-0 cursor-pointer items-center gap-1.5 bg-surface px-2 hover:bg-surface-hover"
+                >
+                  <ChevronIcon isExpanded={!changesGroupCollapsed} className="size-3" />
+                  <span className="text-[12px] text-ink">Changes</span>
+                  <div className="flex-1" />
+                  <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
+                    {entries.length > 0 && (
+                      <>
                         <button
-                          disabled={busy}
-                          title="Open Diff"
-                          aria-label="Open Diff"
-                          onClick={() => void openEntry(entry)}
-                          className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
+                          disabled={busy || loading}
+                          title="Discard All Changes"
+                          aria-label="Discard All Changes"
+                          onClick={() => void discardAll(entries)}
+                          className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"
                         >
-                          <DiffIcon size={12} />
+                          <UndoIcon size={12} />
                         </button>
-                        {partial && (
-                          <button
-                            disabled={busy}
-                            title="Open staged changes"
-                            aria-label={`Open staged diff for ${entry.path}`}
-                            onClick={() => void showDiff(entry, true)}
-                            className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
-                          >
-                            <CheckIcon size={12} />
-                          </button>
-                        )}
-                        {entry.worktree === "M" && !entry.conflict && (
+                        {allStaged ? (
                           <button
                             disabled={busy || loading}
-                            aria-label={`Discard ${entry.path}`}
-                            title={`Discard changes in ${fileName}`}
-                            onClick={() => void discard(entry)}
-                            className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
+                            title="Unstage All Changes"
+                            aria-label="Unstage All Changes"
+                            onClick={() => void unstageAll(entries.filter(hasStagedPart))}
+                            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"
                           >
-                            <UndoIcon size={12} />
+                            <MinusIcon size={12} />
+                          </button>
+                        ) : (
+                          <button
+                            disabled={busy || loading}
+                            title="Stage All Changes"
+                            aria-label="Stage All Changes"
+                            onClick={() =>
+                              void stageAll(
+                                entries.filter((e) => !e.conflict && hasUnstagedPart(e)),
+                              )
+                            }
+                            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"
+                          >
+                            <PlusIcon size={12} />
                           </button>
                         )}
-                      </div>
-
-                      <span
-                        title={`Status: ${status.letter}`}
-                        className={`w-3 text-center text-[11px] font-semibold shrink-0 ${status.color}`}
-                      >
-                        {status.letter}
-                      </span>
-                    </div>
-                  );
-                })}
-                {listed.length > (rowLimits.Changes ?? ROWS_PER_PAGE) && (
-                  <button
-                    onClick={() =>
-                      setRowLimits((prev) => ({
-                        ...prev,
-                        Changes: (prev.Changes ?? ROWS_PER_PAGE) + ROWS_PER_PAGE,
-                      }))
-                    }
-                    className="w-full py-1.5 text-[11px] text-ink-2 hover:bg-surface-hover hover:text-ink"
+                      </>
+                    )}
+                  </div>
+                  {entries.length > 0 && (
+                    <span
+                      aria-label={`${entries.length} changed files`}
+                      className="rounded-full bg-border-strong px-1.5 font-mono text-[10px] leading-4 text-ink-2"
+                    >
+                      {entries.length}
+                    </span>
+                  )}
+                </div>
+                {!changesGroupCollapsed && (
+                  <div
+                    role="list"
+                    aria-label="Changed files"
+                    className="min-h-[44px] flex-1 overflow-y-auto pb-1"
                   >
-                    Show{" "}
-                    {Math.min(ROWS_PER_PAGE, listed.length - (rowLimits.Changes ?? ROWS_PER_PAGE))}{" "}
-                    more of {listed.length - (rowLimits.Changes ?? ROWS_PER_PAGE)} remaining
-                  </button>
+                    {entries.length === 0 && !loading && (
+                      // One row tall, like a single file: a big centred empty state made everything
+                      // below it (the Graph) jump ~100 px the moment the last file was committed,
+                      // and a click aimed at the Graph toolbar then landed elsewhere.
+                      <p className="flex h-[22px] items-center gap-1.5 px-3 text-[11px] text-ink-3">
+                        <CheckIcon size={12} className="shrink-0" />
+                        Working tree clean
+                      </p>
+                    )}
+
+                    {listed.slice(0, rowLimits.Changes ?? ROWS_PER_PAGE).map((entry) => {
+                      const root = activeRepo.root;
+                      const relativePath = entry.path.startsWith(root)
+                        ? entry.path.slice(root.length + 1)
+                        : entry.path;
+                      const parts = relativePath.split(/[/\\]/);
+                      const fileName = parts.pop() || relativePath;
+                      const dirPath = parts.join("/");
+                      const status = getStatusInfo(entry);
+                      const staged = hasStagedPart(entry);
+                      const partial = staged && hasUnstagedPart(entry);
+                      const checked = staged && !partial;
+                      const isActiveDiff = activeDiffPath === entry.path;
+
+                      return (
+                        <div
+                          key={entry.path}
+                          role="button"
+                          tabIndex={0}
+                          aria-label={`Open diff for ${entry.path}`}
+                          className={`flex items-center gap-1.5 pl-2 pr-2.5 h-[22px] hover:bg-surface-hover group/row transition-colors cursor-pointer ${
+                            isActiveDiff ? "bg-accent/15" : ""
+                          }`}
+                          onClick={() => void openEntry(entry)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              void openEntry(entry);
+                            }
+                          }}
+                        >
+                          <button
+                            role="checkbox"
+                            aria-checked={checked ? true : partial ? "mixed" : false}
+                            aria-label={`Stage ${entry.path}`}
+                            title={checked ? `Unstage ${fileName}` : `Stage ${fileName}`}
+                            disabled={busy || loading}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              toggleStage(entry);
+                            }}
+                            className={`flex size-3.5 shrink-0 items-center justify-center rounded-[3px] border transition-colors disabled:opacity-40 ${
+                              staged
+                                ? "bg-accent border-accent text-white"
+                                : "border-border-strong text-transparent hover:border-ink-3"
+                            }`}
+                          >
+                            {checked ? (
+                              <CheckIcon size={10} />
+                            ) : partial ? (
+                              <MinusIcon size={10} />
+                            ) : null}
+                          </button>
+
+                          <FileIcon name={fileName} isDir={false} className="size-3.5 shrink-0" />
+
+                          <div className="flex items-baseline min-w-0 flex-1 truncate">
+                            <span
+                              className={`text-xs truncate ${
+                                status.letter === "D" ? "line-through text-ink-3" : "text-ink"
+                              }`}
+                              title={
+                                entry.originalPath
+                                  ? `${entry.originalPath} → ${entry.path}`
+                                  : entry.path
+                              }
+                            >
+                              {fileName}
+                            </span>
+                            {dirPath && (
+                              <span className="text-ink-3 text-[10.5px] ml-1.5 truncate">
+                                {dirPath}
+                              </span>
+                            )}
+                          </div>
+
+                          <div
+                            className="flex items-center gap-0.5 opacity-0 group-hover/row:opacity-100 focus-within:opacity-100 transition-opacity shrink-0"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <button
+                              disabled={busy}
+                              title="Open Diff"
+                              aria-label="Open Diff"
+                              onClick={() => void openEntry(entry)}
+                              className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
+                            >
+                              <DiffIcon size={12} />
+                            </button>
+                            {partial && (
+                              <button
+                                disabled={busy}
+                                title="Open staged changes"
+                                aria-label={`Open staged diff for ${entry.path}`}
+                                onClick={() => void showDiff(entry, true)}
+                                className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
+                              >
+                                <CheckIcon size={12} />
+                              </button>
+                            )}
+                            {entry.worktree === "M" && !entry.conflict && (
+                              <button
+                                disabled={busy || loading}
+                                aria-label={`Discard ${entry.path}`}
+                                title={`Discard changes in ${fileName}`}
+                                onClick={() => void discard(entry)}
+                                className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
+                              >
+                                <UndoIcon size={12} />
+                              </button>
+                            )}
+                          </div>
+
+                          <span
+                            title={`Status: ${status.letter}`}
+                            className={`w-3 text-center text-[11px] font-semibold shrink-0 ${status.color}`}
+                          >
+                            {status.letter}
+                          </span>
+                        </div>
+                      );
+                    })}
+                    {listed.length > (rowLimits.Changes ?? ROWS_PER_PAGE) && (
+                      <button
+                        onClick={() =>
+                          setRowLimits((prev) => ({
+                            ...prev,
+                            Changes: (prev.Changes ?? ROWS_PER_PAGE) + ROWS_PER_PAGE,
+                          }))
+                        }
+                        className="w-full py-1.5 text-[11px] text-ink-2 hover:bg-surface-hover hover:text-ink"
+                      >
+                        Show{" "}
+                        {Math.min(
+                          ROWS_PER_PAGE,
+                          listed.length - (rowLimits.Changes ?? ROWS_PER_PAGE),
+                        )}{" "}
+                        more of {listed.length - (rowLimits.Changes ?? ROWS_PER_PAGE)} remaining
+                      </button>
+                    )}
+                  </div>
                 )}
-              </div>
+              </>
             )}
           </section>
         )}

@@ -15,6 +15,8 @@ interface RepoScenario {
 interface Scenario {
   workspace: string;
   repos: Record<string, Partial<RepoScenario>>;
+  /** When set, `git_init_repo` fails with this message. */
+  initError?: string;
   /** Path `pick_folder_dialog` returns the next time it is invoked. */
   pick?: string;
   /** Pre-seeds `localStorage["yavin.git.repos"]` before the app loads, for testing restore/migration. */
@@ -86,6 +88,18 @@ async function panel(page: Page, scenario: Scenario) {
             if (!found) throw "This folder is not a Git repository.";
             return { repoId: path, root: path };
           }
+          if (command === "git_init_repo") {
+            if (s.initError) throw s.initError;
+            const path = args.path as string;
+            // A freshly initialised repository is empty: an unborn branch, nothing changed.
+            s.repos[path] = {
+              status: "",
+              branchInfo: "# branch.head main\n",
+              branches: "",
+              remotes: "",
+            };
+            return { repoId: path, root: path };
+          }
           if (command === "git_repo_state") return "";
           if (command === "git_exec") {
             const repoId = args.repoId as string;
@@ -116,7 +130,9 @@ async function panel(page: Page, scenario: Scenario) {
   // in this file exercises it, so turn it on the way a user would.
   await region.getByLabel("Source Control view options").click();
   await page.getByRole("menuitem", { name: "Repositories" }).click();
-  await expect(region.locator("section[aria-label='Repositories']")).toBeVisible();
+  // (Present in the DOM; it is hidden behind the "Initialize Repository" page when the
+  // workspace is not a repository, so this checks existence rather than visibility.)
+  await expect(region.locator("section[aria-label='Repositories']")).toHaveCount(1);
   return region;
 }
 
@@ -753,4 +769,41 @@ test("a workspace folder that is not a repository says so when nothing else is t
 }) => {
   const region = await panel(page, { workspace: "/plain-folder", repos: {} });
   await expect(region.getByText(/not a Git repository/).first()).toBeVisible();
+});
+
+test("a folder that is not a repository offers to initialise one", async ({ page }) => {
+  const region = await panel(page, { workspace: "/plain-folder", repos: {} });
+  await expect(region.getByText(/not a Git repository/).first()).toBeVisible();
+  // Nothing of the normal panel is offered until there is a repository.
+  await expect(region.getByLabel("Commit message")).toHaveCount(0);
+
+  await region.getByRole("button", { name: "Initialize Repository" }).click();
+
+  // `git init` ran in the open folder, and the folder is now tracked like any repository.
+  const calls = await page.evaluate(() =>
+    (
+      window as unknown as { __calls: { command: string; args: Record<string, unknown> }[] }
+    ).__calls.filter((c) => c.command === "git_init_repo"),
+  );
+  expect(calls).toHaveLength(1);
+  expect(calls[0].args.path).toBe("/plain-folder");
+  await expect(region.getByLabel("Commit message")).toBeVisible();
+  await expect(region.getByRole("button", { name: "Initialize Repository" })).toHaveCount(0);
+});
+
+test("a failed initialisation explains why and keeps offering it", async ({ page }) => {
+  const region = await panel(page, {
+    workspace: "/plain-folder",
+    repos: {},
+    initError: "This folder is already inside a Git repository.",
+  });
+  await region.getByRole("button", { name: "Initialize Repository" }).click();
+  await expect(region.getByText(/already inside a Git repository/)).toBeVisible();
+  await expect(region.getByRole("button", { name: "Initialize Repository" })).toBeEnabled();
+});
+
+test("a folder that is already a repository never shows the initialise page", async ({ page }) => {
+  const region = await panel(page, { workspace: "/work", repos: { "/work": repo("main") } });
+  await expect(region.getByLabel("Commit message")).toBeVisible();
+  await expect(region.getByRole("button", { name: "Initialize Repository" })).toHaveCount(0);
 });

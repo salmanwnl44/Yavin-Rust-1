@@ -4,6 +4,8 @@ import { CheckIcon } from "../ui/Icons";
 
 export interface CommitBoxHandle {
   clear: () => void;
+  /** Commits with the current message, exactly as the Commit button would. */
+  commit: () => void;
 }
 
 const draftStorageKey = (key: string) => `yavin.commit:${key}`;
@@ -64,14 +66,20 @@ export const CommitBox = forwardRef<
     onChange(saved);
   }, [draftKey, onChange]);
 
-  useImperativeHandle(ref, () => ({ clear: () => update("", draftKey) }), [update, draftKey]);
-
   const canCommit = text.trim().length > 0 && stagedCount > 0 && conflictCount === 0;
 
   const commit = () => {
     if (!canCommit) return;
     void onCommit(text).then((ok) => ok && update("", draftKey));
   };
+
+  useImperativeHandle(
+    ref,
+    () => ({ clear: () => update("", draftKey), commit }),
+    // `commit` closes over the current text and counts.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [update, draftKey, text, stagedCount, conflictCount],
+  );
 
   const hint = branchName ? ` on "${branchName}"` : "";
 

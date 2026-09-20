@@ -13,6 +13,21 @@ import {
 } from "../ui/Icons";
 import { GitMenu } from "./GitMenu";
 
+/** A remote-branch marker. Drawn inline: the shared icon set has no cloud. */
+const CloudGlyph = () => (
+  <svg
+    width="10"
+    height="10"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2.2"
+    aria-hidden="true"
+  >
+    <path d="M17.5 19a4.5 4.5 0 1 0-1.2-8.8A6 6 0 0 0 4.5 12 3.5 3.5 0 0 0 6 19h11.5z" />
+  </svg>
+);
+
 const ROW_HEIGHT = 22;
 const LANE_WIDTH = 12;
 const NODE_RADIUS = 3.5;
@@ -196,20 +211,27 @@ export function InlineGraphSection({
                 title={node.commit.subject}
                 className="flex items-center gap-1.5 px-1.5 text-[11px] hover:bg-surface-hover truncate"
               >
+                <span className="truncate text-ink">{node.commit.subject}</span>
+                <span className="shrink-0 truncate text-ink-3">{node.commit.authorName}</span>
+                <span className="flex-1" />
+                {/* Ref pills sit at the right edge: remote branches orange with a cloud, the
+                    current/local branch in the accent colour -- like the Antigravity graph. */}
                 {node.commit.refs
-                  .filter((r) => r.kind === "branch" || r.kind === "head")
-                  .slice(0, 1)
+                  .filter((r) => r.kind === "branch" || r.kind === "head" || r.kind === "remote")
+                  .slice(0, 3)
                   .map((r) => (
                     <span
-                      key={r.name}
-                      className="shrink-0 flex items-center gap-0.5 rounded-full bg-accent/20 text-accent-hover border border-accent/40 px-1.5 text-[9.5px]"
+                      key={`${r.kind}:${r.name}`}
+                      className={`flex shrink-0 items-center gap-0.5 rounded-full border px-1.5 text-[9.5px] ${
+                        r.kind === "remote"
+                          ? "border-orange-500/40 bg-orange-500/20 text-orange-300"
+                          : "border-accent/40 bg-accent/20 text-accent-hover"
+                      }`}
                     >
-                      <GitBranchIcon size={9} />
+                      {r.kind === "remote" ? <CloudGlyph /> : <GitBranchIcon size={9} />}
                       {r.name}
                     </span>
                   ))}
-                <span className="truncate flex-1 text-ink">{node.commit.subject}</span>
-                <span className="shrink-0 text-ink-3">{node.commit.authorName}</span>
               </div>
             ))}
           </div>
