@@ -163,7 +163,7 @@ test("clicking a menu item that has a submenu keeps the submenu open", async ({ 
   const stash = page.getByRole("menuitem", { name: /^Stash ›$/ });
   // A mouse user hovers the item (which opens its flyout) and then clicks it.
   await stash.hover();
-  await expect(page.getByRole("menuitem", { name: "Stash Changes" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Stash", exact: true })).toBeVisible();
   await stash.click();
-  await expect(page.getByRole("menuitem", { name: "Stash Changes" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Stash", exact: true })).toBeVisible();
 });

@@ -3,6 +3,7 @@ import type { RepoEntry, RepositoryEntry } from "../../services/git/registry";
 import type { WorktreeInfo } from "../../services/git/parsers/worktree";
 import { useRepoSnapshot } from "../../services/git/hooks";
 import { GitMenu } from "./GitMenu";
+import type { DialogRequest } from "../ui/AppDialog";
 import { buildGitCommandMenu } from "./gitCommandMenu";
 import { syncAction } from "./syncAction";
 import { ChevronIcon } from "../ui/FileIcons";
@@ -104,6 +105,7 @@ function RepoRow({
   onRemove,
   onCommitted,
   onOpenBranches,
+  onDialog,
 }: {
   entry: RepoEntry;
   active: boolean;
@@ -114,6 +116,7 @@ function RepoRow({
   onRemove: () => void;
   onCommitted: () => void;
   onOpenBranches: () => void;
+  onDialog: (request: DialogRequest) => void;
 }) {
   const snapshot = useRepoSnapshot(entry.store);
   const hasChanges = (snapshot?.entries.length ?? 0) > 0;
@@ -164,7 +167,7 @@ function RepoRow({
             hasMessage,
             getMessage,
             onCommitted,
-            onOpenBranches,
+            onDialog,
           })}
         />
       </div>
@@ -204,6 +207,7 @@ export function RepositoriesSection({
   onAdd,
   onCommitted,
   onOpenBranches,
+  onDialog,
 }: {
   repos: RepoEntry[];
   /** Grouped view of the same worktrees, for the "N more worktrees" affordance. */
@@ -221,6 +225,7 @@ export function RepositoriesSection({
   onAdd: () => void;
   onCommitted: () => void;
   onOpenBranches: () => void;
+  onDialog: (request: DialogRequest) => void;
 }) {
   const [sort, setSort] = useState<SortOrder>("discovery");
 
@@ -289,6 +294,7 @@ export function RepositoriesSection({
                     onSelect(entry.repoId);
                     onOpenBranches();
                   }}
+                  onDialog={onDialog}
                 />
                 {owner && (
                   <UntrackedWorktrees

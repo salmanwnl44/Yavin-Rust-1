@@ -17,6 +17,10 @@ export const DIRTY_BLOCKED = new Set([
   "pull",
   "pullRebase",
   "pullMerge",
+  "pullFrom",
+  "mergeBranch",
+  "rebaseOnto",
+  "undoLastCommit",
   "abort",
   "continue",
   "skip",
@@ -61,10 +65,12 @@ const ALL_REFRESH_FIELDS: readonly RefreshField[] = [
  * Which of `refresh()`'s six independent fetches can actually go stale after each
  * `kind` of mutation -- derived from the Git Operation Engine plan's Section H
  * matrix (which ref category each operation actually touches), not "run everything,
- * always". `remotes` never appears here: nothing in the current Git API adds or
- * removes a remote, so nothing ever invalidates the name list. A `kind` with no
- * entry here (a future mutation this table hasn't been taught about yet) falls back
- * to a full refresh -- the safe default.
+ * always". A `kind` with no entry here (a future mutation this table hasn't been
+ * taught about yet) falls back to a full refresh -- the safe default.
+ *
+ * `pushTags`/`deleteRemoteRef`/`createTag`/`deleteTag` invalidate nothing here: a
+ * tag isn't part of `RepoSnapshot`, and a remote-only deletion doesn't change this
+ * worktree's own entries/branch/branches until a later fetch/prune reflects it.
  */
 const INVALIDATES: Readonly<Record<string, readonly RefreshField[]>> = {
   stage: ["entries"],
@@ -76,7 +82,11 @@ const INVALIDATES: Readonly<Record<string, readonly RefreshField[]>> = {
   switch: ["entries", "branch"],
   branch: ["entries", "branch", "branches"],
   deleteBranch: ["branches"],
+  renameBranch: ["branch", "branches"],
   commit: ["entries", "branch", "operationInProgress"],
+  undoLastCommit: ["entries", "branch", "operationInProgress"],
+  mergeBranch: ["entries", "branch", "operationInProgress"],
+  rebaseOnto: ["entries", "branch", "operationInProgress"],
   abort: ["entries", "branch", "operationInProgress"],
   continue: ["entries", "branch", "operationInProgress"],
   skip: ["entries", "branch", "operationInProgress"],
@@ -84,12 +94,21 @@ const INVALIDATES: Readonly<Record<string, readonly RefreshField[]>> = {
   stashApply: ["entries", "stashes"],
   stashPop: ["entries", "stashes"],
   stashDrop: ["stashes"],
+  stashClear: ["stashes"],
+  pushTags: [],
+  deleteRemoteRef: [],
+  createTag: [],
+  deleteTag: [],
   fetch: ["branch"],
   pull: ["entries", "branch", "operationInProgress"],
+  pullFrom: ["entries", "branch", "operationInProgress"],
   pullRebase: ["entries", "branch", "operationInProgress"],
   pullMerge: ["entries", "branch", "operationInProgress"],
   push: ["branch"],
+  pushTo: ["branch"],
   publish: ["branch"],
+  addRemote: ["remotes"],
+  removeRemote: ["remotes"],
 };
 
 function isSubsetOf<T>(a: ReadonlySet<T>, b: ReadonlySet<T>): boolean {

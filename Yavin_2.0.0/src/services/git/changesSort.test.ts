@@ -23,15 +23,15 @@ const MIXED: GitEntry[] = [
   entry("/r/moved.ts", { index: "R", worktree: " ", originalPath: "/r/old.ts" }),
 ];
 
-test("discovery keeps Git's order, with conflicts first", () => {
-  assert.deepEqual(paths(sortChanges(MIXED, "discovery")), [
+test("path sorts by the full path directly, with conflicts first", () => {
+  assert.deepEqual(paths(sortChanges(MIXED, "path")), [
     "/r/clash.ts",
-    "/r/src/b.ts",
-    "/r/README.md",
-    "/r/src/a.ts",
-    "/r/new.txt",
     "/r/lib/A.ts",
     "/r/moved.ts",
+    "/r/new.txt",
+    "/r/README.md",
+    "/r/src/a.ts",
+    "/r/src/b.ts",
   ]);
 });
 
@@ -94,7 +94,7 @@ test("sorting never mutates its input and handles an empty list", () => {
   sortChanges(MIXED, "status");
   sortChanges(MIXED, "name");
   assert.deepEqual(MIXED, copy);
-  for (const order of ["discovery", "name", "status"] as const)
+  for (const order of ["path", "name", "status"] as const)
     assert.deepEqual(sortChanges([], order), []);
 });
 
@@ -103,13 +103,13 @@ test("a large list sorts quickly and completely", () => {
     entry(`/r/dir${i % 50}/file${(i * 7919) % 20_000}.ts`, { worktree: "MD"[i % 2] }),
   );
   const started = Date.now();
-  for (const order of ["name", "status"] as const) {
+  for (const order of ["path", "name", "status"] as const) {
     assert.equal(sortChanges(many, order).length, many.length);
   }
   assert.ok(Date.now() - started < 3000, "sorting 20,000 files should take well under 3 s");
 });
 
-test("the chosen order is remembered, and an invalid or missing value falls back to discovery", () => {
+test("the chosen order is remembered, and an invalid or missing value falls back to path", () => {
   const data = new Map<string, string>();
   const g = globalThis as unknown as { localStorage?: unknown };
   const previous = Object.getOwnPropertyDescriptor(g, "localStorage");
@@ -121,11 +121,11 @@ test("the chosen order is remembered, and an invalid or missing value falls back
     },
   });
   try {
-    assert.equal(readChangesSort(), "discovery");
+    assert.equal(readChangesSort(), "path");
     saveChangesSort("name");
     assert.equal(readChangesSort(), "name");
     data.set("yavin.scm.changesSort", "size"); // not an offered order
-    assert.equal(readChangesSort(), "discovery");
+    assert.equal(readChangesSort(), "path");
   } finally {
     if (previous) Object.defineProperty(g, "localStorage", previous);
     else delete g.localStorage;

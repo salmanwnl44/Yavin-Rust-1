@@ -15,7 +15,9 @@ import { StashesSection } from "../git/StashesSection";
 import { GitMenu } from "../git/GitMenu";
 import {
   readChangesSort,
+  readChangesViewAsTree,
   saveChangesSort,
+  saveChangesViewAsTree,
   sortChanges,
   statusLetter,
 } from "../../services/git/changesSort";
@@ -23,6 +25,8 @@ import type { ChangesSort } from "../../services/git/changesSort";
 import { buildGitCommandMenu } from "../git/gitCommandMenu";
 import type { DiffDocument } from "./DiffEditor";
 import type { Replacement } from "./SearchPanel";
+import type { DialogRequest } from "../ui/AppDialog";
+import { buildFileTree, flattenVisible } from "../../services/git/fileTree";
 import { ChevronIcon, FileIcon } from "../ui/FileIcons";
 import {
   AlertCircleIcon,
@@ -133,6 +137,7 @@ export function SourceControlPanel({
   apply,
   activeDiffPath,
   onOpenGraph,
+  onDialog,
 }: {
   workspace: string;
   visible: boolean;
@@ -145,6 +150,10 @@ export function SourceControlPanel({
   apply: (changes: Replacement[]) => Promise<{ applied: Replacement[]; errors: string[] }>;
   activeDiffPath?: string;
   onOpenGraph?: () => void;
+  /** Opens the shared app dialog (prompt/picker/confirm) -- see `ui/AppDialog.tsx`. Every
+   * name-, remote- or target-requiring Git menu action goes through this, the same modal the
+   * rest of the app already uses for New File/Delete/Go to Line. */
+  onDialog: (request: DialogRequest) => void;
 }) {
   const registrySnapshot = useGitRegistry();
   const activeRepo = useActiveRepo();
@@ -187,6 +196,19 @@ export function SourceControlPanel({
   // state -- switching repositories keeps it, and a refresh never resets it.
   const [changesSort, setChangesSort] = useState<ChangesSort>(readChangesSort);
   useEffect(() => saveChangesSort(changesSort), [changesSort]);
+  // "View as List"/"View as Tree": same kind of remembered view preference as the sort order.
+  const [changesViewAsTree, setChangesViewAsTree] = useState<boolean>(readChangesViewAsTree);
+  useEffect(() => saveChangesViewAsTree(changesViewAsTree), [changesViewAsTree]);
+  // Folder collapse state for the tree view. Not persisted -- everything starts expanded each
+  // session, the same way a fresh Explorer tree would.
+  const [collapsedFolders, setCollapsedFolders] = useState<ReadonlySet<string>>(new Set());
+  const toggleFolder = (path: string) =>
+    setCollapsedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
   const [sectionVisible, setSectionVisible] = useState<SectionVisibility>(readSectionVisibility);
   useEffect(() => {
     try {
@@ -592,6 +614,138 @@ export function SourceControlPanel({
   const toggleCollapsed = (name: keyof SectionVisibility) =>
     setSectionCollapsed((prev) => ({ ...prev, [name]: !prev[name] }));
 
+  const relativePath = (path: string): string => {
+    const root = activeRepo?.root ?? "";
+    return path.startsWith(root) ? path.slice(root.length + 1) : path;
+  };
+
+  // "View as Tree": the same flat `listed` entries, grouped into folders (single-child chains
+  // compacted, matching the Explorer's own convention -- see `fileTree.ts`). Bulk actions
+  // (Stage All, Discard All, ...) are unaffected: they always act on `entries` directly,
+  // regardless of how the list happens to be drawn right now.
+  const treeRows = useMemo(
+    () =>
+      changesViewAsTree
+        ? flattenVisible(
+            buildFileTree(listed, (e) => relativePath(e.path)),
+            collapsedFolders,
+          )
+        : null,
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `relativePath` closes only over `activeRepo?.root`
+    [changesViewAsTree, listed, collapsedFolders, activeRepo?.root],
+  );
+
+  /** One changed-file row -- shared between the flat list and the tree view, `depth` only
+   * changing its indentation. */
+  const renderFileRow = (entry: GitEntry, depth = 0) => {
+    const relative = relativePath(entry.path);
+    const parts = relative.split(/[/\\]/);
+    const fileName = parts.pop() || relative;
+    const dirPath = changesViewAsTree ? "" : parts.join("/"); // the tree already shows the folder
+    const status = getStatusInfo(entry);
+    const staged = hasStagedPart(entry);
+    const partial = staged && hasUnstagedPart(entry);
+    const checked = staged && !partial;
+    const isActiveDiff = activeDiffPath === entry.path;
+
+    return (
+      <div
+        key={entry.path}
+        role="button"
+        tabIndex={0}
+        aria-label={`Open diff for ${entry.path}`}
+        style={{ paddingLeft: `${8 + depth * 14}px` }}
+        className={`flex items-center gap-1.5 pr-2.5 h-[22px] hover:bg-surface-hover group/row transition-colors cursor-pointer ${
+          isActiveDiff ? "bg-accent/15" : ""
+        }`}
+        onClick={() => void openEntry(entry)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            void openEntry(entry);
+          }
+        }}
+      >
+        <button
+          role="checkbox"
+          aria-checked={checked ? true : partial ? "mixed" : false}
+          aria-label={`Stage ${entry.path}`}
+          title={checked ? `Unstage ${fileName}` : `Stage ${fileName}`}
+          disabled={busy || loading}
+          onClick={(e) => {
+            e.stopPropagation();
+            toggleStage(entry);
+          }}
+          className={`flex size-3.5 shrink-0 items-center justify-center rounded-[3px] border transition-colors disabled:opacity-40 ${
+            staged
+              ? "bg-accent border-accent text-white"
+              : "border-border-strong text-transparent hover:border-ink-3"
+          }`}
+        >
+          {checked ? <CheckIcon size={10} /> : partial ? <MinusIcon size={10} /> : null}
+        </button>
+
+        <FileIcon name={fileName} isDir={false} className="size-3.5 shrink-0" />
+
+        <div className="flex items-baseline min-w-0 flex-1 truncate">
+          <span
+            className={`text-xs truncate ${
+              status.letter === "D" ? "line-through text-ink-3" : "text-ink"
+            }`}
+            title={entry.originalPath ? `${entry.originalPath} → ${entry.path}` : entry.path}
+          >
+            {fileName}
+          </span>
+          {dirPath && <span className="text-ink-3 text-[10.5px] ml-1.5 truncate">{dirPath}</span>}
+        </div>
+
+        <div
+          className="flex items-center gap-0.5 opacity-0 group-hover/row:opacity-100 focus-within:opacity-100 transition-opacity shrink-0"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            disabled={busy}
+            title="Open Diff"
+            aria-label="Open Diff"
+            onClick={() => void openEntry(entry)}
+            className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
+          >
+            <DiffIcon size={12} />
+          </button>
+          {partial && (
+            <button
+              disabled={busy}
+              title="Open staged changes"
+              aria-label={`Open staged diff for ${entry.path}`}
+              onClick={() => void showDiff(entry, true)}
+              className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
+            >
+              <CheckIcon size={12} />
+            </button>
+          )}
+          {entry.worktree === "M" && !entry.conflict && (
+            <button
+              disabled={busy || loading}
+              aria-label={`Discard ${entry.path}`}
+              title={`Discard changes in ${fileName}`}
+              onClick={() => void discard(entry)}
+              className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
+            >
+              <UndoIcon size={12} />
+            </button>
+          )}
+        </div>
+
+        <span
+          title={`Status: ${status.letter}`}
+          className={`w-3 text-center text-[11px] font-semibold shrink-0 ${status.color}`}
+        >
+          {status.letter}
+        </span>
+      </div>
+    );
+  };
+
   return (
     <aside
       hidden={!visible}
@@ -689,6 +843,7 @@ export function SourceControlPanel({
             onAdd={() => void addRepository()}
             onCommitted={() => commitBoxRef.current?.clear()}
             onOpenBranches={() => setBranchesOpen(true)}
+            onDialog={onDialog}
           />
         )}
 
@@ -761,10 +916,14 @@ export function SourceControlPanel({
                       hasMessage,
                       getMessage,
                       onCommitted: () => commitBoxRef.current?.clear(),
+                      onDialog,
+                      onDiff,
+                      onDiscardAll: () => void discardAll(entries),
                       includeViewOptions: true,
                       changesSort,
                       onSortChanges: setChangesSort,
-                      onOpenBranches: () => setBranchesOpen(true),
+                      changesViewAsTree,
+                      onToggleViewAsTree: () => setChangesViewAsTree((v) => !v),
                     })}
                   />
                 </div>
@@ -896,7 +1055,9 @@ export function SourceControlPanel({
                               hasMessage,
                               getMessage,
                               onCommitted: () => commitBoxRef.current?.clear(),
-                              onOpenBranches: () => setBranchesOpen(true),
+                              onDialog,
+                              onDiff,
+                              onDiscardAll: () => void discardAll(entries),
                             })}
                           />
                         }
@@ -1239,129 +1400,37 @@ export function SourceControlPanel({
                       </p>
                     )}
 
-                    {listed.slice(0, rowLimits.Changes ?? ROWS_PER_PAGE).map((entry) => {
-                      const root = activeRepo.root;
-                      const relativePath = entry.path.startsWith(root)
-                        ? entry.path.slice(root.length + 1)
-                        : entry.path;
-                      const parts = relativePath.split(/[/\\]/);
-                      const fileName = parts.pop() || relativePath;
-                      const dirPath = parts.join("/");
-                      const status = getStatusInfo(entry);
-                      const staged = hasStagedPart(entry);
-                      const partial = staged && hasUnstagedPart(entry);
-                      const checked = staged && !partial;
-                      const isActiveDiff = activeDiffPath === entry.path;
-
-                      return (
-                        <div
-                          key={entry.path}
-                          role="button"
-                          tabIndex={0}
-                          aria-label={`Open diff for ${entry.path}`}
-                          className={`flex items-center gap-1.5 pl-2 pr-2.5 h-[22px] hover:bg-surface-hover group/row transition-colors cursor-pointer ${
-                            isActiveDiff ? "bg-accent/15" : ""
-                          }`}
-                          onClick={() => void openEntry(entry)}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" || e.key === " ") {
-                              e.preventDefault();
-                              void openEntry(entry);
-                            }
-                          }}
-                        >
-                          <button
-                            role="checkbox"
-                            aria-checked={checked ? true : partial ? "mixed" : false}
-                            aria-label={`Stage ${entry.path}`}
-                            title={checked ? `Unstage ${fileName}` : `Stage ${fileName}`}
-                            disabled={busy || loading}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              toggleStage(entry);
-                            }}
-                            className={`flex size-3.5 shrink-0 items-center justify-center rounded-[3px] border transition-colors disabled:opacity-40 ${
-                              staged
-                                ? "bg-accent border-accent text-white"
-                                : "border-border-strong text-transparent hover:border-ink-3"
-                            }`}
-                          >
-                            {checked ? (
-                              <CheckIcon size={10} />
-                            ) : partial ? (
-                              <MinusIcon size={10} />
-                            ) : null}
-                          </button>
-
-                          <FileIcon name={fileName} isDir={false} className="size-3.5 shrink-0" />
-
-                          <div className="flex items-baseline min-w-0 flex-1 truncate">
-                            <span
-                              className={`text-xs truncate ${
-                                status.letter === "D" ? "line-through text-ink-3" : "text-ink"
-                              }`}
-                              title={
-                                entry.originalPath
-                                  ? `${entry.originalPath} → ${entry.path}`
-                                  : entry.path
-                              }
+                    {changesViewAsTree
+                      ? treeRows!.map((row) =>
+                          row.node.kind === "folder" ? (
+                            <div
+                              key={`folder:${row.node.path}`}
+                              role="button"
+                              tabIndex={0}
+                              aria-expanded={row.expanded}
+                              aria-label={`${row.expanded ? "Collapse" : "Expand"} ${row.node.name}`}
+                              style={{ paddingLeft: `${8 + row.depth * 14}px` }}
+                              className="flex items-center gap-1.5 pr-2.5 h-[22px] hover:bg-surface-hover transition-colors cursor-pointer text-ink-2"
+                              onClick={() => toggleFolder(row.node.path)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" || e.key === " ") {
+                                  e.preventDefault();
+                                  toggleFolder(row.node.path);
+                                }
+                              }}
                             >
-                              {fileName}
-                            </span>
-                            {dirPath && (
-                              <span className="text-ink-3 text-[10.5px] ml-1.5 truncate">
-                                {dirPath}
-                              </span>
-                            )}
-                          </div>
-
-                          <div
-                            className="flex items-center gap-0.5 opacity-0 group-hover/row:opacity-100 focus-within:opacity-100 transition-opacity shrink-0"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <button
-                              disabled={busy}
-                              title="Open Diff"
-                              aria-label="Open Diff"
-                              onClick={() => void openEntry(entry)}
-                              className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
-                            >
-                              <DiffIcon size={12} />
-                            </button>
-                            {partial && (
-                              <button
-                                disabled={busy}
-                                title="Open staged changes"
-                                aria-label={`Open staged diff for ${entry.path}`}
-                                onClick={() => void showDiff(entry, true)}
-                                className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
-                              >
-                                <CheckIcon size={12} />
-                              </button>
-                            )}
-                            {entry.worktree === "M" && !entry.conflict && (
-                              <button
-                                disabled={busy || loading}
-                                aria-label={`Discard ${entry.path}`}
-                                title={`Discard changes in ${fileName}`}
-                                onClick={() => void discard(entry)}
-                                className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
-                              >
-                                <UndoIcon size={12} />
-                              </button>
-                            )}
-                          </div>
-
-                          <span
-                            title={`Status: ${status.letter}`}
-                            className={`w-3 text-center text-[11px] font-semibold shrink-0 ${status.color}`}
-                          >
-                            {status.letter}
-                          </span>
-                        </div>
-                      );
-                    })}
-                    {listed.length > (rowLimits.Changes ?? ROWS_PER_PAGE) && (
+                              <ChevronIcon isExpanded={row.expanded} className="size-3 shrink-0" />
+                              <FileIcon name={row.node.name} isDir className="size-3.5 shrink-0" />
+                              <span className="text-xs truncate">{row.node.name}</span>
+                            </div>
+                          ) : (
+                            renderFileRow(row.node.item, row.depth)
+                          ),
+                        )
+                      : listed
+                          .slice(0, rowLimits.Changes ?? ROWS_PER_PAGE)
+                          .map((entry) => renderFileRow(entry))}
+                    {!changesViewAsTree && listed.length > (rowLimits.Changes ?? ROWS_PER_PAGE) && (
                       <button
                         onClick={() =>
                           setRowLimits((prev) => ({

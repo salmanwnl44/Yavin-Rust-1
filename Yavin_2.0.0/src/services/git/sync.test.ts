@@ -27,7 +27,11 @@ const ALL_KINDS = [
   "switch",
   "branch",
   "deleteBranch",
+  "renameBranch",
   "commit",
+  "undoLastCommit",
+  "mergeBranch",
+  "rebaseOnto",
   "abort",
   "continue",
   "skip",
@@ -35,26 +39,40 @@ const ALL_KINDS = [
   "stashApply",
   "stashPop",
   "stashDrop",
+  "stashClear",
   "fetch",
   "pull",
+  "pullFrom",
   "pullRebase",
   "pullMerge",
   "push",
+  "pushTo",
+  "pushTags",
   "publish",
+  "addRemote",
+  "removeRemote",
+  "createTag",
+  "deleteTag",
+  "deleteRemoteRef",
 ];
 
 test("SIBLING_INVALIDATES only lists kinds that actually touch repository-shared refs", () => {
   const expected: Record<string, readonly string[]> = {
     branch: ["branches"],
     deleteBranch: ["branches"],
+    renameBranch: ["branches"],
     stash: ["stashes"],
     stashApply: ["stashes"],
     stashPop: ["stashes"],
     stashDrop: ["stashes"],
+    stashClear: ["stashes"],
     fetch: ["branch"],
     pull: ["branch"],
+    pullFrom: ["branch"],
     pullRebase: ["branch"],
     pullMerge: ["branch"],
+    addRemote: ["remotes"],
+    removeRemote: ["remotes"],
   };
   for (const kind of ALL_KINDS) {
     assert.deepEqual(
@@ -77,9 +95,9 @@ test("fetch/pull invalidate a sibling's ahead/behind (branch), never its local b
   }
 });
 
-test("only branch creation or deletion invalidates a sibling's local branch-name list", () => {
+test("only branch creation, deletion or rename invalidates a sibling's local branch-name list", () => {
   for (const kind of ALL_KINDS) {
-    if (kind === "branch" || kind === "deleteBranch")
+    if (kind === "branch" || kind === "deleteBranch" || kind === "renameBranch")
       assert.deepEqual(SIBLING_INVALIDATES[kind], ["branches"]);
     else assert.ok(!(SIBLING_INVALIDATES[kind] ?? []).includes("branches"), `"${kind}" must not`);
   }
@@ -88,18 +106,39 @@ test("only branch creation or deletion invalidates a sibling's local branch-name
 test("stash-family mutations invalidate only a sibling's shared stash list, never its own working-tree entries", () => {
   // A stash push/apply/pop's working-tree effect never reaches a DIFFERENT
   // worktree -- only the repository-shared refs/stash list does.
-  for (const kind of ["stash", "stashApply", "stashPop", "stashDrop"]) {
+  for (const kind of ["stash", "stashApply", "stashPop", "stashDrop", "stashClear"]) {
     assert.deepEqual(SIBLING_INVALIDATES[kind], ["stashes"]);
   }
   assert.equal(SIBLING_INVALIDATES.push, undefined);
   assert.equal(SIBLING_INVALIDATES.publish, undefined);
 });
 
-test("switch/commit/abort/continue/skip never invalidate a sibling's RepoSnapshot fields", () => {
+test("only adding or removing a remote invalidates a sibling's remote list", () => {
+  for (const kind of ["addRemote", "removeRemote"]) {
+    assert.deepEqual(SIBLING_INVALIDATES[kind], ["remotes"]);
+  }
+});
+
+test("switch/commit/abort/continue/skip and the new worktree-exclusive kinds never invalidate a sibling's RepoSnapshot fields", () => {
   // Git's own worktree-exclusivity guarantee (see the Git Operation Engine plan's
   // empirical verification) means no sibling can ever be on the branch these
   // mutations move -- so nothing about them can go stale on a *different* worktree.
-  for (const kind of ["switch", "commit", "abort", "continue", "skip"]) {
+  for (const kind of [
+    "switch",
+    "commit",
+    "undoLastCommit",
+    "mergeBranch",
+    "rebaseOnto",
+    "abort",
+    "continue",
+    "skip",
+    "push",
+    "pushTo",
+    "pushTags",
+    "deleteRemoteRef",
+    "createTag",
+    "deleteTag",
+  ]) {
     assert.equal(SIBLING_INVALIDATES[kind], undefined, `"${kind}" must have no sibling entry`);
   }
 });
@@ -114,14 +153,22 @@ test("GRAPH_RESETS is every kind that changes the commits or the ref labels the 
       "abort",
       "branch",
       "commit",
+      "createTag",
       "deleteBranch",
+      "deleteTag",
       "fetch",
+      "mergeBranch",
       "publish",
       "pull",
+      "pullFrom",
       "pullMerge",
       "pullRebase",
       "push",
+      "pushTo",
+      "rebaseOnto",
+      "renameBranch",
       "switch",
+      "undoLastCommit",
     ].sort(),
   );
 });
@@ -138,6 +185,11 @@ test("GRAPH_RESETS never covers what cannot change a commit or a ref label", () 
     "stashApply",
     "stashPop",
     "stashDrop",
+    "stashClear",
+    "pushTags",
+    "deleteRemoteRef",
+    "addRemote",
+    "removeRemote",
   ]) {
     assert.ok(!GRAPH_RESETS.has(kind), `"${kind}" must not be in GRAPH_RESETS`);
   }
@@ -265,12 +317,20 @@ test("'refs'/'remotes'/'stash' events refresh every worktree of the repository",
 
 test("a failed operation that can have changed refs or HEAD still propagates, atomic ones do not", () => {
   // Git does part of the work and then exits non-zero for these.
-  for (const kind of ["fetch", "pull", "pullRebase", "pullMerge"]) {
+  for (const kind of ["fetch", "pull", "pullFrom", "pullRebase", "pullMerge"]) {
     const effect = propagationFor(kind, false, true, "", "");
     assert.deepEqual(effect.siblingFields, ["branch"], `${kind}: siblings`);
     assert.equal(effect.graphReset, true, `${kind}: graph`);
   }
   assert.equal(propagationFor("publish", false, true, "", "").graphReset, true);
+  // mergeBranch/rebaseOnto: the same conflict-after-partial-progress shape as
+  // pullMerge/pullRebase, just against an explicit branch. No sibling can be on this
+  // worktree's branch, so only the graph resets, not a sibling field.
+  for (const kind of ["mergeBranch", "rebaseOnto"]) {
+    const effect = propagationFor(kind, false, true, "", "");
+    assert.equal(effect.siblingFields, undefined, `${kind}: siblings`);
+    assert.equal(effect.graphReset, true, `${kind}: graph`);
+  }
   // A failed continue/skip may have created commits before stopping on the next conflict.
   for (const kind of ["continue", "skip"]) {
     assert.equal(propagationFor(kind, false, true, "rebase", "rebase").graphReset, true);
@@ -278,16 +338,26 @@ test("a failed operation that can have changed refs or HEAD still propagates, at
   // Atomic, or nothing moves when they fail.
   for (const kind of [
     "push",
+    "pushTo",
+    "pushTags",
+    "deleteRemoteRef",
     "switch",
     "branch",
     "deleteBranch",
+    "renameBranch",
     "commit",
+    "undoLastCommit",
+    "createTag",
+    "deleteTag",
+    "addRemote",
+    "removeRemote",
     "stage",
     "unstage",
     "discard",
     "abort",
     "stashPop",
     "stashApply",
+    "stashClear",
   ]) {
     const effect = propagationFor(kind, false, true, "", "");
     assert.deepEqual(effect, { siblingFields: undefined, graphReset: false }, `${kind} failed`);

@@ -1159,6 +1159,7 @@ export default function App() {
               setDiff(null);
               setShowGraph(true);
             }}
+            onDialog={setDialog}
           />
           <Sidebar
             key={`explorer:${workspacePath}`}

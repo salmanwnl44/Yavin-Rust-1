@@ -7,8 +7,9 @@ export interface MenuItemDef {
   disabled?: boolean;
   /** Renders a checkmark when true/false (a toggle); omit for a plain action item. */
   checked?: boolean;
-  /** A one-level flyout revealed on hover/click; leaves with `onSelect` still apply. */
-  children?: MenuItemDef[];
+  /** A one-level flyout revealed on hover/click; leaves with `onSelect` still apply. May
+   * include separators, but never another nested flyout (one level deep only). */
+  children?: (MenuItemDef | { separator: true })[];
 }
 export type MenuEntry = MenuItemDef | { separator: true };
 
@@ -56,25 +57,29 @@ function MenuRow({ item, onDone }: { item: MenuItemDef; onDone: () => void }) {
           aria-label={item.label}
           className="absolute left-full top-0 ml-0.5 min-w-[180px] rounded border border-border-strong bg-surface-hover shadow-xl py-1 z-50"
         >
-          {item.children!.map((child) => (
-            <button
-              key={child.label}
-              role="menuitem"
-              disabled={child.disabled}
-              onClick={() => {
-                child.onSelect?.();
-                onDone();
-              }}
-              className={itemClass(child.disabled)}
-            >
-              <span className="flex items-center gap-1.5 truncate">
-                {child.checked !== undefined && (
-                  <span className="w-3 shrink-0 text-[10px]">{child.checked ? "✓" : ""}</span>
-                )}
-                {child.label}
-              </span>
-            </button>
-          ))}
+          {item.children!.map((child, i) =>
+            "separator" in child ? (
+              <div key={i} className="my-1 border-t border-border-strong" />
+            ) : (
+              <button
+                key={child.label}
+                role="menuitem"
+                disabled={child.disabled}
+                onClick={() => {
+                  child.onSelect?.();
+                  onDone();
+                }}
+                className={itemClass(child.disabled)}
+              >
+                <span className="flex items-center gap-1.5 truncate">
+                  {child.checked !== undefined && (
+                    <span className="w-3 shrink-0 text-[10px]">{child.checked ? "✓" : ""}</span>
+                  )}
+                  {child.label}
+                </span>
+              </button>
+            ),
+          )}
         </div>
       )}
     </div>

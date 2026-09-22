@@ -655,7 +655,7 @@ test("the Commit dropdown's Commit Staged goes through the same path: it resets 
   await region.getByLabel("Commit message").fill("from the dropdown");
   await region.getByRole("button", { name: "Commit actions" }).click();
   await page.getByRole("menuitem", { name: /^Commit ›/ }).click();
-  await page.getByRole("menuitem", { name: "Commit Staged" }).click();
+  await page.getByRole("menuitem", { name: "Commit Staged", exact: true }).click();
 
   await expect.poll(() => gitCalls(page, "commit")).toBe(1);
   await expect.poll(logCalls).toBeGreaterThan(before);
@@ -671,7 +671,7 @@ test("the Commit dropdown refuses to commit while a conflict is unresolved, like
   await expect(region.getByRole("button", { name: /^Commit( \d+)?$/ })).toBeDisabled();
   await region.getByRole("button", { name: "Commit actions" }).click();
   await page.getByRole("menuitem", { name: /^Commit ›/ }).click();
-  await expect(page.getByRole("menuitem", { name: "Commit Staged" })).toBeDisabled();
+  await expect(page.getByRole("menuitem", { name: "Commit Staged", exact: true })).toBeDisabled();
 });
 
 test("a failed refresh marks the shown status as out of date, keeps it, and clears on the next success", async ({
@@ -761,7 +761,9 @@ test("a folder that is no longer this Git worktree is described differently from
 
 // ---- Sort Changes -------------------------------------------------------------------------
 
-const MIXED_STATUS = "M  z-staged.ts\0 M b.ts\0?? new.txt\0 D gone.ts\0UU clash.ts\0 M A.ts\0";
+// "dir/a-first.ts" makes Name and Path sort differently: by full path it sorts with the
+// other "d..."/later entries; by basename alone ("a-first.ts") it sorts to the front.
+const MIXED_STATUS = "M  dir/a-first.ts\0 M b.ts\0?? new.txt\0 D gone.ts\0UU clash.ts\0 M A.ts\0";
 
 async function shownOrder(region: Locator) {
   return region
@@ -772,34 +774,34 @@ async function shownOrder(region: Locator) {
     );
 }
 
-async function chooseSort(page: Page, region: Locator, name: "Discovery Time" | "Name" | "Status") {
+async function chooseSort(page: Page, region: Locator, name: "Name" | "Path" | "Status") {
   await region.getByRole("button", { name: "Changes actions" }).click();
-  await page.getByRole("menuitem", { name: /^Sort Changes/ }).click();
-  await page.getByRole("menuitem", { name, exact: true }).click();
+  await page.getByRole("menuitem", { name: "View & Sort" }).click();
+  await page.getByRole("menuitem", { name: `Sort Changes by ${name}`, exact: true }).click();
 }
 
-test("Sort Changes reorders the list by name and by status, and back to discovery order", async ({
+test("Sort Changes reorders the list by name, path and status; Path is the default", async ({
   page,
 }) => {
   const region = await panel(page, { status: MIXED_STATUS });
-  // Discovery: Git's order, conflicts first.
-  expect(await shownOrder(region)).toEqual([
-    "clash.ts",
-    "z-staged.ts",
-    "b.ts",
-    "new.txt",
-    "gone.ts",
-    "A.ts",
-  ]);
-
-  await chooseSort(page, region, "Name");
+  // Path is the default -- no menu interaction needed to see it.
   expect(await shownOrder(region)).toEqual([
     "clash.ts", // a conflict is never sorted out of sight
     "A.ts",
     "b.ts",
+    "dir/a-first.ts",
     "gone.ts",
     "new.txt",
-    "z-staged.ts",
+  ]);
+
+  await chooseSort(page, region, "Name");
+  expect(await shownOrder(region)).toEqual([
+    "clash.ts",
+    "dir/a-first.ts", // basename "a-first.ts" sorts before "A.ts" ('-' < '.')
+    "A.ts",
+    "b.ts",
+    "gone.ts",
+    "new.txt",
   ]);
 
   await chooseSort(page, region, "Status");
@@ -807,13 +809,13 @@ test("Sort Changes reorders the list by name and by status, and back to discover
     "clash.ts",
     "A.ts", // M (modified), then by path
     "b.ts",
-    "z-staged.ts", // M (staged)
+    "dir/a-first.ts",
     "gone.ts", // D
     "new.txt", // U (untracked)
   ]);
 
-  await chooseSort(page, region, "Discovery Time");
-  expect((await shownOrder(region))[1]).toBe("z-staged.ts");
+  await chooseSort(page, region, "Path");
+  expect((await shownOrder(region))[1]).toBe("A.ts");
 });
 
 test("the chosen sort survives a refresh and a reload, and re-applies when the files change", async ({
@@ -823,38 +825,66 @@ test("the chosen sort survives a refresh and a reload, and re-applies when the f
   await chooseSort(page, region, "Name");
 
   await region.getByTitle("Refresh Status").click();
-  expect((await shownOrder(region))[1]).toBe("A.ts");
+  expect((await shownOrder(region))[1]).toBe("dir/a-first.ts");
 
   // A new file appears: it lands in sorted position without resetting the mode.
   await update(page, { status: MIXED_STATUS + " M aa.ts\0" });
   expect(await shownOrder(region)).toEqual([
     "clash.ts",
+    "dir/a-first.ts",
     "A.ts",
     "aa.ts",
     "b.ts",
     "gone.ts",
     "new.txt",
-    "z-staged.ts",
   ]);
 
   await page.reload();
   await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
   const again = page.getByRole("complementary", { name: "Source control" });
   await expect(again.getByRole("list", { name: "Changed files" })).toBeVisible();
-  expect((await shownOrder(again))[1]).toBe("A.ts");
+  expect((await shownOrder(again))[1]).toBe("dir/a-first.ts");
 });
 
 test("the menu marks the active sort and nothing else is offered", async ({ page }) => {
   const region = await panel(page, { status: MIXED_STATUS });
   await chooseSort(page, region, "Status");
   await region.getByRole("button", { name: "Changes actions" }).click();
-  await page.getByRole("menuitem", { name: /^Sort Changes/ }).click();
-  const options = page.getByRole("menu", { name: "Changes actions" }).getByRole("menu");
-  await expect(options.getByRole("menuitem")).toHaveText([
-    /^Discovery Time$/,
-    /^Name$/,
-    /^✓Status$/,
+  await page.getByRole("menuitem", { name: "View & Sort" }).click();
+  const options = page.getByRole("menu", { name: "View & Sort" });
+  const sortItems = options.getByRole("menuitem").filter({ hasText: "Sort Changes by" });
+  await expect(sortItems).toHaveText([
+    /^Sort Changes by Name$/,
+    /^Sort Changes by Path$/,
+    /^✓Sort Changes by Status$/,
   ]);
+});
+
+test("View as Tree/View as List toggles, and the top-level item names the mode you'd switch to", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: MIXED_STATUS });
+  await region.getByRole("button", { name: "Changes actions" }).click();
+  // Starts in list mode: the quick-toggle item offers to switch to tree.
+  await expect(page.getByRole("menuitem", { name: "View as Tree", exact: true })).toBeVisible();
+  await page.getByRole("menuitem", { name: "View as Tree", exact: true }).click();
+
+  // Folders start expanded, like a freshly opened Explorer tree: all 6 files show
+  // (5 at the root plus the one nested inside "dir").
+  await expect(region.getByRole("button", { name: "Collapse dir" })).toBeVisible();
+  await expect(region.getByText("a-first.ts")).toBeVisible();
+  await expect(region.getByRole("button", { name: /^Open diff for/ })).toHaveCount(6);
+
+  await region.getByRole("button", { name: "Collapse dir" }).click();
+  await expect(region.getByText("a-first.ts")).toHaveCount(0);
+  await expect(region.getByRole("button", { name: /^Open diff for/ })).toHaveCount(5);
+  await expect(region.getByRole("button", { name: "Expand dir" })).toBeVisible();
+
+  // The quick-toggle item now offers to switch back to list.
+  await region.getByRole("button", { name: "Changes actions" }).click();
+  await expect(page.getByRole("menuitem", { name: "View as List", exact: true })).toBeVisible();
+  await page.getByRole("menuitem", { name: "View as List", exact: true }).click();
+  await expect(region.getByRole("button", { name: /^(Expand|Collapse) /i })).toHaveCount(0);
 });
 
 // ---- Escape tooltip -----------------------------------------------------------------------

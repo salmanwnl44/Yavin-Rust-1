@@ -236,6 +236,12 @@ export class Repository {
     await this.run(["check-ref-format", "--branch", name]);
     return this.run(["switch", "-c", name]);
   }
+  /** "Create Branch From…": like `createBranch`, but starting from `startPoint` (an existing
+   * branch) instead of HEAD. */
+  async createBranchFrom(name: string, startPoint: string): Promise<string> {
+    await this.run(["check-ref-format", "--branch", name]);
+    return this.run(["switch", "-c", name, startPoint]);
+  }
 
   /**
    * `force` selects Git's own two-tier safety: `-d` refuses an unmerged branch,

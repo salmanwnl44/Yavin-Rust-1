@@ -2630,6 +2630,7 @@ mod tests {
             &["commit", "-m", "--not-a-flag"],
             &["switch", "--", "main"],
             &["switch", "-c", "feature"],
+            &["switch", "-c", "feature", "origin/feature"],
             &["check-ref-format", "--branch", "feature"],
             &["branch", "-d", "feature"],
             &["branch", "-D", "feature"],

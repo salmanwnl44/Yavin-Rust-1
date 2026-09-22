@@ -16,12 +16,17 @@ import type { GitChangeEvent } from "../native.ts";
  * the commit graph -- see `GRAPH_RESETS` below, a separate table, since the graph
  * isn't part of `RepoSnapshot`).
  *
- * `switch`, `commit`, `abort`, `continue`, `push`, and `publish` are deliberately
- * absent: Git's own worktree-exclusivity guarantee means a `switch`/`commit`/
- * `abort`/`continue` can never affect a sibling's branch-name list (it moves an
- * existing ref, or moves HEAD to one, never creates/deletes one), and `push`/
- * `publish` only update this worktree's own remote-tracking refs to match what
- * was already pushed -- no sibling's `RepoSnapshot` field depends on that.
+ * `switch`, `commit`, `undoLastCommit`, `mergeBranch`, `rebaseOnto`, `abort`,
+ * `continue`, `push`, `pushTo`, and `publish` are deliberately absent: Git's own
+ * worktree-exclusivity guarantee means none of these can ever affect a sibling's
+ * branch-name list (each moves an existing ref, or moves HEAD to one, never
+ * creates/deletes one), and the push variants only update this worktree's own
+ * remote-tracking refs to match what was already pushed -- no sibling's
+ * `RepoSnapshot` field depends on that. `pushTags`/`deleteRemoteRef`/`createTag`/
+ * `deleteTag` are likewise absent: none of them is part of `RepoSnapshot` at all.
+ *
+ * `addRemote`/`removeRemote` map to `"remotes"`: a remote lives in the shared
+ * `.git/config`, not per-worktree, so every sibling's remote list goes stale too.
  *
  * `fetch`/`pull*` map to `"branch"`, not `"branches"`: fetch only ever writes
  * `refs/remotes/**`, never `refs/heads/**` (confirmed against `repository.ts` --
@@ -47,14 +52,20 @@ import type { GitChangeEvent } from "../native.ts";
 export const SIBLING_INVALIDATES: Readonly<Record<string, readonly RefreshField[]>> = {
   branch: ["branches"],
   deleteBranch: ["branches"],
+  renameBranch: ["branches"],
   stash: ["stashes"],
   stashApply: ["stashes"],
   stashPop: ["stashes"],
   stashDrop: ["stashes"],
+  stashClear: ["stashes"],
   fetch: ["branch"],
   pull: ["branch"],
+  pullFrom: ["branch"],
   pullRebase: ["branch"],
   pullMerge: ["branch"],
+  // A remote is shared repository config (`.git/config`), not per-worktree.
+  addRemote: ["remotes"],
+  removeRemote: ["remotes"],
 };
 
 /**
@@ -65,14 +76,20 @@ export const SIBLING_INVALIDATES: Readonly<Record<string, readonly RefreshField[
  * reachable, or HEAD moves to a different history), and the *labels* on commits that
  * are already there (a branch or remote-tracking ref appearing, moving or vanishing).
  *
- * - History: `fetch`, `pull*`, `commit`, `switch`, `abort`. `switch` and `abort` move
- *   HEAD; without a reset the graph kept showing the previous branch and "Load older"
- *   (`--skip N` against the new HEAD) spliced two histories together.
- * - Labels: `push`/`publish` move `origin/<branch>`, `branch` (create) adds a label at
- *   HEAD, `deleteBranch` removes one. No commit is added, but the row's pills change.
- *   In the desktop app the `.git` watcher would report these too (`WATCHER_INVALIDATES`),
- *   but only after its debounce and only while the watcher is running, so Yavin's own
- *   mutations do not rely on it.
+ * - History: `fetch`, `pull*`, `commit`, `undoLastCommit`, `mergeBranch`, `rebaseOnto`,
+ *   `switch`, `abort`. `switch`/`abort`/`undoLastCommit` move HEAD; without a reset the
+ *   graph kept showing the previous branch and "Load older" (`--skip N` against the new
+ *   HEAD) spliced two histories together. `mergeBranch`/`rebaseOnto` add or rewrite commits
+ *   the same way `pullMerge`/`pullRebase` already do.
+ * - Labels: `push`/`pushTo`/`publish` move `origin/<branch>`, `branch`/`renameBranch`
+ *   (create/rename) adds or moves a label at HEAD, `deleteBranch` removes one, and
+ *   `createTag`/`deleteTag` add or remove a tag badge the same way. No commit is added,
+ *   but the row's pills change. In the desktop app the `.git` watcher would report these
+ *   too (`WATCHER_INVALIDATES`), but only after its debounce and only while the watcher is
+ *   running, so Yavin's own mutations do not rely on it.
+ * - `pushTags`/`deleteRemoteRef`/`addRemote`/`removeRemote` are absent: none of them moves
+ *   a local ref or adds a local commit -- a remote-only deletion or a pushed tag doesn't
+ *   change what this worktree's own `git log` shows until a later fetch/prune reflects it.
  *
  * `stage`/`unstage`/`discard`/hunk actions and the stash family are absent: none of them
  * touches a commit or a ref the graph shows (`refs/stash` is not in `%D` without
@@ -83,15 +100,23 @@ export const SIBLING_INVALIDATES: Readonly<Record<string, readonly RefreshField[
 export const GRAPH_RESETS: ReadonlySet<string> = new Set([
   "fetch",
   "pull",
+  "pullFrom",
   "pullRebase",
   "pullMerge",
   "commit",
+  "undoLastCommit",
+  "mergeBranch",
+  "rebaseOnto",
   "switch",
   "abort",
   "push",
+  "pushTo",
   "publish",
   "branch",
   "deleteBranch",
+  "renameBranch",
+  "createTag",
+  "deleteTag",
 ]);
 
 /**
@@ -101,23 +126,31 @@ export const GRAPH_RESETS: ReadonlySet<string> = new Set([
  *
  * - `fetch`: updates each ref independently; one rejected ref fails the command after
  *   the others were written.
- * - `pull`/`pullMerge`/`pullRebase`: fetch first, then merge or rebase. A conflict exits
- *   non-zero with the fetch done and HEAD/index possibly already moved.
+ * - `pull`/`pullFrom`/`pullMerge`/`pullRebase`: fetch first, then merge or rebase. A
+ *   conflict exits non-zero with the fetch done and HEAD/index possibly already moved.
  * - `publish`: `push` then `--set-upstream`; the ref can move before a later step fails.
+ * - `mergeBranch`/`rebaseOnto`: the same conflict-after-partial-progress shape as
+ *   `pullMerge`/`pullRebase`, just against an explicit branch instead of the upstream.
  * - `continue`/`skip`: a rebase or cherry-pick sequence can create commits and then stop
  *   on the next conflict, moving HEAD.
  *
- * Deliberately not listed: `push` (a rejected push updates no ref), `switch`/`branch`
- * (Git checks out or creates atomically), `commit`, `stage`/`unstage`/`discard`,
- * `deleteBranch`, `abort` and the stash family (a stash pop that conflicts keeps the
- * stash, so the shared list is unchanged). The operation's own worktree is always
- * refreshed by `RepoStore.guarded()` whether or not it succeeded.
+ * Deliberately not listed: `push`/`pushTo` (a rejected push updates no ref),
+ * `switch`/`branch`/`renameBranch` (Git checks out, creates or renames atomically),
+ * `commit`, `undoLastCommit` (its own parent-exists check runs before the reset),
+ * `stage`/`unstage`/`discard`, `deleteBranch`, `abort`, `createTag`/`deleteTag`,
+ * `pushTags`/`deleteRemoteRef`/`addRemote`/`removeRemote` (each a single atomic Git
+ * call) and the stash family (a stash pop that conflicts keeps the stash, so the
+ * shared list is unchanged). The operation's own worktree is always refreshed by
+ * `RepoStore.guarded()` whether or not it succeeded.
  */
 export const PARTIAL_ON_FAILURE: ReadonlySet<string> = new Set([
   "fetch",
   "pull",
+  "pullFrom",
   "pullRebase",
   "pullMerge",
+  "mergeBranch",
+  "rebaseOnto",
   "publish",
   "continue",
   "skip",
