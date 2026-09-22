@@ -12,14 +12,12 @@ import {
   type TerminalKeyAction,
   type TerminalSession,
 } from "../../services/terminal";
-
-const PANEL_TABS = [
-  { id: "terminal", label: "TERMINAL" },
-  { id: "problems", label: "PROBLEMS" },
-  { id: "output", label: "OUTPUT" },
-  { id: "debug", label: "DEBUG CONSOLE" },
-  { id: "ai", label: "AI LOGS" },
-];
+import { PANEL_VIEWS, readActiveView, saveActiveView, stepView } from "../../services/panel/views";
+import type { PanelViewId } from "../../services/panel/views";
+import { ProblemsView } from "../panel/views/ProblemsView";
+import { OutputView } from "../panel/views/OutputView";
+import { DebugConsoleView } from "../panel/views/DebugConsoleView";
+import { PortsView } from "../panel/views/PortsView";
 
 const MIN_HEIGHT = 120;
 const DEFAULT_HEIGHT = 260;
@@ -96,7 +94,11 @@ export function TerminalPanel({
   isMaximized: boolean;
   onToggleMaximize: () => void;
 }) {
-  const [activeTab, setActiveTab] = useState("terminal");
+  const [activeTab, setActiveTabState] = useState<PanelViewId>(readActiveView);
+  const setActiveTab = useCallback((id: PanelViewId) => {
+    setActiveTabState(id);
+    saveActiveView(id);
+  }, []);
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
   const [activeId, setActiveId] = useState("");
   const [splitId, setSplitId] = useState<string | null>(null);
@@ -204,16 +206,33 @@ export function TerminalPanel({
     const remaining = sessions.filter((session) => session.id !== id);
     if (splitId === id) setSplitId(null);
     setSessions(remaining);
-    // The panel exists to show terminals; with none left there is nothing to show.
-    if (!remaining.length) onClose();
-    else if (id === activeId) setActiveId(remaining[remaining.length - 1].id);
+    // Closing the last terminal used to close the whole panel, which made sense when the
+    // panel was only ever terminals. It now holds Problems, Output and Ports too, so closing
+    // it would take away views that have nothing to do with the terminal that just exited.
+    // The panel stays; the effect below starts a fresh terminal while the Terminal view is
+    // the one on screen.
+    if (remaining.length && id === activeId) setActiveId(remaining[remaining.length - 1].id);
   };
 
-  // Showing the panel again after every terminal was closed starts a fresh one.
+  /**
+   * Opening the panel with no terminals starts one. Deliberately keyed on the panel becoming
+   * visible rather than on the session count reaching zero: killing your last terminal should
+   * leave the view empty with a way to start another, not immediately spawn the shell you
+   * just asked to close. (The panel itself stays open either way -- it holds Problems, Output
+   * and Ports too, and none of those should disappear because a terminal exited.)
+   */
+  const pendingAutoCreate = useRef(true);
   useEffect(() => {
-    if (hidden || missing || sessions.length || !shells.length) return;
+    if (hidden) {
+      pendingAutoCreate.current = true;
+      return;
+    }
+    if (sessions.length) pendingAutoCreate.current = false;
+    if (!pendingAutoCreate.current || missing || sessions.length || !shells.length) return;
+    if (activeTab !== "terminal") return;
+    pendingAutoCreate.current = false;
     create(shells[0]);
-  }, [hidden, missing, sessions.length, shells, create]);
+  }, [hidden, missing, sessions.length, shells, create, activeTab]);
 
   // A terminal that rang while it was not on screen is worth noticing.
   useEffect(() => {
@@ -233,6 +252,16 @@ export function TerminalPanel({
 
   const active = () => handles.current.get(activeId) ?? null;
   const shown = splitId ? [activeId, splitId] : [activeId];
+
+  /** Per-view tab counts. Only the terminal has something to count so far; Problems and
+   * Ports fill these in as those views gain real data. */
+  const badges: Record<PanelViewId, number> = {
+    problems: 0,
+    output: 0,
+    debug: 0,
+    terminal: sessions.length > 1 ? sessions.length : 0,
+    ports: 0,
+  };
 
   const openFind = () => {
     setActiveTab("terminal");
@@ -320,18 +349,41 @@ export function TerminalPanel({
 
       {/* Panel tabs and actions */}
       <div className="flex h-8 shrink-0 items-center justify-between border-b border-[#141414] bg-[#050505] px-3">
-        <div className="flex items-center gap-4 text-[11px] font-medium">
-          {PANEL_TABS.map((tab) => (
+        <div
+          role="tablist"
+          aria-label="Panel views"
+          className="flex items-center gap-4 text-[11px] font-medium"
+        >
+          {PANEL_VIEWS.map((tab) => (
             <button
               key={tab.id}
+              role="tab"
+              aria-selected={activeTab === tab.id}
+              // Arrow keys move between views, as they must inside a tablist, and give the
+              // next/previous-view commands somewhere to live.
+              onKeyDown={(event) => {
+                if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return;
+                event.preventDefault();
+                setActiveTab(stepView(activeTab, event.key === "ArrowRight" ? 1 : -1));
+              }}
               onClick={() => setActiveTab(tab.id)}
-              className={`relative pb-1 transition-colors ${
+              className={`relative flex items-center gap-1.5 pb-1 transition-colors ${
                 activeTab === tab.id
                   ? "font-semibold text-white"
                   : "text-zinc-500 hover:text-zinc-300"
               }`}
             >
               <span>{tab.label}</span>
+              {/* The count of what a view is holding, like VS Code's Problems badge. Views
+                  with nothing to report show no badge at all rather than a zero. */}
+              {badges[tab.id] > 0 && (
+                <span
+                  aria-label={`${badges[tab.id]} in ${tab.label}`}
+                  className="rounded-full bg-indigo-600 px-1.5 text-[9.5px] leading-4 font-semibold text-white"
+                >
+                  {badges[tab.id]}
+                </span>
+              )}
               {activeTab === tab.id && (
                 <span className="absolute right-0 bottom-0 left-0 h-[2px] rounded-full bg-indigo-500" />
               )}
@@ -569,6 +621,24 @@ export function TerminalPanel({
       {/* Body */}
       <div ref={body} className="min-h-0 flex-1 bg-black">
         <div hidden={activeTab !== "terminal"} className="relative flex h-full min-h-0">
+          {/* Every terminal closed. The panel stays (Problems, Output and Ports live here
+              too), so this view needs its own way back rather than relying on the panel
+              being torn down and rebuilt. */}
+          {!sessions.length && !missing && (
+            <section
+              aria-label="No terminals"
+              className="flex h-full flex-1 flex-col items-center justify-center gap-3"
+            >
+              <p className="text-[11.5px] text-zinc-500">No terminals are running.</p>
+              <button
+                onClick={() => create(shells[0])}
+                disabled={!shells.length}
+                className="rounded bg-indigo-600 px-3 py-1 text-[11px] font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
+              >
+                New Terminal
+              </button>
+            </section>
+          )}
           {sessions.map((session) => {
             const position = shown.indexOf(session.id);
             return (
@@ -616,22 +686,10 @@ export function TerminalPanel({
             />
           )}
         </div>
-        {activeTab === "problems" && (
-          <div className="flex h-full items-center justify-center text-zinc-500">
-            Workspace diagnostics are not connected.
-          </div>
-        )}
-        {activeTab === "output" && (
-          <div className="h-full p-3 text-zinc-500">No output service is connected.</div>
-        )}
-        {activeTab === "debug" && (
-          <div className="h-full p-3 text-zinc-500">No debug session is connected.</div>
-        )}
-        {activeTab === "ai" && (
-          <div className="h-full p-3 text-[11.5px] text-zinc-400">
-            No AI service is connected. No tasks have run.
-          </div>
-        )}
+        {activeTab === "problems" && <ProblemsView />}
+        {activeTab === "output" && <OutputView />}
+        {activeTab === "debug" && <DebugConsoleView />}
+        {activeTab === "ports" && <PortsView />}
       </div>
 
       {menu && (

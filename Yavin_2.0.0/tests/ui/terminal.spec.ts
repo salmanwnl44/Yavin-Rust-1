@@ -225,16 +225,35 @@ test("closing one terminal leaves the others running", async ({ page }) => {
   await expect(view(page, first)).toBeVisible();
 });
 
-test("closing the last terminal closes the panel, and reopening starts a new one", async ({
+test("closing the last terminal leaves the panel open with a way to start another", async ({
   page,
 }) => {
+  // The panel holds Problems, Output and Ports as well, so it must not be torn down because
+  // a terminal exited -- and it must not silently respawn the shell that was just killed.
   await desktop(page);
   await openPanel(page);
   const [first] = await terminalIds(page);
   await expect(page.getByRole("tab", { name: "Command Prompt", exact: true })).toBeVisible();
 
   await terminalMenu(page, "Close Terminal");
-  await expect(page.getByLabel("New Terminal")).toBeHidden();
+  await expect(page.getByRole("tablist", { name: "Panel views" })).toBeVisible();
+  const empty = page.getByRole("region", { name: "No terminals" });
+  await expect(empty).toBeVisible();
+  expect(await terminalIds(page)).toHaveLength(1); // no new shell was started
+
+  await empty.getByRole("button", { name: "New Terminal" }).click();
+  const ids = await terminalIds(page, 2);
+  expect(ids[1]).not.toBe(first);
+  await expect(view(page, ids[1])).toBeVisible();
+});
+
+test("reopening the panel after closing every terminal starts a fresh one", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const [first] = await terminalIds(page);
+
+  await terminalMenu(page, "Close Terminal");
+  await page.getByLabel("Close Panel").click();
 
   await openPanel(page);
   const ids = await terminalIds(page, 2);
@@ -493,4 +512,91 @@ test("the browser preview says a shell needs the desktop application", async ({ 
   // Controls that cannot work are disabled rather than failing when pressed.
   await expect(page.getByLabel("New Terminal")).toBeDisabled();
   await expect(page.getByLabel("Split Terminal")).toBeDisabled();
+});
+
+test("the panel offers the five views, with Terminal showing by default", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+
+  const tabs = page.getByRole("tablist", { name: "Panel views" });
+  await expect(tabs.getByRole("tab")).toHaveText([
+    "PROBLEMS",
+    "OUTPUT",
+    "DEBUG CONSOLE",
+    "TERMINAL",
+    "PORTS",
+  ]);
+  await expect(tabs.getByRole("tab", { name: "TERMINAL" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+});
+
+test("each view says what it will hold rather than claiming a broken connection", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openPanel(page);
+  const tabs = page.getByRole("tablist", { name: "Panel views" });
+
+  for (const [tab, region] of [
+    ["PROBLEMS", "Problems"],
+    ["OUTPUT", "Output"],
+    ["DEBUG CONSOLE", "Debug Console"],
+    ["PORTS", "Ports"],
+  ] as const) {
+    await tabs.getByRole("tab", { name: tab }).click();
+    await expect(page.getByRole("region", { name: region })).toBeVisible();
+  }
+});
+
+test("switching away from the terminal and back keeps the same shell running", async ({ page }) => {
+  // The terminal is hidden rather than unmounted when another view shows; unmounting would
+  // kill the user's running processes.
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await emit(page, "terminal-output", { id, data: "before switching\r\n" });
+  await expect(view(page, id)).toContainText("before switching");
+
+  const tabs = page.getByRole("tablist", { name: "Panel views" });
+  await tabs.getByRole("tab", { name: "PORTS" }).click();
+  await expect(page.getByRole("region", { name: "Ports" })).toBeVisible();
+  await tabs.getByRole("tab", { name: "TERMINAL" }).click();
+
+  // Same session, same scrollback: no new terminal_open, and the earlier output survives.
+  expect(await terminalIds(page)).toEqual([id]);
+  await expect(view(page, id)).toContainText("before switching");
+});
+
+test("the chosen view is remembered across a reload", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await page
+    .getByRole("tablist", { name: "Panel views" })
+    .getByRole("tab", { name: "PORTS" })
+    .click();
+
+  await page.reload();
+  await openPanel(page);
+  await expect(
+    page.getByRole("tablist", { name: "Panel views" }).getByRole("tab", { name: "PORTS" }),
+  ).toHaveAttribute("aria-selected", "true");
+});
+
+test("arrow keys move between panel views", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const tabs = page.getByRole("tablist", { name: "Panel views" });
+
+  await tabs.getByRole("tab", { name: "TERMINAL" }).focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(tabs.getByRole("tab", { name: "PORTS" })).toHaveAttribute("aria-selected", "true");
+  // Wraps rather than dead-ending at the last view.
+  await tabs.getByRole("tab", { name: "PORTS" }).focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(tabs.getByRole("tab", { name: "PROBLEMS" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
 });
