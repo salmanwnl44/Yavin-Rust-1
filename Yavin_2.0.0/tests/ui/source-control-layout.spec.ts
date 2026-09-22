@@ -167,3 +167,85 @@ test("clicking a menu item that has a submenu keeps the submenu open", async ({ 
   await stash.click();
   await expect(page.getByRole("menuitem", { name: "Stash", exact: true })).toBeVisible();
 });
+
+test("the sidebar graph's scope label opens a picker offering Auto, All and every branch", async ({
+  page,
+}) => {
+  const region = await panel(page);
+  await region.getByRole("button", { name: "Change which history is shown" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("option", { name: "Auto" })).toBeVisible();
+  await expect(dialog.getByRole("option", { name: "All" })).toBeVisible();
+  await expect(dialog.getByRole("option", { name: "main", exact: true })).toBeVisible();
+});
+
+test("picking a branch from the sidebar graph's scope picker re-queries the log for it", async ({
+  page,
+}) => {
+  const region = await panel(page);
+  const seen: string[][] = [];
+  await page.exposeFunction("__recordArgv", (argv: string[]) => seen.push(argv));
+  await page.evaluate(() => {
+    const w = window as unknown as {
+      __TAURI_INTERNALS__: {
+        invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>;
+      };
+      __recordArgv: (a: string[]) => void;
+    };
+    const original = w.__TAURI_INTERNALS__.invoke;
+    w.__TAURI_INTERNALS__.invoke = async (command: string, args: Record<string, unknown> = {}) => {
+      if (command === "git_exec") {
+        const argv = (args.args as string[] | undefined) ?? [];
+        if (argv[0] === "log") await w.__recordArgv(argv);
+      }
+      return original(command, args);
+    };
+  });
+  await region.getByRole("button", { name: "Change which history is shown" }).click();
+  await page.getByRole("dialog").getByRole("option", { name: "main", exact: true }).click();
+  await expect
+    .poll(() => seen.some((argv) => argv.includes("main") && !argv.includes("--all")))
+    .toBe(true);
+});
+
+test("a branch behind its upstream shows an Incoming Changes row in the sidebar graph", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const ok = (stdout: string) => ({ stdout, stderr: "", code: 0, truncated: false });
+    Object.assign(window, {
+      isTauri: true,
+      __TAURI_INTERNALS__: {
+        metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        invoke: async (command: string, args: Record<string, unknown> = {}) => {
+          if (command === "get_default_workspace") return "/work";
+          if (command === "list_workspace_files")
+            return { path: "/work", name: "work", is_dir: true, children: [] };
+          if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
+          if (command === "git_repo_state") return "";
+          if (command === "git_exec") {
+            const argv = (args.args as string[] | undefined) ?? [];
+            if (argv[0] === "status" && argv.includes("--porcelain=v2"))
+              return ok("# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -2\n");
+            if (argv[0] === "status") return ok("");
+            return ok("");
+          }
+          return null;
+        },
+      },
+      __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => {} },
+    });
+  });
+  await page.goto("/");
+  await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
+  const region = page.getByRole("complementary", { name: "Source control" });
+  await expect(region.getByText("Incoming Changes")).toBeVisible();
+  await expect(region.getByText("origin/main")).toBeVisible();
+});
+
+test("a branch up to date with its upstream shows no Incoming Changes row", async ({ page }) => {
+  const region = await panel(page);
+  await expect(region.getByText("Incoming Changes")).toHaveCount(0);
+});

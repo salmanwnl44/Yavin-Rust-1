@@ -1,11 +1,27 @@
+import { useEffect, useMemo, useState } from "react";
 import type { RepoEntry } from "../../services/git/registry";
 import { useCommitGraph, useRepoSnapshot } from "../../services/git/hooks";
 import { guardedAffecting } from "../../services/git/sync";
 import { GRAPH_COLOR_COUNT } from "../../services/git/graph/model";
-import { ChevronIcon } from "../ui/FileIcons";
+import type { GraphScope } from "../../services/git/graph/incremental.ts";
+import { parseCommitDetails } from "../../services/git/parsers/log";
+import type {
+  CommitDetailedInfo,
+  CommitFileChange,
+  RawCommit,
+} from "../../services/git/parsers/log";
+import { buildFileTree, flattenVisible } from "../../services/git/fileTree";
+import { defaultRemoteWebLink, openExternalUrl } from "../../services/git/remoteUrl";
+import type { RemoteWebLink } from "../../services/git/remoteUrl";
+import type { DiffDocument } from "../layout/DiffEditor";
+import type { DialogRequest } from "../ui/AppDialog";
+import { ChevronIcon, FileIcon } from "../ui/FileIcons";
 import {
   ArrowDownIcon,
   ArrowUpIcon,
+  CloseIcon,
+  CopyIcon,
+  ExternalLinkIcon,
   GitBranchIcon,
   MoreIcon,
   RefreshIcon,
@@ -46,25 +62,212 @@ const PALETTE = [
 const colorFor = (i: number) => PALETTE[i % GRAPH_COLOR_COUNT] ?? PALETTE[0];
 const laneX = (lane: number) => lane * LANE_WIDTH + LANE_WIDTH / 2;
 
+/** The commit selected in the sidebar graph, with its detail shown below the row list (not
+ * interleaved between rows -- the SVG connector lines are keyed to each row's fixed
+ * `row * ROW_HEIGHT` position, which a variable-height row inserted between them would
+ * disturb; showing the detail below the whole list keeps that untouched). */
+function InlineCommitDetail({
+  commit,
+  repository,
+  onClose,
+  onDiff,
+}: {
+  commit: RawCommit;
+  repository: import("../../services/git/repository").Repository;
+  onClose: () => void;
+  onDiff: (document: DiffDocument) => void;
+}) {
+  const [detail, setDetail] = useState<CommitDetailedInfo | null>(null);
+  const [remoteLink, setRemoteLink] = useState<RemoteWebLink | null>(null);
+  const [error, setError] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [viewAsTree, setViewAsTree] = useState(false);
+  const [collapsedFolders, setCollapsedFolders] = useState<ReadonlySet<string>>(new Set());
+
+  useEffect(() => {
+    let cancelled = false;
+    setDetail(null);
+    setError("");
+    Promise.all([
+      repository.commitDetails(commit.fullHash),
+      defaultRemoteWebLink(repository).catch(() => null),
+    ])
+      .then(([output, link]) => {
+        if (cancelled) return;
+        setDetail(parseCommitDetails(output));
+        setRemoteLink(link);
+      })
+      .catch((reason) => !cancelled && setError(String(reason)));
+    return () => {
+      cancelled = true;
+    };
+  }, [repository, commit.fullHash]);
+
+  const tree = useMemo(() => (detail ? buildFileTree(detail.files, (f) => f.path) : []), [detail]);
+  const treeRows = useMemo(
+    () => (viewAsTree ? flattenVisible(tree, collapsedFolders) : null),
+    [viewAsTree, tree, collapsedFolders],
+  );
+  const toggleFolder = (path: string) =>
+    setCollapsedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+
+  const openFileDiff = ({ path, oldPath }: CommitFileChange) => {
+    repository
+      .commitFileDiff(commit.fullHash, path, oldPath)
+      .then((text) =>
+        onDiff({
+          path,
+          title: `${commit.hash} — ${path}`,
+          text: text || "No textual differences. The change may be metadata or binary only.",
+        }),
+      )
+      .catch((reason) => setError(String(reason)));
+  };
+
+  const fileRow = (file: CommitFileChange, depth = 0, nested = false) => (
+    <li key={file.path}>
+      <button
+        onClick={() => openFileDiff(file)}
+        title={`Show the diff for ${file.oldPath ? `${file.oldPath} → ` : ""}${file.path} in this commit`}
+        style={{ paddingLeft: `${4 + depth * 14}px` }}
+        className="flex w-full items-center gap-1.5 py-1 pr-1 text-[11px] text-ink-2 hover:bg-surface-hover rounded"
+      >
+        <span className="font-mono text-[10px] text-ink-3 w-3 shrink-0">{file.status}</span>
+        <span className="truncate flex-1 text-left">
+          {nested ? file.path.slice(file.path.lastIndexOf("/") + 1) : file.path}
+        </span>
+      </button>
+    </li>
+  );
+
+  return (
+    <div className="border-t border-border bg-surface/40 text-[11px]">
+      <div className="flex items-center justify-between px-2 py-1.5">
+        <p className="text-ink font-medium truncate flex-1">{commit.subject}</p>
+        <button
+          onClick={onClose}
+          title="Close commit details"
+          aria-label="Close commit details"
+          className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-surface-hover shrink-0"
+        >
+          <CloseIcon size={11} />
+        </button>
+      </div>
+      <div className="px-2 pb-1.5 space-y-1">
+        <p className="text-ink-3">
+          {commit.authorName} · {commit.relativeTime}
+        </p>
+        <div className="flex items-center gap-1.5 text-ink-3">
+          <span className="font-mono">{commit.hash}</span>
+          <button
+            title="Copy the full commit hash"
+            aria-label="Copy commit hash"
+            onClick={() => {
+              void navigator.clipboard.writeText(commit.fullHash).then(() => {
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1500);
+              });
+            }}
+            className="p-0.5 rounded hover:bg-surface-hover hover:text-ink"
+          >
+            <CopyIcon size={10} />
+          </button>
+          {copied && <span className="text-green">Copied</span>}
+          {remoteLink && (
+            <button
+              title={`Open this commit on ${remoteLink.label}`}
+              onClick={() => void openExternalUrl(`${remoteLink.url}/commit/${commit.fullHash}`)}
+              className="ml-auto flex items-center gap-1 text-accent hover:text-accent-hover"
+            >
+              <ExternalLinkIcon size={9} />
+              Open on {remoteLink.label}
+            </button>
+          )}
+        </div>
+        {error && <p className="text-red">{error}</p>}
+        {detail && (
+          <>
+            <div className="flex items-center justify-between">
+              <p className="text-ink-3">
+                {detail.filesChanged} file{detail.filesChanged === 1 ? "" : "s"} changed
+              </p>
+              {detail.files.length > 0 && (
+                <button
+                  title={viewAsTree ? "View as List" : "View as Tree"}
+                  aria-label={viewAsTree ? "View as List" : "View as Tree"}
+                  onClick={() => setViewAsTree((v) => !v)}
+                  className="rounded px-1 text-[10px] text-ink-3 hover:text-ink hover:bg-surface-hover"
+                >
+                  {viewAsTree ? "List" : "Tree"}
+                </button>
+              )}
+            </div>
+            <ul className="max-h-[160px] overflow-y-auto">
+              {viewAsTree
+                ? treeRows!.map((row) =>
+                    row.node.kind === "folder" ? (
+                      <li key={`folder:${row.node.path}`}>
+                        <button
+                          aria-label={`${row.expanded ? "Collapse" : "Expand"} ${row.node.name}`}
+                          style={{ paddingLeft: `${4 + row.depth * 14}px` }}
+                          onClick={() => toggleFolder(row.node.path)}
+                          className="flex w-full items-center gap-1.5 py-1 text-[11px] text-ink-2 hover:bg-surface-hover rounded"
+                        >
+                          <ChevronIcon isExpanded={row.expanded} className="size-3 shrink-0" />
+                          <FileIcon name={row.node.name} isDir className="size-3.5 shrink-0" />
+                          <span className="truncate">{row.node.name}</span>
+                        </button>
+                      </li>
+                    ) : (
+                      fileRow(row.node.item, row.depth, true)
+                    ),
+                  )
+                : detail.files.map((file) => fileRow(file))}
+            </ul>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function InlineGraphSection({
   entry,
   dirty,
   collapsed,
   onToggleCollapse,
   onExpand,
+  onDiff,
+  onDialog,
 }: {
   entry: RepoEntry | null;
   dirty: boolean;
   collapsed: boolean;
   onToggleCollapse: () => void;
   onExpand?: () => void;
+  /** Opens the selected commit's file diff -- omitted call sites (a background repo row has
+   * none) simply don't get inline commit selection. */
+  onDiff?: (document: DiffDocument) => void;
+  onDialog?: (request: DialogRequest) => void;
 }) {
-  const { snapshot, loadMore, reset } = useCommitGraph(entry?.store.repository);
+  const { snapshot, loadMore, reset, setScope } = useCommitGraph(entry?.store.repository);
   // A second operation on the same worktree is refused while one runs, and the refusal's notice
   // is replaced by the first operation's own result a moment later -- so a click here during a
   // commit vanished without a trace. Disable the network buttons instead of inviting that.
   const repo = useRepoSnapshot(entry?.store);
   const busy = repo?.busy ?? false;
+  const [selected, setSelected] = useState<RawCommit | null>(null);
+
+  useEffect(() => {
+    setSelected((current) =>
+      current && !snapshot.commits.some((c) => c.fullHash === current.fullHash) ? null : current,
+    );
+  }, [snapshot.commits]);
 
   if (!entry) return null;
 
@@ -80,6 +283,22 @@ export function InlineGraphSection({
   const run = (kind: string, op: () => Promise<string>) =>
     void guardedAffecting(entry, kind, dirty, op);
 
+  const scopeLabel =
+    snapshot.scope === "auto" ? "Auto" : snapshot.scope === "all" ? "All" : snapshot.scope;
+  const openScopePicker = () => {
+    if (!onDialog) return;
+    const branches = repo?.branches ?? [];
+    onDialog({
+      title: "Show history for",
+      options: [
+        { value: "auto", label: "Auto", description: "The current branch's own history" },
+        { value: "all", label: "All", description: "Every branch and remote-tracking ref" },
+        ...branches.map((name) => ({ value: name, label: name })),
+      ],
+      submit: (value) => void setScope(value as GraphScope),
+    });
+  };
+
   return (
     <section aria-label="Graph" className="text-xs flex flex-col min-h-0">
       <div
@@ -88,7 +307,21 @@ export function InlineGraphSection({
       >
         <ChevronIcon isExpanded={!collapsed} className="size-3" />
         <span className="font-semibold text-[12px] text-ink">Graph</span>
-        <span className="text-ink-3 text-[10px]">Auto</span>
+        {onDialog ? (
+          <button
+            title="Change which history is shown"
+            aria-label="Change which history is shown"
+            onClick={(e) => {
+              e.stopPropagation();
+              openScopePicker();
+            }}
+            className="text-ink-3 text-[10px] rounded px-1 hover:bg-surface-hover hover:text-ink"
+          >
+            {scopeLabel}
+          </button>
+        ) : (
+          <span className="text-ink-3 text-[10px]">{scopeLabel}</span>
+        )}
         <div className="flex-1" />
         <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
           <button
@@ -138,11 +371,24 @@ export function InlineGraphSection({
       </div>
 
       {!collapsed && (
-        <div className="overflow-y-auto max-h-[260px]">
+        <div className="overflow-y-auto max-h-[320px]">
           {snapshot.notice && (
             <p role="status" className="px-3 py-1 text-[11px] text-red-400 break-words">
               {snapshot.notice}
             </p>
+          )}
+          {repo && repo.branch.behind > 0 && (
+            <div
+              title={`${repo.branch.behind} commit${repo.branch.behind === 1 ? "" : "s"} on ${repo.branch.upstream || "the remote"} not yet in this branch`}
+              className="flex items-center gap-1.5 px-2 h-[22px] text-[11px] text-ink-3 border-b border-dashed border-border-strong"
+            >
+              <span
+                className="inline-block size-2 shrink-0 rounded-full border border-dashed border-ink-3"
+                aria-hidden="true"
+              />
+              <span className="italic">Incoming Changes</span>
+              <span className="truncate">{repo.branch.upstream}</span>
+            </div>
           )}
           <div style={{ position: "relative", height: totalHeight }}>
             <svg
@@ -197,43 +443,70 @@ export function InlineGraphSection({
                 );
               })}
             </svg>
-            {visible.map((node) => (
-              <div
-                key={node.commit.fullHash}
-                style={{
-                  position: "absolute",
-                  top: node.row * ROW_HEIGHT,
-                  left: gutterWidth,
-                  right: 0,
-                  height: ROW_HEIGHT,
-                }}
-                title={node.commit.subject}
-                className="flex items-center gap-1.5 px-1.5 text-[11px] hover:bg-surface-hover truncate"
-              >
-                <span className="truncate text-ink">{node.commit.subject}</span>
-                <span className="shrink-0 truncate text-ink-3">{node.commit.authorName}</span>
-                <span className="flex-1" />
-                {/* Ref pills sit at the right edge: remote branches orange with a cloud, the
-                    current/local branch in the accent colour -- like the Antigravity graph. */}
-                {node.commit.refs
-                  .filter((r) => r.kind === "branch" || r.kind === "head" || r.kind === "remote")
-                  .slice(0, 3)
-                  .map((r) => (
-                    <span
-                      key={`${r.kind}:${r.name}`}
-                      className={`flex shrink-0 items-center gap-0.5 rounded-full border px-1.5 text-[9.5px] ${
-                        r.kind === "remote"
-                          ? "border-orange-500/40 bg-orange-500/20 text-orange-300"
-                          : "border-accent/40 bg-accent/20 text-accent-hover"
-                      }`}
-                    >
-                      {r.kind === "remote" ? <CloudGlyph /> : <GitBranchIcon size={9} />}
-                      {r.name}
-                    </span>
-                  ))}
-              </div>
-            ))}
+            {visible.map((node) => {
+              const isSelected = selected?.fullHash === node.commit.fullHash;
+              return (
+                <div
+                  key={node.commit.fullHash}
+                  role={onDiff ? "button" : undefined}
+                  tabIndex={onDiff ? 0 : undefined}
+                  aria-selected={onDiff ? isSelected : undefined}
+                  onClick={onDiff ? () => setSelected(isSelected ? null : node.commit) : undefined}
+                  onKeyDown={
+                    onDiff
+                      ? (e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            setSelected(isSelected ? null : node.commit);
+                          }
+                        }
+                      : undefined
+                  }
+                  style={{
+                    position: "absolute",
+                    top: node.row * ROW_HEIGHT,
+                    left: gutterWidth,
+                    right: 0,
+                    height: ROW_HEIGHT,
+                  }}
+                  title={node.commit.subject}
+                  className={`flex items-center gap-1.5 px-1.5 text-[11px] truncate ${
+                    onDiff ? "cursor-pointer" : ""
+                  } ${isSelected ? "bg-accent/15" : "hover:bg-surface-hover"}`}
+                >
+                  <span className="truncate text-ink">{node.commit.subject}</span>
+                  <span className="shrink-0 truncate text-ink-3">{node.commit.authorName}</span>
+                  <span className="flex-1" />
+                  {/* Ref pills sit at the right edge: remote branches orange with a cloud, the
+                      current/local branch in the accent colour -- like the Antigravity graph. */}
+                  {node.commit.refs
+                    .filter((r) => r.kind === "branch" || r.kind === "head" || r.kind === "remote")
+                    .slice(0, 3)
+                    .map((r) => (
+                      <span
+                        key={`${r.kind}:${r.name}`}
+                        className={`flex shrink-0 items-center gap-0.5 rounded-full border px-1.5 text-[9.5px] ${
+                          r.kind === "remote"
+                            ? "border-orange-500/40 bg-orange-500/20 text-orange-300"
+                            : "border-accent/40 bg-accent/20 text-accent-hover"
+                        }`}
+                      >
+                        {r.kind === "remote" ? <CloudGlyph /> : <GitBranchIcon size={9} />}
+                        {r.name}
+                      </span>
+                    ))}
+                </div>
+              );
+            })}
           </div>
+          {selected && onDiff && (
+            <InlineCommitDetail
+              commit={selected}
+              repository={entry.store.repository}
+              onClose={() => setSelected(null)}
+              onDiff={onDiff}
+            />
+          )}
           {!snapshot.hasMore && snapshot.shallow && (
             <p className="px-2 pt-1.5 text-center text-amber-400/80 text-[10.5px]">
               History may be incomplete (this is a shallow clone).

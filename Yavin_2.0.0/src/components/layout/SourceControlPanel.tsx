@@ -1462,6 +1462,8 @@ export function SourceControlPanel({
             collapsed={sectionCollapsed.graph}
             onToggleCollapse={() => toggleCollapsed("graph")}
             onExpand={onOpenGraph}
+            onDiff={onDiff}
+            onDialog={onDialog}
           />
         )}
 
