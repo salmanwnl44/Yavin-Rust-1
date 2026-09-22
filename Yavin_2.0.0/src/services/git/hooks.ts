@@ -3,7 +3,7 @@ import { gitRegistry } from "./registry.ts";
 import type { RepoEntry } from "./registry.ts";
 import type { RepoSnapshot, RepoStore } from "./store.ts";
 import { GraphLoader } from "./graph/incremental.ts";
-import type { GraphSnapshot } from "./graph/incremental.ts";
+import type { GraphScope, GraphSnapshot } from "./graph/incremental.ts";
 import type { Repository } from "./repository.ts";
 
 const EMPTY_SUBSCRIBE = () => () => {};
@@ -43,6 +43,7 @@ const EMPTY_GRAPH_SNAPSHOT: GraphSnapshot = {
   hasMore: false,
   notice: "",
   shallow: false,
+  scope: "auto",
 };
 const NO_GRAPH_SNAPSHOT = () => EMPTY_GRAPH_SNAPSHOT;
 
@@ -115,6 +116,7 @@ export function useCommitGraph(repository: Repository | null | undefined): {
   snapshot: GraphSnapshot;
   loadMore: () => void;
   reset: () => void;
+  setScope: (scope: GraphScope) => void;
 } {
   const [loader, setLoader] = useState<GraphLoader | null>(null);
 
@@ -136,5 +138,6 @@ export function useCommitGraph(repository: Repository | null | undefined): {
     snapshot,
     loadMore: () => void loader?.loadMore(),
     reset: () => void loader?.reset(),
+    setScope: (scope) => void loader?.setScope(scope),
   };
 }

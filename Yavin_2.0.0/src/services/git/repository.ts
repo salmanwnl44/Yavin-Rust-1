@@ -136,6 +136,12 @@ export class Repository {
   removeRemote(name: string): Promise<string> {
     return this.run(["remote", "remove", name]);
   }
+  /** The commit hover card's "Open on GitHub"/etc reads this to turn a remote name into a
+   * web link (`remoteUrl.ts`'s `remoteUrlToWeb`). */
+  async remoteUrl(name: string): Promise<string> {
+    const out = await this.run(["remote", "get-url", name]);
+    return out.trim();
+  }
 
   state(): Promise<GitOperation> {
     return repoState(this.repoId).catch((error) => {
@@ -370,17 +376,26 @@ export class Repository {
   }
 
   /** One page of commit-graph history, oldest-first-within-page, for `graph/incremental.ts`. */
-  graphLog(skip: number, limit: number): Promise<string> {
-    return this.run([
-      "log",
-      "--topo-order",
-      "--skip",
-      String(skip),
-      "-n",
-      String(limit),
+  /**
+   * `scope` widens the graph past its default (whatever HEAD reaches): `"all"` for every
+   * ref (`--all`), or a branch name to show that branch's history instead of HEAD's.
+   */
+  graphLog(skip: number, limit: number, scope?: "all" | string): Promise<string> {
+    const args = ["log", "--topo-order", "--skip", String(skip), "-n", String(limit)];
+    if (scope === "all") args.push("--all");
+    args.push(
       "--pretty=format:%H\x1f%h\x1f%P\x1f%an\x1f%ae\x1f%ad\x1f%cr\x1f%s\x1f%D",
       "--date=format:%B %d, %Y at %I:%M %p",
-    ]);
+    );
+    if (scope && scope !== "all") args.push(scope);
+    return this.run(args);
+  }
+
+  /** The commit's full message, subject and body together -- `graphLog`'s own `%s` is the
+   * subject alone. For the commit detail panel's body text (bullet lists included). */
+  commitBody(hash: string): Promise<string> {
+    if (!hash.trim()) throw new Error("Commit hash required");
+    return this.run(["log", "-n", "1", "--pretty=format:%B", hash]);
   }
 
   commitDetails(hash: string): Promise<string> {

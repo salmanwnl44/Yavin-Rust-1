@@ -198,7 +198,9 @@ fn operation_scope(subcommand: &str, rest: &[String]) -> Scope {
         "status" | "log" | "show" | "diff" | "for-each-ref" | "rev-parse" | "cat-file"
         | "check-ref-format" => Scope::Read,
         // `git remote <verb> ...` can add/remove/rename; only the bare listing is a read.
-        "remote" if rest.is_empty() => Scope::Read,
+        "remote" if rest.is_empty() || rest.first().map(String::as_str) == Some("get-url") => {
+            Scope::Read
+        }
         "worktree" if rest.first().map(String::as_str) == Some("list") => Scope::Read,
         "fetch" | "pull" | "push" => Scope::Network,
         _ => Scope::WorktreeLocal,
@@ -602,6 +604,49 @@ pub async fn git_probe_worktree(
         .map_err(|e| e.to_string())
 }
 
+/// Opens `url` in the OS's default browser -- "Open on GitHub"/"Open on GitLab"/etc, once a
+/// remote URL has already been converted to its web form on the TypeScript side. Restricted to
+/// `https://`: the only schemes a converted remote URL is ever produced as, and narrow enough
+/// that this can never be turned into a way to launch an arbitrary local program or file.
+#[tauri::command]
+pub async fn git_open_external_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("Only an https:// URL may be opened".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || open_external_url(&url))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn open_external_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        // `explorer` treats an http(s) argument as "open this URL in the default browser" --
+        // the same mechanism `reveal_in_os_explorer` already relies on for opening a path.
+        Command::new("explorer")
+            .arg(url)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
 #[tauri::command]
 pub async fn git_repo_state(state: State<'_, Repos>, repo_id: String) -> Result<String, String> {
     let repo = repo_of(&state, &repo_id)?;
@@ -726,10 +771,14 @@ const SYMBOLIC_REF: &[FlagRule] = &[flag("--short")];
 // first place (a client-side guard, since Git's own error text here is generic, not
 // semantically clear the way its worktree-exclusivity/unresolved-conflict refusals are).
 const ABORT_CONTINUE: &[FlagRule] = &[flag("--abort"), flag("--continue"), flag("--skip")];
+// `--all` (every ref, for the graph's "All" scope) and a single trailing branch name
+// (its "pick a branch" scope) are the only two ways `graphLog`'s ref scope can widen
+// past the implicit HEAD-only default; `validate_shape` pins the exact shape.
 const LOG: &[FlagRule] = &[
     value_flag("-n"),
     value_flag("--skip"),
     flag("--topo-order"),
+    flag("--all"),
     prefix_flag("--pretty="),
     prefix_flag("--date="),
 ];
@@ -917,7 +966,9 @@ fn validate_shape(subcommand: &str, flags: &[&str], positionals: &[&str]) -> Res
             [] => Ok(()),
             ["add", name, url] if !name.is_empty() && !url.is_empty() => Ok(()),
             ["remove", name] if !name.is_empty() => Ok(()),
-            _ => refuse("only listing, adding or removing a remote is allowed"),
+            // Reads the URL back for the commit hover card's "Open on GitHub" link.
+            ["get-url", name] if !name.is_empty() => Ok(()),
+            _ => refuse("only listing, adding, removing or reading the URL of a remote is allowed"),
         },
         "worktree" if positionals != ["list"] => refuse("only `worktree list` is allowed"),
         // `-a`/`--amend`/`-s` never replace the need for an explicit message -- without `-m`
@@ -974,6 +1025,15 @@ fn validate_shape(subcommand: &str, flags: &[&str], positionals: &[&str]) -> Res
                 "only starting a merge/rebase onto an existing branch, or --abort/--continue/\
                  --skip on one already in progress, is allowed",
             ),
+        },
+        // The graph's ref scope: the default (HEAD only), --all (every ref), or a single
+        // named branch -- never a refspec, and --all is never combined with a branch name.
+        "log" => match positionals {
+            [] => Ok(()),
+            [branch] if !flags.contains(&"--all") && !branch.is_empty() && !looks_like_refspec_or_url(branch) => {
+                Ok(())
+            }
+            _ => refuse("only the default history, --all, or a single branch name is allowed"),
         },
         _ => Ok(()),
     }
@@ -2695,6 +2755,28 @@ mod tests {
                 "--pretty=format:%H",
                 "--date=format:%B",
             ],
+            &[
+                "log",
+                "--topo-order",
+                "--skip",
+                "0",
+                "-n",
+                "300",
+                "--all",
+                "--pretty=format:%H",
+                "--date=format:%B",
+            ],
+            &[
+                "log",
+                "--topo-order",
+                "--skip",
+                "0",
+                "-n",
+                "300",
+                "--pretty=format:%H",
+                "--date=format:%B",
+                "feature",
+            ],
             &["stash", "push", "-u"],
             &["stash", "push", "-u", "-m", "a message"],
             &["stash", "list"],
@@ -2710,6 +2792,7 @@ mod tests {
             &["reset", "--soft", "HEAD~1"],
             &["remote", "add", "origin", "https://example.com/r.git"],
             &["remote", "remove", "origin"],
+            &["remote", "get-url", "origin"],
             &["tag", "v1.0.0"],
             &["tag", "-d", "v1.0.0"],
             &["branch", "-m", "renamed"],
@@ -2825,6 +2908,12 @@ mod tests {
             // commit: -m is always required, and unlisted flags stay refused
             &["commit", "--amend"],
             &["commit", "-m", "msg", "--no-verify"],
+            // log: the graph's ref scope is the default, --all, or one plain branch name --
+            // never both, never a refspec, never more than one name
+            &["log", "--all", "feature"],
+            &["log", "+feature"],
+            &["log", "feature:other"],
+            &["log", "feature", "other"],
         ];
         for shape in refused {
             let a = args(shape);

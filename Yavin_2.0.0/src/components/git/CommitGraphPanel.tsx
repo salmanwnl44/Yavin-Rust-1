@@ -5,8 +5,12 @@ import type { GraphNode } from "../../services/git/graph/model";
 import { GRAPH_COLOR_COUNT } from "../../services/git/graph/model";
 import { parseCommitDetails } from "../../services/git/parsers/log";
 import type { CommitDetailedInfo, CommitFileChange } from "../../services/git/parsers/log";
+import { defaultRemoteWebLink, openExternalUrl } from "../../services/git/remoteUrl";
+import type { RemoteWebLink } from "../../services/git/remoteUrl";
+import { buildFileTree, flattenVisible } from "../../services/git/fileTree";
 import type { DiffDocument } from "../layout/DiffEditor";
-import { CloseIcon, GitCommitIcon } from "../ui/Icons";
+import { ChevronIcon, FileIcon } from "../ui/FileIcons";
+import { CloseIcon, CopyIcon, ExternalLinkIcon, GitCommitIcon } from "../ui/Icons";
 
 const ROW_HEIGHT = 28;
 const LANE_WIDTH = 16;
@@ -40,6 +44,8 @@ const refBadgeStyle: Record<string, string> = {
   tag: "bg-amber-500/15 text-amber-300 border-amber-500/30",
 };
 
+/** The subject line is `RawCommit.subject`; a body beyond that (bullet lists included) needs
+ * its own fetch (`graphLog`'s `%s` is subject-only). */
 function CommitDetail({
   node,
   repository,
@@ -52,9 +58,14 @@ function CommitDetail({
   onDiff: (document: DiffDocument) => void;
 }) {
   const [detail, setDetail] = useState<CommitDetailedInfo | null>(null);
+  const [body, setBody] = useState("");
+  const [remoteLink, setRemoteLink] = useState<RemoteWebLink | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [diffError, setDiffError] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [viewAsTree, setViewAsTree] = useState(false);
+  const [collapsedFolders, setCollapsedFolders] = useState<ReadonlySet<string>>(new Set());
 
   const openFileDiff = ({ path, oldPath }: CommitFileChange) => {
     setDiffError("");
@@ -75,10 +86,21 @@ function CommitDetail({
     setLoading(true);
     setError("");
     setDetail(null);
-    repository
-      .commitDetails(node.commit.fullHash)
-      .then((output) => {
-        if (!cancelled) setDetail(parseCommitDetails(output));
+    setBody("");
+    setRemoteLink(null);
+    Promise.all([
+      repository.commitDetails(node.commit.fullHash),
+      repository.commitBody(node.commit.fullHash).catch(() => ""),
+      defaultRemoteWebLink(repository).catch(() => null),
+    ])
+      .then(([output, fullBody, link]) => {
+        if (cancelled) return;
+        setDetail(parseCommitDetails(output));
+        // Only the part beyond the subject -- the subject itself is already shown above,
+        // bold, from the graph row's own data.
+        const rest = fullBody.slice(node.commit.subject.length).replace(/^\n+/, "");
+        setBody(rest);
+        setRemoteLink(link);
       })
       .catch((reason) => {
         if (!cancelled) setError(String(reason));
@@ -89,7 +111,44 @@ function CommitDetail({
     return () => {
       cancelled = true;
     };
-  }, [repository, node.commit.fullHash]);
+  }, [repository, node.commit.fullHash, node.commit.subject]);
+
+  const tree = useMemo(() => (detail ? buildFileTree(detail.files, (f) => f.path) : []), [detail]);
+  const treeRows = useMemo(
+    () => (viewAsTree ? flattenVisible(tree, collapsedFolders) : null),
+    [viewAsTree, tree, collapsedFolders],
+  );
+  const toggleFolder = (path: string) =>
+    setCollapsedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+
+  // In tree mode the enclosing folder rows already show the path; a leaf shows only its
+  // own file name, the same convention the Changes list's tree view uses.
+  const fileRow = (file: CommitFileChange, depth = 0, nested = false) => (
+    <li key={file.path}>
+      <button
+        onClick={() => openFileDiff(file)}
+        title={`Show the diff for ${file.oldPath ? `${file.oldPath} → ` : ""}${file.path} in this commit`}
+        style={{ paddingLeft: `${2 + depth * 14}px` }}
+        className="flex w-full items-center gap-1.5 py-1 pr-0.5 text-[11px] text-zinc-300 hover:bg-[#121212] rounded"
+      >
+        <span className="font-mono text-[10px] text-zinc-500 w-3 shrink-0">{file.status}</span>
+        <span className="truncate flex-1 text-left">
+          {nested ? file.path.slice(file.path.lastIndexOf("/") + 1) : file.path}
+        </span>
+        {!file.binary && (
+          <span className="shrink-0 font-mono text-[10px]">
+            <span className="text-emerald-400">+{file.insertions}</span>{" "}
+            <span className="text-rose-400">-{file.deletions}</span>
+          </span>
+        )}
+      </button>
+    </li>
+  );
 
   return (
     <aside className="w-[320px] shrink-0 border-l border-[#141414] bg-black flex flex-col h-full">
@@ -108,42 +167,96 @@ function CommitDetail({
       </div>
       <div className="p-3 space-y-2 overflow-y-auto flex-1 text-xs">
         <p className="text-zinc-200 font-medium break-words">{node.commit.subject}</p>
+        {body && <p className="text-zinc-400 text-[11px] whitespace-pre-wrap">{body}</p>}
         <p className="text-zinc-500 text-[11px]">
-          {node.commit.authorName} · {node.commit.relativeTime}
+          {node.commit.authorName} · {node.commit.relativeTime} ({node.commit.date})
         </p>
-        <p className="text-zinc-600 font-mono text-[10.5px] break-all">{node.commit.fullHash}</p>
+        {node.commit.refs.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {node.commit.refs.map((ref) => (
+              <span
+                key={`${ref.kind}:${ref.name}`}
+                className={`rounded border px-1 text-[9.5px] ${refBadgeStyle[ref.kind]}`}
+              >
+                {ref.name}
+              </span>
+            ))}
+          </div>
+        )}
+        <div className="flex items-center gap-2 text-[10.5px] text-zinc-600">
+          <span className="font-mono break-all">{node.commit.fullHash}</span>
+          <button
+            title="Copy the full commit hash"
+            aria-label="Copy commit hash"
+            onClick={() => {
+              void navigator.clipboard.writeText(node.commit.fullHash).then(() => {
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1500);
+              });
+            }}
+            className="shrink-0 p-0.5 rounded hover:bg-[#121212] hover:text-zinc-300"
+          >
+            <CopyIcon size={11} />
+          </button>
+          {copied && <span className="text-emerald-400">Copied</span>}
+          {remoteLink && (
+            <button
+              title={`Open this commit on ${remoteLink.label}`}
+              onClick={() =>
+                void openExternalUrl(`${remoteLink.url}/commit/${node.commit.fullHash}`)
+              }
+              className="ml-auto flex shrink-0 items-center gap-1 text-indigo-400 hover:text-indigo-300"
+            >
+              <ExternalLinkIcon size={10} />
+              Open on {remoteLink.label}
+            </button>
+          )}
+        </div>
 
         {loading && <p className="text-zinc-500 text-[11px] animate-pulse">Loading changes…</p>}
         {error && <p className="text-red-400 text-[11px]">{error}</p>}
         {diffError && <p className="text-red-400 text-[11px]">{diffError}</p>}
         {detail && (
           <>
-            <p className="text-zinc-400 text-[11px] pt-1">
-              {detail.filesChanged} file{detail.filesChanged === 1 ? "" : "s"} changed,{" "}
-              <span className="text-emerald-400">+{detail.insertions}</span>{" "}
-              <span className="text-rose-400">-{detail.deletions}</span>
-            </p>
+            <div className="flex items-center justify-between pt-1">
+              <p className="text-zinc-400 text-[11px]">
+                {detail.filesChanged} file{detail.filesChanged === 1 ? "" : "s"} changed,{" "}
+                <span className="text-emerald-400">+{detail.insertions}</span>{" "}
+                <span className="text-rose-400">-{detail.deletions}</span>
+              </p>
+              {detail.files.length > 0 && (
+                <button
+                  title={viewAsTree ? "View as List" : "View as Tree"}
+                  aria-label={viewAsTree ? "View as List" : "View as Tree"}
+                  onClick={() => setViewAsTree((v) => !v)}
+                  className="rounded px-1 py-0.5 text-[10px] text-zinc-500 hover:text-zinc-300 hover:bg-[#121212]"
+                >
+                  {viewAsTree ? "List" : "Tree"}
+                </button>
+              )}
+            </div>
             <ul className="divide-y divide-[#101010] border-t border-[#141414]">
-              {detail.files.map((file) => (
-                <li key={file.path}>
-                  <button
-                    onClick={() => openFileDiff(file)}
-                    title={`Show the diff for ${file.oldPath ? `${file.oldPath} → ` : ""}${file.path} in this commit`}
-                    className="flex w-full items-center gap-1.5 py-1 text-[11px] text-zinc-300 hover:bg-[#121212] rounded px-0.5 -mx-0.5"
-                  >
-                    <span className="font-mono text-[10px] text-zinc-500 w-3 shrink-0">
-                      {file.status}
-                    </span>
-                    <span className="truncate flex-1 text-left">{file.path}</span>
-                    {!file.binary && (
-                      <span className="shrink-0 font-mono text-[10px]">
-                        <span className="text-emerald-400">+{file.insertions}</span>{" "}
-                        <span className="text-rose-400">-{file.deletions}</span>
-                      </span>
-                    )}
-                  </button>
-                </li>
-              ))}
+              {viewAsTree
+                ? treeRows!.map((row) =>
+                    row.node.kind === "folder" ? (
+                      <li key={`folder:${row.node.path}`}>
+                        <button
+                          role="button"
+                          aria-label={`${row.expanded ? "Collapse" : "Expand"} ${row.node.name}`}
+                          style={{ paddingLeft: `${2 + row.depth * 14}px` }}
+                          onClick={() => toggleFolder(row.node.path)}
+                          className="flex w-full items-center gap-1.5 py-1 text-[11px] text-zinc-300 hover:bg-[#121212] rounded"
+                        >
+                          <ChevronIcon isExpanded={row.expanded} className="size-3 shrink-0" />
+                          <FileIcon name={row.node.name} isDir className="size-3.5 shrink-0" />
+                          <span className="truncate">{row.node.name}</span>
+                        </button>
+                      </li>
+                    ) : (
+                      fileRow(row.node.item, row.depth, true)
+                    ),
+                  )
+                : detail.files.map((file) => fileRow(file))}
             </ul>
           </>
         )}

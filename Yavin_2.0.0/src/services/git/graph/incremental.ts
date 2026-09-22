@@ -6,6 +6,10 @@ import type { GraphLayout } from "./model.ts";
 
 export const GRAPH_PAGE_SIZE = 300;
 
+/** `"auto"`: HEAD's own history (the default). `"all"`: every ref. A branch name: that
+ * branch's history instead of HEAD's. Mirrors `Repository.graphLog`'s own `scope` param. */
+export type GraphScope = "auto" | "all" | string;
+
 export interface GraphSnapshot {
   commits: RawCommit[];
   layout: GraphLayout;
@@ -16,6 +20,7 @@ export interface GraphSnapshot {
    * checked once, on the first page load, since a repository's shallow-ness cannot
    * change without an explicit deepen operation Yavin doesn't currently expose. */
   shallow: boolean;
+  scope: GraphScope;
 }
 
 const EMPTY_LAYOUT: GraphLayout = { nodes: [], edges: [], laneCount: 0 };
@@ -41,6 +46,7 @@ export class GraphLoader {
     hasMore: true,
     notice: "",
     shallow: false,
+    scope: "auto",
   };
   private listeners = new Set<() => void>();
   private loadingMore = false;
@@ -95,9 +101,17 @@ export class GraphLoader {
       hasMore: true,
       notice: "",
       shallow: this.snapshot.shallow,
+      scope: this.snapshot.scope,
     };
     for (const listener of this.listeners) listener();
     await this.loadMore();
+  }
+
+  /** Changes the ref scope ("Auto"/"All"/a branch name) and reloads from the top. */
+  async setScope(scope: GraphScope): Promise<void> {
+    if (scope === this.snapshot.scope) return;
+    this.patch({ scope });
+    await this.reset();
   }
 
   async loadMore(): Promise<void> {
@@ -113,8 +127,9 @@ export class GraphLoader {
       const shallowResult: Promise<boolean | null> = checkShallow
         ? this.repository.isShallow().catch(() => null)
         : Promise.resolve(null);
+      const scope = this.snapshot.scope;
       const [raw, checked] = await Promise.all([
-        this.repository.graphLog(skip, GRAPH_PAGE_SIZE),
+        this.repository.graphLog(skip, GRAPH_PAGE_SIZE, scope === "auto" ? undefined : scope),
         shallowResult,
       ]);
       if (generation !== this.generation) return;

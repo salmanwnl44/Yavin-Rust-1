@@ -17,6 +17,10 @@ interface Scenario {
   fileDiffs?: Record<string, string>;
   /** Simulates `git rev-parse --is-shallow-repository`'s report. */
   shallow?: boolean;
+  /** hash -> full commit message (subject + body) for the "commitBody" lookup. */
+  bodies?: Record<string, string>;
+  /** The configured "origin" remote's URL, or omitted for no remote. */
+  originUrl?: string;
 }
 
 async function panel(page: Page, scenario: Scenario, options: { inline?: boolean } = {}) {
@@ -55,7 +59,13 @@ async function panel(page: Page, scenario: Scenario, options: { inline?: boolean
             const argv = (args.args as string[] | undefined) ?? [];
             if (argv[0] === "status") return ok("");
             if (argv[0] === "for-each-ref") return ok("");
-            if (argv[0] === "remote") return ok("");
+            if (argv[0] === "remote" && argv[1] === "get-url") return ok(s.originUrl ?? "");
+            if (argv[0] === "remote") return ok(s.originUrl ? "origin\n" : "");
+            if (argv[0] === "log" && argv.includes("-n") && argv[1] === "-n" && argv[2] === "1") {
+              // commitBody(): `log -n 1 --pretty=format:%B <hash>`
+              const hash = argv[argv.length - 1];
+              return ok(s.bodies?.[hash] ?? "");
+            }
             if (argv[0] === "rev-parse" && argv.includes("--is-shallow-repository"))
               return ok(s.shallow ? "true" : "false");
             if (argv[0] === "log" && argv.includes("--topo-order")) {
@@ -266,4 +276,75 @@ test("a graph reset that removes the selected commit clears its detail panel", a
   await expect(graph.getByText("Rewritten commit")).toBeVisible();
   await expect(graph.getByText("Second commit")).toHaveCount(0);
   await expect(detail).toHaveCount(0);
+});
+test("the commit detail shows the message body beyond the subject, and the commit's absolute date", async ({
+  page,
+}) => {
+  const graph = await panel(page, {
+    commits: [{ hash: "c1", subject: "Fix the thing" }],
+    bodies: { c1: "Fix the thing\n\nA longer explanation of why." },
+  });
+  await graph.getByText("Fix the thing").click();
+  const detail = page.getByRole("complementary").filter({ hasText: "Commit" });
+  await expect(detail.getByText("A longer explanation of why.")).toBeVisible();
+  await expect(detail.getByText("Jan 1")).toBeVisible();
+});
+
+test("copying the hash shows a confirmation, and the button copies the FULL hash, not the short one", async ({
+  page,
+}) => {
+  const graph = await panel(page, {
+    commits: [{ hash: "c1-full-hash", subject: "Add a file" }],
+  });
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await graph.getByText("Add a file").click();
+  const detail = page.getByRole("complementary").filter({ hasText: "Commit" });
+  await detail.getByRole("button", { name: "Copy commit hash" }).click();
+  await expect(detail.getByText("Copied")).toBeVisible();
+  const clipboard = await page.evaluate(() => navigator.clipboard.readText());
+  expect(clipboard).toBe("c1-full-hash");
+});
+
+test("with a recognized remote configured, the detail offers to open the commit on it", async ({
+  page,
+}) => {
+  const graph = await panel(page, {
+    commits: [{ hash: "c1", subject: "Add a file" }],
+    originUrl: "https://github.com/owner/repo.git",
+  });
+  await graph.getByText("Add a file").click();
+  const detail = page.getByRole("complementary").filter({ hasText: "Commit" });
+  await expect(detail.getByRole("button", { name: /Open on GitHub/ })).toBeVisible();
+});
+
+test("with no remote configured, the detail offers no open-on-remote link", async ({ page }) => {
+  const graph = await panel(page, { commits: [{ hash: "c1", subject: "Add a file" }] });
+  await graph.getByText("Add a file").click();
+  const detail = page.getByRole("complementary").filter({ hasText: "Commit" });
+  await expect(detail.getByRole("button", { name: /Open on/ })).toHaveCount(0);
+});
+
+test("the commit detail's file list can be viewed as a tree", async ({ page }) => {
+  const graph = await panel(page, {
+    commits: [{ hash: "c1", subject: "Refactor" }],
+    numstat: { c1: ["1\t0\tsrc/a.ts", "1\t0\tsrc/b.ts", "1\t0\tREADME.md"] },
+  });
+  await graph.getByText("Refactor").click();
+  const detail = page.getByRole("complementary").filter({ hasText: "Commit" });
+  await expect(detail.getByText("src/a.ts")).toBeVisible();
+
+  await detail.getByRole("button", { name: "Tree" }).click();
+  // Folders start expanded, like a freshly opened Explorer tree.
+  await expect(detail.getByText("src/a.ts")).toHaveCount(0);
+  await expect(detail.getByRole("button", { name: "Collapse src" })).toBeVisible();
+  await expect(detail.getByText("a.ts")).toBeVisible();
+  await expect(detail.getByText("b.ts")).toBeVisible();
+  await expect(detail.getByText("README.md")).toBeVisible();
+
+  await detail.getByRole("button", { name: "Collapse src" }).click();
+  await expect(detail.getByText("a.ts")).toHaveCount(0);
+  await expect(detail.getByRole("button", { name: "Expand src" })).toBeVisible();
+
+  await detail.getByRole("button", { name: "List" }).click();
+  await expect(detail.getByText("src/a.ts")).toBeVisible();
 });

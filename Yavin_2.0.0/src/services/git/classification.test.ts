@@ -131,7 +131,7 @@ test("the classification matches Rust's operation_scope for every subcommand", (
   }
   // The conditional ones: their read form is recognised by verb, their other verbs are not reads.
   const body = rustFunctionBody("operation_scope");
-  assert.match(body, /"remote"\s+if\s+rest\.is_empty\(\)\s*=>\s*Scope::Read/);
+  assert.match(body, /"remote"\s+if\s+rest\.is_empty\(\)[\s\S]*?Scope::Read/);
   assert.match(body, /"worktree"\s+if\s+rest\.first\(\)[^>]*"list"[^>]*=>\s*Scope::Read/);
   assert.match(body, /"stash"\s*=>/);
 });
