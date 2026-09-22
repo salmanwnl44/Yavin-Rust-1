@@ -8,6 +8,15 @@ import { buildPatch, parseUnifiedDiff } from "./diffHunks.ts";
  * relative to the repository root by the time they reach it -- this recovers that from
  * an absolute path built by `parseGitEntries`/the file explorer.
  */
+/** Mirrors the boundary's own rule, so a bad hash fails here with a readable message rather
+ * than as an opaque validation refusal from Rust. */
+function requireHash(hash: string): string {
+  const trimmed = hash.trim();
+  if (!/^[0-9a-fA-F]{7,64}$/.test(trimmed))
+    throw new Error("A full commit hash is required for this operation.");
+  return trimmed;
+}
+
 function relativeToRoot(root: string, absolutePath: string): string {
   const withSlash = root.endsWith("/") ? root : `${root}/`;
   const lower = absolutePath.toLowerCase();
@@ -371,6 +380,25 @@ export class Repository {
    * conflict/abort/continue/skip machinery already handles once one leaves a conflict. */
   mergeBranch(branch: string): Promise<string> {
     return this.run(["merge", branch]);
+  }
+
+  /**
+   * Applies one commit onto the current branch, or undoes one with a new commit.
+   *
+   * Both take a full hash, never a revision expression: the IPC boundary refuses anything
+   * else, because `a..b` would quietly mean a whole range rather than the single commit the
+   * UI offers. Either can stop on a conflict, which the panel's existing in-progress banner
+   * already handles -- `cherry-pick` and `revert` were already among the operations it knows
+   * how to continue, skip or abort; only *starting* one was missing.
+   */
+  // `async` so a rejected hash surfaces as a rejected promise like every other failure here,
+  // rather than throwing synchronously past a caller's `.catch()`.
+  async cherryPick(hash: string): Promise<string> {
+    return this.run(["cherry-pick", requireHash(hash)]);
+  }
+
+  async revertCommit(hash: string): Promise<string> {
+    return this.run(["revert", requireHash(hash)]);
   }
   rebaseOnto(branch: string): Promise<string> {
     return this.run(["rebase", branch]);

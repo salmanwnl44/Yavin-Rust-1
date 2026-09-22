@@ -1203,6 +1203,23 @@ export default function App() {
                 repository={activeRepo.store.repository}
                 onClose={() => setShowGraph(false)}
                 onDiff={setDiff}
+                onApplyCommit={(kind, commit) => {
+                  const verb = kind === "cherryPick" ? "Cherry-pick" : "Revert";
+                  setDialog({
+                    title: `${verb} commit`,
+                    message:
+                      kind === "cherryPick"
+                        ? `Apply "${commit.subject}" onto the current branch? It may stop on a conflict for you to resolve.`
+                        : `Create a new commit undoing "${commit.subject}"? It may stop on a conflict for you to resolve.`,
+                    confirmLabel: verb,
+                    submit: () =>
+                      void guardedAffecting(activeRepo, kind, hasUnsavedChanges, () =>
+                        kind === "cherryPick"
+                          ? activeRepo.store.repository.cherryPick(commit.fullHash)
+                          : activeRepo.store.repository.revertCommit(commit.fullHash),
+                      ),
+                  });
+                }}
               />
             ) : diff ? (
               <DiffEditor

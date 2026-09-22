@@ -20,6 +20,10 @@ export const DIRTY_BLOCKED = new Set([
   "pullFrom",
   "mergeBranch",
   "rebaseOnto",
+  // Both write the commit's content into the working tree, and can stop mid-way on a
+  // conflict, exactly like a merge.
+  "cherryPick",
+  "revertCommit",
   "undoLastCommit",
   "abort",
   "continue",
@@ -97,6 +101,8 @@ const INVALIDATES: Readonly<Record<string, readonly RefreshField[]>> = {
   undoLastCommit: ["entries", "branch", "operationInProgress"],
   mergeBranch: ["entries", "branch", "operationInProgress"],
   rebaseOnto: ["entries", "branch", "operationInProgress"],
+  cherryPick: ["entries", "branch", "operationInProgress"],
+  revertCommit: ["entries", "branch", "operationInProgress"],
   abort: ["entries", "branch", "operationInProgress"],
   continue: ["entries", "branch", "operationInProgress"],
   skip: ["entries", "branch", "operationInProgress"],

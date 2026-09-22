@@ -217,6 +217,18 @@ test("path resolution stays inside the worktree", () => {
   assert.equal(resolveInRoot("/work", ""), null);
 });
 
+test("an absolute path inside the root is recognised whatever the case of the drive letter", () => {
+  // Windows reports drive letters either way. Comparing case-sensitively made
+  // `c:/work/a.ts` look like a relative path and produced `C:/work/c:/work/a.ts`.
+  assert.equal(resolveInRoot("C:/work", "c:/work/a.ts"), "c:/work/a.ts");
+  assert.equal(resolveInRoot("C:/work", "C:\\work\\a.ts"), "C:/work/a.ts");
+  assert.equal(resolveInRoot("C:/Work", "c:/work/sub/b.ts"), "c:/work/sub/b.ts");
+  // Containment is still enforced: a different folder that merely shares a prefix is not
+  // inside the root, and escapes are still refused.
+  assert.equal(resolveInRoot("C:/work", "c:/work/../elsewhere/a.ts"), null);
+  assert.equal(resolveInRoot("C:/work", "../a"), null);
+});
+
 test("every mutating tool has an explicit risk tier and none exposes force or history rewriting", () => {
   for (const name of ["reset", "forcePush", "forceDeleteBranch", "rebase", "merge", "discard"]) {
     assert.equal(name in TOOL_TIERS, false, name);

@@ -33,6 +33,8 @@ const ALL_KINDS = [
   "undoLastCommit",
   "mergeBranch",
   "rebaseOnto",
+  "cherryPick",
+  "revertCommit",
   "abort",
   "continue",
   "skip",
@@ -77,6 +79,9 @@ test("DIRTY_BLOCKED lists exactly the mutations that rewrite tracked files on di
     "pullFrom",
     "mergeBranch",
     "rebaseOnto",
+    // Apply or undo a commit's content in the working tree.
+    "cherryPick",
+    "revertCommit",
     // Wind an in-progress operation forward or back, rewriting the tree either way.
     "abort",
     "continue",
@@ -221,6 +226,7 @@ test("GRAPH_RESETS is every kind that changes the commits or the ref labels the 
     [
       "abort",
       "branch",
+      "cherryPick",
       "commit",
       "createTag",
       "deleteBranch",
@@ -237,6 +243,7 @@ test("GRAPH_RESETS is every kind that changes the commits or the ref labels the 
       "pushTo",
       "rebaseOnto",
       "renameBranch",
+      "revertCommit",
       "switch",
       "undoLastCommit",
     ].sort(),

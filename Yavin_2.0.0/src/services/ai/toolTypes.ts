@@ -42,9 +42,13 @@ export function resolveWorktree(
 export function resolveInRoot(root: string, path: string): string | null {
   const normalizedRoot = root.replace(/\\/g, "/").replace(/\/$/, "");
   const p = path.replace(/\\/g, "/");
-  const absolute = p.startsWith(`${normalizedRoot}/`)
-    ? p
-    : `${normalizedRoot}/${p.replace(/^\/+/, "")}`;
+  // Case-insensitively, matching `relativeToRoot` in `repository.ts`. A case-sensitive
+  // comparison meant an absolute path whose drive letter merely differed in case
+  // (`c:/work/a.ts` against a root of `C:/work`, routine on Windows) failed the
+  // already-inside-the-root test and was treated as relative, producing the nonsense
+  // `C:/work/c:/work/a.ts` and a misleading "has no changes to stage".
+  const alreadyInside = p.toLowerCase().startsWith(`${normalizedRoot.toLowerCase()}/`);
+  const absolute = alreadyInside ? p : `${normalizedRoot}/${p.replace(/^\/+/, "")}`;
   const relative = absolute.slice(normalizedRoot.length + 1);
   if (!relative || relative.split("/").some((seg) => seg === ".." || seg === "")) return null;
   return absolute;

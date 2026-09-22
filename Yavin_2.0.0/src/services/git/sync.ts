@@ -107,6 +107,9 @@ export const GRAPH_RESETS: ReadonlySet<string> = new Set([
   "undoLastCommit",
   "mergeBranch",
   "rebaseOnto",
+  // Each lands a new commit on the current branch.
+  "cherryPick",
+  "revertCommit",
   "switch",
   "abort",
   "push",
@@ -155,6 +158,10 @@ export const PARTIAL_ON_FAILURE: ReadonlySet<string> = new Set([
   "pullMerge",
   "mergeBranch",
   "rebaseOnto",
+  // A conflict stops these mid-apply, leaving the working tree and CHERRY_PICK_HEAD/
+  // REVERT_HEAD changed even though the call reports failure.
+  "cherryPick",
+  "revertCommit",
   "publish",
   "continue",
   "skip",

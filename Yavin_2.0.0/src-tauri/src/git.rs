@@ -1026,6 +1026,13 @@ fn looks_like_refspec_or_url(arg: &str) -> bool {
     arg.starts_with('+') || arg.contains(':') || arg.contains("://")
 }
 
+/// A bare object name: lowercase hex, long enough to be unambiguous in practice. Used where
+/// the app means "this one commit" and a revision *expression* (`HEAD~3`, `a..b`, `main^`)
+/// would silently mean something much broader.
+fn is_commit_hash(arg: &str) -> bool {
+    arg.len() >= 7 && arg.len() <= 64 && arg.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Whether a URL may be stored as a remote's address.
 ///
 /// This is a security boundary, not a tidiness check. `git remote add` writes the URL into
@@ -1194,11 +1201,6 @@ fn validate_shape(subcommand: &str, flags: &[&str], positionals: &[&str]) -> Res
         // the confirm-and-keep-a-recovery-copy flow the UI puts in front of discarding.
         "rm" if !flags.contains(&"--cached") => refuse("only --cached (unstaging) is allowed"),
         "restore" if !flags.contains(&"--staged") => refuse("only --staged (unstaging) is allowed"),
-        // cherry-pick/revert only ever continue, skip or abort one already in progress --
-        // Yavin has no "Cherry-pick…"/"Revert…" UI to start one arbitrarily.
-        "cherry-pick" | "revert" if !positionals.is_empty() || flags.len() != 1 => {
-            refuse("only --abort, --continue or --skip on an existing operation is allowed")
-        }
         // merge/rebase additionally allow starting one against a plain, unambiguous branch
         // name ("Merge…"/"Rebase Branch…") -- never a refspec, and never combined with
         // --abort/--continue/--skip in the same call.
@@ -1208,6 +1210,18 @@ fn validate_shape(subcommand: &str, flags: &[&str], positionals: &[&str]) -> Res
             _ => refuse(
                 "only starting a merge/rebase onto an existing branch, or --abort/--continue/\
                  --skip on one already in progress, is allowed",
+            ),
+        },
+        // Applying or undoing one commit. The target must be a plain object name, not an
+        // arbitrary revision expression: `HEAD~5..HEAD` or `main..feature` would apply a whole
+        // range in one step, which is a different and much larger operation than the single
+        // commit the UI offers, and `-` style arguments could reach unlisted options.
+        "cherry-pick" | "revert" => match (flags, positionals) {
+            (["--abort"], []) | (["--continue"], []) | (["--skip"], []) => Ok(()),
+            ([], [commit]) if is_commit_hash(commit) => Ok(()),
+            _ => refuse(
+                "only applying/reverting a single commit by hash, or --abort/--continue/--skip \
+                 on one already in progress, is allowed",
             ),
         },
         // The graph's ref scope: the default (HEAD only), --all (every ref), or a single
@@ -3055,6 +3069,9 @@ mod tests {
             &["cherry-pick", "--abort"],
             &["cherry-pick", "--continue"],
             &["cherry-pick", "--skip"],
+            &["cherry-pick", "0123456789abcdef0123456789abcdef01234567"],
+            &["revert", "0123456789abcdef0123456789abcdef01234567"],
+            &["cherry-pick", "abc1234"],
             &["revert", "--abort"],
             &["revert", "--continue"],
             &["revert", "--skip"],
@@ -3276,6 +3293,16 @@ mod tests {
             &["restore", "--theirs", "--", "a.txt"],
             // merge/rebase: a plain branch name may start one, but never combined with
             // --abort/--continue/--skip, never a refspec, never more than one target
+            // cherry-pick/revert take one plain object name, never a revision expression
+            // (a range would apply many commits) and never combined with --abort etc.
+            &["cherry-pick", "HEAD~3"],
+            &["cherry-pick", "main..feature"],
+            &["cherry-pick", "HEAD"],
+            &["revert", "HEAD~1"],
+            &["revert", "v1.0"],
+            &["cherry-pick", "abc"],
+            &["cherry-pick", "--abort", "abc1234"],
+            &["revert", "abc1234", "def5678"],
             &["merge", "--abort", "other"],
             &["merge", "--abort", "--continue"],
             &["merge", "+evil"],

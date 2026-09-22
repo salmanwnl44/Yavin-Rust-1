@@ -5,7 +5,11 @@ import { useCommitGraph } from "../../services/git/hooks";
 import type { GraphNode } from "../../services/git/graph/model";
 import { GRAPH_COLOR_COUNT } from "../../services/git/graph/model";
 import { parseCommitDetails } from "../../services/git/parsers/log";
-import type { CommitDetailedInfo, CommitFileChange } from "../../services/git/parsers/log";
+import type {
+  CommitDetailedInfo,
+  CommitFileChange,
+  RawCommit,
+} from "../../services/git/parsers/log";
 import { defaultRemoteWebLink, openExternalUrl } from "../../services/git/remoteUrl";
 import type { RemoteWebLink } from "../../services/git/remoteUrl";
 import { buildFileTree, flattenVisible } from "../../services/git/fileTree";
@@ -52,11 +56,15 @@ function CommitDetail({
   repository,
   onClose,
   onDiff,
+  onApplyCommit,
 }: {
   node: GraphNode;
   repository: Repository;
   onClose: () => void;
   onDiff: (document: DiffDocument) => void;
+  /** Cherry-picks or reverts the commit. Omitted where there is no repository entry to run
+   * it through (the panel is given a bare `Repository`, not a `RepoEntry`). */
+  onApplyCommit?: (kind: "cherryPick" | "revertCommit", commit: RawCommit) => void;
 }) {
   const [detail, setDetail] = useState<CommitDetailedInfo | null>(null);
   const [body, setBody] = useState("");
@@ -223,6 +231,28 @@ function CommitDetail({
           )}
         </div>
 
+        {/* Apply this commit here, or undo it with a new one. Both can stop on a conflict,
+            which the Source Control panel's in-progress banner already knows how to continue,
+            skip or abort -- only starting one was missing. */}
+        {onApplyCommit && (
+          <div className="flex items-center gap-1.5 pt-1">
+            <button
+              onClick={() => onApplyCommit("cherryPick", node.commit)}
+              title="Apply this commit's changes onto the current branch"
+              className="rounded border border-[#222222] px-2 py-0.5 text-[10.5px] text-zinc-400 hover:border-zinc-600 hover:text-zinc-200"
+            >
+              Cherry-pick
+            </button>
+            <button
+              onClick={() => onApplyCommit("revertCommit", node.commit)}
+              title="Create a new commit that undoes this one"
+              className="rounded border border-[#222222] px-2 py-0.5 text-[10.5px] text-zinc-400 hover:border-zinc-600 hover:text-zinc-200"
+            >
+              Revert
+            </button>
+          </div>
+        )}
+
         {loading && <p className="text-zinc-500 text-[11px] animate-pulse">Loading changes…</p>}
         {error && <p className="text-red-400 text-[11px]">{error}</p>}
         {diffError && <p className="text-red-400 text-[11px]">{diffError}</p>}
@@ -279,10 +309,12 @@ export function CommitGraphPanel({
   repository,
   onClose,
   onDiff,
+  onApplyCommit,
 }: {
   repository: Repository;
   onClose: () => void;
   onDiff: (document: DiffDocument) => void;
+  onApplyCommit?: (kind: "cherryPick" | "revertCommit", commit: RawCommit) => void;
 }) {
   const { snapshot, loadMore } = useCommitGraph(repository);
   const [selected, setSelected] = useState<GraphNode | null>(null);
@@ -499,6 +531,7 @@ export function CommitGraphPanel({
         <CommitDetail
           repository={repository}
           node={selected}
+          onApplyCommit={onApplyCommit}
           onClose={() => setSelected(null)}
           onDiff={(document) => {
             // Switches to the same DiffEditor slot every other diff already renders
