@@ -81,6 +81,11 @@ export function AppDialog({ request, onClose }: { request: DialogRequest; onClos
         event.preventDefault();
         if (!busy) onClose();
       }}
+      // Clicking the backdrop dismisses, like every other modal in the app. The click lands
+      // on the <dialog> itself only when it is outside the content box.
+      onClick={(event) => {
+        if (event.target === event.currentTarget && !busy) onClose();
+      }}
       className="m-auto max-h-[80vh] w-[min(480px,90vw)] overflow-y-auto rounded-xl border border-zinc-700 bg-zinc-950 p-6 text-zinc-100 backdrop:bg-black/70"
     >
       <form
@@ -149,6 +154,11 @@ export function AppDialog({ request, onClose }: { request: DialogRequest; onClos
                     role="option"
                     aria-selected={index === activeIndex}
                     disabled={busy}
+                    // The filter input owns the keyboard here (arrows plus
+                    // `aria-activedescendant`), so the options themselves are out of the tab
+                    // order: leaving them in made a repository with 100 branches 100 tab
+                    // stops between the filter and Cancel. They stay clickable.
+                    tabIndex={-1}
                     onMouseEnter={() => setActiveIndex(index)}
                     onClick={() => choose(option.value)}
                     className={`flex w-full flex-col items-start gap-0.5 px-3 py-1.5 text-left text-sm ${

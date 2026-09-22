@@ -605,17 +605,22 @@ export function buildGitCommandMenu({
         {
           label: "Delete Tag…",
           onSelect: () =>
-            void repo.tags().then((tags) => {
-              if (!tags.length) {
-                entry.store.setNotice("No tags in this repository.");
-                return;
-              }
-              onDialog({
-                title: "Delete tag",
-                options: tags.map((name) => ({ value: name, label: name })),
-                submit: (name) => void run("deleteTag", () => repo.deleteTag(name)),
-              });
-            }),
+            void repo
+              .tags()
+              .then((tags) => {
+                if (!tags.length) {
+                  entry.store.setNotice("No tags in this repository.");
+                  return;
+                }
+                onDialog({
+                  title: "Delete tag",
+                  options: tags.map((name) => ({ value: name, label: name })),
+                  submit: (name) => void run("deleteTag", () => repo.deleteTag(name)),
+                });
+              })
+              // Without this, a failure to list tags was a silent no-op plus an unhandled
+              // rejection: the menu closed and nothing at all happened.
+              .catch((reason: unknown) => entry.store.setNotice(String(reason))),
         },
         {
           label: "Delete Remote Tag…",

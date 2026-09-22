@@ -29,12 +29,24 @@ export type TreeNode<T> = TreeFolder<T> | TreeFile<T>;
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
-function sortChildren<T>(nodes: TreeNode<T>[]): void {
+/**
+ * Folders first, then files. `preserveFileOrder` keeps the files in the order they were
+ * given instead of re-sorting them by name, which is what the Changes list wants: its input
+ * is already ordered by the user's chosen sort (Name/Path/Status) with conflicts pulled to
+ * the front, and re-sorting alphabetically here silently threw both away -- picking "Sort by
+ * Status" did nothing in tree mode, and a conflicted file lost its guaranteed top position.
+ * Folders stay alphabetical either way, since a tree whose folders jump around by status is
+ * not a tree anyone can navigate.
+ */
+function sortChildren<T>(nodes: TreeNode<T>[], preserveFileOrder: boolean): void {
+  const order = new Map(nodes.map((node, index) => [node, index]));
   nodes.sort((a, b) => {
     if (a.kind !== b.kind) return a.kind === "folder" ? -1 : 1;
+    if (a.kind === "file" && preserveFileOrder) return order.get(a)! - order.get(b)!;
     return collator.compare(a.name, b.name);
   });
-  for (const node of nodes) if (node.kind === "folder") sortChildren(node.children);
+  for (const node of nodes)
+    if (node.kind === "folder") sortChildren(node.children, preserveFileOrder);
 }
 
 /** Merges a folder into its one-and-only child folder, repeatedly, until that's no longer true. */
@@ -60,7 +72,11 @@ function compactNode<T>(node: TreeNode<T>): TreeNode<T> {
  * convention throughout `src/services/git`); a leading `/` is treated as the root and stripped
  * from segment splitting, so both repo-relative and absolute paths group the same way.
  */
-export function buildFileTree<T>(items: readonly T[], pathOf: (item: T) => string): TreeNode<T>[] {
+export function buildFileTree<T>(
+  items: readonly T[],
+  pathOf: (item: T) => string,
+  options: { preserveFileOrder?: boolean } = {},
+): TreeNode<T>[] {
   const root: TreeFolder<T> = { kind: "folder", name: "", path: "", children: [] };
   const foldersByPath = new Map<string, TreeFolder<T>>([["", root]]);
 
@@ -85,7 +101,7 @@ export function buildFileTree<T>(items: readonly T[], pathOf: (item: T) => strin
   }
 
   const compacted = root.children.map(compactNode);
-  sortChildren(compacted);
+  sortChildren(compacted, options.preserveFileOrder ?? false);
   return compacted;
 }
 

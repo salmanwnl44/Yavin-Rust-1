@@ -47,12 +47,27 @@ export function redactUrlCredentials(argument: string): string {
 }
 
 let nextId = 1;
-let entries: GitLogEntry[] = [];
+const entries: GitLogEntry[] = [];
+/**
+ * The id of `entries[0]`, which makes an entry's position `id - firstId` -- an O(1) lookup
+ * instead of a scan. Ids are handed out in order and entries are only ever appended or
+ * dropped from the front, so the relationship always holds.
+ */
+let firstId = 1;
 const listeners = new Set<() => void>();
 
-function emit(): void {
-  // A fresh array identity per change is what `useSyncExternalStore` compares; mutating in
-  // place would leave React seeing the same snapshot and skipping the render.
+/**
+ * The array handed to `useSyncExternalStore`, rebuilt lazily. Every Git command in the app
+ * writes here, including bulk operations that issue one call per file, so the writes are kept
+ * O(1): copying the buffer on each write instead cost two full-length array copies per Git
+ * call, which was measurable on a 1,200-file Stage All. The copy now happens only when
+ * something actually reads the log, i.e. when the Git Output view is open.
+ */
+let cache: readonly GitLogEntry[] = [];
+let cacheStale = false;
+
+function changed(): void {
+  cacheStale = true;
   for (const listener of listeners) listener();
 }
 
@@ -61,14 +76,20 @@ export function subscribeGitLog(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
-/** Stable between changes, as `useSyncExternalStore` requires. */
+/** A new identity after each change and a stable one between changes, as
+ * `useSyncExternalStore` requires on both counts. */
 export function gitLogSnapshot(): readonly GitLogEntry[] {
-  return entries;
+  if (cacheStale) {
+    cache = entries.slice();
+    cacheStale = false;
+  }
+  return cache;
 }
 
 export function clearGitLog(): void {
-  entries = [];
-  emit();
+  entries.length = 0;
+  firstId = nextId;
+  changed();
 }
 
 /**
@@ -84,9 +105,13 @@ export function recordGitStart(repoId: string, args: string[], input?: string): 
     args: args.map(redactUrlCredentials),
     inputBytes: input ? input.length : 0,
   };
-  entries = [...entries, entry];
-  if (entries.length > CAPACITY) entries = entries.slice(entries.length - CAPACITY);
-  emit();
+  entries.push(entry);
+  if (entries.length === 1) firstId = entry.id;
+  while (entries.length > CAPACITY) {
+    entries.shift();
+    firstId++;
+  }
+  changed();
   return entry.id;
 }
 
@@ -94,11 +119,11 @@ export function recordGitEnd(
   id: number,
   outcome: { code: number; stderr?: string } | { error: string },
 ): void {
-  const index = entries.findIndex((entry) => entry.id === id);
-  // Dropped by the capacity trim while it ran: nothing to close out.
-  if (index === -1) return;
+  const index = id - firstId;
+  // Out of range means the capacity trim dropped it while it ran: nothing to close out.
+  if (index < 0 || index >= entries.length) return;
   const previous = entries[index];
-  const finished: GitLogEntry = {
+  entries[index] = {
     ...previous,
     durationMs: Date.now() - previous.startedAt,
     ...("error" in outcome
@@ -110,8 +135,7 @@ export function recordGitEnd(
             : undefined,
         }),
   };
-  entries = [...entries.slice(0, index), finished, ...entries.slice(index + 1)];
-  emit();
+  changed();
 }
 
 /** The command line as it would be typed, for display and for copying out of the view. */

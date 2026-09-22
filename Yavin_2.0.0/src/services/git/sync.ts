@@ -117,6 +117,10 @@ export const GRAPH_RESETS: ReadonlySet<string> = new Set([
   "renameBranch",
   "createTag",
   "deleteTag",
+  // `push <remote> --delete <branch>` also removes the local `refs/remotes/<remote>/<branch>`,
+  // so the graph's `origin/foo` pill has to go with it -- without this the pill stayed on its
+  // commit row until some unrelated operation happened to reset the graph.
+  "deleteRemoteRef",
 ]);
 
 /**

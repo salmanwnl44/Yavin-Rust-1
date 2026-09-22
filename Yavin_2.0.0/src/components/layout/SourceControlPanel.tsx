@@ -26,7 +26,7 @@ import { buildGitCommandMenu } from "../git/gitCommandMenu";
 import type { DiffDocument } from "./DiffEditor";
 import type { Replacement } from "./SearchPanel";
 import type { DialogRequest } from "../ui/AppDialog";
-import { buildFileTree, flattenVisible } from "../../services/git/fileTree";
+import { buildFileTree, collectFiles, flattenVisible } from "../../services/git/fileTree";
 import { ChevronIcon, FileIcon } from "../ui/FileIcons";
 import {
   AlertCircleIcon,
@@ -212,6 +212,19 @@ export function SourceControlPanel({
       else next.add(path);
       return next;
     });
+
+  // State that describes the repository being shown, cleared when that changes: another
+  // repository's collapsed folder paths, its half-typed new-branch name and its "Show more"
+  // page position all mean nothing here and were being carried across the switch.
+  //
+  // Deliberately not reset: the sort order and List/Tree mode (panel preferences, meant to
+  // persist), whether the branch drawer is open (a view toggle, same reasoning), and the
+  // discard-undo offer, which `App.tsx` already clears on a switch.
+  useEffect(() => {
+    setCollapsedFolders(new Set());
+    setNewBranch("");
+    setRowLimits({});
+  }, [activeRepo?.repoId]);
   const [sectionVisible, setSectionVisible] = useState<SectionVisibility>(readSectionVisibility);
   useEffect(() => {
     try {
@@ -536,6 +549,33 @@ export function SourceControlPanel({
     });
   };
 
+  /**
+   * Resolves a conflicted file by taking one side whole, then staging it as resolved --
+   * what "Accept Current/Incoming Change" does in a VS Code-family merge editor.
+   *
+   * Written through the same `apply` path as Discard (so it is undoable and goes through the
+   * editor's own write path) rather than `git restore --ours/--theirs`, which is not
+   * allow-listed: on a path Git does not consider conflicted, that flag silently overwrites
+   * the file from the index instead of refusing.
+   */
+  const acceptConflictSide = async (entry: GitEntry, side: "ours" | "theirs") => {
+    if (!activeRepo) return;
+    await guarded("stage", async () => {
+      const repo = activeRepo.store.repository;
+      const before = await native("read_file_content", { path: entry.path });
+      const after = await repo.conflictSide(entry.path, side);
+      const change = { path: entry.path, before, after };
+      const outcome = await apply([change]);
+      if (outcome.errors.length) throw new Error(outcome.errors.join(" "));
+      setRecovery([change]);
+      await repo.stage(entry.path);
+      await callbacks.current.onChanged();
+      return side === "ours"
+        ? "Kept this branch's version and staged it as resolved."
+        : "Took the incoming version and staged it as resolved.";
+    });
+  };
+
   const discardAll = async (targetEntries: GitEntry[]) => {
     if (!activeRepo) return;
     const modified = targetEntries.filter(isDiscardable);
@@ -636,20 +676,24 @@ export function SourceControlPanel({
   // chosen "Sort Changes" mode. Whether a file is staged is shown by its checkbox, not by
   // which section it sits in. Memoized on `entries` and the sort mode alone so typing a
   // commit message never re-derives it.
-  const { listed, stagedCount, conflictCount, allStaged, discardable } = useMemo(() => {
-    const conflicts = entries.filter((e) => e.conflict);
-    const others = entries.filter((e) => !e.conflict);
-    const stageable = others; // conflicts are resolved one at a time, never in bulk
-    return {
-      listed: sortChanges(entries, changesSort),
-      stagedCount: entries.filter(hasStagedPart).length,
-      conflictCount: conflicts.length,
-      allStaged:
-        stageable.length > 0 && stageable.every((e) => hasStagedPart(e) && !hasUnstagedPart(e)),
-      // What "Discard All" acts on: modified tracked files only (see `isDiscardable`).
-      discardable: entries.filter(isDiscardable).length,
-    };
-  }, [entries, changesSort]);
+  const { listed, stagedCount, modifiedCount, conflictCount, allStaged, discardable } =
+    useMemo(() => {
+      const conflicts = entries.filter((e) => e.conflict);
+      const others = entries.filter((e) => !e.conflict);
+      const stageable = others; // conflicts are resolved one at a time, never in bulk
+      return {
+        listed: sortChanges(entries, changesSort),
+        stagedCount: entries.filter(hasStagedPart).length,
+        // What a commit with nothing staged would pick up itself (`-a`): tracked files with
+        // working-tree changes. Untracked files are excluded, exactly as `-a` excludes them.
+        modifiedCount: others.filter((e) => !e.untracked && e.worktree !== " ").length,
+        conflictCount: conflicts.length,
+        allStaged:
+          stageable.length > 0 && stageable.every((e) => hasStagedPart(e) && !hasUnstagedPart(e)),
+        // What "Discard All" acts on: modified tracked files only (see `isDiscardable`).
+        discardable: entries.filter(isDiscardable).length,
+      };
+    }, [entries, changesSort]);
   const sync = divergence(branch);
 
   const toggleSection = (name: keyof SectionVisibility) =>
@@ -657,9 +701,16 @@ export function SourceControlPanel({
   const toggleCollapsed = (name: keyof SectionVisibility) =>
     setSectionCollapsed((prev) => ({ ...prev, [name]: !prev[name] }));
 
+  /**
+   * A repo-relative path for display and for tree grouping. Case-insensitive, via the same
+   * `rootContains` every other path comparison here uses: a plain `startsWith` meant that when
+   * Git reported a differently-cased drive letter or root (routine on Windows, and on
+   * case-insensitive macOS volumes) every row fell back to its full absolute path and the
+   * tree grouped them under a bogus root.
+   */
   const relativePath = (path: string): string => {
     const root = activeRepo?.root ?? "";
-    return path.startsWith(root) ? path.slice(root.length + 1) : path;
+    return root && rootContains(root, path) ? path.slice(root.length + 1) : path;
   };
 
   // "View as Tree": the same flat `listed` entries, grouped into folders (single-child chains
@@ -670,13 +721,22 @@ export function SourceControlPanel({
     () =>
       changesViewAsTree
         ? flattenVisible(
-            buildFileTree(listed, (e) => relativePath(e.path)),
+            // `listed` is already in the user's chosen order with conflicts first; the tree
+            // groups it without reordering the files inside each folder.
+            buildFileTree(listed, (e) => relativePath(e.path), { preserveFileOrder: true }),
             collapsedFolders,
           )
         : null,
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `relativePath` closes only over `activeRepo?.root`
     [changesViewAsTree, listed, collapsedFolders, activeRepo?.root],
   );
+
+  // The row cap applies to whichever view is drawn. Tree mode used to ignore it entirely and
+  // render every row, so switching a large change set to View as Tree froze the panel for
+  // seconds -- the exact cost `ROWS_PER_PAGE` exists to bound. Folder rows count toward the
+  // cap too: they are the same ~22 DOM nodes as a file row.
+  const totalRowCount = changesViewAsTree ? (treeRows?.length ?? 0) : listed.length;
+  const shownRowCount = rowLimits.Changes ?? ROWS_PER_PAGE;
 
   /** One changed-file row -- shared between the flat list and the tree view, `depth` only
    * changing its indentation. */
@@ -776,6 +836,30 @@ export function SourceControlPanel({
             >
               <UndoIcon size={12} />
             </button>
+          )}
+          {/* Resolving a conflict by taking one side whole -- the common case that otherwise
+              means hand-editing conflict markers. Both are undoable, like Discard. */}
+          {entry.conflict && (
+            <>
+              <button
+                disabled={busy || loading}
+                aria-label={`Accept current change for ${entry.path}`}
+                title={`Resolve ${fileName} by keeping this branch's version`}
+                onClick={() => void acceptConflictSide(entry, "ours")}
+                className="rounded px-1 text-[10px] text-ink-3 hover:bg-border-strong hover:text-ink"
+              >
+                Ours
+              </button>
+              <button
+                disabled={busy || loading}
+                aria-label={`Accept incoming change for ${entry.path}`}
+                title={`Resolve ${fileName} by taking the incoming version`}
+                onClick={() => void acceptConflictSide(entry, "theirs")}
+                className="rounded px-1 text-[10px] text-ink-3 hover:bg-border-strong hover:text-ink"
+              >
+                Theirs
+              </button>
+            </>
           )}
         </div>
 
@@ -1109,12 +1193,19 @@ export function SourceControlPanel({
                           />
                         }
                         stagedCount={stagedCount}
+                        modifiedCount={modifiedCount}
                         conflictCount={conflictCount}
                         busy={busy}
                         loading={loading}
                         onChange={onMessageChange}
                         onCommit={(message) =>
-                          guarded("commit", () => activeRepo.store.repository.commit(message))
+                          guarded("commit", () =>
+                            // Nothing staged means "commit every tracked change", exactly as
+                            // the dropdown's own Commit item does.
+                            activeRepo.store.repository.commit(message, {
+                              all: stagedCount === 0,
+                            }),
+                          )
                         }
                       />
 
@@ -1162,26 +1253,31 @@ export function SourceControlPanel({
                             </button>
                           </div>
 
-                          {branches.length > 0 && (
+                          {/* The checked-out branch is excluded: Git always refuses to delete
+                              it, so offering the button was a guaranteed dead end. The
+                              command menu's Delete Branch… already filtered it out. */}
+                          {branches.some((name) => name !== branch.name) && (
                             <ul aria-label="Delete a branch" className="space-y-0.5">
-                              {branches.map((name) => (
-                                <li
-                                  key={name}
-                                  className="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-surface-hover"
-                                >
-                                  <span className="flex-1 min-w-0 truncate text-[11px] text-ink-2 font-mono">
-                                    {name}
-                                  </span>
-                                  <button
-                                    aria-label={`Delete ${name}`}
-                                    title={`Delete ${name}`}
-                                    onClick={() => void deleteBranch(name)}
-                                    className="p-0.5 rounded text-ink-3 hover:text-red-400 hover:bg-red-950/40 transition-colors shrink-0"
+                              {branches
+                                .filter((name) => name !== branch.name)
+                                .map((name) => (
+                                  <li
+                                    key={name}
+                                    className="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-surface-hover"
                                   >
-                                    <TrashIcon size={11} />
-                                  </button>
-                                </li>
-                              ))}
+                                    <span className="flex-1 min-w-0 truncate text-[11px] text-ink-2 font-mono">
+                                      {name}
+                                    </span>
+                                    <button
+                                      aria-label={`Delete ${name}`}
+                                      title={`Delete ${name}`}
+                                      onClick={() => void deleteBranch(name)}
+                                      className="p-0.5 rounded text-ink-3 hover:text-red-400 hover:bg-red-950/40 transition-colors shrink-0"
+                                    >
+                                      <TrashIcon size={11} />
+                                    </button>
+                                  </li>
+                                ))}
                             </ul>
                           )}
 
@@ -1304,28 +1400,32 @@ export function SourceControlPanel({
                   </>
                 )}
 
-                {(notice || busy || loading) && (
-                  <div className="flex items-center gap-2">
-                    <p
-                      role="status"
-                      aria-live="polite"
-                      className={`flex-1 text-[11px] break-words leading-tight ${
-                        cancelled ? "text-ink-3" : "text-ink-2"
-                      }`}
+                {/* The live region is always mounted, only its text changes. Mounting it
+                    together with the first notice meant screen readers had nothing to watch
+                    at the moment the text appeared, so the first result of every operation
+                    went unannounced -- a live region has to pre-exist its own updates. */}
+                <div
+                  className={`flex items-center gap-2 ${notice || busy || loading ? "" : "hidden"}`}
+                >
+                  <p
+                    role="status"
+                    aria-live="polite"
+                    className={`flex-1 text-[11px] break-words leading-tight ${
+                      cancelled ? "text-ink-3" : "text-ink-2"
+                    }`}
+                  >
+                    {busy ? "Running Git operation…" : loading ? "Refreshing…" : notice}
+                  </p>
+                  {busy && (
+                    <button
+                      onClick={() => activeRepo?.store.cancel()}
+                      title="Cancel this Git operation"
+                      className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-ink-2 hover:bg-surface-hover hover:text-ink"
                     >
-                      {busy ? "Running Git operation…" : loading ? "Refreshing…" : notice}
-                    </p>
-                    {busy && (
-                      <button
-                        onClick={() => activeRepo?.store.cancel()}
-                        title="Cancel this Git operation"
-                        className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-ink-2 hover:bg-surface-hover hover:text-ink"
-                      >
-                        Cancel
-                      </button>
-                    )}
-                  </div>
-                )}
+                      Cancel
+                    </button>
+                  )}
+                </div>
 
                 {recovery && (
                   <button
@@ -1448,7 +1548,7 @@ export function SourceControlPanel({
                     )}
 
                     {changesViewAsTree
-                      ? treeRows!.map((row) =>
+                      ? treeRows!.slice(0, shownRowCount).map((row) =>
                           row.node.kind === "folder" ? (
                             <div
                               key={`folder:${row.node.path}`}
@@ -1457,7 +1557,7 @@ export function SourceControlPanel({
                               aria-expanded={row.expanded}
                               aria-label={`${row.expanded ? "Collapse" : "Expand"} ${row.node.name}`}
                               style={{ paddingLeft: `${8 + row.depth * 14}px` }}
-                              className="flex items-center gap-1.5 pr-2.5 h-[22px] hover:bg-surface-hover transition-colors cursor-pointer text-ink-2"
+                              className="flex items-center gap-1.5 pr-2.5 h-[22px] hover:bg-surface-hover group/row transition-colors cursor-pointer text-ink-2"
                               onClick={() => toggleFolder(row.node.path)}
                               onKeyDown={(e) => {
                                 if (e.key === "Enter" || e.key === " ") {
@@ -1469,15 +1569,66 @@ export function SourceControlPanel({
                               <ChevronIcon isExpanded={row.expanded} className="size-3 shrink-0" />
                               <FileIcon name={row.node.name} isDir className="size-3.5 shrink-0" />
                               <span className="text-xs truncate">{row.node.name}</span>
+                              {/* Folder-level actions, acting on every file below the folder
+                                  including collapsed ones -- the same bulk handlers the
+                                  section header uses, so the behaviour cannot drift. */}
+                              <div className="ml-auto flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover/row:opacity-100 focus-within:opacity-100">
+                                {(() => {
+                                  const files = collectFiles([row.node]);
+                                  const discardable = files.filter(isDiscardable);
+                                  return (
+                                    <>
+                                      <button
+                                        title={`Stage ${files.length} file${files.length === 1 ? "" : "s"} in ${row.node.name}`}
+                                        aria-label={`Stage folder ${row.node.name}`}
+                                        disabled={busy}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          void stageAll(files);
+                                        }}
+                                        className="rounded p-0.5 text-ink-3 hover:bg-surface-hover hover:text-ink disabled:opacity-40"
+                                      >
+                                        <PlusIcon size={11} />
+                                      </button>
+                                      <button
+                                        title={`Unstage ${files.length} file${files.length === 1 ? "" : "s"} in ${row.node.name}`}
+                                        aria-label={`Unstage folder ${row.node.name}`}
+                                        disabled={busy}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          void unstageAll(files);
+                                        }}
+                                        className="rounded p-0.5 text-ink-3 hover:bg-surface-hover hover:text-ink disabled:opacity-40"
+                                      >
+                                        <MinusIcon size={11} />
+                                      </button>
+                                      <button
+                                        title={
+                                          discardable.length
+                                            ? `Discard changes in ${discardable.length} file${discardable.length === 1 ? "" : "s"} in ${row.node.name}`
+                                            : `Nothing in ${row.node.name} can be discarded`
+                                        }
+                                        aria-label={`Discard folder ${row.node.name}`}
+                                        disabled={busy || discardable.length === 0}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          void discardAll(discardable);
+                                        }}
+                                        className="rounded p-0.5 text-ink-3 hover:bg-surface-hover hover:text-red-400 disabled:opacity-40"
+                                      >
+                                        <UndoIcon size={11} />
+                                      </button>
+                                    </>
+                                  );
+                                })()}
+                              </div>
                             </div>
                           ) : (
                             renderFileRow(row.node.item, row.depth)
                           ),
                         )
-                      : listed
-                          .slice(0, rowLimits.Changes ?? ROWS_PER_PAGE)
-                          .map((entry) => renderFileRow(entry))}
-                    {!changesViewAsTree && listed.length > (rowLimits.Changes ?? ROWS_PER_PAGE) && (
+                      : listed.slice(0, shownRowCount).map((entry) => renderFileRow(entry))}
+                    {totalRowCount > shownRowCount && (
                       <button
                         onClick={() =>
                           setRowLimits((prev) => ({
@@ -1487,12 +1638,8 @@ export function SourceControlPanel({
                         }
                         className="w-full py-1.5 text-[11px] text-ink-2 hover:bg-surface-hover hover:text-ink"
                       >
-                        Show{" "}
-                        {Math.min(
-                          ROWS_PER_PAGE,
-                          listed.length - (rowLimits.Changes ?? ROWS_PER_PAGE),
-                        )}{" "}
-                        more of {listed.length - (rowLimits.Changes ?? ROWS_PER_PAGE)} remaining
+                        Show {Math.min(ROWS_PER_PAGE, totalRowCount - shownRowCount)} more of{" "}
+                        {totalRowCount - shownRowCount} remaining
                       </button>
                     )}
                   </div>

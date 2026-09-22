@@ -212,7 +212,10 @@ test("switch/commit/abort/continue/skip and the new worktree-exclusive kinds nev
 test("GRAPH_RESETS is every kind that changes the commits or the ref labels the graph shows", () => {
   // The graph is `git log` from HEAD plus each commit's `%D` labels. History changes:
   // fetch/pull*/commit add commits, switch/abort move HEAD. Label changes: push and
-  // publish move origin/<branch>, branch and deleteBranch add and remove a label.
+  // publish move origin/<branch>, branch and deleteBranch add and remove a label, and
+  // deleteRemoteRef removes the local refs/remotes/<remote>/<branch> that `origin/foo`
+  // pill is drawn from -- `git push --delete` deletes the remote-tracking ref too, not
+  // just the branch on the server.
   assert.deepEqual(
     [...GRAPH_RESETS].sort(),
     [
@@ -221,6 +224,7 @@ test("GRAPH_RESETS is every kind that changes the commits or the ref labels the 
       "commit",
       "createTag",
       "deleteBranch",
+      "deleteRemoteRef",
       "deleteTag",
       "fetch",
       "mergeBranch",
@@ -252,12 +256,44 @@ test("GRAPH_RESETS never covers what cannot change a commit or a ref label", () 
     "stashPop",
     "stashDrop",
     "stashClear",
+    // `pushTags` only uploads tags that already exist locally, so no local label changes.
     "pushTags",
-    "deleteRemoteRef",
     "addRemote",
     "removeRemote",
   ]) {
     assert.ok(!GRAPH_RESETS.has(kind), `"${kind}" must not be in GRAPH_RESETS`);
+  }
+});
+
+test("deleting a remote branch really removes the local remote-tracking label the graph draws", async () => {
+  // Ground truth for `deleteRemoteRef`'s place in GRAPH_RESETS: `git push --delete` is not
+  // only a server-side change, it drops refs/remotes/<remote>/<branch> here too.
+  const { realRepo, git } = await import("./testing/realGit.ts");
+  const remote = realRepo();
+  const r = realRepo();
+  try {
+    git(remote.root, "config", "receive.denyCurrentBranch", "ignore");
+    writeFileSync(join(r.root, "a.txt"), "a\n");
+    r.git("add", "-A");
+    r.git("commit", "-qm", "one");
+    r.git("remote", "add", "origin", remote.root);
+    r.git("push", "-q", "origin", "main:feature");
+    r.git("fetch", "-q", "origin");
+
+    const labelsBefore = (await r.repository.graphLog(0, 10)).split("\x1f").pop() ?? "";
+    assert.match(labelsBefore, /origin\/feature/, "the remote-tracking label must exist first");
+
+    await r.repository.deleteRemoteRef("origin", "feature");
+
+    const labelsAfter = (await r.repository.graphLog(0, 10)).split("\x1f").pop() ?? "";
+    assert.doesNotMatch(
+      labelsAfter,
+      /origin\/feature/,
+      "deleting the remote branch removes the local remote-tracking ref, so the graph must reset",
+    );
+  } finally {
+    r.dispose();
+    remote.dispose();
   }
 });
 

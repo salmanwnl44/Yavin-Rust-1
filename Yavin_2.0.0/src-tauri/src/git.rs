@@ -827,6 +827,12 @@ const DIFF: &[FlagRule] = &[
     prefix_flag("--diff-filter="),
 ];
 const NONE: &[FlagRule] = &[];
+// Deliberately no `--ours`/`--theirs` for conflict resolution, despite the obvious appeal:
+// on a path with no merge stages Git does NOT refuse them, it silently restores the file from
+// the index and exits 0 -- i.e. exactly the unrecoverable working-tree discard that the bare
+// `restore -- <path>` shape is refused for below. Taking one side of a conflict is done
+// instead by reading that side's blob (`cat-file blob :2:/:3:<path>`) and writing it through
+// the app's own undoable apply path, like every other discard in this app.
 const RESTORE: &[FlagRule] = &[flag("--staged")];
 const RM: &[FlagRule] = &[flag("--cached")];
 // `-a` (stage every tracked change first), `--amend` (replace HEAD instead of adding a new
@@ -894,6 +900,9 @@ const LOG: &[FlagRule] = &[
     flag("--all"),
     prefix_flag("--pretty="),
     prefix_flag("--date="),
+    // Full ref names in `%D`, so the graph can tell a local branch containing a slash from a
+    // remote-tracking one. Purely a display format; it reaches nothing new.
+    prefix_flag("--decorate="),
 ];
 const FOR_EACH_REF: &[FlagRule] = &[prefix_flag("--format=")];
 // Like `stash` (`push`/`pop`/`apply`/`drop`/`list` are positional, not flags, so this
@@ -2282,6 +2291,34 @@ mod tests {
         assert_eq!(stored.stdout.trim(), HELPER_URL);
     }
 
+    /// Why `restore --ours/--theirs` is not allow-listed even though it is the obvious way to
+    /// take one side of a conflict: on a path with *no* merge stages Git does not refuse it,
+    /// it silently restores the file from the index and exits 0. That is precisely the
+    /// unrecoverable working-tree discard that the bare `restore -- <path>` shape is refused
+    /// for, so allow-listing these flags would reopen it through the side door. Conflict
+    /// resolution reads the wanted side's blob instead (see `Repository.conflictSide`).
+    #[test]
+    fn restore_ours_would_silently_discard_an_edit_which_is_why_it_stays_refused() {
+        let (dir, git) = fixture();
+        fs::write(dir.join("a.txt"), "uncommitted edit\n").unwrap();
+
+        // Run it directly, bypassing the allow-list, to show what the flag actually does.
+        let ran = git(&["restore", "--ours", "--", "a.txt"]);
+        let content = fs::read_to_string(dir.join("a.txt")).unwrap();
+
+        // And confirm the boundary refuses it, so the above can never reach Git through Yavin.
+        let repo = open(&dir);
+        let refused = exec(&repo, &args(&["restore", "--ours", "--", "a.txt"]), None);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(ran, "git accepts --ours on a non-conflicted path");
+        assert_eq!(
+            content, "base\n",
+            "…and silently discards the edit, which is the whole reason it is refused"
+        );
+        assert!(refused.is_err(), "the IPC boundary must refuse it");
+    }
+
     #[test]
     fn cloning_produces_a_usable_work_tree_and_refuses_unsafe_urls_and_names() {
         let (source, git) = fixture();
@@ -2973,6 +3010,10 @@ mod tests {
             &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
             &["remote"],
             &["cat-file", "--filters", ":a.txt"],
+            // One side of a conflicted file, for "Accept Ours"/"Accept Theirs": stage 2 is
+            // this branch's version, stage 3 the incoming one.
+            &["cat-file", "--filters", ":2:a.txt"],
+            &["cat-file", "--filters", ":3:a.txt"],
             &[
                 "diff",
                 "--no-ext-diff",
@@ -3228,6 +3269,11 @@ mod tests {
             &["rm", "--", "a.txt"],
             &["restore", "--", "a.txt"],
             &["restore", "a.txt"],
+            // --ours/--theirs are NOT allowed: on a non-conflicted path Git silently
+            // restores from the index and exits 0, which is the same unrecoverable discard
+            // that `restore -- <path>` is refused for.
+            &["restore", "--ours", "--", "a.txt"],
+            &["restore", "--theirs", "--", "a.txt"],
             // merge/rebase: a plain branch name may start one, but never combined with
             // --abort/--continue/--skip, never a refspec, never more than one target
             &["merge", "--abort", "other"],

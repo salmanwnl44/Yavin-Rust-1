@@ -25,6 +25,9 @@ export const CommitBox = forwardRef<
     /** Current branch name, shown in the placeholder like a VS Code-style SCM input. */
     branchName?: string;
     stagedCount: number;
+    /** Tracked files with working-tree changes. With nothing staged, these are what a commit
+     * would stage itself (`-a`), which is what makes the button usable in that state. */
+    modifiedCount: number;
     conflictCount: number;
     busy: boolean;
     loading: boolean;
@@ -34,7 +37,18 @@ export const CommitBox = forwardRef<
     menu?: ReactNode;
   }
 >(function CommitBox(
-  { draftKey, branchName, stagedCount, conflictCount, busy, loading, onCommit, onChange, menu },
+  {
+    draftKey,
+    branchName,
+    stagedCount,
+    modifiedCount,
+    conflictCount,
+    busy,
+    loading,
+    onCommit,
+    onChange,
+    menu,
+  },
   ref,
 ) {
   const [text, setText] = useState("");
@@ -45,7 +59,11 @@ export const CommitBox = forwardRef<
       onChange(next);
       if (!persistUnder) return;
       try {
-        localStorage.setItem(draftStorageKey(persistUnder), next);
+        // An empty draft is removed rather than stored as "". Every repository ever opened
+        // otherwise left a permanent empty key behind, and the common case -- commit, which
+        // clears the box -- is exactly when the entry stops being worth anything.
+        if (next) localStorage.setItem(draftStorageKey(persistUnder), next);
+        else localStorage.removeItem(draftStorageKey(persistUnder));
       } catch {
         /* The draft stays in memory when storage is unavailable. */
       }
@@ -66,7 +84,13 @@ export const CommitBox = forwardRef<
     onChange(saved);
   }, [draftKey, onChange]);
 
-  const canCommit = text.trim().length > 0 && stagedCount > 0 && conflictCount === 0;
+  // With nothing staged, a commit stages every tracked change itself (`-a`) -- the same thing
+  // this button's own dropdown "Commit" does, and what VS Code's does. Requiring something
+  // staged first meant the button and the dropdown item beside it, both labelled "Commit",
+  // disagreed about whether the action was available at all.
+  const willCommitAll = stagedCount === 0;
+  const commitCount = willCommitAll ? modifiedCount : stagedCount;
+  const canCommit = text.trim().length > 0 && commitCount > 0 && conflictCount === 0;
 
   const commit = () => {
     if (!canCommit) return;
@@ -76,9 +100,10 @@ export const CommitBox = forwardRef<
   useImperativeHandle(
     ref,
     () => ({ clear: () => update("", draftKey), commit }),
-    // `commit` closes over the current text and counts.
+    // `commit` closes over the current text and counts -- `modifiedCount` included, since
+    // that is what decides whether a commit is possible with nothing staged.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [update, draftKey, text, stagedCount, conflictCount],
+    [update, draftKey, text, stagedCount, modifiedCount, conflictCount],
   );
 
   const hint = branchName ? ` on "${branchName}"` : "";
@@ -105,23 +130,25 @@ export const CommitBox = forwardRef<
           disabled={!canCommit}
           onClick={commit}
           title={
-            stagedCount === 0
-              ? "Tick the files you want to include first"
-              : conflictCount > 0
-                ? "Resolve conflicts first"
-                : text.trim()
-                  ? `Commit ${stagedCount} staged file${stagedCount === 1 ? "" : "s"}`
-                  : "Enter a commit message"
+            conflictCount > 0
+              ? "Resolve conflicts first"
+              : commitCount === 0
+                ? "Nothing to commit"
+                : !text.trim()
+                  ? "Enter a commit message"
+                  : willCommitAll
+                    ? `Commit all ${commitCount} changed file${commitCount === 1 ? "" : "s"} (nothing is staged)`
+                    : `Commit ${commitCount} staged file${commitCount === 1 ? "" : "s"}`
           }
           className={`flex-1 min-w-0 py-1.5 px-3 text-xs font-medium text-white flex items-center justify-center gap-1.5 bg-accent hover:bg-accent-hover transition-colors disabled:opacity-40 disabled:hover:bg-accent ${
             menu ? "rounded-l" : "rounded"
           }`}
         >
           <CheckIcon size={13} />
-          <span>Commit</span>
-          {stagedCount > 0 && (
+          <span>{willCommitAll && commitCount > 0 ? "Commit All" : "Commit"}</span>
+          {commitCount > 0 && (
             <span className="rounded-full bg-white/20 px-1.5 text-[10px] leading-4">
-              {stagedCount}
+              {commitCount}
             </span>
           )}
         </button>

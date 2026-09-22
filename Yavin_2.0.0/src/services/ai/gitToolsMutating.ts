@@ -26,7 +26,9 @@ export const MAX_PATHS = 500;
 export const TOOL_TIERS = {
   stage: "reversible",
   unstage: "reversible",
-  stash: "reversible",
+  // Not "reversible": stashing takes changes off the working tree, and undoing it means
+  // finding and applying the right stash afterwards. Worth asking about first.
+  stash: "confirm",
   createBranch: "reversible",
   commit: "confirm",
   switchBranch: "confirm",
@@ -172,13 +174,24 @@ export function createGitMutatingTools(options: {
     stage: staging("stage"),
     unstage: staging("unstage"),
 
-    stash: (ref: WorktreeRef, args: { message?: string } = {}) =>
+    /**
+     * `includeUntracked` must be asked for explicitly, and defaults to off. It used to be
+     * hardcoded on, which made this the one tool that could take never-tracked files off
+     * disk: `stash -u` followed by `stashDrop` destroys them with no reflog to recover from,
+     * so "stash the workspace, then tidy up old stashes" -- two individually unremarkable
+     * steps -- was a complete data-loss chain. Tracked changes stay recoverable either way.
+     */
+    stash: (ref: WorktreeRef, args: { message?: string; includeUntracked?: boolean } = {}) =>
       run(
         ref,
         "stash",
         "stash",
         (snap) => (snap.entries.length ? null : pre("There are no changes to stash.")),
-        (e) => e.store.repository.stash({ message: args.message, untracked: true }),
+        (e) =>
+          e.store.repository.stash({
+            message: args.message,
+            untracked: args.includeUntracked === true,
+          }),
       ),
 
     createBranch: (ref: WorktreeRef, args: { name: string }) =>

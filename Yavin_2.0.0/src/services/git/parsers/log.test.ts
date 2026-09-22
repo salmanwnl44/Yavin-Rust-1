@@ -90,3 +90,40 @@ test("parseGraphLog reads parent hashes and ref decorations per commit", () => {
   ]);
   assert.deepEqual(parseGraphLog(""), []);
 });
+
+test("full ref names say exactly what a ref is, so a local branch with a slash is not a remote", () => {
+  // `--decorate=full`, which `graphLog` asks for. The short form cannot distinguish a local
+  // `feature/login` from a remote-tracking branch, and guessing "remote" from the slash gave
+  // ordinary local feature branches the remote pill in both graph views.
+  assert.deepEqual(
+    parseRefLabels(
+      "HEAD -> refs/heads/feature/login, refs/remotes/origin/feature/login, refs/tags/v1.0",
+    ),
+    [
+      { name: "HEAD", kind: "head" },
+      { name: "feature/login", kind: "branch" },
+      { name: "origin/feature/login", kind: "remote" },
+      { name: "v1.0", kind: "tag" },
+    ],
+  );
+});
+
+test("a full-form tag decoration keeps its short display name", () => {
+  assert.deepEqual(parseRefLabels("tag: refs/tags/v2.0"), [{ name: "v2.0", kind: "tag" }]);
+});
+
+test("short ref names still parse, for the abbreviated decoration form", () => {
+  assert.deepEqual(parseRefLabels("HEAD -> main, origin/main, tag: v1"), [
+    { name: "HEAD", kind: "head" },
+    { name: "main", kind: "branch" },
+    { name: "origin/main", kind: "remote" },
+    { name: "v1", kind: "tag" },
+  ]);
+});
+
+test("a detached HEAD decoration is still a head label", () => {
+  assert.deepEqual(parseRefLabels("HEAD, refs/tags/v3"), [
+    { name: "HEAD", kind: "head" },
+    { name: "v3", kind: "tag" },
+  ]);
+});

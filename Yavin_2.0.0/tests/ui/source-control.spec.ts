@@ -414,6 +414,37 @@ test("an interrupted merge must be resolved or aborted before it can continue", 
   await expect.poll(() => gitCalls(page, "continue")).toBe(1);
 });
 
+test("a conflicted file offers to resolve by taking either side, and stages the result", async ({
+  page,
+}) => {
+  // Resolving by hand-editing conflict markers was the only option before this.
+  const region = await panel(page, { state: "merge", status: "UU conflict.ts\0" });
+  const row = region.getByRole("button", { name: /Open diff for .*conflict\.ts/ });
+  await expect(row).toBeVisible();
+
+  await expect(region.getByRole("button", { name: /Accept current change/ })).toBeVisible();
+  await region.getByRole("button", { name: /Accept incoming change/ }).click();
+
+  // Reads the incoming side (index stage 3) and stages the file as resolved. Nothing goes
+  // through `restore --ours/--theirs`, which is not allow-listed.
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as unknown as { __calls: { args: { args?: string[] } }[] }).__calls.some((call) =>
+          call.args.args?.some((argument) => argument.startsWith(":3:")),
+        ),
+      ),
+    )
+    .toBe(true);
+  await expect.poll(() => gitCalls(page, "stage")).toBe(1);
+});
+
+test("a file that is not conflicted offers no take-a-side buttons", async ({ page }) => {
+  const region = await panel(page, { status: " M a.ts\0" });
+  await expect(region.getByRole("button", { name: /Accept current change/ })).toHaveCount(0);
+  await expect(region.getByRole("button", { name: /Accept incoming change/ })).toHaveCount(0);
+});
+
 test("an interrupted rebase must be resolved or aborted before it can continue, exactly like a merge", async ({
   page,
 }) => {
@@ -1056,7 +1087,9 @@ test("a huge change set draws a page of rows at a time but still counts and acts
   const rows = region.getByRole("button", { name: /^Open diff for / });
   await expect(rows).toHaveCount(500);
   const changes = region.getByRole("region", { name: "Changes" });
-  await expect(changes.getByText("1200", { exact: true })).toBeVisible();
+  // By its label, not its text: with nothing staged the Commit button now also shows a 1200
+  // badge (it commits every tracked change), so bare text is ambiguous.
+  await expect(changes.getByLabel("1200 changed files")).toBeVisible();
 
   await region.getByRole("button", { name: /Show 500 more of 700 remaining/ }).click();
   await expect(rows).toHaveCount(1000);
@@ -1066,7 +1099,10 @@ test("a huge change set draws a page of rows at a time but still counts and acts
 
   // Stage All covers the whole group, not just the rows that were drawn.
   await region.getByLabel("Stage All Changes").click();
-  await expect.poll(() => gitCalls(page, "stage")).toBe(1200);
+  // 1,200 sequential IPC round trips. The assertion is that every file is acted on, not how
+  // fast -- `poll`'s 5 s default was tight enough that this failed on a loaded machine
+  // (reproduced on an unmodified checkout), which is a flaky test rather than a real signal.
+  await expect.poll(() => gitCalls(page, "stage"), { timeout: 60_000 }).toBe(1200);
 });
 
 test("typing a commit message does not lose the draft or the Commit button state", async ({
@@ -1086,6 +1122,39 @@ test("typing a commit message does not lose the draft or the Commit button state
   await expect(
     page.getByRole("complementary", { name: "Source control" }).getByLabel("Commit message"),
   ).toHaveValue("draft survives reload");
+});
+
+test("with nothing staged the Commit button commits every tracked change, like its own dropdown", async ({
+  page,
+}) => {
+  // The button used to be disabled with nothing staged ("Tick the files you want to include
+  // first") while the dropdown item beside it, also labelled Commit, committed with `-a`.
+  // Two controls with the same name disagreeing about whether the action existed at all.
+  const region = await panel(page, { status: " M a.ts\0 M b.ts\0" });
+  const commitAll = region.getByRole("button", { name: /^Commit All/ });
+  await expect(commitAll).toBeDisabled(); // no message yet
+  await region.getByLabel("Commit message").fill("commit everything");
+  await expect(commitAll).toBeEnabled();
+  await commitAll.click();
+  // `-a` is what makes it commit tracked changes that were never staged.
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as unknown as { __calls: { args: { args?: string[] } }[] }).__calls.some(
+          (call) => call.args.args?.[0] === "commit" && call.args.args.includes("-a"),
+        ),
+      ),
+    )
+    .toBe(true);
+});
+
+test("an untracked-only change set offers nothing to commit until something is staged", async ({
+  page,
+}) => {
+  // `-a` never picks up untracked files, so "Commit All" must not claim it would.
+  const region = await panel(page, { status: "?? new.ts\0" });
+  await region.getByLabel("Commit message").fill("message");
+  await expect(region.getByRole("button", { name: /^Commit/ }).first()).toBeDisabled();
 });
 
 test("every changed file appears once in one list, with a checkbox for its staging state", async ({

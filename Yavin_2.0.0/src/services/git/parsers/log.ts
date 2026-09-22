@@ -88,6 +88,26 @@ export interface RefLabel {
   kind: RefKind;
 }
 
+/**
+ * Classifies one decoration token. With `--decorate=full` (which `graphLog` asks for) Git
+ * spells out `refs/heads/…`, `refs/remotes/…` and `refs/tags/…`, which says exactly what a
+ * ref is. Short names are still handled, for the abbreviated form and for older callers, but
+ * only as a fallback -- the short form is genuinely ambiguous: `feature/login` is a perfectly
+ * ordinary *local* branch, and treating every name containing a slash as a remote gave it
+ * the orange remote pill in both graph views.
+ */
+function classifyRef(token: string): RefLabel {
+  if (token.startsWith("refs/remotes/"))
+    return { name: token.slice("refs/remotes/".length), kind: "remote" };
+  if (token.startsWith("refs/heads/"))
+    return { name: token.slice("refs/heads/".length), kind: "branch" };
+  if (token.startsWith("refs/tags/"))
+    return { name: token.slice("refs/tags/".length), kind: "tag" };
+  // Short form: a slash can only be guessed at, and "remote" is the better guess because a
+  // local branch usually also appears undecorated alongside its `origin/` counterpart.
+  return { name: token, kind: token.includes("/") ? "remote" : "branch" };
+}
+
 /** Splits one `%D` decoration string (e.g. `"HEAD -> main, origin/main, tag: v1"`). */
 export function parseRefLabels(decorations: string): RefLabel[] {
   if (!decorations.trim()) return [];
@@ -98,15 +118,14 @@ export function parseRefLabels(decorations: string): RefLabel[] {
     if (token.includes(" -> ")) {
       const [head, branch] = token.split(" -> ");
       labels.push({ name: head.trim(), kind: "head" });
-      labels.push({ name: branch.trim(), kind: "branch" });
+      labels.push(classifyRef(branch.trim()));
     } else if (token.startsWith("tag: ")) {
-      labels.push({ name: token.slice(5).trim(), kind: "tag" });
+      const name = token.slice(5).trim();
+      labels.push({ name: name.replace(/^refs\/tags\//, ""), kind: "tag" });
     } else if (token === "HEAD") {
       labels.push({ name: token, kind: "head" });
-    } else if (token.includes("/")) {
-      labels.push({ name: token, kind: "remote" });
     } else {
-      labels.push({ name: token, kind: "branch" });
+      labels.push(classifyRef(token));
     }
   }
   return labels;

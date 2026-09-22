@@ -134,3 +134,32 @@ test("a large, deeply mixed list builds and flattens quickly and completely", ()
   assert.equal(rows.filter((r) => r.node.kind === "file").length, many.length);
   assert.ok(Date.now() - started < 2000, "building and flattening 5,000 files should be fast");
 });
+
+test("preserveFileOrder keeps the caller's file order, which is how the Changes list keeps its sort", () => {
+  // The Changes list hands in entries already ordered by the user's sort with conflicts
+  // first. Re-sorting them by name here silently discarded both.
+  const input = ["src/zebra.ts", "src/alpha.ts", "readme.md"];
+  assert.deepEqual(shape(buildFileTree(input, byPath, { preserveFileOrder: true })), [
+    { src: ["zebra.ts", "alpha.ts"] },
+    "readme.md",
+  ]);
+});
+
+test("without preserveFileOrder files are sorted by name, the default for any other caller", () => {
+  const input = ["src/zebra.ts", "src/alpha.ts", "readme.md"];
+  assert.deepEqual(shape(buildFileTree(input, byPath)), [
+    { src: ["alpha.ts", "zebra.ts"] },
+    "readme.md",
+  ]);
+});
+
+test("folders stay alphabetical and ahead of files even when file order is preserved", () => {
+  // A tree whose folders jump around by status is not navigable, so only files follow the
+  // caller's order.
+  const input = ["zeta/b.ts", "alpha/a.ts", "root-file.ts"];
+  assert.deepEqual(shape(buildFileTree(input, byPath, { preserveFileOrder: true })), [
+    { alpha: ["a.ts"] },
+    { zeta: ["b.ts"] },
+    "root-file.ts",
+  ]);
+});

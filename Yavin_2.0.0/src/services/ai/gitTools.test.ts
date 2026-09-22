@@ -225,6 +225,32 @@ test("every mutating tool has an explicit risk tier and none exposes force or hi
   assert.equal(TOOL_TIERS.stage, "reversible");
 });
 
+test("the AI's stash leaves untracked files alone unless it is explicitly asked not to", async () => {
+  // `stash -u` takes never-tracked files off disk, and a later stashDrop destroys them with
+  // no reflog to recover from -- so "stash" plus "tidy up stashes", two individually
+  // unremarkable steps, used to be a complete data-loss chain. It is opt-in now.
+  const stashOptions: Array<{ message?: string; untracked?: boolean }> = [];
+  const f = await fixture({ status: " M a.ts\0" });
+  (f.entry.store.repository as unknown as { stash: (o: object) => Promise<string> }).stash = async (
+    options,
+  ) => {
+    stashOptions.push(options);
+    return "stashed";
+  };
+
+  await f.tools.stash({ repoId: "/work" }, { message: "wip" });
+  assert.deepEqual(stashOptions.at(-1), { message: "wip", untracked: false });
+
+  await f.tools.stash({ repoId: "/work" }, { message: "wip", includeUntracked: true });
+  assert.deepEqual(stashOptions.at(-1), { message: "wip", untracked: true });
+});
+
+test("stashing is a confirm-tier tool, not a reversible one", () => {
+  // It removes changes from the working tree; undoing it means finding the right stash
+  // afterwards. "reversible" is the tier that means "just do it".
+  assert.equal(TOOL_TIERS.stash, "confirm");
+});
+
 test("the AI tool layer never imports the native Git bridge or spawns processes", () => {
   const dir = new URL(".", import.meta.url);
   for (const file of readdirSync(dir).filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"))) {

@@ -102,6 +102,20 @@ test("the snapshot identity is stable between writes, so useSyncExternalStore do
   assert.equal(gitLogSnapshot(), gitLogSnapshot());
 });
 
+test("recording stays cheap under a bulk operation that issues one command per file", () => {
+  // Every Git call in the app passes through here, including a Stage All over thousands of
+  // files. Copying the whole buffer per write made that measurably slower, so writes are
+  // O(1) and the snapshot is only materialised when something reads it.
+  const started = Date.now();
+  for (let i = 0; i < 20_000; i++)
+    recordGitEnd(recordGitStart("/repo", ["add", `f${i}.ts`]), {
+      code: 0,
+    });
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 2000, `40,000 log writes took ${elapsed}ms, which suggests O(n) per write`);
+  assert.equal(gitLogSnapshot().length, 500);
+});
+
 test("subscribers are notified on write and stop being notified once unsubscribed", () => {
   let calls = 0;
   const unsubscribe = subscribeGitLog(() => calls++);

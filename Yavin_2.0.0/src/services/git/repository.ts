@@ -162,6 +162,26 @@ export class Repository {
     return this.run(["cat-file", "--filters", `:${relativeToRoot(this.root, absolutePath)}`]);
   }
 
+  /**
+   * One side of a conflicted file, for "Accept Ours"/"Accept Theirs": stage 2 is the current
+   * branch's version, stage 3 is the incoming one.
+   *
+   * Reading the blob and letting the caller write it through the app's own apply path is
+   * deliberate. `git restore --ours/--theirs` would do this in one step, but on a path with
+   * no merge stages Git silently restores from the index and exits 0 instead of refusing --
+   * an unrecoverable working-tree discard, which is exactly what the allow-list refuses the
+   * bare `restore -- <path>` shape for. Going through `apply` also makes the result undoable,
+   * like every other change this panel writes.
+   */
+  conflictSide(absolutePath: string, side: "ours" | "theirs"): Promise<string> {
+    const stage = side === "ours" ? 2 : 3;
+    return this.run([
+      "cat-file",
+      "--filters",
+      `:${stage}:${relativeToRoot(this.root, absolutePath)}`,
+    ]);
+  }
+
   diff(absolutePath: string, staged: boolean, oldAbsolutePath?: string): Promise<string> {
     const args = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "-M"];
     if (staged) args.push("--cached");
@@ -389,7 +409,17 @@ export class Repository {
    * ref (`--all`), or a branch name to show that branch's history instead of HEAD's.
    */
   graphLog(skip: number, limit: number, scope?: "all" | string): Promise<string> {
-    const args = ["log", "--topo-order", "--skip", String(skip), "-n", String(limit)];
+    // `--decorate=full` so `%D` spells out refs/heads vs refs/remotes: the short form cannot
+    // tell a local `feature/login` from a remote branch (see `parseRefLabels`).
+    const args = [
+      "log",
+      "--topo-order",
+      "--decorate=full",
+      "--skip",
+      String(skip),
+      "-n",
+      String(limit),
+    ];
     if (scope === "all") args.push("--all");
     args.push(
       "--pretty=format:%H\x1f%h\x1f%P\x1f%an\x1f%ae\x1f%ad\x1f%cr\x1f%s\x1f%D",

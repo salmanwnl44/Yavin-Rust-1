@@ -1,5 +1,6 @@
 import type { RepoEntry } from "../../services/git/registry";
 import { guardedAffecting } from "../../services/git/sync";
+import { useRepoSnapshot } from "../../services/git/hooks";
 import type { StashEntry } from "../../services/git/parsers/stash";
 import { ChevronIcon } from "../ui/FileIcons";
 import { ArrowDownIcon, TrashIcon, UndoIcon } from "../ui/Icons";
@@ -17,6 +18,9 @@ export function StashesSection({
   collapsed: boolean;
   onToggleCollapse: () => void;
 }) {
+  // Read before the early return: hooks cannot be called conditionally.
+  const snapshot = useRepoSnapshot(entry?.store);
+  const busy = snapshot?.busy ?? false;
   if (!entry) return null;
 
   const run = (kind: string, op: () => Promise<string>) =>
@@ -60,32 +64,40 @@ export function StashesSection({
                     {stash.branch}
                   </span>
                 )}
-                <div className="flex items-center gap-0.5 shrink-0 opacity-0 group-hover/stash:opacity-100 transition-opacity">
+                {/* `focus-within` as well as hover, or tabbing to these buttons landed on
+                    something invisible -- the changed-file rows already do both. */}
+                <div className="flex items-center gap-0.5 shrink-0 opacity-0 transition-opacity group-hover/stash:opacity-100 focus-within:opacity-100">
                   <button
                     title="Apply Stash"
                     aria-label={`Apply stash ${stash.message}`}
+                    // Stash indexes shift as soon as one is applied or dropped, so a second
+                    // click before the list refreshes would act on a different stash than
+                    // the one it names. `busy` closes that window.
+                    disabled={busy}
                     onClick={() =>
                       run("stashApply", () => entry.store.repository.stashApply(stash.index))
                     }
-                    className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
+                    className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover disabled:opacity-40 disabled:hover:text-ink-3"
                   >
                     <ArrowDownIcon size={11} />
                   </button>
                   <button
                     title="Pop Stash (apply and remove)"
                     aria-label={`Pop stash ${stash.message}`}
+                    disabled={busy}
                     onClick={() =>
                       run("stashPop", () => entry.store.repository.stashPop(stash.index))
                     }
-                    className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
+                    className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover disabled:opacity-40 disabled:hover:text-ink-3"
                   >
                     <UndoIcon size={11} />
                   </button>
                   <button
                     title="Drop Stash"
                     aria-label={`Drop stash ${stash.message}`}
+                    disabled={busy}
                     onClick={() => drop(stash.index, stash.message)}
-                    className="p-1 rounded text-ink-3 hover:text-rose-300 hover:bg-surface-hover"
+                    className="p-1 rounded text-ink-3 hover:text-rose-300 hover:bg-surface-hover disabled:opacity-40 disabled:hover:text-ink-3"
                   >
                     <TrashIcon size={11} />
                   </button>

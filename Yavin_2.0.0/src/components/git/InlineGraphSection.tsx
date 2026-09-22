@@ -71,30 +71,43 @@ function InlineCommitDetail({
   repository,
   onClose,
   onDiff,
+  viewAsTree,
+  onToggleViewAsTree,
 }: {
   commit: RawCommit;
   repository: import("../../services/git/repository").Repository;
   onClose: () => void;
   onDiff: (document: DiffDocument) => void;
+  /** Owned by the section so the graph's "..." menu can toggle it too, not just the
+   * inline Tree/List button. */
+  viewAsTree: boolean;
+  onToggleViewAsTree: () => void;
 }) {
   const [detail, setDetail] = useState<CommitDetailedInfo | null>(null);
+  const [body, setBody] = useState("");
   const [remoteLink, setRemoteLink] = useState<RemoteWebLink | null>(null);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
-  const [viewAsTree, setViewAsTree] = useState(false);
   const [collapsedFolders, setCollapsedFolders] = useState<ReadonlySet<string>>(new Set());
 
   useEffect(() => {
     let cancelled = false;
     setDetail(null);
+    setBody("");
     setError("");
     Promise.all([
       repository.commitDetails(commit.fullHash),
+      repository.commitBody(commit.fullHash).catch(() => ""),
       defaultRemoteWebLink(repository).catch(() => null),
     ])
-      .then(([output, link]) => {
+      .then(([output, fullBody, link]) => {
         if (cancelled) return;
         setDetail(parseCommitDetails(output));
+        // Everything after the first blank line. Not a slice by the subject's length:
+        // the row's subject comes from `%s`, which collapses whitespace, so its length
+        // does not line up with the raw `%B` text.
+        const blankLine = fullBody.search(/\n\s*\n/);
+        setBody(blankLine === -1 ? "" : fullBody.slice(blankLine).trim());
         setRemoteLink(link);
       })
       .catch((reason) => !cancelled && setError(String(reason)));
@@ -159,8 +172,9 @@ function InlineCommitDetail({
         </button>
       </div>
       <div className="px-2 pb-1.5 space-y-1">
+        {body && <p className="whitespace-pre-wrap text-ink-2">{body}</p>}
         <p className="text-ink-3">
-          {commit.authorName} · {commit.relativeTime}
+          {commit.authorName} · {commit.relativeTime} ({commit.date})
         </p>
         <div className="flex items-center gap-1.5 text-ink-3">
           <span className="font-mono">{commit.hash}</span>
@@ -168,10 +182,15 @@ function InlineCommitDetail({
             title="Copy the full commit hash"
             aria-label="Copy commit hash"
             onClick={() => {
-              void navigator.clipboard.writeText(commit.fullHash).then(() => {
-                setCopied(true);
-                setTimeout(() => setCopied(false), 1500);
-              });
+              // Clipboard access is refused outside a secure context; report that rather
+              // than leaving the button looking inert.
+              navigator.clipboard.writeText(commit.fullHash).then(
+                () => {
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 1500);
+                },
+                () => setError("Could not copy the hash to the clipboard."),
+              );
             }}
             className="p-0.5 rounded hover:bg-surface-hover hover:text-ink"
           >
@@ -195,12 +214,14 @@ function InlineCommitDetail({
             <div className="flex items-center justify-between">
               <p className="text-ink-3">
                 {detail.filesChanged} file{detail.filesChanged === 1 ? "" : "s"} changed
+                {detail.insertions > 0 && <span className="text-green"> +{detail.insertions}</span>}
+                {detail.deletions > 0 && <span className="text-red"> −{detail.deletions}</span>}
               </p>
               {detail.files.length > 0 && (
                 <button
                   title={viewAsTree ? "View as List" : "View as Tree"}
                   aria-label={viewAsTree ? "View as List" : "View as Tree"}
-                  onClick={() => setViewAsTree((v) => !v)}
+                  onClick={onToggleViewAsTree}
                   className="rounded px-1 text-[10px] text-ink-3 hover:text-ink hover:bg-surface-hover"
                 >
                   {viewAsTree ? "List" : "Tree"}
@@ -262,6 +283,10 @@ export function InlineGraphSection({
   const repo = useRepoSnapshot(entry?.store);
   const busy = repo?.busy ?? false;
   const [selected, setSelected] = useState<RawCommit | null>(null);
+  // Owned here rather than inside the detail panel so the "..." menu's View as List/Tree
+  // items drive the same state the panel's own Tree/List button does -- the menu entry was
+  // previously a permanently-disabled label with nothing behind it.
+  const [filesAsTree, setFilesAsTree] = useState(false);
 
   useEffect(() => {
     setSelected((current) =>
@@ -275,6 +300,10 @@ export function InlineGraphSection({
   const edges = snapshot.layout.edges.filter((e) => e.fromRow < VISIBLE_COUNT);
   const gutterWidth = Math.max(1, Math.min(snapshot.layout.laneCount, 4)) * LANE_WIDTH + 6;
   const totalHeight = visible.length * ROW_HEIGHT;
+  // The incoming-changes node sits in HEAD's own lane, so it reads as the commits that are
+  // about to land on this branch rather than a stray mark in lane 0.
+  const incomingLane =
+    (visible.find((n) => n.commit.refs.some((r) => r.kind === "head")) ?? visible[0])?.lane ?? 0;
 
   // guardedAffecting resets the repository's shared GraphLoader itself for every operation
   // that changes what the graph shows (see sync.ts's GRAPH_RESETS). Since the loader is
@@ -363,8 +392,16 @@ export function InlineGraphSection({
             label="Graph view options"
             buttonClassName="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover"
             items={[
-              { label: "View as List", checked: true },
-              { label: "View as Tree", disabled: true },
+              {
+                label: "View as List",
+                checked: !filesAsTree,
+                onSelect: () => setFilesAsTree(false),
+              },
+              {
+                label: "View as Tree",
+                checked: filesAsTree,
+                onSelect: () => setFilesAsTree(true),
+              },
             ]}
           />
         </div>
@@ -377,17 +414,55 @@ export function InlineGraphSection({
               {snapshot.notice}
             </p>
           )}
+          {/* "Incoming Changes": a hollow, dashed node drawn in the graph's own lane geometry
+              directly above HEAD and connected down to it, the way the reference shows it --
+              not a detached text row. It gets its own SVG of exactly one row rather than
+              being spliced into the list below, so the main graph's `row * ROW_HEIGHT`
+              coordinates (and every connector keyed to them) stay exactly as they were. */}
           {repo && repo.branch.behind > 0 && (
-            <div
-              title={`${repo.branch.behind} commit${repo.branch.behind === 1 ? "" : "s"} on ${repo.branch.upstream || "the remote"} not yet in this branch`}
-              className="flex items-center gap-1.5 px-2 h-[22px] text-[11px] text-ink-3 border-b border-dashed border-border-strong"
-            >
-              <span
-                className="inline-block size-2 shrink-0 rounded-full border border-dashed border-ink-3"
+            <div style={{ position: "relative", height: ROW_HEIGHT }}>
+              <svg
+                width={gutterWidth}
+                height={ROW_HEIGHT}
+                style={{ position: "absolute", top: 0, left: 0, pointerEvents: "none" }}
                 aria-hidden="true"
-              />
-              <span className="italic">Incoming Changes</span>
-              <span className="truncate">{repo.branch.upstream}</span>
+              >
+                <line
+                  x1={laneX(incomingLane)}
+                  y1={ROW_HEIGHT / 2}
+                  x2={laneX(incomingLane)}
+                  y2={ROW_HEIGHT}
+                  stroke="#71717a"
+                  strokeWidth={1.25}
+                  strokeDasharray="2 2"
+                />
+                <circle
+                  cx={laneX(incomingLane)}
+                  cy={ROW_HEIGHT / 2}
+                  r={NODE_RADIUS}
+                  fill="none"
+                  stroke="#71717a"
+                  strokeWidth={1.25}
+                  strokeDasharray="2 1.5"
+                />
+              </svg>
+              <div
+                title={`${repo.branch.behind} commit${repo.branch.behind === 1 ? "" : "s"} on ${repo.branch.upstream || "the remote"} not yet in this branch`}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: gutterWidth,
+                  right: 0,
+                  height: ROW_HEIGHT,
+                }}
+                className="flex items-center gap-1.5 px-1.5 text-[11px] text-ink-3"
+              >
+                <span className="italic">Incoming Changes</span>
+                <span className="truncate">{repo.branch.upstream}</span>
+                <span className="ml-auto shrink-0 rounded-full border border-dashed border-ink-3 px-1.5 text-[9.5px]">
+                  {repo.branch.behind}
+                </span>
+              </div>
             </div>
           )}
           <div style={{ position: "relative", height: totalHeight }}>
@@ -505,6 +580,8 @@ export function InlineGraphSection({
               repository={entry.store.repository}
               onClose={() => setSelected(null)}
               onDiff={onDiff}
+              viewAsTree={filesAsTree}
+              onToggleViewAsTree={() => setFilesAsTree((v) => !v)}
             />
           )}
           {!snapshot.hasMore && snapshot.shallow && (

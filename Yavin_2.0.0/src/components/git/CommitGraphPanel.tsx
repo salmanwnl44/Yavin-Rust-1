@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { UIEvent } from "react";
 import type { Repository } from "../../services/git/repository";
 import { useCommitGraph } from "../../services/git/hooks";
 import type { GraphNode } from "../../services/git/graph/model";
@@ -97,9 +98,13 @@ function CommitDetail({
         if (cancelled) return;
         setDetail(parseCommitDetails(output));
         // Only the part beyond the subject -- the subject itself is already shown above,
-        // bold, from the graph row's own data.
-        const rest = fullBody.slice(node.commit.subject.length).replace(/^\n+/, "");
-        setBody(rest);
+        // bold, from the graph row's own data. Split on the first blank line rather than
+        // slicing by the subject's length: the row's subject comes from `%s`, which
+        // collapses whitespace and folds a wrapped subject onto one line, so its length
+        // does not line up with the raw `%B` text and the slice cut mid-subject, showing a
+        // fragment of the subject line as though it were the body.
+        const blankLine = fullBody.search(/\n\s*\n/);
+        setBody(blankLine === -1 ? "" : fullBody.slice(blankLine).trim());
         setRemoteLink(link);
       })
       .catch((reason) => {
@@ -189,10 +194,15 @@ function CommitDetail({
             title="Copy the full commit hash"
             aria-label="Copy commit hash"
             onClick={() => {
-              void navigator.clipboard.writeText(node.commit.fullHash).then(() => {
-                setCopied(true);
-                setTimeout(() => setCopied(false), 1500);
-              });
+              // The rejection path matters: clipboard access is refused outside a secure
+              // context, and without it the button silently did nothing at all.
+              navigator.clipboard.writeText(node.commit.fullHash).then(
+                () => {
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 1500);
+                },
+                () => setError("Could not copy the hash to the clipboard."),
+              );
             }}
             className="shrink-0 p-0.5 rounded hover:bg-[#121212] hover:text-zinc-300"
           >
@@ -289,6 +299,17 @@ export function CommitGraphPanel({
     return () => observer.disconnect();
   }, []);
 
+  // Scroll events fire far faster than frames, and each `setScrollTop` re-slices the node
+  // list and re-filters every edge. Coalescing to one update per animation frame does the
+  // same work at the rate the screen can actually show it.
+  const scrollFrame = useRef(0);
+  useEffect(() => () => cancelAnimationFrame(scrollFrame.current), []);
+  const onScroll = (event: UIEvent<HTMLDivElement>) => {
+    const { scrollTop: top } = event.currentTarget;
+    cancelAnimationFrame(scrollFrame.current);
+    scrollFrame.current = requestAnimationFrame(() => setScrollTop(top));
+  };
+
   // A commit selected before a same-repository history rewrite (an amend, a
   // rebase, or an external rewrite the .git watcher picked up) can vanish from
   // the freshly-reloaded snapshot -- reconcile the selection against it so
@@ -355,7 +376,7 @@ export function CommitGraphPanel({
           role="grid"
           aria-label="Commit history"
           className="flex-1 overflow-auto relative"
-          onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+          onScroll={onScroll}
         >
           <div style={{ height: totalHeight, position: "relative" }}>
             <svg
@@ -414,7 +435,12 @@ export function CommitGraphPanel({
                 aria-selected={selected?.commit.fullHash === node.commit.fullHash}
                 onClick={() => setSelected(node)}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") setSelected(node);
+                  if (e.key === "Enter" || e.key === " ") {
+                    // Without this, Space selected the commit AND scrolled the graph a page
+                    // down, losing the row the user had just picked.
+                    e.preventDefault();
+                    setSelected(node);
+                  }
                 }}
                 style={{
                   position: "absolute",

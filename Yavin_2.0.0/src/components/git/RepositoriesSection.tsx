@@ -178,7 +178,7 @@ function RepoRow({
           e.stopPropagation();
           onRemove();
         }}
-        className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover opacity-0 group-hover/repo:opacity-100 shrink-0"
+        className="p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover opacity-0 group-hover/repo:opacity-100 focus:opacity-100 shrink-0"
       >
         <CloseIcon size={11} />
       </button>
@@ -248,7 +248,7 @@ export function RepositoriesSection({
           Repositories
         </span>
         <div
-          className="flex items-center gap-0.5 opacity-0 group-hover/header:opacity-100 transition-opacity"
+          className="flex items-center gap-0.5 opacity-0 group-hover/header:opacity-100 focus-within:opacity-100 transition-opacity"
           onClick={(e) => e.stopPropagation()}
         >
           <button

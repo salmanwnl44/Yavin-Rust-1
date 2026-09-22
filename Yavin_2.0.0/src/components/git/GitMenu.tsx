@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 
 export interface MenuItemDef {
   label: string;
@@ -30,6 +30,15 @@ function MenuRow({ item, onDone }: { item: MenuItemDef; onDone: () => void }) {
       <button
         role="menuitem"
         disabled={item.disabled}
+        {...(hasChildren ? { "aria-haspopup": "menu" as const, "aria-expanded": subOpen } : {})}
+        // Keyboard users cannot hover, so the flyout also opens on focus and on Right arrow.
+        onFocus={() => hasChildren && setSubOpen(true)}
+        onKeyDown={(e) => {
+          if (hasChildren && e.key === "ArrowRight") {
+            e.preventDefault();
+            setSubOpen(true);
+          }
+        }}
         onClick={() => {
           if (hasChildren) {
             // Clicking never closes the flyout: hovering already opened it, so a toggle here
@@ -107,6 +116,8 @@ export function GitMenu({
 }) {
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -114,7 +125,12 @@ export function GitMenu({
       if (containerRef.current && !containerRef.current.contains(e.target as Node)) setOpen(false);
     };
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") {
+        setOpen(false);
+        // Escape has to put focus back where it came from, or a keyboard user is dropped at
+        // the top of the document with no idea where they are.
+        triggerRef.current?.focus();
+      }
     };
     document.addEventListener("mousedown", onPointerDown);
     document.addEventListener("keydown", onKeyDown);
@@ -124,15 +140,44 @@ export function GitMenu({
     };
   }, [open]);
 
+  // Opening moves focus to the first enabled item, so the menu is operable from the keyboard
+  // at all rather than requiring a Tab walk through the page to reach it.
+  useEffect(() => {
+    if (!open) return;
+    const first = menuRef.current?.querySelector<HTMLButtonElement>(
+      'button[role="menuitem"]:not(:disabled)',
+    );
+    first?.focus();
+  }, [open]);
+
+  /** Up/Down move between items, the way a menu is expected to behave. */
+  const onMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    event.preventDefault();
+    const buttons = [
+      ...(menuRef.current?.querySelectorAll<HTMLButtonElement>(
+        'button[role="menuitem"]:not(:disabled)',
+      ) ?? []),
+    ];
+    if (!buttons.length) return;
+    const current = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    const step = event.key === "ArrowDown" ? 1 : -1;
+    const next = (current + step + buttons.length) % buttons.length;
+    buttons[next]?.focus();
+  };
+
   return (
     <div className="relative" ref={containerRef}>
       <button
+        ref={triggerRef}
         onClick={(e) => {
           e.stopPropagation();
           setOpen((o) => !o);
         }}
         title={label}
         aria-label={label}
+        aria-haspopup="menu"
+        aria-expanded={open}
         className={
           buttonClassName ??
           "p-1 rounded text-ink-3 hover:text-ink hover:bg-surface-hover transition-colors"
@@ -142,9 +187,11 @@ export function GitMenu({
       </button>
       {open && (
         <div
+          ref={menuRef}
           role="menu"
           aria-label={label}
           onClick={(e) => e.stopPropagation()}
+          onKeyDown={onMenuKeyDown}
           className={`absolute ${align === "end" ? "right-0" : "left-0"} top-full mt-1 z-50 min-w-[190px] rounded border border-border-strong bg-surface-hover shadow-xl py-1 text-[12px]`}
         >
           {items.map((entry, i) =>
