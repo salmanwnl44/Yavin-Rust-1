@@ -254,12 +254,18 @@ export class Repository {
     return this.run(["branch", "-m", oldName, newName]);
   }
 
-  // Always prunes: a remote branch deleted upstream would otherwise leave its
-  // refs/remotes/<remote>/* entry (and any graph decoration badge on it) around
-  // indefinitely -- --prune only ever removes local records of refs the remote no
-  // longer has, it can never delete anything from the remote itself.
-  fetch(): Promise<string> {
-    return this.run(["fetch", "--prune"]);
+  /**
+   * `prune` defaults to on: a remote branch deleted upstream would otherwise leave its
+   * refs/remotes/<remote>/* entry (and any graph decoration badge on it) around
+   * indefinitely -- --prune only ever removes local records of refs the remote no
+   * longer has, it can never delete anything from the remote itself. `allRemotes` is
+   * "Fetch From All Remotes" (`--all`); plain "Fetch" passes `{ prune: false }`.
+   */
+  fetch(options: { prune?: boolean; allRemotes?: boolean } = {}): Promise<string> {
+    const args = ["fetch"];
+    if (options.prune ?? true) args.push("--prune");
+    if (options.allRemotes) args.push("--all");
+    return this.run(args);
   }
 
   // Reconciling a divergence is always the user's explicit choice, and never
@@ -273,16 +279,42 @@ export class Repository {
   pullMerge(): Promise<string> {
     return this.run(["pull", "--no-rebase", "--no-autostash", "--no-edit"]);
   }
+  /** "Pull from…": an explicit remote and branch, once, instead of the branch's own
+   * configured upstream. Still a plain, non-force, fast-forward-or-fail pull. */
+  async pullFrom(remote: string, branch: string): Promise<string> {
+    await this.knownRemote(remote);
+    return this.run(["pull", remote, branch]);
+  }
   push(): Promise<string> {
     return this.run(["push"]);
   }
+  /** "Push to…": an explicit remote and branch, once, instead of the current branch's
+   * configured upstream (if any). Never sets upstream -- that is `publish`'s job. */
+  async pushTo(remote: string, branch: string): Promise<string> {
+    await this.knownRemote(remote);
+    return this.run(["push", remote, branch]);
+  }
+  /** "Push Tags": every local tag the remote doesn't already have. */
+  pushTags(): Promise<string> {
+    return this.run(["push", "--tags"]);
+  }
+  /** "Delete Remote Branch…" / "Delete Remote Tag…": the same `push --delete` for both --
+   * Git resolves `name` against whichever of refs/heads or refs/tags it unambiguously is. */
+  async deleteRemoteRef(remote: string, name: string): Promise<string> {
+    await this.knownRemote(remote);
+    return this.run(["push", remote, "--delete", name]);
+  }
 
-  async publish(remote: string): Promise<string> {
-    // Only a remote Git itself reports can be pushed to, so the name can never be
-    // read as an option or a URL.
+  private async knownRemote(remote: string): Promise<void> {
+    // Only a remote Git itself reports can be a target, so the name can never be read as
+    // an option, a URL, or a refspec.
     const remotes = await this.remotes();
     if (!remotes.includes(remote))
       throw new Error("Unknown remote. Add one with git remote add first.");
+  }
+
+  async publish(remote: string): Promise<string> {
+    await this.knownRemote(remote);
     let head;
     try {
       head = await gitExec(this.repoId, ["symbolic-ref", "--short", "HEAD"], crypto.randomUUID());
@@ -291,6 +323,17 @@ export class Repository {
     }
     if (head.code !== 0) throw new Error("Detached HEAD: switch to a branch before publishing.");
     return this.run(["push", "--set-upstream", remote, head.stdout.trim()]);
+  }
+
+  /** "Merge…": merges `branch` into the current branch (a normal, non-fast-forward-forced
+   * merge commit unless Git fast-forwards on its own). "Rebase Branch…" replays the current
+   * branch's commits onto `branch` instead. Both are ordinary Git operations Yavin's existing
+   * conflict/abort/continue/skip machinery already handles once one leaves a conflict. */
+  mergeBranch(branch: string): Promise<string> {
+    return this.run(["merge", branch]);
+  }
+  rebaseOnto(branch: string): Promise<string> {
+    return this.run(["rebase", branch]);
   }
 
   async abort(): Promise<string> {
@@ -368,9 +411,18 @@ export class Repository {
     ]);
   }
 
-  stash(message?: string): Promise<string> {
-    const args = ["stash", "push", "-u"];
-    if (message?.trim()) args.push("-m", message.trim());
+  /**
+   * `untracked` is "Stash (Include Untracked)" (`-u`); `staged` is "Stash Staged" (`--staged`,
+   * only what's already in the index -- everything else stays in the working tree). Plain
+   * "Stash" passes neither, matching Git's own plain `stash push` (tracked changes only).
+   */
+  stash(
+    options: { message?: string; untracked?: boolean; staged?: boolean } = {},
+  ): Promise<string> {
+    const args = ["stash", "push"];
+    if (options.staged) args.push("--staged");
+    else if (options.untracked) args.push("-u");
+    if (options.message?.trim()) args.push("-m", options.message.trim());
     return this.run(args);
   }
   stashPop(index?: number): Promise<string> {
@@ -381,6 +433,15 @@ export class Repository {
   }
   stashDrop(index: number): Promise<string> {
     return this.run(["stash", "drop", `stash@{${index}}`]);
+  }
+  /** "Drop All Stashes": clears the entire stash list at once. */
+  stashClear(): Promise<string> {
+    return this.run(["stash", "clear"]);
+  }
+  /** "View Stash…": the stash's own unified diff against the commit it was taken from --
+   * the same format `diff()`/`commitFileDiff()` already produce, so it reuses their viewer. */
+  stashShow(index: number): Promise<string> {
+    return this.run(["stash", "show", "--no-color", "-p", `stash@{${index}}`]);
   }
   stashList(): Promise<string> {
     return this.run(["stash", "list"]);

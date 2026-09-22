@@ -146,7 +146,9 @@ export function buildGitCommandMenu({
           disabled: modified.length === 0,
           onSelect: () => {
             const stashMessage = window.prompt("Stash message (optional)") ?? "";
-            run("stash", () => repo.stash(stashMessage || undefined));
+            // Kept as-is (untracked included) pending the full Stash submenu rebuild, which
+            // splits this into separate Stash / Stash (Include Untracked) / Stash Staged items.
+            run("stash", () => repo.stash({ message: stashMessage || undefined, untracked: true }));
           },
         },
         { label: "Pop Latest Stash", onSelect: () => run("stashPop", () => repo.stashPop()) },

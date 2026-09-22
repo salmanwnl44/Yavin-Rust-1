@@ -178,7 +178,7 @@ export function createGitMutatingTools(options: {
         "stash",
         "stash",
         (snap) => (snap.entries.length ? null : pre("There are no changes to stash.")),
-        (e) => e.store.repository.stash(args.message),
+        (e) => e.store.repository.stash({ message: args.message, untracked: true }),
       ),
 
     createBranch: (ref: WorktreeRef, args: { name: string }) =>

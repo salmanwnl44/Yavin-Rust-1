@@ -189,8 +189,10 @@ enum Scope {
 fn operation_scope(subcommand: &str, rest: &[String]) -> Scope {
     match subcommand {
         "stash" => match rest.first().map(String::as_str) {
-            Some("push") | Some("apply") | Some("pop") | Some("drop") => Scope::Stash,
-            Some("list") => Scope::Read,
+            Some("push") | Some("apply") | Some("pop") | Some("drop") | Some("clear") => {
+                Scope::Stash
+            }
+            Some("list") | Some("show") => Scope::Read,
             _ => Scope::WorktreeLocal,
         },
         "status" | "log" | "show" | "diff" | "for-each-ref" | "rev-parse" | "cat-file"
@@ -685,7 +687,10 @@ const PULL: &[FlagRule] = &[
     flag("--no-rebase"),
     flag("--no-edit"),
 ];
-const PUSH: &[FlagRule] = &[flag("--set-upstream")];
+// `--delete` and `--tags` are added for "Delete Remote Branch/Tag…" and "Push Tags"; neither
+// takes a refspec of its own (see `validate_shape`'s two-positional arm below), so the
+// no-force-push guarantee this file's other comments describe is unaffected.
+const PUSH: &[FlagRule] = &[flag("--set-upstream"), flag("--delete"), flag("--tags")];
 const SHOW: &[FlagRule] = &[
     flag("--stat"),
     flag("--oneline"),
@@ -701,7 +706,13 @@ const SHOW: &[FlagRule] = &[
     flag("--no-color"),
     flag("-M"),
 ];
-const STASH: &[FlagRule] = &[flag("-u"), value_flag("-m")];
+const STASH: &[FlagRule] = &[
+    flag("-u"),
+    flag("--staged"),
+    flag("-p"),
+    flag("--no-color"),
+    value_flag("-m"),
+];
 const TAG: &[FlagRule] = &[flag("-l"), flag("-d")];
 // The patch content itself travels over stdin, not argv -- see `git_exec`'s `input`.
 const APPLY: &[FlagRule] = &[flag("--cached"), flag("-R")];
@@ -738,8 +749,10 @@ const WORKTREE: &[FlagRule] = &[flag("--porcelain"), flag("-z")];
 const BRANCH: &[FlagRule] = &[flag("-d"), flag("-D"), flag("-m")];
 // `--prune` only ever removes LOCAL records of refs the remote no longer has -- it
 // can never delete anything from the remote itself, and it never resets the graph
-// (it removes a ref, never a commit object; see the plan's Section T).
-const FETCH: &[FlagRule] = &[flag("--prune")];
+// (it removes a ref, never a commit object; see the plan's Section T). `--all`
+// (Fetch From All Remotes) fetches every configured remote instead of just the
+// current branch's; it takes no remote/refspec positional of its own.
+const FETCH: &[FlagRule] = &[flag("--prune"), flag("--all")];
 
 /// The declarative allow-list this whole design leans on: every subcommand
 /// TypeScript may run, and every flag it may pass before a literal `--`. Anything not
@@ -853,11 +866,22 @@ fn validate_shape(subcommand: &str, flags: &[&str], positionals: &[&str]) -> Res
         ))
     };
     match subcommand {
-        // fetch/pull only ever run against the branch's configured remote.
-        "fetch" | "pull" if !positionals.is_empty() => {
-            refuse("it takes no remote or refspec arguments")
-        }
-        // push: bare, or `--set-upstream <remote> <branch>` for publishing.
+        // fetch only ever runs against the branch's configured remote(s) (plain, or every
+        // remote with --all); "Pull from…" is the one place a plain remote+branch pair is
+        // legitimate on the read/network side, same reasoning as push-to below.
+        "fetch" if !positionals.is_empty() => refuse("it takes no remote or refspec arguments"),
+        "pull" => match positionals {
+            [] => Ok(()),
+            [remote, branch]
+                if !looks_like_refspec_or_url(remote) && !looks_like_refspec_or_url(branch) =>
+            {
+                Ok(())
+            }
+            _ => refuse("only a plain pull, or pull <remote> <branch>, is allowed"),
+        },
+        // push: bare (optionally --tags), --set-upstream <remote> <branch> (publish),
+        // --delete <remote> <ref> (Delete Remote Branch/Tag), or a plain <remote> <branch>
+        // (Push to…) -- never a refspec, a URL or an `ext::` transport (`looks_like_refspec_or_url`).
         "push" => match positionals {
             [] => Ok(()),
             [remote, branch]
@@ -867,7 +891,24 @@ fn validate_shape(subcommand: &str, flags: &[&str], positionals: &[&str]) -> Res
             {
                 Ok(())
             }
-            _ => refuse("only a plain push, or --set-upstream <remote> <branch>, is allowed"),
+            [remote, ref_name]
+                if flags.contains(&"--delete")
+                    && !looks_like_refspec_or_url(remote)
+                    && !looks_like_refspec_or_url(ref_name) =>
+            {
+                Ok(())
+            }
+            [remote, branch]
+                if flags.is_empty()
+                    && !looks_like_refspec_or_url(remote)
+                    && !looks_like_refspec_or_url(branch) =>
+            {
+                Ok(())
+            }
+            _ => refuse(
+                "only a plain push, push --tags, --set-upstream <remote> <branch>, \
+                 --delete <remote> <ref>, or push <remote> <branch> is allowed",
+            ),
         },
         // Bare `git remote` lists names; `add`/`remove` take exactly the two/one positional(s)
         // Repository.addRemote()/removeRemote() produce. Re-pointing a remote's URL
@@ -903,23 +944,37 @@ fn validate_shape(subcommand: &str, flags: &[&str], positionals: &[&str]) -> Res
             }
             _ => refuse("only deleting (-d/-D) or renaming (-m) a branch is allowed"),
         },
+        // "clear" (Drop All Stashes) and "show" (View Stash, read-only) join the existing
+        // verbs; `-p`/`--no-color` on `show` are the same flags `diff()`/`show()` already use
+        // for a readable, unambiguous unified diff.
         "stash" => match positionals {
-            ["push" | "list"] => Ok(()),
+            ["push" | "list" | "clear"] => Ok(()),
             ["pop" | "apply" | "drop"] => Ok(()),
-            ["pop" | "apply" | "drop", entry] if is_stash_ref(entry) => Ok(()),
-            _ => refuse("only push, list, pop, apply and drop of a stash@{n} entry are allowed"),
+            ["pop" | "apply" | "drop" | "show", entry] if is_stash_ref(entry) => Ok(()),
+            _ => {
+                refuse("only push, list, clear, show, pop, apply and drop of a stash@{n} entry are allowed")
+            }
         },
         // Without the flag these would delete files / discard working-tree edits, bypassing
         // the confirm-and-keep-a-recovery-copy flow the UI puts in front of discarding.
         "rm" if !flags.contains(&"--cached") => refuse("only --cached (unstaging) is allowed"),
         "restore" if !flags.contains(&"--staged") => refuse("only --staged (unstaging) is allowed"),
-        // Starting a merge/rebase/cherry-pick/revert rewrites history; the app only ever
-        // continues, skips or aborts one that already exists.
-        "merge" | "rebase" | "cherry-pick" | "revert"
-            if !positionals.is_empty() || flags.len() != 1 =>
-        {
+        // cherry-pick/revert only ever continue, skip or abort one already in progress --
+        // Yavin has no "Cherry-pick…"/"Revert…" UI to start one arbitrarily.
+        "cherry-pick" | "revert" if !positionals.is_empty() || flags.len() != 1 => {
             refuse("only --abort, --continue or --skip on an existing operation is allowed")
         }
+        // merge/rebase additionally allow starting one against a plain, unambiguous branch
+        // name ("Merge…"/"Rebase Branch…") -- never a refspec, and never combined with
+        // --abort/--continue/--skip in the same call.
+        "merge" | "rebase" => match (flags, positionals) {
+            (["--abort"], []) | (["--continue"], []) | (["--skip"], []) => Ok(()),
+            ([], [branch]) if !branch.is_empty() && !looks_like_refspec_or_url(branch) => Ok(()),
+            _ => refuse(
+                "only starting a merge/rebase onto an existing branch, or --abort/--continue/\
+                 --skip on one already in progress, is allowed",
+            ),
+        },
         _ => Ok(()),
     }
 }
@@ -2101,7 +2156,7 @@ mod tests {
     fn an_unrelated_fetch_flag_is_rejected() {
         let (dir, _git) = fixture();
         let repo = open(&dir);
-        let result = exec(&repo, &args(&["fetch", "--all"]), None);
+        let result = exec(&repo, &args(&["fetch", "--tags"]), None);
         let _ = fs::remove_dir_all(&dir);
         let error = result.unwrap_err();
         assert!(error.contains("not permitted"), "unexpected error: {error}");
@@ -2275,30 +2330,39 @@ mod tests {
     }
 
     #[test]
-    fn starting_an_unrelated_operation_while_one_is_unresolved_is_refused_by_git_itself() {
+    fn starting_an_operation_while_one_is_unresolved_is_refused_by_git_itself() {
         let (dir, git) = fixture();
         let repo = open(&dir);
-        fs::write(dir.join("a.txt"), "c1\n").unwrap();
-        assert!(git(&["commit", "-qam", "c1"]));
-        fs::write(dir.join("a.txt"), "c2\n").unwrap();
-        assert!(git(&["commit", "-qam", "c2"]));
-        assert!(git(&["switch", "-qc", "other", "HEAD~2"]));
-        fs::write(dir.join("a.txt"), "other1\n").unwrap();
-        assert!(git(&["commit", "-qam", "other1"]));
+        // Two branches change the same line differently, so cherry-picking one onto the
+        // other is guaranteed to conflict and leave a real, unresolved CHERRY_PICK_HEAD --
+        // not just a nonzero exit for some unrelated reason.
+        assert!(git(&["switch", "-qc", "feature"]));
+        fs::write(dir.join("a.txt"), "feature change\n").unwrap();
+        assert!(git(&["commit", "-qam", "feature change"]));
+        assert!(git(&["switch", "-q", "master"]));
+        fs::write(dir.join("a.txt"), "master change\n").unwrap();
+        assert!(git(&["commit", "-qam", "master change"]));
 
-        assert!(!git(&["cherry-pick", "master~1"]));
-        // Starting a merge is not something the IPC boundary permits any more (only
-        // --abort/--continue/--skip of an existing operation is), so Git's own "already in
-        // progress" refusal can no longer be provoked through `exec`; its message text is
-        // classified by errors.test.ts against real Git output. What still matters here is that
-        // the boundary refuses, and that the in-progress cherry-pick remains abortable.
-        let result = exec(&repo, &args(&["merge", "master"]), None);
+        assert!(!git(&["cherry-pick", "feature"]));
+        assert!(
+            dir.join(".git/CHERRY_PICK_HEAD").exists(),
+            "sanity: the cherry-pick must have actually conflicted, not merely failed"
+        );
+        // The IPC boundary now permits *starting* a merge/rebase against a plain branch name
+        // (validate_shape's "merge" | "rebase" arm, for "Merge…"/"Rebase Branch…") -- but Git
+        // itself still refuses to start a second operation while a cherry-pick is unresolved,
+        // a protection that was never the IPC boundary's job to provide.
+        let result = exec(&repo, &args(&["merge", "feature"]), None);
         let abort = exec(&repo, &args(&["cherry-pick", "--abort"]), None);
         let _ = fs::remove_dir_all(&dir);
 
-        assert!(
-            result.as_ref().is_err_and(|e| e.contains("not permitted")),
-            "starting a merge must be refused before git runs: {result:?}"
+        // The IPC boundary itself accepts the shape (`result` is `Ok`, a spawned process);
+        // git's own exit code is what refuses it -- the same layering `Repository.run` (TS)
+        // already relies on for every other command.
+        let output = result.expect("the IPC boundary must let this shape through to git");
+        assert_ne!(
+            output.code, 0,
+            "git itself must still refuse a second operation while one is unresolved: {output:?}"
         );
         assert!(abort.is_ok());
     }
@@ -2649,6 +2713,20 @@ mod tests {
             &["tag", "-d", "v1.0.0"],
             &["branch", "-m", "renamed"],
             &["branch", "-m", "old-name", "new-name"],
+            &["fetch", "--all"],
+            &["fetch", "--prune", "--all"],
+            &["pull", "origin", "main"],
+            &["push", "origin", "main"],
+            &["push", "--tags"],
+            &["push", "origin", "--delete", "feature"],
+            &["push", "origin", "--delete", "v1.0.0"],
+            &["merge", "other-branch"],
+            &["rebase", "other-branch"],
+            &["stash", "push", "--staged"],
+            &["stash", "push", "--staged", "-m", "a message"],
+            &["stash", "clear"],
+            &["stash", "show", "stash@{0}"],
+            &["stash", "show", "--no-color", "-p", "stash@{0}"],
         ];
         for shape in shapes {
             let a = args(shape);
@@ -2667,9 +2745,11 @@ mod tests {
             &["push", "origin", "+main:main"],
             &["push", "origin", ":some-branch"],
             &["push", "origin", "main:main"],
-            &["push", "origin", "main"],
+            &["push", "origin", "+feature"],
             &["push", "--set-upstream", "origin", "+main"],
             &["push", "--set-upstream", "origin", ":main"],
+            &["push", "origin", "--delete", "+evil"],
+            &["push", "origin", "--delete", ":evil"],
             // pushing to a URL / remote helper instead of a configured remote
             &[
                 "push",
@@ -2683,8 +2763,11 @@ mod tests {
             &["fetch", "origin"],
             &["fetch", "ext::sh -c touch pwned"],
             &["fetch", "https://evil.example/r.git"],
-            &["pull", "origin", "main"],
             &["pull", "--ff-only", "https://evil.example/r.git"],
+            &["pull", "origin", "+main"],
+            &["pull", "origin", ":main"],
+            &["pull", "origin"],
+            &["pull", "origin", "main", "extra"],
             // editing remotes beyond add/remove, and worktrees
             &["remote", "set-url", "origin", "https://evil.example/r.git"],
             &["remote", "rename", "origin", "up"],
@@ -2695,24 +2778,30 @@ mod tests {
             &["worktree", "remove", "--force", "x"],
             &["worktree"],
             // stash forms the app does not use
-            &["stash", "clear"],
             &["stash"],
             &["stash", "branch", "b"],
             &["stash", "create"],
+            &["stash", "clear", "extra"],
             &["stash", "pop", "--index"],
             &["stash", "drop", "stash@{}"],
             &["stash", "drop", "stash@{x}"],
             &["stash", "drop", "HEAD"],
             &["stash", "drop", "stash@{0}", "stash@{1}"],
+            &["stash", "show"],
+            &["stash", "show", "HEAD"],
+            &["stash", "show", "-p", "stash@{0}", "stash@{1}"],
             // deleting files / discarding working-tree edits without the safe flag
             &["rm", "--", "a.txt"],
             &["restore", "--", "a.txt"],
             &["restore", "a.txt"],
-            // starting (rather than continuing) a history-rewriting operation
-            &["merge", "other"],
+            // merge/rebase: a plain branch name may start one, but never combined with
+            // --abort/--continue/--skip, never a refspec, never more than one target
             &["merge", "--abort", "other"],
             &["merge", "--abort", "--continue"],
-            &["rebase", "main"],
+            &["merge", "+evil"],
+            &["merge", "a:b"],
+            &["rebase", "main", "extra"],
+            // cherry-pick/revert have no "start" form at all
             &["cherry-pick", "abc123"],
             &["revert", "HEAD"],
             &["revert"],
