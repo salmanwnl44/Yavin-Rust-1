@@ -62,12 +62,20 @@ export class Repository {
     return output.stdout;
   }
 
+  /**
+   * A probe whose *exit code* is the answer -- "does HEAD exist", "does HEAD~1 exist".
+   *
+   * Deliberately does NOT swallow a failure to run Git at all. It used to, and the two
+   * outcomes are not interchangeable: `unstage` reads this as "the repository has no
+   * commits yet" and falls back to `git rm --cached`, which in a repository that *does*
+   * have commits does not just unstage the file, it untracks it. So a cancelled call, a
+   * lock contention, or any transient IPC rejection during the probe silently turned a
+   * routine unstage into an untrack. Letting the rejection through means the caller
+   * reports a real error instead of quietly taking the destructive branch.
+   */
   private async ok(args: string[]): Promise<boolean> {
-    try {
-      return (await gitExec(this.repoId, args, crypto.randomUUID())).code === 0;
-    } catch {
-      return false;
-    }
+    const output = await gitExec(this.repoId, args, crypto.randomUUID());
+    return output.code === 0;
   }
 
   private async runWithInput(args: string[], input: string): Promise<string> {

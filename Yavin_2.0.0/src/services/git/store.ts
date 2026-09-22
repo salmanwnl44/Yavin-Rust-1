@@ -24,6 +24,16 @@ export const DIRTY_BLOCKED = new Set([
   "abort",
   "continue",
   "skip",
+  // The stash family rewrites tracked files on disk exactly like a pull does. Without
+  // these, stashing with an unsaved editor open reverted the file on disk while the stale
+  // buffer survived, so the next save wrote the stashed-away content straight back -- the
+  // change then existed both in the stash and in the working tree.
+  "stash",
+  "stashApply",
+  "stashPop",
+  // `git apply -R` against the working-tree file, for the same reason. (`stage-hunk` and
+  // `unstage-hunk` are deliberately absent: they only ever touch the index.)
+  "discard-hunk",
 ]);
 
 export interface RepoSnapshot {

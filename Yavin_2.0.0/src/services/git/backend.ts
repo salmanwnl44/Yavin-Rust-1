@@ -1,5 +1,6 @@
 import { native } from "../native.ts";
 import type { ToolOutput } from "../native.ts";
+import { recordGitEnd, recordGitStart } from "./outputLog.ts";
 
 export interface RepoInfo {
   repoId: string;
@@ -25,13 +26,23 @@ export function closeRepo(repoId: string): Promise<void> {
  * `cancelRepoOperations` below can find and cancel it. `Repository` generates a fresh
  * one per call; nothing above it tracks ids, because cancellation is by repository.
  */
-export function gitExec(
+export async function gitExec(
   repoId: string,
   args: string[],
   id: string,
   input?: string,
 ): Promise<ToolOutput> {
-  return native("git_exec", { repoId, args, id, input });
+  // Every Git invocation in the app passes through here, which is what makes this the one
+  // place "Show Git Output" has to hook -- see `outputLog.ts`.
+  const logId = recordGitStart(repoId, args, input);
+  try {
+    const output = await native("git_exec", { repoId, args, id, input });
+    recordGitEnd(logId, { code: output.code, stderr: output.stderr });
+    return output;
+  } catch (reason) {
+    recordGitEnd(logId, { error: String(reason) });
+    throw reason;
+  }
 }
 
 /**

@@ -1,5 +1,6 @@
 import type { RepoEntry } from "../../services/git/registry";
 import { guardedAffecting } from "../../services/git/sync";
+import { syncAction } from "./syncAction";
 import type { MenuEntry } from "./GitMenu";
 import type { DialogRequest, DialogOption } from "../ui/AppDialog";
 import type { DiffDocument } from "../layout/DiffEditor";
@@ -26,6 +27,8 @@ export function buildGitCommandMenu({
   changesSort,
   changesViewAsTree,
   onToggleViewAsTree,
+  onClone,
+  onShowOutput,
 }: {
   entry: RepoEntry;
   dirty: boolean;
@@ -47,6 +50,10 @@ export function buildGitCommandMenu({
   changesSort?: ChangesSort;
   changesViewAsTree?: boolean;
   onToggleViewAsTree?: () => void;
+  /** Runs the panel's clone flow (pick a folder, prompt for a URL, open the result). */
+  onClone?: () => void;
+  /** Opens the Git Output view -- the log of every command the app has run. */
+  onShowOutput?: () => void;
 }): MenuEntry[] {
   const repo = entry.store.repository;
   const snapshot = entry.store.getSnapshot();
@@ -138,8 +145,23 @@ export function buildGitCommandMenu({
   items.push(
     { label: "Pull", disabled: !hasUpstream, onSelect: () => run("pull", () => repo.pull()) },
     { label: "Push", disabled: !hasUpstream, onSelect: () => run("push", () => repo.push()) },
-    { label: "Clone…", disabled: true },
-    { label: "Checkout to…", disabled: true },
+    {
+      label: "Clone…",
+      disabled: !onClone,
+      onSelect: () => onClone?.(),
+    },
+    {
+      label: "Checkout to…",
+      // A repository with only the current branch has nothing to check out to; the Branch
+      // submenu is where a new one gets created.
+      disabled: otherBranches.length === 0,
+      onSelect: () =>
+        onDialog({
+          title: "Checkout to branch",
+          options: branchPicker(otherBranches),
+          submit: (branch) => void run("switch", () => repo.switchBranch(branch)),
+        }),
+    },
     { label: "Fetch", onSelect: () => run("fetch", () => repo.fetch({ prune: false })) },
     { separator: true },
     {
@@ -282,12 +304,20 @@ export function buildGitCommandMenu({
         {
           label: "Sync",
           disabled: !hasUpstream,
-          onSelect: () =>
-            snapshot.branch.behind > 0
-              ? run("pull", () => repo.pull())
-              : run("push", () => repo.push()),
+          // Shares the repo row's sync-pill decision instead of reimplementing it. The
+          // reimplementation here was `behind > 0 ? pull() : push()`, which on a *diverged*
+          // branch (ahead AND behind) silently took the pull branch and created a merge
+          // commit the user never chose -- exactly the one case `syncAction` refuses to
+          // decide, and refuses with an explanation naming Rebase and Merge, both of which
+          // this same menu offers.
+          onSelect: () => syncAction(entry, dirty).run(() => {}),
         },
         { separator: true },
+        {
+          label: "Pull",
+          disabled: !hasUpstream,
+          onSelect: () => run("pull", () => repo.pull()),
+        },
         {
           label: "Pull (Rebase)",
           disabled: !hasUpstream,
@@ -295,8 +325,10 @@ export function buildGitCommandMenu({
         },
         { label: "Pull from…", onSelect: () => promptPullFrom() },
         { separator: true },
+        { label: "Push", onSelect: () => run("push", () => repo.push()) },
         { label: "Push to…", onSelect: () => promptPushTo() },
         { separator: true },
+        { label: "Fetch", onSelect: () => run("fetch", () => repo.fetch()) },
         {
           label: "Fetch (Prune)",
           onSelect: () => run("fetch", () => repo.fetch({ prune: true })),
@@ -594,9 +626,10 @@ export function buildGitCommandMenu({
         { label: "Push Tags", onSelect: () => run("pushTags", () => repo.pushTags()) },
       ],
     },
-    { label: "Worktrees", disabled: true },
+    // No "Worktrees" item: Antigravity's menu has none, and Yavin's own worktree support is
+    // reached from the repository switcher. A permanently-disabled entry was only ever noise.
     { separator: true },
-    { label: "Show Git Output", disabled: true },
+    { label: "Show Git Output", disabled: !onShowOutput, onSelect: () => onShowOutput?.() },
   );
 
   function promptStash(options: { untracked?: boolean; staged?: boolean }) {

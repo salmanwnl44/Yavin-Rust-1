@@ -4,6 +4,7 @@ import type { RepoEntry } from "./registry.ts";
 import type { RepoSnapshot, RepoStore } from "./store.ts";
 import { GraphLoader } from "./graph/incremental.ts";
 import type { GraphScope, GraphSnapshot } from "./graph/incremental.ts";
+import { acquireLoader, releaseLoader, resetLoader } from "./graph/shared.ts";
 import type { Repository } from "./repository.ts";
 
 const EMPTY_SUBSCRIBE = () => () => {};
@@ -65,34 +66,31 @@ const NO_GRAPH_SNAPSHOT = () => EMPTY_GRAPH_SNAPSHOT;
  * catches up (this only matters for the brief window before `GitRegistry.openNew()`
  * finishes attaching a newly-opened worktree to its `RepositoryEntry`).
  */
-const sharedGraphLoaders = new Map<string, { loader: GraphLoader; refCount: number }>();
-
 function graphLoaderKey(repository: Repository): string {
   return gitRegistry.repositoryFor(repository.repoId)?.repositoryId ?? repository.repoId;
 }
 
-function acquireGraphLoader(repository: Repository): GraphLoader {
+/**
+ * Returns the key alongside the loader so the caller can release under the SAME key it
+ * acquired with. Recomputing the key at release time was a leak: `graphLoaderKey` consults
+ * the registry, and closing the repository removes the entry it reads, so the release
+ * computed the `repository.repoId` fallback instead, missed the table, and returned without
+ * decrementing. The loader then stayed forever -- and, worse, was handed back out when the
+ * same repository was reopened, by which point `GitRegistry.close()` had already called
+ * `close()` on the `Repository` inside it, so every later `graphLog` failed against a dead
+ * native handle while the view showed the pre-close commit list.
+ */
+function acquireGraphLoader(repository: Repository): { loader: GraphLoader; key: string } {
   const key = graphLoaderKey(repository);
-  const existing = sharedGraphLoaders.get(key);
-  if (existing) {
-    existing.refCount++;
-    return existing.loader;
-  }
-  const loader = new GraphLoader(repository);
-  sharedGraphLoaders.set(key, { loader, refCount: 1 });
-  void loader.loadMore();
-  return loader;
-}
-
-function releaseGraphLoader(repository: Repository): void {
-  const key = graphLoaderKey(repository);
-  const existing = sharedGraphLoaders.get(key);
-  if (!existing) return;
-  existing.refCount--;
-  if (existing.refCount <= 0) {
-    sharedGraphLoaders.delete(key);
-    existing.loader.dispose();
-  }
+  let created: GraphLoader | null = null;
+  const loader = acquireLoader(key, () => {
+    created = new GraphLoader(repository);
+    return created;
+  });
+  // Only the view that actually created the loader kicks off the first page; a second
+  // view acquiring the same one must not re-fetch what is already loading.
+  if (created) void loader.loadMore();
+  return { loader, key };
 }
 
 /**
@@ -104,7 +102,7 @@ function releaseGraphLoader(repository: Repository): void {
  * a plain function rather than something threaded through `useCommitGraph`.
  */
 export function resetSharedGraphLoader(repositoryId: string): void {
-  sharedGraphLoaders.get(repositoryId)?.loader.reset();
+  resetLoader(repositoryId);
 }
 
 /**
@@ -125,9 +123,9 @@ export function useCommitGraph(repository: Repository | null | undefined): {
       setLoader(null);
       return;
     }
-    const shared = acquireGraphLoader(repository);
+    const { loader: shared, key } = acquireGraphLoader(repository);
     setLoader(shared);
-    return () => releaseGraphLoader(repository);
+    return () => releaseLoader(key);
   }, [repository]);
 
   const subscribe = useMemo(() => loader?.subscribe ?? EMPTY_SUBSCRIBE, [loader]);

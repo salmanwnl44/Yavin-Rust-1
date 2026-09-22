@@ -23,6 +23,7 @@ import { SourceControlPanel } from "./components/layout/SourceControlPanel";
 import { DiffEditor } from "./components/layout/DiffEditor";
 import type { DiffDocument } from "./components/layout/DiffEditor";
 import { CommitGraphPanel } from "./components/git/CommitGraphPanel";
+import { GitOutputPanel } from "./components/git/GitOutputPanel";
 import type { SearchHit } from "./services/search";
 import { recordEdit } from "./services/editor";
 import { requestTerminal } from "./services/terminal";
@@ -139,6 +140,7 @@ export default function App() {
   const [activeActivityTab, setActiveActivityTab] = useState("explorer");
   const [diff, setDiff] = useState<DiffDocument | null>(null);
   const [showGraph, setShowGraph] = useState(false);
+  const [showGitOutput, setShowGitOutput] = useState(false);
   const [searchFocus, setSearchFocus] = useState(0);
   const [gitRevision, setGitRevision] = useState(0);
   const [pendingHit, setPendingHit] = useState<SearchHit | null>(null);
@@ -568,8 +570,11 @@ export default function App() {
 
     // Routed through the shared `guarded()` (same as commit/stage/pull/push) so a
     // hunk action sets the repo's busy flag, blocks conflicting concurrent
-    // operations, and reports failures through the store's shared notice.
-    const ok = await guardedAffecting(entry, `${action}-hunk`, false, async () => {
+    // operations, and reports failures through the store's shared notice. The real
+    // dirty flag is passed and `DIRTY_BLOCKED` decides which of the three kinds it
+    // actually blocks -- only `discard-hunk` rewrites the file on disk, and it must be
+    // blocked or a stale editor buffer's next save silently undoes the discard.
+    const ok = await guardedAffecting(entry, `${action}-hunk`, hasUnsavedChanges, async () => {
       if (action === "stage") await repo.stageHunks(targetText, [hunkIndex]);
       else if (action === "unstage") await repo.unstageHunks(targetText, [hunkIndex]);
       else await repo.discardHunks(targetText, [hunkIndex]);
@@ -1159,6 +1164,11 @@ export default function App() {
               setDiff(null);
               setShowGraph(true);
             }}
+            onShowOutput={() => {
+              setDiff(null);
+              setShowGraph(false);
+              setShowGitOutput(true);
+            }}
             onDialog={setDialog}
           />
           <Sidebar
@@ -1185,7 +1195,9 @@ export default function App() {
 
           {/* Center: Editor + Bottom Terminal Panel */}
           <div className="flex flex-1 flex-col min-w-0 bg-[#000000]">
-            {showGraph && activeRepo ? (
+            {showGitOutput ? (
+              <GitOutputPanel onClose={() => setShowGitOutput(false)} />
+            ) : showGraph && activeRepo ? (
               <CommitGraphPanel
                 key={activeRepo.repoId}
                 repository={activeRepo.store.repository}

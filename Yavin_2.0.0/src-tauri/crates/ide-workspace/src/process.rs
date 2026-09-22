@@ -15,10 +15,27 @@ pub struct ToolOutput {
     pub truncated: bool,
 }
 
+/// How long a tool may run before it is killed. Generous for interactive commands, which all
+/// finish in well under a second; a command that is still going after two minutes has hung.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub fn capture(
+    command: Command,
+    input: Option<String>,
+    cancel: Arc<AtomicBool>,
+) -> Result<ToolOutput, String> {
+    capture_within(command, input, cancel, DEFAULT_TIMEOUT)
+}
+
+/// `capture` with an explicit deadline, for the few commands where the default is genuinely
+/// too short -- cloning a large repository over a slow network is minutes of legitimate work,
+/// and killing it at two minutes would make the feature useless on exactly the repositories
+/// people most want it for.
+pub fn capture_within(
     mut command: Command,
     input: Option<String>,
     cancel: Arc<AtomicBool>,
+    timeout: Duration,
 ) -> Result<ToolOutput, String> {
     const LIMIT: u64 = 16 * 1024 * 1024;
     command
@@ -83,7 +100,7 @@ pub fn capture(
         kill_reason = stop_reason(
             cancel.load(Ordering::Relaxed),
             overflow.load(Ordering::Relaxed),
-            start.elapsed() > Duration::from_secs(120),
+            start.elapsed() > timeout,
         );
         if kill_reason.is_some() && !killed {
             killed = true;
@@ -116,8 +133,13 @@ pub fn capture(
     // once more here only because `truncated` is final once the readers are joined.)
     outcome(kill_reason, truncated)?;
     Ok(ToolOutput {
-        stdout: String::from_utf8(bytes)
-            .map_err(|_| "Tool returned unsupported non-UTF-8 output")?,
+        // Lossy, like stderr below, rather than failing the whole call: a path that is not
+        // valid UTF-8 is legal on Linux and turns up after a latin-1 checkout on any OS, and
+        // hard-erroring meant one such filename anywhere in a repository made `git status`
+        // -- and therefore the entire Source Control panel -- fail with a message that never
+        // said which file. One unreadable name rendered with replacement characters is a far
+        // smaller failure than no Git UI at all.
+        stdout: String::from_utf8_lossy(&bytes).into_owned(),
         stderr: String::from_utf8_lossy(&errors).into_owned(),
         code: status.code().unwrap_or(-1),
         truncated,

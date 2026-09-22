@@ -25,6 +25,10 @@ interface Commands {
   cancel_search: { args: { id: string }; result: void };
   git_open_repo: { args: { path: string }; result: { repoId: string; root: string } };
   git_init_repo: { args: { path: string }; result: { repoId: string; root: string } };
+  git_clone_repo: {
+    args: { parent: string; url: string; folder: string };
+    result: { repoId: string; root: string };
+  };
   git_close_repo: { args: { repoId: string }; result: void };
   git_probe_worktree: { args: { repoId: string }; result: "ready" | "missing" | "invalid" };
   git_open_external_url: { args: { url: string }; result: void };

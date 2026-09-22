@@ -8,6 +8,7 @@ import {
   SIBLING_INVALIDATES,
   WATCHER_INVALIDATES,
 } from "./sync.ts";
+import { DIRTY_BLOCKED } from "./store.ts";
 import type { RepoEntry, RepositoryEntry } from "./registry.ts";
 import type { GitChangeEvent } from "../native.ts";
 import { writeFileSync } from "node:fs";
@@ -55,6 +56,71 @@ const ALL_KINDS = [
   "deleteTag",
   "deleteRemoteRef",
 ];
+
+/**
+ * `DIRTY_BLOCKED` had no test at all, which is exactly how the stash family and
+ * `discard-hunk` came to be missing from it: each of those rewrites tracked files on disk
+ * while an unsaved editor buffer holds the old content, so the next Ctrl+S silently undoes
+ * the operation. This is the table's completeness check -- every kind is classified here by
+ * hand, and a new one added to `ALL_KINDS` without a decision recorded fails the test rather
+ * than defaulting to "not blocked", which is the dangerous direction.
+ */
+test("DIRTY_BLOCKED lists exactly the mutations that rewrite tracked files on disk", () => {
+  const rewritesWorkingTree = new Set([
+    // Move HEAD and rewrite the tree to match it.
+    "switch",
+    "branch",
+    // Bring in commits and write their content into the tree.
+    "pull",
+    "pullRebase",
+    "pullMerge",
+    "pullFrom",
+    "mergeBranch",
+    "rebaseOnto",
+    // Wind an in-progress operation forward or back, rewriting the tree either way.
+    "abort",
+    "continue",
+    "skip",
+    // Takes changes off the tree / puts them back onto it.
+    "stash",
+    "stashApply",
+    "stashPop",
+    // `git apply -R` against the working-tree file.
+    "discard-hunk",
+    // `reset --soft` only moves HEAD, but it is blocked deliberately: the app treats
+    // moving HEAD under unsaved editors as something to refuse regardless.
+    "undoLastCommit",
+  ]);
+  for (const kind of ALL_KINDS) {
+    assert.equal(
+      DIRTY_BLOCKED.has(kind),
+      rewritesWorkingTree.has(kind),
+      rewritesWorkingTree.has(kind)
+        ? `"${kind}" rewrites the working tree and must be refused while an editor is dirty`
+        : `"${kind}" does not rewrite the working tree and must not be blocked`,
+    );
+  }
+  // Nothing may be listed that is not a real mutation kind -- a typo in the set would
+  // otherwise silently block nothing at all.
+  for (const kind of DIRTY_BLOCKED) {
+    assert.ok(ALL_KINDS.includes(kind), `DIRTY_BLOCKED lists unknown kind "${kind}"`);
+  }
+});
+
+test("index-only hunk actions are never dirty-blocked, unlike discarding one", () => {
+  // Staging and unstaging a hunk touch only the index, so they stay usable with unsaved
+  // editors open; discarding writes the file, so it must not.
+  assert.equal(DIRTY_BLOCKED.has("stage-hunk"), false);
+  assert.equal(DIRTY_BLOCKED.has("unstage-hunk"), false);
+  assert.equal(DIRTY_BLOCKED.has("discard-hunk"), true);
+});
+
+test("dropping a stash never rewrites the tree, so it stays available with unsaved edits", () => {
+  // `stash drop`/`clear` only delete stash refs -- blocking them would be a pointless
+  // refusal, and the distinction from apply/pop is the whole reason this is a table.
+  assert.equal(DIRTY_BLOCKED.has("stashDrop"), false);
+  assert.equal(DIRTY_BLOCKED.has("stashClear"), false);
+});
 
 test("SIBLING_INVALIDATES only lists kinds that actually touch repository-shared refs", () => {
   const expected: Record<string, readonly string[]> = {

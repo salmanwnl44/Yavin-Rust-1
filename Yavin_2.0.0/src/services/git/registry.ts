@@ -7,6 +7,7 @@ import { parseWorktreeList } from "./parsers/worktree.ts";
 import type { WorktreeInfo } from "./parsers/worktree.ts";
 import { probeWorktree, unwatchRepo, watchRepo } from "./backend.ts";
 import type { WorktreeStatus } from "./backend.ts";
+import { dropLoader } from "./graph/shared.ts";
 
 /**
  * One open worktree. Kept under this name (rather than `WorktreeEntry`) so every
@@ -439,6 +440,10 @@ export class GitRegistry {
     const { repository, worktree } = found;
     worktree.store.dispose();
     void worktree.store.repository.close();
+    // The shared graph loader holds whichever worktree's `Repository` first acquired it,
+    // which may be the one just closed. Dropping it here guarantees a later acquire builds
+    // a fresh loader against a live handle instead of being handed this dead one.
+    dropLoader(repository.repositoryId);
 
     const remainingWorktrees = repository.worktrees.filter((w) => w !== worktree);
     const repositories = remainingWorktrees.length

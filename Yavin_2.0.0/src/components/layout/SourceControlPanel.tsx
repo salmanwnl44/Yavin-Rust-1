@@ -137,6 +137,7 @@ export function SourceControlPanel({
   apply,
   activeDiffPath,
   onOpenGraph,
+  onShowOutput,
   onDialog,
 }: {
   workspace: string;
@@ -150,6 +151,8 @@ export function SourceControlPanel({
   apply: (changes: Replacement[]) => Promise<{ applied: Replacement[]; errors: string[] }>;
   activeDiffPath?: string;
   onOpenGraph?: () => void;
+  /** Opens the Git Output view -- the log of every Git command the app has run. */
+  onShowOutput?: () => void;
   /** Opens the shared app dialog (prompt/picker/confirm) -- see `ui/AppDialog.tsx`. Every
    * name-, remote- or target-requiring Git menu action goes through this, the same modal the
    * rest of the app already uses for New File/Delete/Go to Line. */
@@ -371,6 +374,46 @@ export function SourceControlPanel({
     } catch (error) {
       setOpenError(String(error));
     }
+  };
+
+  /**
+   * "Clone…": ask for the URL, pick the folder to clone into, then open the result like any
+   * other repository. The folder name is derived from the URL (`repo.git` -> `repo`) the way
+   * `git clone` itself would, so the common case is two clicks and a paste.
+   */
+  const cloneRepository = () => {
+    onDialog({
+      title: "Clone repository",
+      message: "The repository URL to clone from.",
+      input: "",
+      confirmLabel: "Choose Folder…",
+      submit: async (url) => {
+        const trimmed = url.trim();
+        if (!trimmed) throw new Error("Enter a repository URL.");
+        const parent = await native("pick_folder_dialog").catch(() => null);
+        if (!parent) return;
+        const suggested =
+          trimmed
+            .replace(/\/+$/, "")
+            .replace(/\.git$/, "")
+            .split(/[/:]/)
+            .pop() || "repository";
+        onDialog({
+          title: "Folder name",
+          message: `Cloning into a new folder inside ${parent}.`,
+          input: suggested,
+          confirmLabel: "Clone",
+          submit: async (folder) => {
+            const name = folder.trim();
+            if (!name) throw new Error("Enter a folder name.");
+            // Reported by the dialog itself (it renders a thrown error), so a failed clone
+            // explains itself instead of closing as though it had worked.
+            const info = await native("git_clone_repo", { parent, url: trimmed, folder: name });
+            await gitRegistry.open(info.root, { makeActive: true });
+          },
+        });
+      },
+    });
   };
 
   /** `git init` in the open workspace folder, then track it like any other repository. */
@@ -924,6 +967,8 @@ export function SourceControlPanel({
                       onSortChanges: setChangesSort,
                       changesViewAsTree,
                       onToggleViewAsTree: () => setChangesViewAsTree((v) => !v),
+                      onClone: cloneRepository,
+                      onShowOutput,
                     })}
                   />
                 </div>
@@ -1058,6 +1103,8 @@ export function SourceControlPanel({
                               onDialog,
                               onDiff,
                               onDiscardAll: () => void discardAll(entries),
+                              onClone: cloneRepository,
+                              onShowOutput,
                             })}
                           />
                         }
