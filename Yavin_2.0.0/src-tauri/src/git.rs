@@ -669,7 +669,14 @@ const DIFF: &[FlagRule] = &[
 const NONE: &[FlagRule] = &[];
 const RESTORE: &[FlagRule] = &[flag("--staged")];
 const RM: &[FlagRule] = &[flag("--cached")];
-const COMMIT: &[FlagRule] = &[value_flag("-m")];
+// `-a` (stage every tracked change first), `--amend` (replace HEAD instead of adding a new
+// commit) and `-s` (append a Signed-off-by trailer) are Git's own ordinary commit modes --
+// none of them can rewrite anything other than the working commit itself.
+const COMMIT: &[FlagRule] = &[value_flag("-m"), flag("-a"), flag("--amend"), flag("-s")];
+// A soft reset only moves HEAD (and the branch it points to) back one commit, leaving the
+// index and working tree untouched -- nothing is deleted, and `validate_shape` below pins the
+// target to exactly `HEAD~1`, so this can only ever undo the single most recent commit.
+const RESET: &[FlagRule] = &[flag("--soft")];
 const SWITCH: &[FlagRule] = &[value_flag("-c")];
 const PULL: &[FlagRule] = &[
     flag("--ff-only"),
@@ -695,7 +702,7 @@ const SHOW: &[FlagRule] = &[
     flag("-M"),
 ];
 const STASH: &[FlagRule] = &[flag("-u"), value_flag("-m")];
-const TAG: &[FlagRule] = &[flag("-l")];
+const TAG: &[FlagRule] = &[flag("-l"), flag("-d")];
 // The patch content itself travels over stdin, not argv -- see `git_exec`'s `input`.
 const APPLY: &[FlagRule] = &[flag("--cached"), flag("-R")];
 // The branch name being validated is the whole point of this call, so it must pass
@@ -721,11 +728,14 @@ const FOR_EACH_REF: &[FlagRule] = &[prefix_flag("--format=")];
 // `worktree list --porcelain`; nothing constructs `worktree add/remove/lock/prune`
 // yet, so there is nothing else to validate here today.
 const WORKTREE: &[FlagRule] = &[flag("--porcelain"), flag("-z")];
-// Deletion only -- no rename/create flag, since `switch -c` already owns creation
+// Deletion and rename -- no create flag, since `switch -c` already owns creation
 // (SWITCH above). `-d`/`-D` are Git's own two-tier safety (safe delete vs. force);
 // neither can bypass Git's separate, unconditional refusal to delete a branch
-// checked out in any worktree (verified empirically, not assumed).
-const BRANCH: &[FlagRule] = &[flag("-d"), flag("-D")];
+// checked out in any worktree (verified empirically, not assumed). `-m` (rename) is
+// a pure local metadata change -- it moves a ref name, never a commit -- and has no
+// refspec/force-push equivalent, so it doesn't reopen anything the delete-only
+// design above was guarding against.
+const BRANCH: &[FlagRule] = &[flag("-d"), flag("-D"), flag("-m")];
 // `--prune` only ever removes LOCAL records of refs the remote no longer has -- it
 // can never delete anything from the remote itself, and it never resets the graph
 // (it removes a ref, never a commit object; see the plan's Section T).
@@ -745,6 +755,7 @@ fn rules_for(subcommand: &str) -> Option<&'static [FlagRule]> {
         "restore" => RESTORE,
         "rm" => RM,
         "commit" => COMMIT,
+        "reset" => RESET,
         "switch" => SWITCH,
         "branch" => BRANCH,
         "remote" => NONE,
@@ -858,10 +869,40 @@ fn validate_shape(subcommand: &str, flags: &[&str], positionals: &[&str]) -> Res
             }
             _ => refuse("only a plain push, or --set-upstream <remote> <branch>, is allowed"),
         },
-        // Only bare `git remote` (list names) is ever used; adding/removing/re-pointing a
-        // remote is not something the app does.
-        "remote" if !positionals.is_empty() => refuse("only listing remotes is allowed"),
+        // Bare `git remote` lists names; `add`/`remove` take exactly the two/one positional(s)
+        // Repository.addRemote()/removeRemote() produce. Re-pointing a remote's URL
+        // (`set-url`) or renaming one is not something the app does.
+        "remote" => match positionals {
+            [] => Ok(()),
+            ["add", name, url] if !name.is_empty() && !url.is_empty() => Ok(()),
+            ["remove", name] if !name.is_empty() => Ok(()),
+            _ => refuse("only listing, adding or removing a remote is allowed"),
+        },
         "worktree" if positionals != ["list"] => refuse("only `worktree list` is allowed"),
+        // `-a`/`--amend`/`-s` never replace the need for an explicit message -- without `-m`
+        // a bare `commit --amend` would try to open an interactive editor Yavin never wires up.
+        "commit" if !flags.contains(&"-m") || !positionals.is_empty() => {
+            refuse("a commit message (-m) is required, and commit takes no positionals")
+        }
+        // A soft reset that isn't pinned to exactly one commit back would let a caller move
+        // HEAD arbitrarily far; `Repository.undoLastCommit()` never asks for more than this.
+        "reset" if flags != ["--soft"] || positionals != ["HEAD~1"] => {
+            refuse("only a soft reset of HEAD~1 (undoing the last commit) is allowed")
+        }
+        "tag" => match (flags, positionals) {
+            (["-l"], []) => Ok(()),
+            ([], [name]) if !name.is_empty() => Ok(()),
+            (["-d"], [name]) if !name.is_empty() => Ok(()),
+            _ => refuse("only listing, creating or deleting a local tag is allowed"),
+        },
+        "branch" => match (flags, positionals) {
+            (["-d"], [name]) | (["-D"], [name]) if !name.is_empty() => Ok(()),
+            (["-m"], [new_name]) if !new_name.is_empty() => Ok(()),
+            (["-m"], [old_name, new_name]) if !old_name.is_empty() && !new_name.is_empty() => {
+                Ok(())
+            }
+            _ => refuse("only deleting (-d/-D) or renaming (-m) a branch is allowed"),
+        },
         "stash" => match positionals {
             ["push" | "list"] => Ok(()),
             ["pop" | "apply" | "drop"] => Ok(()),
@@ -2597,6 +2638,17 @@ mod tests {
             &["stash", "apply", "stash@{12}"],
             &["stash", "drop", "stash@{3}"],
             &["tag", "-l"],
+            &["commit", "-m", "a message", "--amend"],
+            &["commit", "-m", "a message", "-a"],
+            &["commit", "-m", "a message", "-s"],
+            &["commit", "-m", "a message", "-a", "--amend", "-s"],
+            &["reset", "--soft", "HEAD~1"],
+            &["remote", "add", "origin", "https://example.com/r.git"],
+            &["remote", "remove", "origin"],
+            &["tag", "v1.0.0"],
+            &["tag", "-d", "v1.0.0"],
+            &["branch", "-m", "renamed"],
+            &["branch", "-m", "old-name", "new-name"],
         ];
         for shape in shapes {
             let a = args(shape);
@@ -2633,10 +2685,12 @@ mod tests {
             &["fetch", "https://evil.example/r.git"],
             &["pull", "origin", "main"],
             &["pull", "--ff-only", "https://evil.example/r.git"],
-            // editing remotes / worktrees
-            &["remote", "add", "x", "https://evil.example/r.git"],
-            &["remote", "remove", "origin"],
+            // editing remotes beyond add/remove, and worktrees
             &["remote", "set-url", "origin", "https://evil.example/r.git"],
+            &["remote", "rename", "origin", "up"],
+            &["remote", "add", "x"],
+            &["remote", "add", "x", "y", "z"],
+            &["remote", "remove"],
             &["worktree", "add", "../escape"],
             &["worktree", "remove", "--force", "x"],
             &["worktree"],
@@ -2662,6 +2716,25 @@ mod tests {
             &["cherry-pick", "abc123"],
             &["revert", "HEAD"],
             &["revert"],
+            // reset must never move further than undoing exactly one commit
+            &["reset", "--hard", "HEAD~1"],
+            &["reset", "--soft", "HEAD~2"],
+            &["reset", "--soft", "main"],
+            &["reset", "--soft"],
+            &["reset"],
+            // tag: no annotated tags, no remote tag deletion, no batch delete
+            &["tag", "-a", "v1", "-m", "msg"],
+            &["tag", "-d", "v1", "v2"],
+            &["tag", "-d"],
+            &["tag"],
+            // branch: rename takes at most two names, delete exactly one, and -r (a
+            // remote-tracking ref) is not a form Yavin's own BRANCH flags allow
+            &["branch", "-m", "a", "b", "c"],
+            &["branch", "-D", "-r", "origin/feature"],
+            &["branch"],
+            // commit: -m is always required, and unlisted flags stay refused
+            &["commit", "--amend"],
+            &["commit", "-m", "msg", "--no-verify"],
         ];
         for shape in refused {
             let a = args(shape);
@@ -2742,6 +2815,9 @@ mod tests {
             &["branch", "-d", "x"],
             &["remote", "add", "x", "url"],
             &["tag", "v1"],
+            &["tag", "-d", "v1"],
+            &["branch", "-m", "old", "new"],
+            &["reset", "--soft", "HEAD~1"],
             &["symbolic-ref", "HEAD", "refs/heads/x"],
             &["stash", "push"],
             &["stash", "drop"],

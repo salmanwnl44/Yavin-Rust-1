@@ -130,6 +130,13 @@ export class Repository {
     return out.trim().split("\n").filter(Boolean);
   }
 
+  addRemote(name: string, url: string): Promise<string> {
+    return this.run(["remote", "add", name, url]);
+  }
+  removeRemote(name: string): Promise<string> {
+    return this.run(["remote", "remove", name]);
+  }
+
   state(): Promise<GitOperation> {
     return repoState(this.repoId).catch((error) => {
       throw new Error(describeGitError(error));
@@ -190,11 +197,35 @@ export class Repository {
       : this.run(["rm", "--cached", "--", path]);
   }
 
-  async commit(message: string): Promise<string> {
+  /**
+   * `all` stages every tracked modification first (`-a`, matching "Commit All"), `amend`
+   * replaces HEAD instead of adding a new commit, `signoff` appends a Signed-off-by trailer.
+   * All three are ordinary Git commit modes; none of them can touch history beyond HEAD itself.
+   */
+  async commit(
+    message: string,
+    options: { all?: boolean; amend?: boolean; signoff?: boolean } = {},
+  ): Promise<string> {
     if (!message.trim()) throw new Error("Enter a commit message");
     const conflicted = await this.run(["diff", "--name-only", "--diff-filter=U"]);
     if (conflicted.trim()) throw new Error("Resolve and stage conflicts before committing");
-    return this.run(["commit", "-m", message]);
+    const args = ["commit", "-m", message];
+    if (options.all) args.push("-a");
+    if (options.amend) args.push("--amend");
+    if (options.signoff) args.push("-s");
+    return this.run(args);
+  }
+
+  /**
+   * "Undo Last Commit": a soft reset one commit back, so the undone commit's changes land
+   * back in the index exactly as they were about to be committed, never discarded. Refuses
+   * with a plain explanation instead of running a reset with nothing to land on when the
+   * branch has no earlier commit.
+   */
+  async undoLastCommit(): Promise<string> {
+    const hasParent = await this.ok(["rev-parse", "--verify", "HEAD~1"]);
+    if (!hasParent) throw new Error("There is no earlier commit on this branch to undo into.");
+    return this.run(["reset", "--soft", "HEAD~1"]);
   }
 
   switchBranch(name: string): Promise<string> {
@@ -214,6 +245,13 @@ export class Repository {
    */
   deleteBranch(name: string, force: boolean): Promise<string> {
     return this.run(["branch", force ? "-D" : "-d", name]);
+  }
+
+  /** Renames `oldName` to `newName` -- a local metadata change; the branch's history and
+   * (if it was checked out here) current-branch status are unaffected. */
+  async renameBranch(oldName: string, newName: string): Promise<string> {
+    await this.run(["check-ref-format", "--branch", newName]);
+    return this.run(["branch", "-m", oldName, newName]);
   }
 
   // Always prunes: a remote branch deleted upstream would otherwise leave its
@@ -351,5 +389,18 @@ export class Repository {
   async tags(): Promise<string[]> {
     const out = await this.run(["tag", "-l"]);
     return out.trim().split("\n").filter(Boolean);
+  }
+
+  /**
+   * A lightweight tag at HEAD. `check-ref-format --branch` is reused to validate the name --
+   * Git has no `--tag` mode for that command, and tag and branch short names follow the same
+   * basic ref-component rules (no annotated tags/messages: not something the UI offers yet).
+   */
+  async createTag(name: string): Promise<string> {
+    await this.run(["check-ref-format", "--branch", name]);
+    return this.run(["tag", name]);
+  }
+  deleteTag(name: string): Promise<string> {
+    return this.run(["tag", "-d", name]);
   }
 }

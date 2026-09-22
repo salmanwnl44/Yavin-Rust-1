@@ -33,6 +33,7 @@ const CLASSIFIED: Record<string, Scope> = {
   restore: "local",
   rm: "local",
   commit: "local",
+  reset: "local",
   switch: "local",
   branch: "local",
   apply: "local",
