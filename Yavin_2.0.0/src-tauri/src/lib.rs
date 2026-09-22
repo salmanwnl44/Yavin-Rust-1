@@ -3,13 +3,15 @@ use ide_workspace::file_tree::{self, FileNode};
 use ide_workspace::watcher::{self, RecommendedWatcher};
 use std::{env, path::Path, sync::Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
+mod external;
 mod git;
 mod terminal;
 mod workbench;
+use external::open_external_url;
 use git::{
-    git_cancel_repo, git_clone_repo, git_close_repo, git_exec, git_init_repo,
-    git_open_external_url, git_open_repo, git_probe_worktree, git_repo_state, git_unwatch_repo,
-    git_watch_repo, GitJobs, GitWatches, NetworkLocks, Repos, StashLocks,
+    git_cancel_repo, git_clone_repo, git_close_repo, git_exec, git_init_repo, git_open_repo,
+    git_probe_worktree, git_repo_state, git_unwatch_repo, git_watch_repo, GitJobs, GitWatches,
+    NetworkLocks, Repos, StashLocks,
 };
 use terminal::{
     terminal_close, terminal_close_all, terminal_open, terminal_resize, terminal_shells,
@@ -215,7 +217,7 @@ pub fn run() {
             git_exec,
             git_cancel_repo,
             git_probe_worktree,
-            git_open_external_url,
+            open_external_url,
             git_repo_state,
             git_watch_repo,
             git_unwatch_repo,

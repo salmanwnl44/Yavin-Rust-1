@@ -14,12 +14,14 @@ import {
 } from "../../services/terminal";
 import { PANEL_VIEWS, readActiveView, saveActiveView, stepView } from "../../services/panel/views";
 import type { PanelViewId } from "../../services/panel/views";
+import { clampToViewport } from "../../services/panel/menuPosition";
 import { ProblemsView } from "../panel/views/ProblemsView";
 import { OutputView } from "../panel/views/OutputView";
 import { DebugConsoleView } from "../panel/views/DebugConsoleView";
 import { PortsView } from "../panel/views/PortsView";
 
 const MIN_HEIGHT = 120;
+
 const DEFAULT_HEIGHT = 260;
 
 function Icon({ path, size = 12 }: { path: string; size?: number }) {
@@ -102,6 +104,8 @@ export function TerminalPanel({
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
   const [activeId, setActiveId] = useState("");
   const [splitId, setSplitId] = useState<string | null>(null);
+  /** Which half of a split the user is working in; always "primary" when not split. */
+  const [focusedPane, setFocusedPane] = useState<"primary" | "secondary">("primary");
   const [splitRatio, setSplitRatio] = useState(0.5);
   const [shells, setShells] = useState<Shell[]>([]);
   const [shellMenu, setShellMenu] = useState(false);
@@ -245,12 +249,15 @@ export function TerminalPanel({
   }, [activeId, bells.size]);
 
   const toggleSplit = () => {
+    setFocusedPane("primary");
     if (splitId) return setSplitId(null);
     const other = sessions.find((session) => session.id !== activeId);
     setSplitId(other ? other.id : create(shells[0], false).id);
   };
 
-  const active = () => handles.current.get(activeId) ?? null;
+  /** The terminal the toolbar acts on: the focused half of a split, else the active one. */
+  const focusedId = focusedPane === "secondary" && splitId ? splitId : activeId;
+  const active = () => handles.current.get(focusedId) ?? null;
   const shown = splitId ? [activeId, splitId] : [activeId];
 
   /** Per-view tab counts. Only the terminal has something to count so far; Problems and
@@ -275,10 +282,50 @@ export function TerminalPanel({
 
   const zoom = (action: TerminalKeyAction) => setFontSize((size) => zoomFontSize(size, action));
 
+  /**
+   * Closes every terminal at once. Each session is unmounted, and `TerminalView`'s own
+   * cleanup sends `terminal_close` for it, so no shell is left running.
+   */
+  const killAll = () => {
+    handles.current.clear();
+    setSplitId(null);
+    setFocusedPane("primary");
+    setSessions([]);
+    setActiveId("");
+  };
+
+  /** Moves the focused terminal `delta` places through the tab order, wrapping. */
+  const stepTerminal = (delta: 1 | -1) => {
+    if (sessions.length < 2) return;
+    const at = sessions.findIndex((session) => session.id === activeId);
+    const next = sessions[((at === -1 ? 0 : at) + delta + sessions.length) % sessions.length];
+    setActiveId(next.id);
+    handles.current.get(next.id)?.focus();
+  };
+
+  /**
+   * Moves between the two panes of a split. It cannot just reassign `activeId`: the panes
+   * render in `[activeId, splitId]` order, so doing that would swap their positions on
+   * screen. `focusedPane` says which of the two the user is working in, and the toolbar's
+   * Clear/Find follow it -- before this they always acted on the left pane even while the
+   * user was typing in the right one.
+   */
+  const stepPane = () => {
+    if (!splitId) return;
+    setFocusedPane((current) => {
+      const next = current === "primary" ? "secondary" : "primary";
+      handles.current.get(next === "primary" ? activeId : splitId)?.focus();
+      return next;
+    });
+  };
+
   const shortcut = (action: TerminalKeyAction) => {
     if (action === "find") openFind();
     else if (action === "new") create(shells[0]);
     else if (action === "split") toggleSplit();
+    else if (action === "next") stepTerminal(1);
+    else if (action === "previous") stepTerminal(-1);
+    else if (action === "pane-next" || action === "pane-previous") stepPane();
     else zoom(action);
   };
 
@@ -330,7 +377,12 @@ export function TerminalPanel({
       run: () => setRenaming(activeId),
       enabled: true,
     },
-    { label: "Kill Terminal", run: () => closeSession(activeId), enabled: true },
+    { label: "Kill Terminal", run: () => closeSession(focusedId), enabled: true },
+    {
+      label: "Kill All Terminals",
+      run: killAll,
+      enabled: sessions.length > 1,
+    },
   ];
 
   return (
@@ -645,6 +697,11 @@ export function TerminalPanel({
               <div
                 key={session.id}
                 hidden={position === -1}
+                // Clicking or tabbing into a pane makes it the one the toolbar acts on,
+                // so Clear and Find follow the pane the user is actually working in.
+                onFocusCapture={() =>
+                  position !== -1 && setFocusedPane(position === 0 ? "primary" : "secondary")
+                }
                 style={
                   splitId && position !== -1
                     ? { width: `${(position === 0 ? splitRatio : 1 - splitRatio) * 100}%` }
@@ -696,7 +753,10 @@ export function TerminalPanel({
         <div
           role="menu"
           aria-label="Terminal actions"
-          style={{ left: menu.x, top: menu.y }}
+          // Kept inside the window. The panel sits at the bottom of the screen, so a menu
+          // placed at the pointer runs off the edge and its last items become unclickable --
+          // which is exactly what happened when this menu gained one more entry.
+          style={clampToViewport(menu, menuItems.length)}
           onMouseDown={(event) => event.stopPropagation()}
           className="fixed z-50 min-w-[160px] rounded border border-[#222222] bg-[#0a0a0a] py-1 shadow-xl"
         >

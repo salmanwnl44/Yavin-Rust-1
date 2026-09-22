@@ -51,6 +51,61 @@ export function onTerminalExit(handler: (exit: TerminalExit) => void): () => voi
 }
 
 /**
+ * Routes native terminal events to the one terminal they belong to.
+ *
+ * The native side broadcasts `terminal-output` globally, so every open terminal used to
+ * receive every other terminal's bytes and discard the ones whose id did not match -- work
+ * proportional to the number of open terminals for every chunk of output, on the hot path of
+ * a build scrolling past. The router subscribes once and dispatches by id, so a chunk costs
+ * one map lookup no matter how many terminals are open.
+ */
+interface Router<T> {
+  handlers: Map<string, Set<(payload: T) => void>>;
+  stop: (() => void) | null;
+}
+
+const outputRouter: Router<TerminalOutput> = { handlers: new Map(), stop: null };
+const exitRouter: Router<TerminalExit> = { handlers: new Map(), stop: null };
+
+function route<T extends { id: string }>(
+  router: Router<T>,
+  event: string,
+  id: string,
+  handler: (payload: T) => void,
+): () => void {
+  let forId = router.handlers.get(id);
+  if (!forId) {
+    forId = new Set();
+    router.handlers.set(id, forId);
+  }
+  forId.add(handler);
+  router.stop ??= subscribe<T>(event, (payload) => {
+    const listeners = router.handlers.get(payload.id);
+    if (listeners) for (const listener of listeners) listener(payload);
+  });
+
+  return () => {
+    forId.delete(handler);
+    if (forId.size === 0) router.handlers.delete(id);
+    // Nothing is listening any more, so nothing should stay subscribed either.
+    if (router.handlers.size === 0) {
+      router.stop?.();
+      router.stop = null;
+    }
+  };
+}
+
+/** This terminal's output only. */
+export function onOutputFor(id: string, handler: (data: string) => void): () => void {
+  return route(outputRouter, "terminal-output", id, (payload) => handler(payload.data));
+}
+
+/** This terminal's exit only. */
+export function onExitFor(id: string, handler: (code: number | null) => void): () => void {
+  return route(exitRouter, "terminal-exit", id, (payload) => handler(payload.code));
+}
+
+/**
  * The terminal size in whole cells. xterm reports 0 before it has been laid out,
  * which the shell would take literally, so a sane minimum is enforced here.
  */
@@ -83,7 +138,23 @@ export function describeExit(code: number | null): string {
 }
 
 export type TerminalKeyAction =
-  "copy" | "paste" | "find" | "zoom-in" | "zoom-out" | "zoom-reset" | "new" | "split" | null;
+  | "copy"
+  | "paste"
+  | "find"
+  | "zoom-in"
+  | "zoom-out"
+  | "zoom-reset"
+  | "new"
+  | "split"
+  | "next"
+  | "previous"
+  | "pane-next"
+  | "pane-previous"
+  | "scroll-page-up"
+  | "scroll-page-down"
+  | "scroll-top"
+  | "scroll-bottom"
+  | null;
 
 /**
  * Which editing action a key press means, or null to send the keys to the shell.
@@ -93,12 +164,35 @@ export type TerminalKeyAction =
  * when there is a selection to copy, matching what other terminals do.
  */
 export function terminalKeyAction(
-  event: Pick<KeyboardEvent, "key" | "ctrlKey" | "shiftKey" | "metaKey" | "type">,
+  event: Pick<KeyboardEvent, "key" | "ctrlKey" | "shiftKey" | "metaKey" | "type"> & {
+    altKey?: boolean;
+  },
   hasSelection: boolean,
 ): TerminalKeyAction {
   if (event.type !== "keydown") return null;
   const key = event.key.toLowerCase();
   const command = event.metaKey && !event.ctrlKey;
+
+  // Scrolling the buffer. Shift+PageUp/PageDown and Ctrl+Home/End are what every terminal
+  // uses, and no shell wants them, so they are handled before the Ctrl/Cmd gate below.
+  if (event.shiftKey && !event.ctrlKey && !event.altKey) {
+    if (key === "pageup") return "scroll-page-up";
+    if (key === "pagedown") return "scroll-page-down";
+  }
+  if (event.ctrlKey && !event.shiftKey && !event.altKey) {
+    if (key === "home") return "scroll-top";
+    if (key === "end") return "scroll-bottom";
+    // Moving between terminals, matching VS Code.
+    if (key === "pagedown") return "next";
+    if (key === "pageup") return "previous";
+  }
+  // Moving between the panes of a split. Alt alone is otherwise unused here.
+  if (event.altKey && !event.ctrlKey && !event.shiftKey && !event.metaKey) {
+    if (key === "arrowright") return "pane-next";
+    if (key === "arrowleft") return "pane-previous";
+    return null;
+  }
+
   if (!event.ctrlKey && !command) return null;
 
   // Font size follows the same keys the rest of the application uses.

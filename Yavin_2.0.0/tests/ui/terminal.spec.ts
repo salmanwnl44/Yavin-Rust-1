@@ -600,3 +600,103 @@ test("arrow keys move between panel views", async ({ page }) => {
     "true",
   );
 });
+
+test("Ctrl+PageDown and Ctrl+PageUp move between terminals", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("New Terminal").click();
+  const [first, second] = await terminalIds(page, 2);
+  await view(page, second).click();
+
+  await page.keyboard.press("Control+PageUp");
+  await expect(view(page, first)).toBeVisible();
+  await expect(page.getByRole("tab", { name: "Command Prompt", exact: true })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+
+  await view(page, first).click();
+  await page.keyboard.press("Control+PageDown");
+  await expect(view(page, second)).toBeVisible();
+});
+
+test("Shift+PageUp scrolls the buffer instead of reaching the shell", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await view(page, id).click();
+  const before = await countCalls(page, "terminal_write");
+
+  await page.keyboard.press("Shift+PageUp");
+  await page.keyboard.press("Control+Home");
+  await page.keyboard.press("Control+End");
+
+  // Scrolling is local to the buffer: none of it is sent to the shell.
+  expect(await countCalls(page, "terminal_write")).toBe(before);
+});
+
+test("a plain arrow key still reaches the shell", async ({ page }) => {
+  // Alt+Arrow moves between split panes, so the unmodified arrows must stay untouched or
+  // shell history and line editing would stop working.
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await view(page, id).click();
+
+  await page.keyboard.press("ArrowUp");
+  await expect
+    .poll(async () => (await calls(page, "terminal_write")).map((c) => c.args.data).join(""))
+    .toBe("\x1b[A");
+});
+
+test("Kill All Terminals closes every terminal at once", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("New Terminal").click();
+  const ids = await terminalIds(page, 2);
+
+  // The second terminal is the visible one after creating it.
+  await view(page, ids[1]).click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Kill All Terminals" }).click();
+
+  await expect(page.getByRole("region", { name: "No terminals" })).toBeVisible();
+  // Every shell is closed natively, not just removed from the UI. Containment rather than
+  // equality: React's development StrictMode mounts and unmounts each view once before the
+  // real mount, which legitimately closes the same id earlier too.
+  await expect
+    .poll(async () => {
+      const closed = new Set((await calls(page, "terminal_close")).map((c) => c.args.id));
+      return ids.every((id) => closed.has(id));
+    })
+    .toBe(true);
+});
+
+test("output reaches only the terminal it belongs to, with one native subscription", async ({
+  page,
+}) => {
+  // Routed by id rather than every terminal filtering a broadcast.
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("New Terminal").click();
+  const [first, second] = await terminalIds(page, 2);
+
+  await emit(page, "terminal-output", { id: second, data: "only for the second" });
+  await expect(view(page, second)).toContainText("only for the second");
+  await expect(view(page, first)).not.toContainText("only for the second");
+
+  // The count must not grow with the number of terminals: one subscription routes to all of
+  // them. (It is not exactly one overall, because React's development StrictMode mounts,
+  // unmounts and remounts, which legitimately resubscribes.)
+  const outputListens = async () =>
+    (await calls(page, "plugin:event|listen")).filter(
+      (call) => call.args.event === "terminal-output",
+    ).length;
+  const before = await outputListens();
+  await page.getByLabel("New Terminal").click();
+  await page.getByLabel("New Terminal").click();
+  await terminalIds(page, 4);
+  expect(await outputListens()).toBe(before);
+});

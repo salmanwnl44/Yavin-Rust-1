@@ -2,13 +2,14 @@ import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "re
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import { isTauri } from "@tauri-apps/api/core";
 import { native } from "../../services/native";
 import {
   describeExit,
-  onTerminalExit,
-  onTerminalOutput,
+  onExitFor,
+  onOutputFor,
   terminalKeyAction,
   usableSize,
   type TerminalKeyAction,
@@ -72,6 +73,25 @@ export const TerminalView = forwardRef<
   report.current = { onStatus, onBell, onShortcut, onContextMenu, onSearchResults };
   const start = useRef<(clear: boolean) => void>(() => {});
 
+  // Declared before the effect below so xterm's custom key handler, which is attached there,
+  // can call them; the imperative handle reuses the same two.
+  const copyFrom = (term: XTerm) => {
+    const selection = term.getSelection();
+    if (!selection) return;
+    void navigator.clipboard
+      .writeText(selection)
+      .catch(() => report.current.onStatus("The clipboard is not available."));
+  };
+
+  const pasteInto = () => {
+    void navigator.clipboard
+      .readText()
+      .then((text) => {
+        if (text && running.current) return native("terminal_write", { id, data: text });
+      })
+      .catch(() => report.current.onStatus("The clipboard is not available."));
+  };
+
   useEffect(() => {
     const container = host.current;
     if (!container) return;
@@ -96,11 +116,48 @@ export const TerminalView = forwardRef<
     const search = new SearchAddon();
     term.loadAddon(fit);
     term.loadAddon(search);
+    // URLs a program printed become clickable. The handler goes through the same validated
+    // native launcher the Git view uses, so a link made of terminal output -- which is not
+    // trusted input -- cannot open a local file or a UNC path.
+    term.loadAddon(
+      new WebLinksAddon((event, uri) => {
+        event.preventDefault();
+        void native("open_external_url", { url: uri }).catch((error) =>
+          report.current.onStatus(String(error)),
+        );
+      }),
+    );
     term.open(container);
     // The panel may still be laying out; measuring on the next frame avoids
     // starting the shell at a size that is about to change.
     const firstFit = requestAnimationFrame(() => fit.fit());
     view.current = { term, fit, search };
+
+    /**
+     * Runs before xterm interprets a key, and returning false stops it both acting on the
+     * key and sending it to the shell. That ordering is the point: handling these on the
+     * React container instead meant the event reached us only after xterm had already
+     * written the key to the shell, so Shift+PageUp scrolled *and* typed `\x1b[5;2~` at the
+     * prompt. Anything this does not claim is passed straight through.
+     */
+    term.attachCustomKeyEventHandler((event) => {
+      const action = terminalKeyAction(event, term.hasSelection());
+      if (!action) return true;
+      if (event.type !== "keydown") return false;
+      // Returning false stops xterm handling the key, but not the browser: Chromium treats
+      // Ctrl+Shift+V as a paste, which xterm's own paste listener would then deliver a
+      // second time. Claiming the key means claiming it from both.
+      event.preventDefault();
+      if (action === "copy") copyFrom(term);
+      else if (action === "paste") pasteInto();
+      // Scrolling is this terminal's own buffer; the panel has no access to it.
+      else if (action === "scroll-page-up") term.scrollPages(-1);
+      else if (action === "scroll-page-down") term.scrollPages(1);
+      else if (action === "scroll-top") term.scrollToTop();
+      else if (action === "scroll-bottom") term.scrollToBottom();
+      else report.current.onShortcut(action);
+      return false;
+    });
 
     const results = search.onDidChangeResults((found) =>
       report.current.onSearchResults({ index: found.resultIndex, count: found.resultCount }),
@@ -143,13 +200,12 @@ export const TerminalView = forwardRef<
         report.current.onStatus(String(error)),
       );
     });
-    const stopOutput = onTerminalOutput((output) => {
-      if (output.id === id) term.write(output.data);
-    });
-    const stopExit = onTerminalExit((exit) => {
-      if (exit.id !== id) return;
+    // Routed by id rather than filtered from a broadcast, so one terminal's output costs
+    // one lookup instead of waking every other open terminal.
+    const stopOutput = onOutputFor(id, (data) => term.write(data));
+    const stopExit = onExitFor(id, (code) => {
       running.current = false;
-      const message = describeExit(exit.code);
+      const message = describeExit(code);
       setExited(message);
       report.current.onStatus("");
       term.writeln(`\r\n\x1b[38;5;244m[${message}]\x1b[0m`);
@@ -206,21 +262,9 @@ export const TerminalView = forwardRef<
   }, [fontSize]);
 
   const copySelection = () => {
-    const selection = view.current?.term.getSelection();
-    if (!selection) return;
-    void navigator.clipboard
-      .writeText(selection)
-      .catch(() => report.current.onStatus("The clipboard is not available."));
+    if (view.current) copyFrom(view.current.term);
   };
-
-  const paste = () => {
-    void navigator.clipboard
-      .readText()
-      .then((text) => {
-        if (text && running.current) return native("terminal_write", { id, data: text });
-      })
-      .catch(() => report.current.onStatus("The clipboard is not available."));
-  };
+  const paste = pasteInto;
 
   useImperativeHandle(ref, () => ({
     focus: () => view.current?.term.focus(),
@@ -254,15 +298,10 @@ export const TerminalView = forwardRef<
         ref={host}
         aria-label={`Terminal ${id}`}
         className="min-h-0 flex-1 overflow-hidden pt-1 pl-2"
-        onKeyDown={(event) => {
-          const action = terminalKeyAction(event.nativeEvent, !!view.current?.term.hasSelection());
-          if (!action) return;
-          event.preventDefault();
-          event.stopPropagation();
-          if (action === "copy") copySelection();
-          else if (action === "paste") paste();
-          else report.current.onShortcut(action);
-        }}
+        // Key handling lives in xterm's own custom handler (see the effect above), which runs
+        // before xterm interprets the key. Handling it here instead meant the event had
+        // already bubbled past xterm, which had by then sent the key to the shell -- so
+        // Shift+PageUp both scrolled and typed an escape sequence at the prompt.
         onContextMenu={(event) => {
           event.preventDefault();
           report.current.onContextMenu({ x: event.clientX, y: event.clientY });

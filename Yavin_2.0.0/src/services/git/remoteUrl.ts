@@ -63,7 +63,7 @@ export function remoteUrlToWeb(remoteUrl: string): RemoteWebLink | null {
 
 /** Opens `link.url` (already converted by `remoteUrlToWeb`) in the OS's default browser. */
 export function openExternalUrl(url: string): Promise<void> {
-  return native("git_open_external_url", { url });
+  return native("open_external_url", { url });
 }
 
 /**

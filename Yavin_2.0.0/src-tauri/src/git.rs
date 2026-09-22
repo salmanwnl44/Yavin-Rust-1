@@ -691,75 +691,6 @@ pub async fn git_probe_worktree(
         .map_err(|e| e.to_string())
 }
 
-/// Opens `url` in the OS's default browser -- "Open on GitHub"/"Open on GitLab"/etc, once a
-/// remote URL has already been converted to its web form on the TypeScript side. Restricted to
-/// `https://`: the only schemes a converted remote URL is ever produced as, and narrow enough
-/// that this can never be turned into a way to launch an arbitrary local program or file.
-#[tauri::command]
-pub async fn git_open_external_url(url: String) -> Result<(), String> {
-    if !is_openable_web_url(&url) {
-        return Err("Only a plain https:// URL may be opened".into());
-    }
-    tauri::async_runtime::spawn_blocking(move || open_external_url(&url))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-/// The URL reaching `open_external_url` is derived from `git remote get-url`, i.e. from
-/// repository content, so "it starts with https://" is not on its own enough. The launchers
-/// below are not shells, but `explorer.exe` in particular does not follow the usual argument
-/// quoting and has historically split its argument on commas -- which would let one crafted
-/// remote URL open a *second* target such as a UNC path (`\\host\share\x.exe`, an NTLM leak
-/// or a program launch). Whitespace, quotes, backslashes and commas have no business in a
-/// converted web URL, so all of them are refused rather than escaped.
-fn is_openable_web_url(url: &str) -> bool {
-    const MAX_URL: usize = 2048;
-    let Some(rest) = url.strip_prefix("https://") else {
-        return false;
-    };
-    if url.len() > MAX_URL || rest.is_empty() {
-        return false;
-    }
-    if url
-        .chars()
-        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '\\' | ',' | '"' | '\'' | '|'))
-    {
-        return false;
-    }
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = host.rsplit('@').next().unwrap_or("");
-    !host.is_empty() && !host.starts_with('-')
-}
-
-fn open_external_url(url: &str) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        // `explorer` treats an http(s) argument as "open this URL in the default browser" --
-        // the same mechanism `reveal_in_os_explorer` already relies on for opening a path.
-        Command::new("explorer")
-            .arg(url)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-    #[cfg(target_os = "linux")]
-    {
-        Command::new("xdg-open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-}
-
 #[tauri::command]
 pub async fn git_repo_state(state: State<'_, Repos>, repo_id: String) -> Result<String, String> {
     let repo = repo_of(&state, &repo_id)?;
@@ -2399,39 +2330,6 @@ mod tests {
         ] {
             assert!(!is_safe_remote_url(bad), "should be refused: {bad}");
         }
-    }
-
-    #[test]
-    fn only_a_plain_https_url_can_be_handed_to_the_os_browser_launcher() {
-        for good in [
-            "https://github.com/owner/repo/commit/abc123",
-            "https://git.example.com:8443/o/r/commit/abc",
-            "https://host.test/path?query=1#frag",
-        ] {
-            assert!(is_openable_web_url(good), "should be openable: {good}");
-        }
-        for bad in [
-            "",
-            "http://github.com/x",
-            "file:///etc/passwd",
-            "javascript:alert(1)",
-            "https://",
-            // explorer.exe has historically split on commas, which would open a second,
-            // attacker-chosen target -- here a UNC path (NTLM leak / program launch).
-            "https://ok.test/x,\\\\10.0.0.1\\share\\evil.exe",
-            "https://ok.test/x\\..\\..\\evil",
-            "https://ok.test/a b",
-            "https://ok.test/x\nhttps://evil.test",
-            "https://ok.test/\"quoted\"",
-            "https://-badhost/x",
-        ] {
-            assert!(!is_openable_web_url(bad), "should be refused: {bad}");
-        }
-        // Length is bounded so a pathological URL cannot be handed to the launcher.
-        assert!(!is_openable_web_url(&format!(
-            "https://ok.test/{}",
-            "a".repeat(4096)
-        )));
     }
 
     #[test]

@@ -31,7 +31,7 @@ interface Commands {
   };
   git_close_repo: { args: { repoId: string }; result: void };
   git_probe_worktree: { args: { repoId: string }; result: "ready" | "missing" | "invalid" };
-  git_open_external_url: { args: { url: string }; result: void };
+  open_external_url: { args: { url: string }; result: void };
   git_exec: {
     args: { repoId: string; args: string[]; id: string; input?: string };
     result: ToolOutput;

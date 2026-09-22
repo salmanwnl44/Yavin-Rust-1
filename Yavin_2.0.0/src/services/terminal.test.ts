@@ -83,3 +83,54 @@ test("Ctrl+C interrupts the program unless there is something to copy", () => {
     null,
   );
 });
+
+/** A key press, with every modifier explicit so each test reads unambiguously. */
+const key = (
+  name: string,
+  modifiers: { ctrl?: boolean; shift?: boolean; meta?: boolean; alt?: boolean } = {},
+) =>
+  ({
+    key: name,
+    type: "keydown",
+    ctrlKey: !!modifiers.ctrl,
+    shiftKey: !!modifiers.shift,
+    metaKey: !!modifiers.meta,
+    altKey: !!modifiers.alt,
+  }) as unknown as KeyboardEvent;
+
+test("the buffer can be scrolled with the keys every terminal uses", () => {
+  assert.equal(terminalKeyAction(key("PageUp", { shift: true }), false), "scroll-page-up");
+  assert.equal(terminalKeyAction(key("PageDown", { shift: true }), false), "scroll-page-down");
+  assert.equal(terminalKeyAction(key("Home", { ctrl: true }), false), "scroll-top");
+  assert.equal(terminalKeyAction(key("End", { ctrl: true }), false), "scroll-bottom");
+});
+
+test("Ctrl+PageUp/PageDown move between terminals", () => {
+  assert.equal(terminalKeyAction(key("PageDown", { ctrl: true }), false), "next");
+  assert.equal(terminalKeyAction(key("PageUp", { ctrl: true }), false), "previous");
+});
+
+test("Alt+Arrow moves between the panes of a split", () => {
+  assert.equal(terminalKeyAction(key("ArrowRight", { alt: true }), false), "pane-next");
+  assert.equal(terminalKeyAction(key("ArrowLeft", { alt: true }), false), "pane-previous");
+});
+
+test("a plain arrow key still reaches the shell, so history and editing keep working", () => {
+  // Alt is the modifier that claims arrows; without it they must go through untouched.
+  assert.equal(terminalKeyAction(key("ArrowRight"), false), null);
+  assert.equal(terminalKeyAction(key("ArrowLeft"), false), null);
+  assert.equal(terminalKeyAction(key("ArrowUp"), false), null);
+});
+
+test("a plain PageUp reaches the shell -- only Shift and Ctrl claim it", () => {
+  assert.equal(terminalKeyAction(key("PageUp"), false), null);
+  assert.equal(terminalKeyAction(key("PageDown"), false), null);
+  assert.equal(terminalKeyAction(key("Home"), false), null);
+});
+
+test("the navigation keys do not collide with the existing copy and zoom bindings", () => {
+  assert.equal(terminalKeyAction(key("c", { ctrl: true, shift: true }), false), "copy");
+  assert.equal(terminalKeyAction(key("=", { ctrl: true }), false), "zoom-in");
+  assert.equal(terminalKeyAction(key("`", { ctrl: true, shift: true }), false), "new");
+  assert.equal(terminalKeyAction(key("5", { ctrl: true, shift: true }), false), "split");
+});
