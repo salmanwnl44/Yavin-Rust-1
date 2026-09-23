@@ -39,9 +39,14 @@ let kept: {
  * publishes under an owner, so one finishing replaces its own findings and leaves the rest.
  */
 export function ProblemsView({
+  trusted = true,
+  onManageTrust,
   activeFile,
   onOpen,
 }: {
+  /** Running a checker starts the project's own build tooling, so it needs trust. */
+  trusted?: boolean;
+  onManageTrust?: () => void;
   /** Path of the file in the editor, for the "current file only" toggle. */
   activeFile?: string;
   /** Opens a file at a position, for click-to-navigate. */
@@ -65,11 +70,15 @@ export function ProblemsView({
   }, [filter, severities, activeOnly, collapsed]);
 
   useEffect(() => {
+    if (!trusted) {
+      setCheckers([]);
+      return;
+    }
     native("available_checkers")
       .then(setCheckers)
       // No workspace open yet is the common case, and not worth an error banner.
       .catch(() => setCheckers([]));
-  }, []);
+  }, [trusted]);
 
   const run = useCallback(async (id: string, label: string) => {
     setRunning(id);
@@ -107,6 +116,22 @@ export function ProblemsView({
       current.includes(severity)
         ? current.filter((one) => one !== severity)
         : [...current, severity],
+    );
+
+  if (!trusted)
+    return (
+      <EmptyView
+        label="Problems"
+        message="This folder is open in Restricted Mode, so Yavin does not run its compiler or linter. Collecting diagnostics means running the project's own tools, and a project decides what those do."
+        action={
+          <button
+            onClick={onManageTrust}
+            className="rounded bg-indigo-600 px-3 py-1 text-[11px] font-medium text-white hover:bg-indigo-500"
+          >
+            Manage Workspace Trust
+          </button>
+        }
+      />
     );
 
   if (!checkers.length && !everRan)

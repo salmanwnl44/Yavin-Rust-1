@@ -9,6 +9,9 @@ interface StatusBarProps {
   branch?: Branch;
   /** Opens the Problems view, as clicking the count does in VS Code. */
   onShowProblems?: () => void;
+  /** Whether the open folder is in Restricted Mode. */
+  restricted?: boolean;
+  onManageTrust?: () => void;
 }
 
 export function StatusBar({
@@ -16,6 +19,8 @@ export function StatusBar({
   onToggleTerminal,
   branch,
   onShowProblems,
+  restricted,
+  onManageTrust,
 }: StatusBarProps) {
   useSyncExternalStore(subscribeProblems, problemsVersion, problemsVersion);
   const counts = problemCounts();
@@ -29,6 +34,17 @@ export function StatusBar({
   return (
     <footer className="flex h-6 items-center justify-between border-t border-[#151515] bg-black px-3 text-[11px] text-zinc-400">
       <div className="flex min-w-0 items-center gap-3">
+        {/* Present only while restricted, so a trusted window carries no permanent badge --
+            and it is the way back to the decision. */}
+        {restricted && (
+          <button
+            onClick={onManageTrust}
+            title="This folder is open in Restricted Mode. Click to manage trust."
+            className="flex shrink-0 items-center gap-1 rounded bg-amber-500/15 px-1.5 text-amber-300 hover:bg-amber-500/25"
+          >
+            Restricted Mode
+          </button>
+        )}
         {(branch?.name || branch?.detached) && (
           <span
             className="flex items-center gap-1 shrink-0"

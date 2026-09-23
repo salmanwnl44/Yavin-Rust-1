@@ -92,6 +92,8 @@ export function TerminalPanel({
   isMaximized,
   onToggleMaximize,
   request,
+  trusted,
+  onManageTrust,
   activeFile,
   onOpenProblem,
 }: {
@@ -104,6 +106,9 @@ export function TerminalPanel({
    * repeated request work: asking twice for the same view is a real request both times.
    */
   request?: { nonce: number; view?: PanelViewId; channel?: string };
+  /** Whether the folder is trusted; Problems cannot run anything without it. */
+  trusted?: boolean;
+  onManageTrust?: () => void;
   /** The file in the editor, for the Problems view's "current file only" toggle. */
   activeFile?: string;
   /** Opens a file at a position, for clicking a problem. */
@@ -824,7 +829,12 @@ export function TerminalPanel({
           )}
         </div>
         {!hidden && activeTab === "problems" && (
-          <ProblemsView activeFile={activeFile} onOpen={onOpenProblem} />
+          <ProblemsView
+            trusted={trusted !== false}
+            onManageTrust={onManageTrust}
+            activeFile={activeFile}
+            onOpen={onOpenProblem}
+          />
         )}
         {!hidden && activeTab === "output" && <OutputView initialChannel={channel} />}
         {!hidden && activeTab === "debug" && <DebugConsoleView />}

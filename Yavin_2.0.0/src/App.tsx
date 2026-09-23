@@ -27,6 +27,9 @@ import type { SearchHit } from "./services/search";
 import { recordEdit } from "./services/editor";
 import { requestTerminal, onTerminalRequestObserved } from "./services/terminal";
 import type { PanelViewId } from "./services/panel/views";
+import { readTrust, UNKNOWN_TRUST } from "./services/trust";
+import type { TrustState } from "./services/trust";
+import { WorkspaceTrustDialog } from "./components/trust/WorkspaceTrustDialog";
 
 import { isTauri } from "@tauri-apps/api/core";
 import type { FileNode, EditorTab, RecentFile } from "./types";
@@ -165,6 +168,27 @@ export default function App() {
     view?: PanelViewId;
     channel?: string;
   }>({ nonce: 0 });
+
+  /** Workspace Trust: owned natively, mirrored here so the UI can reflect and change it. */
+  const [trust, setTrust] = useState<TrustState>(UNKNOWN_TRUST);
+  const [trustDialog, setTrustDialog] = useState<"prompt" | "manage" | null>(null);
+  // Re-read whenever the open folder changes: the decision is per folder.
+  useEffect(() => {
+    let cancelled = false;
+    readTrust()
+      .then((next) => {
+        if (cancelled) return;
+        setTrust(next);
+        // An undecided folder is the only thing that raises the prompt unbidden.
+        if (!next.decided) setTrustDialog("prompt");
+      })
+      // No desktop backend (the browser preview) runs nothing, so there is nothing to gate.
+      .catch(() => !cancelled && setTrust({ ...UNKNOWN_TRUST, trusted: true }));
+    return () => {
+      cancelled = true;
+    };
+  }, [workspacePath]);
+
   const showPanelView = useCallback((view: PanelViewId, channel?: string) => {
     setPanelRequest((previous) => ({ nonce: previous.nonce + 1, view, channel }));
   }, []);
@@ -818,6 +842,15 @@ export default function App() {
       run: () => handleReveal(activeTabId),
     },
     {
+      // The status bar only carries a trust entry point while restricted, so this is the way
+      // back to the decision once a folder is trusted -- otherwise trust could never be revoked.
+      id: "file.trust",
+      menu: "File",
+      label: "Manage Workspace Trust",
+      disabled: !desktop,
+      run: () => setTrustDialog("manage"),
+    },
+    {
       id: "file.exit",
       menu: "File",
       label: "Exit",
@@ -1298,6 +1331,8 @@ export default function App() {
                   isMaximized={isTerminalMaximized}
                   onToggleMaximize={() => setIsTerminalMaximized((prev) => !prev)}
                   request={panelRequest}
+                  trusted={trust.trusted}
+                  onManageTrust={() => setTrustDialog("manage")}
                   activeFile={activeTab?.path}
                   onOpenProblem={(file, line) => {
                     // Opening is asynchronous, so the jump waits for the editor to hold the
@@ -1317,6 +1352,8 @@ export default function App() {
         <StatusBar
           activeFile={activeTab?.path || ""}
           onToggleTerminal={() => showTerminal((prev) => !prev)}
+          restricted={!trust.trusted}
+          onManageTrust={() => setTrustDialog("manage")}
           onShowProblems={() => {
             showTerminal(true);
             showPanelView("problems");
@@ -1324,6 +1361,14 @@ export default function App() {
           branch={activeRepoSnapshot?.branch}
         />
 
+        {trustDialog && (
+          <WorkspaceTrustDialog
+            trust={trust}
+            mode={trustDialog}
+            onDecided={setTrust}
+            onClose={() => setTrustDialog(null)}
+          />
+        )}
         {dialog && <AppDialog request={dialog} onClose={() => setDialog(null)} />}
         {/* Command Palette */}
         <CommandPalette

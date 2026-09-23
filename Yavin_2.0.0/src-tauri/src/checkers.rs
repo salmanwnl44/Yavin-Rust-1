@@ -7,6 +7,7 @@
 //! a fixed set of checkers, each with a fixed argv that the caller cannot influence. The
 //! caller picks an id from the list and nothing else.
 
+use crate::trust::{require_trust, Trust};
 use crate::{with_workspace, Workspace};
 use ide_workspace::process::capture_within;
 use serde::Serialize;
@@ -14,7 +15,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Duration;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 /// A checker, its exact command line, and how to tell it applies to a project.
 struct Checker {
@@ -72,8 +73,18 @@ fn find(id: &str) -> Option<&'static Checker> {
 }
 
 /// The checkers that apply here, by looking for each one's marker file in the workspace root.
+///
+/// A folder open in Restricted Mode offers none: running one executes the project's own
+/// toolchain, so the buttons should not be there to press rather than failing when pressed.
 #[tauri::command]
-pub async fn available_checkers(state: State<'_, Workspace>) -> Result<Vec<CheckerInfo>, String> {
+pub async fn available_checkers(
+    app: AppHandle,
+    state: State<'_, Workspace>,
+    trust: State<'_, Trust>,
+) -> Result<Vec<CheckerInfo>, String> {
+    if require_trust(&app, &state, &trust).is_err() {
+        return Ok(Vec::new());
+    }
     let root = with_workspace(&state, |manager| Ok(manager.root().to_path_buf()))?;
     Ok(CHECKERS
         .iter()
@@ -91,7 +102,15 @@ pub async fn available_checkers(state: State<'_, Workspace>) -> Result<Vec<Check
 /// an error here; only failing to run it at all is. stdout and stderr are both returned
 /// because tools disagree about where diagnostics go (`tsc` uses stdout, `cargo` stderr).
 #[tauri::command]
-pub async fn run_checker(state: State<'_, Workspace>, id: String) -> Result<String, String> {
+pub async fn run_checker(
+    app: AppHandle,
+    state: State<'_, Workspace>,
+    trust: State<'_, Trust>,
+    id: String,
+) -> Result<String, String> {
+    // Checked here as well as in `available_checkers`, because that one only decides what to
+    // offer; this is the call that actually starts the project's build tooling.
+    require_trust(&app, &state, &trust)?;
     let checker = find(&id).ok_or_else(|| format!("No checker named {id}."))?;
     let root = with_workspace(&state, |manager| Ok(manager.root().to_path_buf()))?;
 

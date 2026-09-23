@@ -100,10 +100,26 @@ export function createOutputChannel(name: string): OutputChannel {
   }
   const owned = state;
 
+  /**
+   * The registered state for this name, re-registering it if the registry has been reset.
+   * Handles are memoized for the life of the process (see `outputLog.ts`), so one that kept
+   * writing into a dropped state would silently black-hole everything written through it.
+   */
+  const live = (): ChannelState => {
+    let current = channels.get(id);
+    if (!current) {
+      current = { id, name, lines: [], nextLineId: 1, cache: [], cacheStale: false };
+      channels.set(id, current);
+      changed();
+    }
+    return current;
+  };
+
   const push = (text: string, level: LogLevel) => {
-    owned.lines.push({ id: owned.nextLineId++, text, level, at: Date.now() });
-    while (owned.lines.length > CAPACITY) owned.lines.shift();
-    changed(owned);
+    const current = live();
+    current.lines.push({ id: current.nextLineId++, text, level, at: Date.now() });
+    while (current.lines.length > CAPACITY) current.lines.shift();
+    changed(current);
   };
 
   return {
@@ -112,11 +128,14 @@ export function createOutputChannel(name: string): OutputChannel {
     append: (text, level = "info") => push(text, level),
     appendLine: (text, level = "info") => {
       // Split so one call carrying several lines is still several lines to filter and scroll.
-      for (const line of text.split("\n")) push(line, level);
+      // The carriage return of a Windows pipe's CRLF is dropped: it does not show on screen
+      // but does come back when the output is copied out.
+      for (const line of text.split("\n")) push(line.replace(/\r$/, ""), level);
     },
     clear: () => {
-      owned.lines = [];
-      changed(owned);
+      const current = live();
+      current.lines = [];
+      changed(current);
     },
     lines: () => channelLines(owned.id),
   };

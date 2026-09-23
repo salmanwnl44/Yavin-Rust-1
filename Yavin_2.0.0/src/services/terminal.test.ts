@@ -114,8 +114,15 @@ test("Ctrl+PageUp/PageDown move between terminals", () => {
 });
 
 test("Alt+Arrow moves between the panes of a split", () => {
-  assert.equal(terminalKeyAction(key("ArrowRight", { alt: true }), false), "pane-next");
-  assert.equal(terminalKeyAction(key("ArrowLeft", { alt: true }), false), "pane-previous");
+  assert.equal(terminalKeyAction(key("ArrowRight", { alt: true }), false, true), "pane-next");
+  assert.equal(terminalKeyAction(key("ArrowLeft", { alt: true }), false, true), "pane-previous");
+});
+
+test("Alt+Arrow reaches the shell when there is no split to move between", () => {
+  // Option+Arrow is readline's move-by-word and several shells bind Alt+Arrow to history, so
+  // claiming it unconditionally broke line editing for everyone not using splits.
+  assert.equal(terminalKeyAction(key("ArrowRight", { alt: true }), false, false), null);
+  assert.equal(terminalKeyAction(key("ArrowLeft", { alt: true }), false, false), null);
 });
 
 test("a plain arrow key still reaches the shell, so history and editing keep working", () => {

@@ -38,10 +38,19 @@ async function desktop(
     ports?: unknown[];
     checkers?: { id: string; label: string }[];
     checkerOutput?: string;
+    trust?: { trusted: boolean; decided: boolean; root: string | null; parent: string | null };
   } = {},
 ) {
   await page.addInitScript((setup) => {
     const calls: Call[] = [];
+    // Trust is stateful, like the native side: a decision made in the dialog must change
+    // what later calls see, or the test can never observe the effect of trusting.
+    let trust = setup.trust ?? {
+      trusted: true,
+      decided: true,
+      root: "/work",
+      parent: "/",
+    };
     const callbacks: Record<number, (event: unknown) => void> = {};
     const listeners: Record<string, number[]> = {};
     let nextId = 1;
@@ -77,7 +86,18 @@ async function desktop(
               children: [{ path: "/work/file.ts", name: "file.ts", is_dir: false, children: null }],
             };
           if (command === "list_listening_ports") return setup.ports ?? [];
-          if (command === "available_checkers") return setup.checkers ?? [];
+          if (command === "workspace_trust") return trust;
+          if (command === "set_workspace_trust") {
+            trust = { ...trust, trusted: (args as { trusted: boolean }).trusted, decided: true };
+            return trust;
+          }
+          if (command === "trusted_folders") return trust.trusted ? [trust.root] : [];
+          if (command === "forget_trusted_folder") {
+            trust = { ...trust, trusted: false, decided: false };
+            return trust;
+          }
+          // A restricted folder is offered no checkers, matching the native side.
+          if (command === "available_checkers") return trust.trusted ? (setup.checkers ?? []) : [];
           if (command === "run_checker") {
             const override = (window as unknown as { __scenarioCheckerOutput?: string })
               .__scenarioCheckerOutput;
@@ -1053,4 +1073,100 @@ test("the panel's tabs are one tab stop, with arrows moving between them", async
   await page.keyboard.press("ArrowRight");
   // Focus follows selection, so the next arrow press moves from the right place.
   await expect(tabs.getByRole("tab", { name: "PORTS" })).toBeFocused();
+});
+
+const UNDECIDED = { trusted: false, decided: false, root: "/work", parent: "/projects" };
+const RESTRICTED = { trusted: false, decided: true, root: "/work", parent: "/projects" };
+
+test("an undecided folder asks about trust before anything runs its tools", async ({ page }) => {
+  await desktop(page, { trust: UNDECIDED });
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("Do you trust the authors");
+  // Says what it does and does not block, so the choice is informed.
+  await expect(dialog).toContainText("compiler or linter");
+  await expect(dialog).toContainText("integrated terminal");
+});
+
+test("a decided folder is not asked again", async ({ page }) => {
+  await desktop(page, { trust: RESTRICTED });
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Restricted Mode/ })).toBeVisible();
+});
+
+test("choosing Restricted Mode leaves the terminal and editing working", async ({ page }) => {
+  await desktop(page, { trust: UNDECIDED });
+  await page.getByRole("button", { name: "No, browse in Restricted Mode" }).click();
+
+  await expect(page.getByRole("button", { name: /Restricted Mode/ })).toBeVisible();
+  // The terminal is an explicit user action and stays available.
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await expect(view(page, id)).toBeVisible();
+});
+
+test("Restricted Mode explains why Problems is empty and offers a way out", async ({ page }) => {
+  await desktop(page, { trust: RESTRICTED, checkers: [{ id: "tsc", label: "TypeScript" }] });
+  await showView(page, "PROBLEMS");
+
+  const problems = page.getByRole("region", { name: "Problems" });
+  await expect(problems).toContainText("Restricted Mode");
+  // No checker is offered to press, rather than one that fails when pressed.
+  await expect(problems.getByRole("button", { name: "TypeScript", exact: true })).toHaveCount(0);
+  await problems.getByRole("button", { name: "Manage Workspace Trust" }).click();
+  await expect(page.getByRole("dialog")).toContainText("Workspace Trust");
+});
+
+test("trusting the folder enables the checkers", async ({ page }) => {
+  await desktop(page, { trust: UNDECIDED, checkers: [{ id: "tsc", label: "TypeScript" }] });
+  await page.getByRole("button", { name: "Yes, I trust the authors" }).click();
+  await expect(page.getByRole("button", { name: /Restricted Mode/ })).toHaveCount(0);
+
+  await showView(page, "PROBLEMS");
+  await expect(
+    page.getByRole("region", { name: "Problems" }).getByRole("button", {
+      name: "TypeScript",
+      exact: true,
+    }),
+  ).toBeVisible();
+});
+
+test("the parent-folder option is offered and passed through", async ({ page }) => {
+  await desktop(page, { trust: UNDECIDED });
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("projects");
+  await dialog.getByRole("checkbox").check();
+  await dialog.getByRole("button", { name: "Yes, I trust the authors" }).click();
+
+  await expect
+    .poll(async () =>
+      (await calls(page, "set_workspace_trust")).map((c) => [c.args.trusted, c.args.parent]),
+    )
+    .toContainEqual([true, true]);
+});
+
+test("the status bar opens the manage view, which is dismissible", async ({ page }) => {
+  await desktop(page, { trust: RESTRICTED });
+  await page.getByRole("button", { name: /Restricted Mode/ }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("Workspace Trust");
+  // Dismissible, unlike the first decision.
+  await dialog.getByRole("button", { name: "Close" }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+test("a trusted window can still reach trust, and take it back", async ({ page }) => {
+  // A trusted window shows no Restricted Mode badge, so without the menu entry there would be
+  // no way back to the decision and trust could never be revoked.
+  await desktop(page, {
+    trust: { trusted: true, decided: true, root: "/work", parent: "/projects" },
+  });
+  await page.getByRole("menubar").getByRole("menuitem", { name: "File", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Manage Workspace Trust", exact: true }).click();
+
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("region", { name: "Trusted folders" })).toContainText("/work");
+  await dialog.getByRole("button", { name: "Stop trusting /work" }).click();
+
+  await expect(page.getByRole("button", { name: /Restricted Mode/ })).toBeVisible();
 });

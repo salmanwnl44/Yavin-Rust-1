@@ -8,6 +8,7 @@ mod external;
 mod git;
 mod ports;
 mod terminal;
+mod trust;
 mod workbench;
 use checkers::{available_checkers, run_checker};
 use external::open_external_url;
@@ -21,6 +22,7 @@ use terminal::{
     terminal_close, terminal_close_all, terminal_open, terminal_resize, terminal_shells,
     terminal_write, Terminals,
 };
+use trust::{forget_trusted_folder, set_workspace_trust, trusted_folders, workspace_trust, Trust};
 use workbench::{cancel_search, search_project, write_file_guarded};
 
 struct Workspace(Mutex<Option<WorkspaceManager>>);
@@ -197,6 +199,7 @@ pub fn run() {
         .manage(GitJobs::default())
         .manage(GitWatches::default())
         .manage(Terminals::default())
+        .manage(Trust::default())
         .invoke_handler(tauri::generate_handler![
             get_default_workspace,
             list_workspace_files,
@@ -223,6 +226,10 @@ pub fn run() {
             git_probe_worktree,
             open_external_url,
             available_checkers,
+            workspace_trust,
+            set_workspace_trust,
+            trusted_folders,
+            forget_trusted_folder,
             run_checker,
             list_listening_ports,
             stop_listening_process,
