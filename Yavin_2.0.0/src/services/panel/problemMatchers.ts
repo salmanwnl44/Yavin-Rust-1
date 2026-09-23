@@ -55,7 +55,7 @@ const severityOf = (text: string | undefined, fallback: Severity): Severity => {
 export const TSC: ProblemMatcher = {
   owner: "tsc",
   label: "TypeScript",
-  pattern: /^(\S.*?)\((\d+),(\d+)\):\s+(error|warning)\s+(TS\d+):\s+(.*)$/,
+  pattern: /^\s*(\S.*?)\((\d+),(\d+)\):\s+(error|warning)\s+(TS\d+):\s+(.*)$/,
   groups: { file: 1, line: 2, column: 3, severity: 4, code: 5, message: 6 },
 };
 
@@ -66,7 +66,7 @@ export const TSC: ProblemMatcher = {
 export const CARGO: ProblemMatcher = {
   owner: "cargo",
   label: "Rust",
-  pattern: /^(\S.*?):(\d+):(\d+):\s+(error|warning)(?:\[([^\]]+)\])?:\s+(.*)$/,
+  pattern: /^\s*(\S.*?):(\d+):(\d+):\s+(error|warning)(?:\[([^\]]+)\])?:\s+(.*)$/,
   groups: { file: 1, line: 2, column: 3, severity: 4, code: 5, message: 6 },
 };
 
@@ -89,7 +89,7 @@ export const ESLINT: ProblemMatcher = {
 export const RUFF: ProblemMatcher = {
   owner: "ruff",
   label: "Ruff",
-  pattern: /^(\S.*?):(\d+):(\d+):\s+([A-Z]+\d+)\s+(?:\[[*x ]\]\s+)?(.*)$/,
+  pattern: /^\s*(\S.*?):(\d+):(\d+):\s+([A-Z]+\d+)\s+(?:\[[*x ]\]\s+)?(.*)$/,
   groups: { file: 1, line: 2, column: 3, code: 4, message: 5 },
   // Ruff prints no severity word. A lint finding is something to look at, not a build
   // failure, so it is a warning rather than inheriting the compiler default of error.
@@ -117,17 +117,17 @@ export function parseProblems(matcher: ProblemMatcher, output: string): Diagnost
     if (!match) continue;
 
     const at = Number(match[matcher.groups.line]);
-    const column = matcher.groups.column ? Number(match[matcher.groups.column]) : 1;
+    const column = matcher.groups.column === undefined ? 1 : Number(match[matcher.groups.column]);
     // A location that is not a positive number is not a location.
     if (!Number.isFinite(at) || at < 1) continue;
 
-    const code = matcher.groups.code ? match[matcher.groups.code] : undefined;
+    const code = matcher.groups.code === undefined ? undefined : match[matcher.groups.code];
     found.push({
       file: match[matcher.groups.file],
       line: at,
       column: Number.isFinite(column) && column >= 1 ? column : 1,
       severity: severityOf(
-        matcher.groups.severity ? match[matcher.groups.severity] : undefined,
+        matcher.groups.severity === undefined ? undefined : match[matcher.groups.severity],
         matcher.defaultSeverity ?? "error",
       ),
       message: match[matcher.groups.message].trim(),

@@ -18,6 +18,19 @@ const SEVERITY_STYLE: Record<Severity, string> = {
 };
 const SEVERITY_MARK: Record<Severity, string> = { error: "×", warning: "!", info: "i" };
 
+/** What the view was showing last time it was mounted. See the comment where it is read. */
+let kept: {
+  filter: string;
+  severities: Severity[];
+  activeOnly: boolean;
+  collapsed: ReadonlySet<string>;
+} = {
+  filter: "",
+  severities: ["error", "warning", "info"],
+  activeOnly: false,
+  collapsed: new Set(),
+};
+
 /**
  * Diagnostics for the workspace.
  *
@@ -41,10 +54,15 @@ export function ProblemsView({
   const [checkers, setCheckers] = useState<{ id: string; label: string }[]>([]);
   const [running, setRunning] = useState("");
   const [error, setError] = useState("");
-  const [filter, setFilter] = useState("");
-  const [severities, setSeverities] = useState<Severity[]>(["error", "warning", "info"]);
-  const [activeOnly, setActiveOnly] = useState(false);
-  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
+  // Filters and collapse state outlive the component: it is unmounted whenever another view
+  // shows, and losing a carefully typed filter on a trip to the terminal is infuriating.
+  const [filter, setFilter] = useState(kept.filter);
+  const [severities, setSeverities] = useState<Severity[]>(kept.severities);
+  const [activeOnly, setActiveOnly] = useState(kept.activeOnly);
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(kept.collapsed);
+  useEffect(() => {
+    kept = { filter, severities, activeOnly, collapsed };
+  }, [filter, severities, activeOnly, collapsed]);
 
   useEffect(() => {
     native("available_checkers")
@@ -80,6 +98,9 @@ export function ProblemsView({
   );
   const total = files.reduce((sum, file) => sum + file.problems.length, 0);
   const everRan = allProblems().length > 0;
+  /** Whether anything is actually narrowing the list, so "no match" is not blamed on
+   * filters the user has not set. */
+  const narrowed = !!filter.trim() || severities.length < 3 || activeOnly;
 
   const toggleSeverity = (severity: Severity) =>
     setSeverities((current) =>
@@ -155,9 +176,11 @@ export function ProblemsView({
       <div className="min-h-0 flex-1 overflow-auto py-1 text-[11px]">
         {total === 0 ? (
           <p className="px-3 py-2 text-zinc-500">
-            {everRan
-              ? "No problems match. Nothing was reported for the current filters."
-              : "No checker has run yet. Choose one above to collect diagnostics."}
+            {!everRan
+              ? "No checker has run yet. Choose one above to collect diagnostics."
+              : narrowed
+                ? "No problems match the current filters."
+                : "No problems found."}
           </p>
         ) : (
           files.map((file) => {
@@ -168,8 +191,11 @@ export function ProblemsView({
                   aria-expanded={open}
                   onClick={() =>
                     setCollapsed((current) => {
-                      const next = new Set(current);
-                      if (next.has(file.file)) next.delete(file.file);
+                      // Rebuilt from the files actually on screen, so paths that have been
+                      // fixed or filtered away do not accumulate forever.
+                      const shown = new Set(files.map((one) => one.file));
+                      const next = new Set([...current].filter((path) => shown.has(path)));
+                      if (current.has(file.file)) next.delete(file.file);
                       else next.add(file.file);
                       return next;
                     })

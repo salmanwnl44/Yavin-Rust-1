@@ -53,6 +53,8 @@ export const TerminalView = forwardRef<
     /** The whole session, so a profile's arguments, environment and folder reach the shell. */
     session: TerminalSession;
     visible: boolean;
+    /** Whether a split is open, so Alt+Arrow is only claimed when it means something. */
+    hasSplit?: boolean;
     fontSize: number;
     onStatus: (message: string) => void;
     onBell: () => void;
@@ -61,7 +63,17 @@ export const TerminalView = forwardRef<
     onSearchResults: (results: { index: number; count: number }) => void;
   }
 >(function TerminalView(
-  { session, visible, fontSize, onStatus, onBell, onShortcut, onContextMenu, onSearchResults },
+  {
+    session,
+    visible,
+    hasSplit,
+    fontSize,
+    onStatus,
+    onBell,
+    onShortcut,
+    onContextMenu,
+    onSearchResults,
+  },
   ref,
 ) {
   const { id, shell } = session;
@@ -79,6 +91,10 @@ export const TerminalView = forwardRef<
   // shell whenever anything about the session changed.
   const launch = useRef(session);
   launch.current = session;
+  // Read through a ref for the same reason: the key handler is attached once, inside the
+  // effect that owns the shell.
+  const split = useRef(hasSplit);
+  split.current = hasSplit;
   const start = useRef<(clear: boolean) => void>(() => {});
 
   // Declared before the effect below so xterm's custom key handler, which is attached there,
@@ -149,7 +165,7 @@ export const TerminalView = forwardRef<
      * prompt. Anything this does not claim is passed straight through.
      */
     term.attachCustomKeyEventHandler((event) => {
-      const action = terminalKeyAction(event, term.hasSelection());
+      const action = terminalKeyAction(event, term.hasSelection(), !!split.current);
       if (!action) return true;
       if (event.type !== "keydown") return false;
       // Returning false stops xterm handling the key, but not the browser: Chromium treats

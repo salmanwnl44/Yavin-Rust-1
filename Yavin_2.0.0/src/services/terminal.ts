@@ -45,11 +45,6 @@ export interface TerminalSession {
   cwd?: string;
 }
 
-/** A detected shell as a profile, which is what "New Terminal" offers by default. */
-export function profileForShell(shell: Shell): TerminalProfile {
-  return { name: shell.name, shell: shell.path };
-}
-
 /**
  * The arguments `terminal_open` takes for a session. Environment is sent as pairs rather than
  * an object so the native side keeps the author's ordering, which matters when one variable
@@ -94,16 +89,6 @@ function subscribe<T>(event: string, handler: (payload: T) => void): () => void 
   };
 }
 
-/** Bytes a shell has produced, already decoded as UTF-8 by the native side. */
-export function onTerminalOutput(handler: (output: TerminalOutput) => void): () => void {
-  return subscribe<TerminalOutput>("terminal-output", handler);
-}
-
-/** A shell has ended, whether by `exit`, a signal, or a crash. */
-export function onTerminalExit(handler: (exit: TerminalExit) => void): () => void {
-  return subscribe<TerminalExit>("terminal-exit", handler);
-}
-
 /**
  * Routes native terminal events to the one terminal they belong to.
  *
@@ -121,6 +106,23 @@ interface Router<T> {
 const outputRouter: Router<TerminalOutput> = { handlers: new Map(), stop: null };
 const exitRouter: Router<TerminalExit> = { handlers: new Map(), stop: null };
 
+/**
+ * Hands a payload to the terminal it belongs to. A copy of the set, and one try per listener:
+ * a handler that throws must not swallow the chunk for every other terminal, nor escape into
+ * the native event callback.
+ */
+function dispatch<T extends { id: string }>(router: Router<T>, payload: T): void {
+  const listeners = router.handlers.get(payload.id);
+  if (!listeners) return;
+  for (const listener of [...listeners]) {
+    try {
+      listener(payload);
+    } catch {
+      /* One terminal's failure is not the others' problem. */
+    }
+  }
+}
+
 function route<T extends { id: string }>(
   router: Router<T>,
   event: string,
@@ -133,20 +135,38 @@ function route<T extends { id: string }>(
     router.handlers.set(id, forId);
   }
   forId.add(handler);
-  router.stop ??= subscribe<T>(event, (payload) => {
-    const listeners = router.handlers.get(payload.id);
-    if (listeners) for (const listener of listeners) listener(payload);
-  });
+  router.stop ??= subscribe<T>(event, (payload) => dispatch(router, payload));
 
+  const registered = forId;
   return () => {
-    forId.delete(handler);
-    if (forId.size === 0) router.handlers.delete(id);
+    // Only tear down what this subscription actually owns. Calling an unsubscribe twice
+    // would otherwise delete the set a *later* subscription for the same id had installed,
+    // silently stopping that terminal's output and dropping the native listener with it.
+    if (router.handlers.get(id) !== registered) return;
+    registered.delete(handler);
+    if (registered.size > 0) return;
+    router.handlers.delete(id);
     // Nothing is listening any more, so nothing should stay subscribed either.
     if (router.handlers.size === 0) {
       router.stop?.();
       router.stop = null;
     }
   };
+}
+
+/**
+ * Test seam: delivers a payload exactly as the native event would. The routers subscribe
+ * through `listen`, which is inert outside Tauri, so without this the routing rules -- which
+ * is where the bugs were -- could only be checked in a browser test.
+ */
+export function deliverForTest(
+  event: "terminal-output" | "terminal-exit",
+  payload: { id: string; data?: string; code?: number | null },
+): void {
+  // Goes through the same `dispatch` the native subscription uses, so what the tests check
+  // is the real routing rather than a re-implementation of it.
+  if (event === "terminal-output") dispatch(outputRouter, payload as TerminalOutput);
+  else dispatch(exitRouter, payload as TerminalExit);
 }
 
 /** This terminal's output only. */
@@ -222,6 +242,10 @@ export function terminalKeyAction(
     altKey?: boolean;
   },
   hasSelection: boolean,
+  /** Whether a split is open. Alt+Arrow is only claimed when there is a second pane to move
+   * to: on macOS Option+Arrow is readline's move-by-word and several shells bind Alt+Arrow to
+   * history, so taking it unconditionally broke line editing for everyone not using splits. */
+  hasSplit = false,
 ): TerminalKeyAction {
   if (event.type !== "keydown") return null;
   const key = event.key.toLowerCase();
@@ -242,6 +266,7 @@ export function terminalKeyAction(
   }
   // Moving between the panes of a split. Alt alone is otherwise unused here.
   if (event.altKey && !event.ctrlKey && !event.shiftKey && !event.metaKey) {
+    if (!hasSplit) return null;
     if (key === "arrowright") return "pane-next";
     if (key === "arrowleft") return "pane-previous";
     return null;
@@ -294,9 +319,9 @@ export type TerminalRequest = TerminalRequestName | { name: "new"; cwd: string }
 
 const REQUEST = "yavin.terminal.request";
 
-/** How many panels are currently listening, and a request that arrived while none were. */
+/** How many panels are currently listening, and requests that arrived while none were. */
 let panelListeners = 0;
-let undelivered: TerminalRequest | null = null;
+const undelivered: TerminalRequest[] = [];
 
 /**
  * Asks the panel to do something. A message keeps the menu in `App` independent of
@@ -310,7 +335,9 @@ export function requestTerminal(request: TerminalRequest): void {
   // Dispatched first and unconditionally, so observers -- the app shell, which reveals the
   // panel -- always see it. Only then is it held for a panel that has yet to mount.
   window.dispatchEvent(new CustomEvent(REQUEST, { detail: request }));
-  if (panelListeners === 0) undelivered = request;
+  // A queue, not one slot: opening two folders in a terminal before the panel exists should
+  // open two terminals, not silently drop the first.
+  if (panelListeners === 0) undelivered.push(request);
 }
 
 /** Subscribes the panel. Only the panel should use this: it is what "delivered" means. */
@@ -318,13 +345,18 @@ export function onTerminalRequest(handler: (request: TerminalRequest) => void): 
   const listener = (event: Event) => handler((event as CustomEvent<TerminalRequest>).detail);
   window.addEventListener(REQUEST, listener);
   panelListeners += 1;
-  if (undelivered !== null) {
-    const held = undelivered;
-    undelivered = null;
-    // After the caller has finished mounting, so the handler sees a settled component.
-    queueMicrotask(() => handler(held));
+  let live = true;
+  if (undelivered.length) {
+    // Drained inside the callback, not before it: development StrictMode subscribes,
+    // unsubscribes and subscribes again, so taking the queue up front threw the request away
+    // on the discarded first mount and nothing ever delivered it.
+    queueMicrotask(() => {
+      if (!live) return;
+      for (const request of undelivered.splice(0, undelivered.length)) handler(request);
+    });
   }
   return () => {
+    live = false;
     panelListeners -= 1;
     window.removeEventListener(REQUEST, listener);
   };
@@ -338,9 +370,4 @@ export function onTerminalRequestObserved(handler: (request: TerminalRequest) =>
   const listener = (event: Event) => handler((event as CustomEvent<TerminalRequest>).detail);
   window.addEventListener(REQUEST, listener);
   return () => window.removeEventListener(REQUEST, listener);
-}
-
-/** Test seam: forgets a request that was never delivered. */
-export function resetTerminalRequests(): void {
-  undelivered = null;
 }

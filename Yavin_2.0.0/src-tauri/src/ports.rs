@@ -117,6 +117,43 @@ pub fn parse_lsof(text: &str) -> Vec<ListeningPort> {
     found
 }
 
+/// Parses `ss -ltnp` (Linux), the stand-in where `lsof` is not installed:
+/// `LISTEN 0 511 127.0.0.1:5173 0.0.0.0:* users:(("node",pid=23188,fd=23))`
+pub fn parse_ss(text: &str) -> Vec<ListeningPort> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 || !fields[0].eq_ignore_ascii_case("LISTEN") {
+            continue;
+        }
+        let Some((address, port)) = split_address(fields[3]) else {
+            continue;
+        };
+        // `users:(("name",pid=123,fd=4))` -- absent when ss runs without privileges.
+        let users = fields.iter().find(|field| field.starts_with("users:("));
+        let pid = users
+            .and_then(|field| field.split("pid=").nth(1))
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|digits| digits.parse::<u32>().ok())
+            .unwrap_or(0);
+        let process = users
+            .and_then(|field| field.split('"').nth(1))
+            .unwrap_or("")
+            .to_string();
+        found.push(ListeningPort {
+            port,
+            address: if address == "*" {
+                "0.0.0.0".into()
+            } else {
+                address
+            },
+            pid,
+            process,
+        });
+    }
+    found
+}
+
 /// One entry per port, preferring a row that already names its process, then lowest port
 /// first. `netstat` reports the same port once per address family, which would otherwise show
 /// a dev server twice.
@@ -133,6 +170,12 @@ pub fn tidy(mut ports: Vec<ListeningPort>) -> Vec<ListeningPort> {
     ports
 }
 
+/// Runs a tool and insists it actually worked.
+///
+/// The exit status is checked, not just the stdout: `taskkill` reports "could not be
+/// terminated" on stderr with a nonzero code, and returning only stdout meant a refused kill
+/// looked like a success. A failed `netstat` was worse -- an empty list, which the view
+/// renders as the cheerful "nothing is listening" rather than an error.
 fn run(program: &str, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new(program);
     command.args(args);
@@ -141,29 +184,51 @@ fn run(program: &str, args: &[&str]) -> Result<String, String> {
         None,
         Arc::new(AtomicBool::new(false)),
         Duration::from_secs(10),
-    )?;
+    )
+    .map_err(|e| format!("Could not run {program}: {e}"))?;
+    if output.code != 0 {
+        let reason = output.stderr.trim();
+        let reason = if reason.is_empty() {
+            output.stdout.trim()
+        } else {
+            reason
+        };
+        return Err(format!("{program} failed: {reason}"));
+    }
     Ok(output.stdout)
+}
+
+fn with_names(mut ports: Vec<ListeningPort>) -> Vec<ListeningPort> {
+    // Names are a separate call on Windows; a failure there leaves the ports listed without
+    // names rather than failing the whole view, which is still useful.
+    if let Ok(list) = run("tasklist", &["/FO", "CSV", "/NH"]) {
+        let names = parse_tasklist(&list);
+        for port in &mut ports {
+            if let Some(name) = names.get(&port.pid) {
+                port.process = name.clone();
+            }
+        }
+    }
+    ports
 }
 
 fn detect() -> Result<Vec<ListeningPort>, String> {
     if cfg!(windows) {
-        let mut ports = parse_netstat(&run("netstat", &["-ano", "-p", "TCP"])?);
-        // Names are a separate call on Windows; a failure there leaves the ports listed
-        // without names rather than failing the whole view.
-        if let Ok(list) = run("tasklist", &["/FO", "CSV", "/NH"]) {
-            let names = parse_tasklist(&list);
-            for port in &mut ports {
-                if let Some(name) = names.get(&port.pid) {
-                    port.process = name.clone();
-                }
-            }
-        }
-        Ok(tidy(ports))
-    } else {
-        Ok(tidy(parse_lsof(&run(
-            "lsof",
-            &["-nP", "-iTCP", "-sTCP:LISTEN"],
-        )?)))
+        return Ok(tidy(with_names(parse_netstat(&run(
+            "netstat",
+            &["-ano", "-p", "TCP"],
+        )?))));
+    }
+    // `lsof` is absent from minimal Linux images, where `ss` is the modern equivalent, so
+    // whichever is present is used and only a failure of both is reported.
+    match run("lsof", &["-nP", "-iTCP", "-sTCP:LISTEN"]) {
+        Ok(text) => Ok(tidy(parse_lsof(&text))),
+        Err(lsof_error) => match run("ss", &["-ltnp"]) {
+            Ok(text) => Ok(tidy(parse_ss(&text))),
+            Err(ss_error) => Err(format!(
+                "Neither lsof nor ss could list local ports. {lsof_error} {ss_error}"
+            )),
+        },
     }
 }
 
@@ -176,24 +241,39 @@ pub async fn list_listening_ports() -> Result<Vec<ListeningPort>, String> {
 
 /// Ends the process holding a port.
 ///
-/// Deliberately takes a port rather than a pid, and re-enumerates before acting: that way the
-/// only processes this can end are ones currently listening and currently shown, instead of
-/// any pid the caller cares to name.
+/// Takes the pid as well as the port, and requires both to still match a listening entry.
+/// Port alone was wrong: two processes can listen on the same port number on different
+/// interfaces -- the view shows a row for each -- and picking "the first with this port"
+/// meant Stop on the second row killed the first one's process.
+///
+/// Re-enumerating is a real check rather than a formality, but it is not atomic: a pid can be
+/// recycled between the listing and the kill. That window is why it refuses to touch this
+/// process's own tree and the system idle/kernel pids, which are the outcomes that would be
+/// unrecoverable rather than merely annoying.
 #[tauri::command]
-pub async fn stop_listening_process(port: u16) -> Result<(), String> {
+pub async fn stop_listening_process(port: u16, pid: u32) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        if pid == 0 || pid == 4 {
+            return Err("That port belongs to the operating system and cannot be stopped.".into());
+        }
+        if pid == std::process::id() {
+            return Err("That port belongs to Yavin itself.".into());
+        }
+
         let holder = detect()?
             .into_iter()
-            .find(|listening| listening.port == port)
-            .ok_or_else(|| format!("Nothing is listening on port {port} any more."))?;
+            .find(|listening| listening.port == port && listening.pid == pid)
+            .ok_or_else(|| {
+                format!("Nothing with process {pid} is listening on port {port} any more.")
+            })?;
 
-        let pid = holder.pid.to_string();
-        let output = if cfg!(windows) {
-            run("taskkill", &["/PID", &pid, "/T", "/F"])
+        let target = holder.pid.to_string();
+        if cfg!(windows) {
+            run("taskkill", &["/PID", &target, "/T", "/F"])
         } else {
-            run("kill", &[&pid])
-        };
-        output.map(|_| ())
+            run("kill", &[&target])
+        }
+        .map(|_| ())
     })
     .await
     .map_err(|e| e.to_string())?

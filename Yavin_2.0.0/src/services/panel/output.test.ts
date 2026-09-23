@@ -133,3 +133,29 @@ test("the version advances with every change, for useSyncExternalStore", () => {
   createOutputChannel("Git").appendLine("x");
   assert.ok(outputVersion() > before);
 });
+
+test("a handle keeps working after the registry is reset", () => {
+  // `outputLog.ts` memoizes its handle for the life of the process, so a handle that stopped
+  // writing after a reset silently black-holed every Git command from then on.
+  const channel = createOutputChannel("Git");
+  resetOutputChannels();
+  channel.appendLine("after the reset");
+  assert.deepEqual(
+    channel.lines().map((line) => line.text),
+    ["after the reset"],
+  );
+  assert.deepEqual(
+    outputChannels().map((one) => one.name),
+    ["Git"],
+  );
+});
+
+test("a carriage return from a Windows pipe is not stored invisibly", () => {
+  // It does not show on screen but does come back when the output is copied out.
+  const channel = createOutputChannel("Git");
+  channel.appendLine("one\r\ntwo");
+  assert.deepEqual(
+    channel.lines().map((line) => line.text),
+    ["one", "two"],
+  );
+});

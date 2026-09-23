@@ -228,8 +228,12 @@ fn resolve_cwd(requested: Option<&str>, fallback: PathBuf) -> Result<PathBuf, St
             "{requested} is not a folder this terminal can start in."
         ));
     }
-    path.canonicalize()
-        .map_err(|e| format!("Cannot use {requested}: {e}"))
+    // Deliberately NOT canonicalised. On Windows `canonicalize` returns the extended-length
+    // `\\?\C:\...` form, and `cmd.exe` refuses to use such a path as a working directory --
+    // it prints a warning and starts somewhere else entirely, so "Open in Integrated
+    // Terminal" would silently land in the wrong folder. The path has already been shown to
+    // be a real directory, which is what actually needed checking.
+    Ok(path)
 }
 
 #[tauri::command]
@@ -582,9 +586,15 @@ mod tests {
         assert_eq!(resolve_cwd(None, fallback.clone()).unwrap(), fallback);
         assert_eq!(resolve_cwd(Some(""), fallback.clone()).unwrap(), fallback);
 
-        // A real folder is accepted, and canonicalised so later comparisons agree.
+        // A real folder is accepted as given. Not canonicalised: on Windows that yields the
+        // extended-length `\?\C:\...` form, which cmd.exe refuses as a working directory
+        // and silently starts elsewhere.
         let resolved = resolve_cwd(Some(&dir.to_string_lossy()), fallback.clone()).unwrap();
-        assert_eq!(resolved, dir.canonicalize().unwrap());
+        assert_eq!(resolved, dir);
+        assert!(
+            !resolved.to_string_lossy().starts_with("\\?\\"),
+            "must not hand cmd.exe an extended-length path"
+        );
 
         // A file, and a folder that is not there, each fail by name rather than deep inside
         // the spawn with a message that identifies nothing.

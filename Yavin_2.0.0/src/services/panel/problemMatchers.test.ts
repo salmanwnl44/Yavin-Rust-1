@@ -175,3 +175,27 @@ test("a message containing parentheses keeps them when there is no trailing rule
   assert.equal(problem.code, "see docs");
   assert.equal(problem.message, "Unexpected token");
 });
+
+test("an indented diagnostic is still found, not silently dropped", () => {
+  // Anchoring on a non-space character meant any tool that indents its findings produced
+  // nothing at all, with no error to explain why.
+  const problems = parseProblems(TSC, "    src/app.ts(1,1): error TS1005: ';' expected.");
+  assert.equal(problems.length, 1);
+  assert.equal(problems[0].file, "src/app.ts");
+});
+
+test("a path containing spaces and parentheses is still parsed", () => {
+  const problems = parseProblems(TSC, "src/my (old) app.ts(4,2): error TS1005: ';' expected.");
+  assert.equal(problems[0].file, "src/my (old) app.ts");
+  assert.equal(problems[0].line, 4);
+});
+
+test("a cargo path with spaces parses, and a note after an error is not a diagnostic", () => {
+  const output = [
+    "src/my file.rs:7:3: error[E0308]: mismatched types",
+    "note: expected `u32`, found `&str`",
+  ].join("\n");
+  const problems = parseProblems(CARGO, output);
+  assert.equal(problems.length, 1);
+  assert.equal(problems[0].file, "src/my file.rs");
+});

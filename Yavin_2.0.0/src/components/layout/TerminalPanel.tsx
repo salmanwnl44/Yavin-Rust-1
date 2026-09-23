@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { native } from "../../services/native";
 import { TerminalView } from "../terminal/TerminalView";
 import type { TerminalHandle } from "../terminal/TerminalView";
@@ -91,8 +91,7 @@ export function TerminalPanel({
   onClose,
   isMaximized,
   onToggleMaximize,
-  outputChannel,
-  requestedView,
+  request,
   activeFile,
   onOpenProblem,
 }: {
@@ -100,17 +99,22 @@ export function TerminalPanel({
   onClose: () => void;
   isMaximized: boolean;
   onToggleMaximize: () => void;
-  /** Channel the Output view should show, when something asked for a specific one. */
-  outputChannel?: string;
-  /** A view something asked to see, e.g. the status bar's problem counts. */
-  requestedView?: PanelViewId;
+  /**
+   * What to show, when something outside the panel has asked. The `nonce` is what makes a
+   * repeated request work: asking twice for the same view is a real request both times.
+   */
+  request?: { nonce: number; view?: PanelViewId; channel?: string };
   /** The file in the editor, for the Problems view's "current file only" toggle. */
   activeFile?: string;
   /** Opens a file at a position, for clicking a problem. */
   onOpenProblem?: (file: string, line: number, column: number) => void;
 }) {
   // Re-renders the tab strip as diagnostics change, so the badge stays accurate.
-  useSyncExternalStore(subscribeProblems, problemsVersion, problemsVersion);
+  const problemsRevision = useSyncExternalStore(
+    subscribeProblems,
+    problemsVersion,
+    problemsVersion,
+  );
   const [activeTab, setActiveTabState] = useState<PanelViewId>(readActiveView);
   const setActiveTab = useCallback((id: PanelViewId) => {
     setActiveTabState(id);
@@ -138,6 +142,7 @@ export function TerminalPanel({
   const [bells, setBells] = useState<Set<string>>(new Set());
 
   const handles = useRef(new Map<string, TerminalHandle | null>());
+  const tabRefs = useRef(new Map<string, HTMLButtonElement | null>());
   const findInput = useRef<HTMLInputElement>(null);
   const body = useRef<HTMLDivElement>(null);
 
@@ -219,14 +224,14 @@ export function TerminalPanel({
     [],
   );
 
-  // "Show Git Output" and friends name a channel; showing it means showing the Output view.
+  // "Show Git Output" and the status bar's counts both land here. Keyed on the nonce so
+  // asking for the same view twice actually switches to it both times.
+  const [channel, setChannel] = useState<string | undefined>(undefined);
   useEffect(() => {
-    if (outputChannel) setActiveTab("output");
-  }, [outputChannel, setActiveTab]);
-
-  useEffect(() => {
-    if (requestedView) setActiveTab(requestedView);
-  }, [requestedView, setActiveTab]);
+    if (!request?.nonce) return;
+    if (request.channel) setChannel(request.channel);
+    setActiveTab(request.view ?? (request.channel ? "output" : "terminal"));
+  }, [request?.nonce, request?.view, request?.channel, setActiveTab]);
 
   // Closing anything that floats above the terminal when focus moves elsewhere.
   useEffect(() => {
@@ -248,12 +253,20 @@ export function TerminalPanel({
     const remaining = sessions.filter((session) => session.id !== id);
     if (splitId === id) setSplitId(null);
     setSessions(remaining);
+    setFocusedPane("primary");
     // Closing the last terminal used to close the whole panel, which made sense when the
     // panel was only ever terminals. It now holds Problems, Output and Ports too, so closing
     // it would take away views that have nothing to do with the terminal that just exited.
     // The panel stays; the effect below starts a fresh terminal while the Terminal view is
     // the one on screen.
-    if (remaining.length && id === activeId) setActiveId(remaining[remaining.length - 1].id);
+    if (remaining.length && id === activeId) {
+      // Never the other pane's session: the two halves render as `[activeId, splitId]`, so
+      // making them the same id drew one terminal at half width with dead space beside it.
+      const next =
+        remaining.filter((session) => session.id !== splitId).at(-1) ?? remaining.at(-1)!;
+      setActiveId(next.id);
+      if (next.id === splitId) setSplitId(null);
+    }
   };
 
   /**
@@ -298,9 +311,9 @@ export function TerminalPanel({
   const active = () => handles.current.get(focusedId) ?? null;
   const shown = splitId ? [activeId, splitId] : [activeId];
 
-  /** Per-view tab counts. Only the terminal has something to count so far; Problems and
-   * Ports fill these in as those views gain real data. */
-  const counts = problemCounts();
+  /** Per-view tab counts. Memoised on the diagnostics version: counting walks every
+   * diagnostic, and the panel re-renders on every Find keystroke and terminal status change. */
+  const counts = useMemo(() => problemCounts(), [problemsRevision]);
   const badges: Record<PanelViewId, number> = {
     // Errors and warnings, matching VS Code's badge; informational entries are not counted.
     problems: counts.error + counts.warning,
@@ -419,7 +432,7 @@ export function TerminalPanel({
     { label: "Split Terminal", run: toggleSplit, enabled: !missing },
     {
       label: "Rename",
-      run: () => setRenaming(activeId),
+      run: () => setRenaming(focusedId),
       enabled: true,
     },
     { label: "Kill Terminal", run: () => closeSession(focusedId), enabled: true },
@@ -455,13 +468,26 @@ export function TerminalPanel({
             <button
               key={tab.id}
               role="tab"
+              id={`panel-tab-${tab.id}`}
+              aria-controls="panel-view"
               aria-selected={activeTab === tab.id}
+              // Roving tabindex: a tablist is one tab stop, and the arrow keys move within
+              // it. Leaving every tab focusable put five stops between the panel and its
+              // contents.
+              tabIndex={activeTab === tab.id ? 0 : -1}
+              ref={(element) => {
+                if (activeTab === tab.id) tabRefs.current.set(tab.id, element);
+              }}
               // Arrow keys move between views, as they must inside a tablist, and give the
               // next/previous-view commands somewhere to live.
               onKeyDown={(event) => {
                 if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return;
                 event.preventDefault();
-                setActiveTab(stepView(activeTab, event.key === "ArrowRight" ? 1 : -1));
+                const next = stepView(activeTab, event.key === "ArrowRight" ? 1 : -1);
+                setActiveTab(next);
+                // Focus follows selection, or focus and selection drift apart and the next
+                // arrow press moves from the wrong place.
+                requestAnimationFrame(() => tabRefs.current.get(next)?.focus());
               }}
               onClick={() => setActiveTab(tab.id)}
               className={`relative flex items-center gap-1.5 pb-1 transition-colors ${
@@ -716,7 +742,13 @@ export function TerminalPanel({
       )}
 
       {/* Body */}
-      <div ref={body} className="min-h-0 flex-1 bg-black">
+      <div
+        ref={body}
+        id="panel-view"
+        role="tabpanel"
+        aria-labelledby={`panel-tab-${activeTab}`}
+        className="min-h-0 flex-1 bg-black"
+      >
         <div hidden={activeTab !== "terminal"} className="relative flex h-full min-h-0">
           {/* Every terminal closed. The panel stays (Problems, Output and Ports live here
               too), so this view needs its own way back rather than relying on the panel
@@ -759,6 +791,7 @@ export function TerminalPanel({
                     handles.current.set(session.id, handle);
                   }}
                   session={session}
+                  hasSplit={!!splitId}
                   visible={!hidden && activeTab === "terminal" && position !== -1}
                   fontSize={fontSize}
                   onStatus={setStatus}
@@ -768,9 +801,12 @@ export function TerminalPanel({
                     )
                   }
                   onShortcut={shortcut}
-                  onContextMenu={(position) => {
-                    setActiveId(session.id);
-                    setMenu(position);
+                  onContextMenu={(at) => {
+                    // Focus the pane rather than reassigning `activeId`: in a split that
+                    // would set activeId === splitId and collapse the layout onto one pane.
+                    if (position !== -1) setFocusedPane(position === 0 ? "primary" : "secondary");
+                    if (!splitId) setActiveId(session.id);
+                    setMenu(at);
                   }}
                   onSearchResults={setMatches}
                 />
@@ -787,12 +823,12 @@ export function TerminalPanel({
             />
           )}
         </div>
-        {activeTab === "problems" && (
+        {!hidden && activeTab === "problems" && (
           <ProblemsView activeFile={activeFile} onOpen={onOpenProblem} />
         )}
-        {activeTab === "output" && <OutputView initialChannel={outputChannel} />}
-        {activeTab === "debug" && <DebugConsoleView />}
-        {activeTab === "ports" && <PortsView />}
+        {!hidden && activeTab === "output" && <OutputView initialChannel={channel} />}
+        {!hidden && activeTab === "debug" && <DebugConsoleView />}
+        {!hidden && activeTab === "ports" && <PortsView />}
       </div>
 
       {menu && (
@@ -823,7 +859,7 @@ export function TerminalPanel({
         </div>
       )}
 
-      {status && (
+      {activeTab === "terminal" && status && (
         <p
           role="status"
           aria-live="polite"

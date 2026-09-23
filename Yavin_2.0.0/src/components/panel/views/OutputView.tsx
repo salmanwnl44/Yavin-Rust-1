@@ -33,7 +33,7 @@ export function OutputView({ initialChannel }: { initialChannel?: string }) {
   /** Off means the view stops following new lines, so a result can be read while it scrolls. */
   const [follow, setFollow] = useState(true);
   const [copied, setCopied] = useState(false);
-  const bottom = useRef<HTMLDivElement>(null);
+  const scroller = useRef<HTMLDivElement>(null);
 
   // Follow the requested channel, and fall back to the first one as channels appear.
   useEffect(() => {
@@ -47,7 +47,10 @@ export function OutputView({ initialChannel }: { initialChannel?: string }) {
   const shown = useMemo(() => lines.filter((line) => atLeast(line.level, level)), [lines, level]);
 
   useEffect(() => {
-    if (follow) bottom.current?.scrollIntoView({ block: "end" });
+    // Scrolls this container only. `scrollIntoView` walks up and can scroll every scrollable
+    // ancestor with it, which jerks the whole panel when output is streaming.
+    if (!follow || !scroller.current) return;
+    scroller.current.scrollTop = scroller.current.scrollHeight;
   }, [shown, follow]);
 
   if (!channels.length)
@@ -148,7 +151,10 @@ export function OutputView({ initialChannel }: { initialChannel?: string }) {
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto px-3 py-1 font-mono text-[11px] leading-relaxed">
+      <div
+        ref={scroller}
+        className="min-h-0 flex-1 overflow-auto px-3 py-1 font-mono text-[11px] leading-relaxed"
+      >
         {shown.length === 0 ? (
           <p className="py-2 text-zinc-600">
             {lines.length ? "Nothing at this level." : "This channel has produced no output yet."}
@@ -167,7 +173,6 @@ export function OutputView({ initialChannel }: { initialChannel?: string }) {
             ))}
           </ul>
         )}
-        <div ref={bottom} />
       </div>
     </section>
   );

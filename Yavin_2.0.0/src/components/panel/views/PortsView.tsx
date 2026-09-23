@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { native } from "../../../services/native";
 import type { ListeningPort } from "../../../services/native";
 import { EmptyView } from "./EmptyView";
@@ -23,22 +23,41 @@ export function PortsView() {
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(0);
 
+  /** Guards the poll: enumerating shells out to two processes and can outlast the interval. */
+  const inFlight = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
   const refresh = useCallback(async () => {
+    // A slow `netstat` + `tasklist` can take longer than the poll interval; without this the
+    // calls overlap and an older result can land after a newer one, flipping the table back
+    // to stale data.
+    if (inFlight.current) return;
+    inFlight.current = true;
     setBusy(true);
     try {
-      setPorts(await native("list_listening_ports"));
+      const found = await native("list_listening_ports");
+      if (!mounted.current) return;
+      setPorts(found);
       setError("");
     } catch (reason) {
-      setError(String(reason));
+      if (mounted.current) setError(String(reason));
     } finally {
-      setBusy(false);
+      inFlight.current = false;
+      if (mounted.current) setBusy(false);
     }
   }, []);
 
   useEffect(() => {
     void refresh();
     // Ports come and go as servers start and stop, so the list refreshes itself. Five seconds
-    // matches the Source Control poll and is far cheaper than it.
+    // matches the Source Control poll and is far cheaper than it. The view is unmounted when
+    // another view shows or the panel closes, which is what stops this.
     const timer = setInterval(() => void refresh(), 5000);
     return () => clearInterval(timer);
   }, [refresh]);
@@ -51,7 +70,7 @@ export function PortsView() {
     )
       return;
     try {
-      await native("stop_listening_process", { port: port.port });
+      await native("stop_listening_process", { port: port.port, pid: port.pid });
       await refresh();
     } catch (reason) {
       setError(String(reason));

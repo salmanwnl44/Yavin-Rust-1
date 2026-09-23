@@ -977,5 +977,80 @@ test("a second run replaces that checker's earlier findings", async ({ page }) =
     (window as unknown as { __scenarioCheckerOutput: string }).__scenarioCheckerOutput = "";
   });
   await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
-  await expect(problems.getByText(/No problems match|No checker has run/)).toBeVisible();
+  // "No problems found." rather than blaming filters that were never set.
+  await expect(problems.getByText("No problems found.")).toBeVisible();
+});
+
+test("right-clicking the second pane of a split does not collapse the layout", async ({ page }) => {
+  // Right-click used to make the pane "active", which in a split set activeId === splitId:
+  // both halves then rendered the same terminal, one at half width with dead space beside it.
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("Split Terminal").click();
+  const ids = await terminalIds(page, 2);
+
+  await view(page, ids[1]).click({ button: "right" });
+  await page.keyboard.press("Escape");
+
+  // Both panes still show their own terminal.
+  await expect(view(page, ids[0])).toBeVisible();
+  await expect(view(page, ids[1])).toBeVisible();
+});
+
+test("closing the first pane of a split leaves one working terminal", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("Split Terminal").click();
+  const ids = await terminalIds(page, 2);
+
+  // Close the left pane from its tab.
+  await page.getByRole("tab", { name: "Command Prompt", exact: true }).hover();
+  await page.getByLabel("Close Command Prompt", { exact: true }).click();
+
+  await expect(view(page, ids[1])).toBeVisible();
+  await emit(page, "terminal-output", { id: ids[1], data: "still alive" });
+  await expect(view(page, ids[1])).toContainText("still alive");
+});
+
+test("Show Git Output works again after switching away from it", async ({ page }) => {
+  // Requesting the same view twice set identical state, React bailed out, and the panel's
+  // effect never re-ran -- so this worked exactly once per session.
+  await desktop(page);
+  await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
+  const showGitOutput = async () => {
+    await page
+      .getByRole("complementary", { name: "Source control" })
+      .getByLabel("Changes actions")
+      .click();
+    await page.getByRole("menuitem", { name: "Show Git Output" }).click();
+  };
+
+  await showGitOutput();
+  await expect(page.getByRole("region", { name: "Output" })).toBeVisible();
+
+  await page
+    .getByRole("tablist", { name: "Panel views" })
+    .getByRole("tab", { name: "PORTS" })
+    .click();
+  await expect(page.getByRole("region", { name: "Ports" })).toBeVisible();
+
+  await showGitOutput();
+  await expect(page.getByRole("region", { name: "Output" })).toBeVisible();
+});
+
+test("the panel's tabs are one tab stop, with arrows moving between them", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const tabs = page.getByRole("tablist", { name: "Panel views" });
+
+  // Roving tabindex: only the selected tab is reachable by Tab.
+  await expect(tabs.getByRole("tab", { name: "TERMINAL" })).toHaveAttribute("tabindex", "0");
+  await expect(tabs.getByRole("tab", { name: "PORTS" })).toHaveAttribute("tabindex", "-1");
+
+  await tabs.getByRole("tab", { name: "TERMINAL" }).focus();
+  await page.keyboard.press("ArrowRight");
+  // Focus follows selection, so the next arrow press moves from the right place.
+  await expect(tabs.getByRole("tab", { name: "PORTS" })).toBeFocused();
 });

@@ -6,7 +6,8 @@ import {
   nextTerminalName,
   terminalKeyAction,
   openArgsFor,
-  profileForShell,
+  onOutputFor,
+  deliverForTest,
   usableSize,
 } from "./terminal.ts";
 
@@ -181,9 +182,31 @@ test("empty profile extras are omitted rather than sent as empty", () => {
   assert.deepEqual(args, { id: "t3", shell: "/bin/sh", cols: 80, rows: 24 });
 });
 
-test("a detected shell becomes a profile with no extras", () => {
-  assert.deepEqual(profileForShell({ name: "Git Bash", path: "C:/Git/bash.exe" }), {
-    name: "Git Bash",
-    shell: "C:/Git/bash.exe",
+test("unsubscribing twice does not tear down a later subscription for the same terminal", () => {
+  // The unsubscribe captured its own handler set; calling it again deleted whatever set a
+  // newer subscription had since installed, silently stopping that terminal's output.
+  const first: string[] = [];
+  const second: string[] = [];
+  const stopFirst = onOutputFor("t1", (data) => first.push(data));
+  stopFirst();
+  const stopSecond = onOutputFor("t1", (data) => second.push(data));
+  stopFirst(); // the stale unsubscribe must be a no-op
+
+  deliverForTest("terminal-output", { id: "t1", data: "hello" });
+  assert.deepEqual(second, ["hello"]);
+  assert.deepEqual(first, []);
+  stopSecond();
+});
+
+test("one terminal's failing handler does not stop another from receiving output", () => {
+  const seen: string[] = [];
+  const stopBad = onOutputFor("t1", () => {
+    throw new Error("handler blew up");
   });
+  const stopGood = onOutputFor("t1", (data) => seen.push(data));
+
+  assert.doesNotThrow(() => deliverForTest("terminal-output", { id: "t1", data: "still here" }));
+  assert.deepEqual(seen, ["still here"]);
+  stopBad();
+  stopGood();
 });

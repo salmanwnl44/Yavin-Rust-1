@@ -35,7 +35,7 @@ interface Commands {
   list_listening_ports: { args: undefined; result: ListeningPort[] };
   available_checkers: { args: undefined; result: { id: string; label: string }[] };
   run_checker: { args: { id: string }; result: string };
-  stop_listening_process: { args: { port: number }; result: void };
+  stop_listening_process: { args: { port: number; pid: number }; result: void };
   git_exec: {
     args: { repoId: string; args: string[]; id: string; input?: string };
     result: ToolOutput;

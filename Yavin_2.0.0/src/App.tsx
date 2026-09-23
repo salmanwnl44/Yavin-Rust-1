@@ -152,10 +152,22 @@ export default function App() {
   const [activeActivityTab, setActiveActivityTab] = useState("explorer");
   const [diff, setDiff] = useState<DiffDocument | null>(null);
   const [showGraph, setShowGraph] = useState(false);
-  /** Set when something asked to see a particular Output channel, e.g. "Show Git Output". */
-  const [outputChannel, setOutputChannel] = useState<string | undefined>(undefined);
-  /** Set when something asked for a particular panel view, e.g. the status bar's counts. */
-  const [panelView, setPanelView] = useState<PanelViewId | undefined>(undefined);
+  /**
+   * What the panel has been asked to show, if anything.
+   *
+   * Carries a `nonce` because the value alone is not enough: asking for the same channel or
+   * view twice in a row set identical state, React bailed out, the prop never changed and the
+   * panel's effect never re-ran -- so "Show Git Output" worked once per session and did
+   * nothing afterwards.
+   */
+  const [panelRequest, setPanelRequest] = useState<{
+    nonce: number;
+    view?: PanelViewId;
+    channel?: string;
+  }>({ nonce: 0 });
+  const showPanelView = useCallback((view: PanelViewId, channel?: string) => {
+    setPanelRequest((previous) => ({ nonce: previous.nonce + 1, view, channel }));
+  }, []);
   const [searchFocus, setSearchFocus] = useState(0);
   const [gitRevision, setGitRevision] = useState(0);
   const [pendingHit, setPendingHit] = useState<SearchHit | null>(null);
@@ -1183,7 +1195,7 @@ export default function App() {
               // The Output view in the bottom panel, with Git selected -- where VS Code
               // shows it, rather than a second, Git-only view of the same log.
               showTerminal(true);
-              setOutputChannel("git");
+              showPanelView("output", "git");
             }}
             onDialog={setDialog}
           />
@@ -1285,8 +1297,7 @@ export default function App() {
                   onClose={() => setIsTerminalOpen(false)}
                   isMaximized={isTerminalMaximized}
                   onToggleMaximize={() => setIsTerminalMaximized((prev) => !prev)}
-                  outputChannel={outputChannel}
-                  requestedView={panelView}
+                  request={panelRequest}
                   activeFile={activeTab?.path}
                   onOpenProblem={(file, line) => {
                     // Opening is asynchronous, so the jump waits for the editor to hold the
@@ -1308,7 +1319,7 @@ export default function App() {
           onToggleTerminal={() => showTerminal((prev) => !prev)}
           onShowProblems={() => {
             showTerminal(true);
-            setPanelView("problems");
+            showPanelView("problems");
           }}
           branch={activeRepoSnapshot?.branch}
         />

@@ -49,7 +49,9 @@ export function publishProblems(
   label: string,
   diagnostics: readonly Diagnostic[],
 ): void {
-  owners.set(owner, { owner, label, diagnostics, at: Date.now() });
+  // Copied: holding the caller's array would let a later mutation change what is displayed
+  // with no version bump, so nothing would re-render and the two would silently disagree.
+  owners.set(owner, { owner, label, diagnostics: [...diagnostics], at: Date.now() });
   changed();
 }
 
