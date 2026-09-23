@@ -3,6 +3,7 @@ import { native } from "../../services/native";
 import { divergence } from "../../services/git/parsers/branch";
 import type { GitEntry } from "../../services/git/parsers/status";
 import type { GitOperation } from "../../services/git/backend";
+import { cloneRepository as cloneRepositoryFlow } from "../../services/git/clone";
 import { gitRegistry } from "../../services/git/registry";
 import { useActiveRepo, useGitRegistry, useRepoSnapshot } from "../../services/git/hooks";
 import { guardedAffecting } from "../../services/git/sync";
@@ -389,45 +390,7 @@ export function SourceControlPanel({
     }
   };
 
-  /**
-   * "Clone…": ask for the URL, pick the folder to clone into, then open the result like any
-   * other repository. The folder name is derived from the URL (`repo.git` -> `repo`) the way
-   * `git clone` itself would, so the common case is two clicks and a paste.
-   */
-  const cloneRepository = () => {
-    onDialog({
-      title: "Clone repository",
-      message: "The repository URL to clone from.",
-      input: "",
-      confirmLabel: "Choose Folder…",
-      submit: async (url) => {
-        const trimmed = url.trim();
-        if (!trimmed) throw new Error("Enter a repository URL.");
-        const parent = await native("pick_folder_dialog").catch(() => null);
-        if (!parent) return;
-        const suggested =
-          trimmed
-            .replace(/\/+$/, "")
-            .replace(/\.git$/, "")
-            .split(/[/:]/)
-            .pop() || "repository";
-        onDialog({
-          title: "Folder name",
-          message: `Cloning into a new folder inside ${parent}.`,
-          input: suggested,
-          confirmLabel: "Clone",
-          submit: async (folder) => {
-            const name = folder.trim();
-            if (!name) throw new Error("Enter a folder name.");
-            // Reported by the dialog itself (it renders a thrown error), so a failed clone
-            // explains itself instead of closing as though it had worked.
-            const info = await native("git_clone_repo", { parent, url: trimmed, folder: name });
-            await gitRegistry.open(info.root, { makeActive: true });
-          },
-        });
-      },
-    });
-  };
+  const cloneRepository = () => cloneRepositoryFlow(onDialog);
 
   /** `git init` in the open workspace folder, then track it like any other repository. */
   const initializeWorkspace = async () => {

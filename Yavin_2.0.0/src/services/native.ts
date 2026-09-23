@@ -2,6 +2,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { FileNode } from "../types";
 import type { Shell } from "./terminal";
+import type { Session, WorkspaceSession } from "./session";
 import type { TrustState } from "./trust";
 
 interface Commands {
@@ -36,6 +37,10 @@ interface Commands {
   list_listening_ports: { args: undefined; result: ListeningPort[] };
   available_checkers: { args: undefined; result: { id: string; label: string }[] };
   run_checker: { args: { id: string }; result: string };
+  open_workspace: { args: { path: string }; result: string };
+  read_session: { args: undefined; result: Session };
+  save_workspace_session: { args: { state: WorkspaceSession }; result: void };
+  forget_workspace: { args: { folder: string }; result: Session };
   workspace_trust: { args: undefined; result: TrustState };
   set_workspace_trust: { args: { trusted: boolean; parent: boolean }; result: TrustState };
   trusted_folders: { args: undefined; result: string[] };

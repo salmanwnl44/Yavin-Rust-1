@@ -5194,6 +5194,7 @@ dependencies = [
  "ide-workspace",
  "portable-pty",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
 ]

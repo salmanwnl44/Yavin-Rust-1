@@ -6,7 +6,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 mod checkers;
 mod external;
 mod git;
+mod paths;
 mod ports;
+mod session;
 mod terminal;
 mod trust;
 mod workbench;
@@ -18,6 +20,7 @@ use git::{
     NetworkLocks, Repos, StashLocks,
 };
 use ports::{list_listening_ports, stop_listening_process};
+use session::{forget_workspace, read_session, save_workspace_session, Sessions};
 use terminal::{
     terminal_close, terminal_close_all, terminal_open, terminal_resize, terminal_shells,
     terminal_write, Terminals,
@@ -158,6 +161,28 @@ fn open_folder_dialog(
     Ok(selected)
 }
 
+/// Opens a folder the user has already chosen once -- restoring the last session, or a pick
+/// from the recent list -- without putting a dialog in front of them.
+///
+/// It is as powerful as `open_folder_dialog`, so it validates the same way: `WorkspaceManager`
+/// canonicalizes the path and refuses anything that is not a directory, which is what keeps a
+/// stale or hand-edited session entry from opening something unexpected. A folder that has
+/// been moved or deleted since is reported as an error rather than silently leaving the
+/// previous workspace in place.
+#[tauri::command(async)]
+fn open_workspace(
+    app: AppHandle,
+    state: State<'_, Workspace>,
+    watch: State<'_, Watch>,
+    path: String,
+) -> Result<String, String> {
+    let manager = WorkspaceManager::new(&path)?;
+    let root = manager.root().to_path_buf();
+    *state.0.lock().map_err(|e| e.to_string())? = Some(manager);
+    watch_workspace(&app, &watch, &root);
+    Ok(file_tree::clean_path_str(&root))
+}
+
 // A side-effect-free folder picker: unlike `open_folder_dialog`, this never replaces
 // the active file-tree workspace. Used to add an extra repository to Source Control.
 #[tauri::command]
@@ -200,6 +225,7 @@ pub fn run() {
         .manage(GitWatches::default())
         .manage(Terminals::default())
         .manage(Trust::default())
+        .manage(Sessions::default())
         .invoke_handler(tauri::generate_handler![
             get_default_workspace,
             list_workspace_files,
@@ -212,6 +238,7 @@ pub fn run() {
             copy_path,
             reveal_in_explorer,
             open_folder_dialog,
+            open_workspace,
             pick_folder_dialog,
             open_file_dialog,
             search_project,
@@ -230,6 +257,9 @@ pub fn run() {
             set_workspace_trust,
             trusted_folders,
             forget_trusted_folder,
+            read_session,
+            save_workspace_session,
+            forget_workspace,
             run_checker,
             list_listening_ports,
             stop_listening_process,

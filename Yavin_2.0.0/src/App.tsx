@@ -27,6 +27,18 @@ import type { SearchHit } from "./services/search";
 import { recordEdit } from "./services/editor";
 import { requestTerminal, onTerminalRequestObserved } from "./services/terminal";
 import type { PanelViewId } from "./services/panel/views";
+import { folderKey } from "./services/paths";
+import {
+  EMPTY_SESSION,
+  forgetFolder,
+  lastFolder,
+  readSession,
+  RECENT_FOLDERS,
+  saveWorkspaceSession,
+  workspaceIn,
+} from "./services/session";
+import type { Session, WorkspaceSession } from "./services/session";
+import { cloneRepository } from "./services/git/clone";
 import { readTrust, UNKNOWN_TRUST } from "./services/trust";
 import type { TrustState } from "./services/trust";
 import { WorkspaceTrustDialog } from "./components/trust/WorkspaceTrustDialog";
@@ -123,6 +135,10 @@ export default function App() {
   ]);
   const [activeTabId, setActiveTabId] = useState("welcome");
   const [recentFiles, setRecentFiles] = useState<RecentFile[]>([]);
+  /** The folders opened before, and what each looked like. See `services/session.ts`. */
+  const [session, setSession] = useState<Session>(EMPTY_SESSION);
+  /** What the explorer looks like now, kept out of render: it changes on every scroll. */
+  const explorerRef = useRef<{ expanded: string[]; scroll: number }>({ expanded: [], scroll: 0 });
   const [error, setError] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isTerminalOpen, setIsTerminalOpen] = useState(false);
@@ -311,12 +327,100 @@ export default function App() {
     setGitRevision((value) => value + 1);
   };
 
+  /**
+   * Reopens the tabs a folder had when it was last closed.
+   *
+   * A file that has been deleted, renamed or moved since is simply not reopened: a restore
+   * that reported four errors for four files someone deleted on purpose would be worse than
+   * one that quietly opens what is still there.
+   */
+  const restoreTabs = useCallback(async (state: WorkspaceSession) => {
+    const revision = workspaceRevision.current;
+    const opened: EditorTab[] = [];
+    const contents: Record<string, string> = {};
+    for (const path of state.files) {
+      try {
+        const content = await native("read_file_content", { path });
+        if (revision !== workspaceRevision.current) return;
+        contents[path] = content;
+        savedContents.current[path] = content;
+        opened.push({ id: path, path, name: path.split(/[\\/]/).pop() || path, dirty: false });
+      } catch {
+        // Gone since last time; nothing to reopen and nothing worth saying.
+      }
+    }
+    if (!opened.length || revision !== workspaceRevision.current) return;
+    updateContents({ ...contentsRef.current, ...contents });
+    setTabs((previous) => [
+      ...previous,
+      ...opened.filter((tab) => !previous.some((existing) => existing.path === tab.path)),
+    ]);
+    setRecentFiles(opened.map((tab) => ({ name: tab.name, path: tab.path })).reverse());
+    if (state.active && contents[state.active] !== undefined) setActiveTabId(state.active);
+  }, []);
+
+  // Startup: reopen the folder from last time, with what was open in it. A folder that has
+  // since been moved or deleted falls back to opening no folder rather than failing to start.
   useEffect(() => {
     if (!isTauri()) return;
-    native("get_default_workspace")
-      .then((path) => (path ? loadWorkspace(path) : undefined))
-      .catch(reportError);
-  }, [loadWorkspace, reportError]);
+    let cancelled = false;
+    void (async () => {
+      const saved = await readSession().catch(() => EMPTY_SESSION);
+      if (cancelled) return;
+      setSession(saved);
+      const target = lastFolder(saved);
+      if (target) {
+        try {
+          const root = await native("open_workspace", { path: target });
+          if (cancelled) return;
+          const state = workspaceIn(saved, target);
+          if (state) explorerRef.current = { expanded: state.expanded, scroll: state.scroll };
+          await loadWorkspace(root);
+          if (!cancelled && state) await restoreTabs(state);
+          return;
+        } catch {
+          // Moved, deleted, or on a drive that is not mounted right now.
+        }
+      }
+      if (cancelled) return;
+      // Development builds open the directory Yavin was started from; release builds open
+      // nothing, which is what puts the welcome page in front of a first run.
+      const fallback = await native("get_default_workspace").catch(() => null);
+      if (!cancelled && fallback) await loadWorkspace(fallback);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [loadWorkspace, restoreTabs]);
+
+  /**
+   * Records what this folder looks like now. Called from the effect below and from the
+   * explorer, which reports scrolling and unfolding outside render -- the writer coalesces
+   * the bursts, so calling it often is cheap.
+   */
+  const sessionState = useRef({ workspacePath, tabs, activeTabId });
+  sessionState.current = { workspacePath, tabs, activeTabId };
+  const writeSession = useCallback(() => {
+    const { workspacePath: folder, tabs: open, activeTabId: active } = sessionState.current;
+    if (!isTauri() || !folder) return;
+    saveWorkspaceSession({
+      folder,
+      files: open.filter((tab) => tab.id !== "welcome").map((tab) => tab.path),
+      active: active === "welcome" ? null : active,
+      expanded: explorerRef.current.expanded,
+      scroll: explorerRef.current.scroll,
+    });
+  }, []);
+  useEffect(writeSession, [workspacePath, tabs, activeTabId, writeSession]);
+
+  /** The explorer reporting what it has unfolded and where it is scrolled. */
+  const rememberExplorer = useCallback(
+    (next: { expanded: string[]; scroll: number }) => {
+      explorerRef.current = next;
+      writeSession();
+    },
+    [writeSession],
+  );
 
   // Edits made outside the app (a checkout, a build, another editor) re-list the tree.
   const refreshTreeRef = useRef(refreshTree);
@@ -409,31 +513,74 @@ export default function App() {
         saving.current.delete(path);
       }
     });
+  /**
+   * Everything that has to happen when the window changes folder, whichever way the folder
+   * was chosen. `restore` reopens what that folder had open last time.
+   */
+  const enterWorkspace = async (selected: string, restore?: WorkspaceSession) => {
+    workspaceRevision.current++;
+    setDiff(null);
+    setPendingHit(null);
+    updateContents({});
+    savedContents.current = {};
+    histories.current.clear();
+    setTabs([{ id: "welcome", name: "Welcome", path: "welcome", dirty: false }]);
+    setActiveTabId("welcome");
+    setRecentFiles([]);
+    setWorkspacePath(selected);
+    applyTree(null);
+    setDecorations({ files: new Map(), folders: new Set() });
+    // Seeded before the explorer mounts for the new folder, so it unfolds where it was.
+    explorerRef.current = { expanded: restore?.expanded ?? [], scroll: restore?.scroll ?? 0 };
+    // Optimistic, so the recent list is in the right order before the file is written.
+    setSession((previous) => ({
+      ...previous,
+      folders: [
+        selected,
+        ...previous.folders.filter((folder) => folderKey(folder) !== folderKey(selected)),
+      ].slice(0, RECENT_FOLDERS),
+    }));
+    await loadWorkspace(selected);
+    if (restore) await restoreTabs(restore);
+  };
+
+  /** Refuses to leave a folder while saves are in flight, and asks about unsaved edits. */
+  const canLeaveWorkspace = () => {
+    if (saving.current.size)
+      throw new Error("Wait for file saves to finish before changing workspace.");
+    return (
+      !tabs.some((tab) => tab.dirty) ||
+      window.confirm("Discard unsaved changes and open another workspace?")
+    );
+  };
+
   const handleOpenFolderDialog = () =>
     run(async () => {
-      if (saving.current.size)
-        throw new Error("Wait for file saves to finish before changing workspace.");
-      if (
-        tabs.some((tab) => tab.dirty) &&
-        !window.confirm("Discard unsaved changes and open another workspace?")
-      )
-        return;
+      if (!canLeaveWorkspace()) return;
       const selected = await native("open_folder_dialog");
       if (!selected) return;
-      workspaceRevision.current++;
-      setDiff(null);
-      setPendingHit(null);
-      updateContents({});
-      savedContents.current = {};
-      histories.current.clear();
-      setTabs([{ id: "welcome", name: "Welcome", path: "welcome", dirty: false }]);
-      setActiveTabId("welcome");
-      setRecentFiles([]);
-      setWorkspacePath(selected);
-      applyTree(null);
-      setDecorations({ files: new Map(), folders: new Set() });
-      await loadWorkspace(selected);
+      // A folder picked from the dialog restores what it had open just as one picked from
+      // the recent list does: how the folder was chosen should not change what comes back.
+      await enterWorkspace(selected, workspaceIn(session, selected));
     });
+
+  /** Opening a folder from the recent list: the same thing, without the dialog. */
+  const handleOpenRecentFolder = (folder: string) =>
+    run(async () => {
+      if (!canLeaveWorkspace()) return;
+      let root: string;
+      try {
+        root = await native("open_workspace", { path: folder });
+      } catch (reason) {
+        // Most often the folder has been moved or deleted, and the entry is now noise.
+        setSession(await forgetFolder(folder).catch(() => session));
+        throw new Error(`Cannot open ${folder}: ${String(reason)}`);
+      }
+      await enterWorkspace(root, workspaceIn(session, folder));
+    });
+
+  const handleForgetRecentFolder = (folder: string) =>
+    run(async () => setSession(await forgetFolder(folder)));
   const handleCreateFile = (path: string) =>
     run(async () => {
       await native("create_file", { path });
@@ -1097,6 +1244,14 @@ export default function App() {
         }),
     },
     {
+      // The welcome page holds the recent folders, so there has to be a way back to it once
+      // its tab has been closed.
+      id: "help.welcome",
+      menu: "Help",
+      label: "Welcome",
+      run: () => void handleOpenFile("welcome", "Welcome"),
+    },
+    {
       id: "help.about",
       menu: "Help",
       label: "About Yavin",
@@ -1108,6 +1263,19 @@ export default function App() {
         }),
     },
   ];
+
+  /**
+   * The keyboard hints the welcome page shows, taken from the commands themselves so the
+   * page cannot end up teaching a shortcut that has since changed.
+   */
+  const welcomeHints = ["file.folder", "file.new", "view.commands", "go.file"]
+    .map((id) => commands.find((command) => command.id === id))
+    .filter((command): command is AppCommand => !!command)
+    .map((command) => ({
+      label: command.label.replace(/[.…]+$/, ""),
+      shortcut: command.shortcut ? shortcutLabel(command.shortcut) : undefined,
+    }));
+
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       if (
@@ -1252,6 +1420,11 @@ export default function App() {
             onMoveFile={handleMovePath}
             onReveal={handleReveal}
             onOpenFolderDialog={handleOpenFolderDialog}
+            recentFolders={session.folders}
+            onOpenRecentFolder={handleOpenRecentFolder}
+            initialExpanded={explorerRef.current.expanded}
+            initialScroll={explorerRef.current.scroll}
+            onExplorerState={rememberExplorer}
           />
 
           {/* Center: Editor + Bottom Terminal Panel */}
@@ -1315,6 +1488,12 @@ export default function App() {
                 onContentChange={handleContentChange}
                 onSaveFile={handleSaveFile}
                 recentFiles={recentFiles}
+                workspacePath={workspacePath || null}
+                recentFolders={session.folders}
+                hints={welcomeHints}
+                onOpenRecentFolder={handleOpenRecentFolder}
+                onForgetRecentFolder={handleForgetRecentFolder}
+                onCloneRepository={() => cloneRepository(setDialog)}
                 editorRef={editorRef}
                 histories={histories.current}
                 onEditorState={setEditorState}

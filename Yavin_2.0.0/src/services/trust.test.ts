@@ -1,27 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  asTrustState,
-  folderName,
-  RESTRICTED_SUMMARY,
-  STILL_WORKS_SUMMARY,
-  UNKNOWN_TRUST,
-} from "./trust.ts";
-
-const BACKSLASH = String.fromCharCode(92);
-
-test("a folder is named by its last segment, whichever separator it uses", () => {
-  assert.equal(folderName(`C:${BACKSLASH}Projects${BACKSLASH}Yavin`), "Yavin");
-  assert.equal(folderName("/home/me/work/project"), "project");
-  assert.equal(folderName("/home/me/work/project/"), "project");
-  assert.equal(folderName("project"), "project");
-});
-
-test("a path that is only separators falls back to the path itself rather than empty", () => {
-  assert.equal(folderName("/"), "/");
-  assert.equal(folderName(null), "");
-  assert.equal(folderName(""), "");
-});
+import { asTrustState, RESTRICTED_SUMMARY, STILL_WORKS_SUMMARY, UNKNOWN_TRUST } from "./trust.ts";
 
 test("the state assumed before an answer arrives is restricted and silent", () => {
   // Assuming trusted would run the project's tooling in the window before the real answer

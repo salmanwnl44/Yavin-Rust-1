@@ -1,6 +1,7 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FileNode } from "../../types";
 import type { Decorations } from "../../services/git";
+import { folderName, parentPath } from "../../services/paths";
 import { isWithin, parentOf, validateEntryName } from "../../services/workspace";
 import { requestTerminal } from "../../services/terminal";
 import { ContextMenu } from "../ui/ContextMenu";
@@ -52,12 +53,22 @@ interface SidebarProps {
   onMoveFile: (src: string, dest: string) => void;
   onReveal: (path: string) => void;
   onOpenFolderDialog: () => void;
+  /** Folders opened before, offered when there is no folder open. */
+  recentFolders?: string[];
+  onOpenRecentFolder?: (folder: string) => void;
+  /** What this folder had unfolded last time, and where it was scrolled. */
+  initialExpanded?: string[];
+  initialScroll?: number;
+  /** Reports unfolding and scrolling, so the session can be written. */
+  onExplorerState?: (state: { expanded: string[]; scroll: number }) => void;
 }
 
 export function Sidebar(props: SidebarProps) {
   const { visible, activeTab, workspacePath, fileTree, decorations, onLoadDirectory } = props;
 
-  const [expandedPaths, setExpandedPaths] = useState(() => new Set<string>());
+  // Seeded from the session, so a reopened folder is unfolded the way it was left. Folders
+  // whose children are not loaded yet are listed on demand, exactly as an unfold does.
+  const [expandedPaths, setExpandedPaths] = useState(() => new Set<string>(props.initialExpanded));
   const [selection, setSelection] = useState(() => new Set<string>());
   const [anchor, setAnchor] = useState<string | null>(null);
   const [focused, setFocused] = useState<string | null>(null);
@@ -184,6 +195,27 @@ export function Sidebar(props: SidebarProps) {
       element.removeEventListener("scroll", measure);
     };
   }, []);
+
+  // Restoring the scroll waits for rows to exist: a viewport with nothing in it cannot be
+  // scrolled, and the attempt would silently land at zero.
+  const restoredScroll = useRef(false);
+  useLayoutEffect(() => {
+    const element = viewportRef.current;
+    const wanted = props.initialScroll ?? 0;
+    if (restoredScroll.current || !element || !rows.length || !wanted) return;
+    restoredScroll.current = true;
+    element.scrollTop = wanted;
+  }, [rows.length, props.initialScroll]);
+
+  // Reported outside render: the session writer coalesces the bursts that scrolling makes.
+  const reportState = props.onExplorerState;
+  useEffect(() => {
+    if (!reportState) return;
+    reportState({
+      expanded: [...expandedPaths],
+      scroll: viewportRef.current?.scrollTop ?? 0,
+    });
+  }, [expandedPaths, view.top, reportState]);
 
   const first = Math.max(0, Math.floor(view.top / ROW_HEIGHT) - OVERSCAN);
   const last = Math.min(rows.length, Math.ceil((view.top + view.height) / ROW_HEIGHT) + OVERSCAN);
@@ -731,7 +763,7 @@ export function Sidebar(props: SidebarProps) {
             </div>
           </div>
         ) : (
-          <div className="flex flex-col items-center justify-center p-6 text-center text-zinc-500 gap-3">
+          <div className="flex flex-col items-center p-6 text-center text-zinc-500 gap-3">
             <FolderClosedIcon className="size-10" />
             <p className="text-xs">No workspace opened</p>
             <button
@@ -740,6 +772,28 @@ export function Sidebar(props: SidebarProps) {
             >
               Open Folder
             </button>
+            {/* The folders opened before, here as well as on the welcome page: this is where
+                someone looks when the explorer is the empty thing in front of them. */}
+            {!!props.recentFolders?.length && props.onOpenRecentFolder && (
+              <nav aria-label="Recent folders" className="w-full text-left">
+                <h3 className="mb-1 px-1 text-[10px] font-semibold tracking-wider text-zinc-600 uppercase">
+                  Recent
+                </h3>
+                {props.recentFolders.slice(0, 5).map((folder) => (
+                  <button
+                    key={folder}
+                    onClick={() => props.onOpenRecentFolder?.(folder)}
+                    title={folder}
+                    className="block w-full truncate rounded px-1.5 py-1 text-left text-[11.5px] text-zinc-400 hover:bg-[#121212] hover:text-zinc-100"
+                  >
+                    {folderName(folder)}
+                    <span className="ml-1.5 font-mono text-[9.5px] text-zinc-600">
+                      {parentPath(folder)}
+                    </span>
+                  </button>
+                ))}
+              </nav>
+            )}
           </div>
         )}
       </div>

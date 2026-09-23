@@ -127,7 +127,9 @@ test("menus fit narrow viewports and dismiss on outside click", async ({ page })
   const bounds = await page.getByRole("menu", { name: "Help", exact: true }).boundingBox();
   expect(bounds).not.toBeNull();
   expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(800);
-  await page.getByRole("heading", { name: "Yavin IDE", exact: true }).click();
+  // Dismissed by clicking the explorer's header: it is to the left of any menu dropped from
+  // the menu bar, so this stays outside the menu however many items the menu grows.
+  await page.getByText("Explorer", { exact: true }).click();
   await expect(page.getByRole("menu", { name: "Help", exact: true })).not.toBeVisible();
 });
 

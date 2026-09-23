@@ -15,6 +15,7 @@
 //!   people to click Trust without reading. What is blocked is running the project's
 //!   toolchain.
 
+use crate::paths::normalise;
 use crate::{with_workspace, Workspace};
 use serde::Serialize;
 use std::fs;
@@ -36,12 +37,6 @@ pub struct Trust(pub Mutex<Option<Store>>);
 pub struct Store {
     file: PathBuf,
     entries: Vec<(Decision, PathBuf)>,
-}
-
-/// Compared case-insensitively with `/` separators: the same folder reaches this spelled
-/// either way on Windows, and trusting it once should mean trusting it.
-fn normalise(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
 /// Whether `folder` is `ancestor` or sits underneath it. Compared per segment so

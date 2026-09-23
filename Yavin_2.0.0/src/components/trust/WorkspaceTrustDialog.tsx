@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
+import { folderName } from "../../services/paths";
 import {
   decideTrust,
-  folderName,
   forgetTrustedFolder,
   listTrustedFolders,
   RESTRICTED_SUMMARY,

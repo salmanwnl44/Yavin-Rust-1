@@ -55,13 +55,6 @@ export const listTrustedFolders = async (): Promise<string[]> =>
 export const forgetTrustedFolder = async (folder: string): Promise<TrustState> =>
   asTrustState(await native("forget_trusted_folder", { folder }));
 
-/** The last path segment, for naming a folder in the prompt without its whole path. */
-export function folderName(path: string | null): string {
-  if (!path) return "";
-  const parts = path.replace(/[\\/]+$/, "").split(/[\\/]/);
-  return parts[parts.length - 1] || path;
-}
-
 /**
  * What Restricted Mode actually stops, in the user's terms. Shown in the prompt and the
  * manage dialog so the choice is informed rather than a reflex -- and kept short and true,
