@@ -205,6 +205,15 @@ export class RepoStore {
   /** The `notice` text a failed refresh produced, so a later success can clear exactly
    * that text without wiping an operation's own message. */
   private refreshError: string | null = null;
+  /**
+   * The `git status` output the current `entries` were parsed from.
+   *
+   * Re-parsing identical output produces an equal array with a new identity, and that
+   * identity is what the panel's effects and the explorer's decorations key on -- so a poll
+   * that found nothing changed still rebuilt the decoration maps and re-rendered the window,
+   * every five seconds, for every open repository.
+   */
+  private lastStatus: string | null = null;
   /** Set on every successful `refresh()` completion, whatever triggered it --
    * read by `SourceControlPanel.tsx` to skip a redundant refresh right after
    * switching to a worktree whose cached snapshot is already fresh enough. */
@@ -294,16 +303,21 @@ export class RepoStore {
           wants("operationInProgress") ? this.repository.state() : undefined,
         ]);
       const next: Partial<RepoSnapshot> = {};
-      if (status !== undefined && live("entries"))
+      if (status !== undefined && live("entries") && status !== this.lastStatus) {
+        this.lastStatus = status;
         next.entries = parseGitEntries(status, this.repository.root);
+      }
       if (branchInfo !== undefined && live("branch")) next.branch = parseBranch(branchInfo);
       if (branches !== undefined && live("branches")) next.branches = branches;
       if (remotes !== undefined && live("remotes")) next.remotes = remotes;
       if (stashList !== undefined && live("stashes")) next.stashes = parseStashList(stashList);
       if (operationInProgress !== undefined && live("operationInProgress"))
         next.operationInProgress = operationInProgress;
-      // Everything this call fetched was superseded: nothing of it is worth applying.
-      if (Object.keys(next).length === 0) return;
+      // Everything this call fetched was superseded: nothing of it is worth applying. Asked
+      // of the claims rather than of `next`, which can now be empty for a refresh that
+      // succeeded and simply found the status unchanged -- that one still clears `stale`,
+      // clears a stale failure notice, and counts as a successful refresh.
+      if (![...claimed.keys()].some(live)) return;
       next.stale = false;
       // A notice that only reported this store's own failed refresh is obsolete now.
       if (this.refreshError !== null && this.snapshot.notice === this.refreshError) {

@@ -61,7 +61,6 @@ import {
   guardedAffecting,
   useActiveRepo,
   useGitRegistry,
-  useRepoSnapshot,
   useTotalChanges,
 } from "./services/git";
 import type { Decorations } from "./services/git";
@@ -227,7 +226,6 @@ export default function App() {
   const hasUnsavedChanges = tabs.some((tab) => tab.dirty);
   const totalGitChanges = useTotalChanges();
   const activeRepo = useActiveRepo();
-  const activeRepoSnapshot = useRepoSnapshot(activeRepo?.store);
   const activeRepoId = useGitRegistry().activeRepoId;
 
   // A diff view has no identity of its own tying it to the repository it came
@@ -320,17 +318,53 @@ export default function App() {
     },
     [loadDirectory],
   );
-  // Re-lists every loaded folder: manual refresh, and after Git operations.
+  /**
+   * Re-lists every loaded folder: manual refresh, and after Git operations.
+   *
+   * The listings are independent, so they are issued together and folded into the tree in
+   * one pass. Done one at a time, a workspace someone had browsed into sixty folders deep
+   * cost sixty round trips end to end and sixty renders of the whole window -- once per
+   * settled burst of filesystem events, which a running build produces continuously.
+   */
+  const refreshingTree = useRef(false);
   const refreshTree = async () => {
     const tree = treeRef.current;
     if (!tree) return;
-    for (const directory of loadedDirectories(tree)) {
-      if (!treeRef.current || !findNode(treeRef.current, directory)) continue;
-      try {
-        await loadDirectory(directory);
-      } catch (error) {
-        reportError(`${directory}: ${String(error)}`);
+    // Overlapping refreshes would each re-list everything and fight over the result; the
+    // one already running is about to re-read the same directories anyway.
+    if (refreshingTree.current) return;
+    refreshingTree.current = true;
+    try {
+      const directories = loadedDirectories(tree).filter(
+        (directory) => treeRef.current && findNode(treeRef.current, directory),
+      );
+      const revision = workspaceRevision.current;
+      const listed = await Promise.all(
+        directories.map((directory) =>
+          native("list_workspace_files", { path: directory, maxDepth: 1 }).then(
+            (node) => ({ directory, node }),
+            (error) => {
+              reportError(`${directory}: ${String(error)}`);
+              return null;
+            },
+          ),
+        ),
+      );
+      if (revision !== workspaceRevision.current) return;
+
+      let next = treeRef.current;
+      for (const result of listed) {
+        if (!result || !next) continue;
+        // A directory that has gone since the listing was asked for is skipped rather than
+        // grafted back on; `setChildren` would have nowhere to put it.
+        if (!findNode(next, result.node.path)) continue;
+        next = isWithin(result.node.path, next.path)
+          ? setChildren(next, result.node.path, result.node.children ?? [])
+          : result.node;
       }
+      if (next !== treeRef.current) applyTree(next);
+    } finally {
+      refreshingTree.current = false;
     }
     setQuickOpen(null);
     setGitRevision((value) => value + 1);
@@ -1363,8 +1397,18 @@ export default function App() {
       shortcut: command.shortcut ? shortcutLabel(command.shortcut) : undefined,
     }));
 
+  /**
+   * The keyboard handler reads the commands, the open dialog and the palette through a ref.
+   *
+   * All three change identity on most renders, so an effect that closed over them had to be
+   * listed without a dependency array -- which removed and re-added a window listener on
+   * every single render of the application, several times a second while Git polls.
+   */
+  const keyContext = useRef({ commands, dialog, isCommandPaletteOpen, run });
+  keyContext.current = { commands, dialog, isCommandPaletteOpen, run };
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
+      const { commands, dialog, isCommandPaletteOpen, run } = keyContext.current;
       if (
         event.defaultPrevented ||
         event.isComposing ||
@@ -1399,7 +1443,7 @@ export default function App() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  });
+  }, []);
 
   return (
     <ErrorBoundary>
@@ -1630,7 +1674,6 @@ export default function App() {
             showTerminal(true);
             showPanelView("problems");
           }}
-          branch={activeRepoSnapshot?.branch}
         />
 
         {trustDialog && (

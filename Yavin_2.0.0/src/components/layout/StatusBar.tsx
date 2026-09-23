@@ -1,12 +1,11 @@
 ﻿import { useSyncExternalStore } from "react";
-import type { Branch } from "../../services/git";
+import { useActiveRepo, useRepoSnapshot } from "../../services/git";
 import { GitBranchIcon } from "../ui/Icons";
 import { problemCounts, problemsVersion, subscribeProblems } from "../../services/panel/problems";
 
 interface StatusBarProps {
   activeFile: string;
   onToggleTerminal: () => void;
-  branch?: Branch;
   /** Opens the Problems view, as clicking the count does in VS Code. */
   onShowProblems?: () => void;
   /** Whether the open folder is in Restricted Mode. */
@@ -14,15 +13,23 @@ interface StatusBarProps {
   onManageTrust?: () => void;
 }
 
+/**
+ * Subscribed to the active repository here rather than in `App`.
+ *
+ * The branch is the only thing the root component wanted from the repository snapshot, and
+ * that snapshot changes on every field of every refresh -- loading on, data in, loading off
+ * -- so reading it at the root re-rendered the entire window several times per poll for a
+ * branch name that had not changed.
+ */
 export function StatusBar({
   activeFile,
   onToggleTerminal,
-  branch,
   onShowProblems,
   restricted,
   onManageTrust,
 }: StatusBarProps) {
   useSyncExternalStore(subscribeProblems, problemsVersion, problemsVersion);
+  const branch = useRepoSnapshot(useActiveRepo()?.store)?.branch;
   const counts = problemCounts();
   const language = activeFile.endsWith(".tsx")
     ? "TypeScript React"

@@ -1,4 +1,4 @@
-import { useImperativeHandle, useRef, useState, useEffect } from "react";
+import { useImperativeHandle, useMemo, useRef, useState, useEffect } from "react";
 import type { Ref } from "react";
 import {
   duplicateSelection,
@@ -55,6 +55,25 @@ export function TextEditor({
 }) {
   const textarea = useRef<HTMLTextAreaElement>(null);
   const gutter = useRef<HTMLDivElement>(null);
+
+  /**
+   * The line numbers, as one string rather than one element per line.
+   *
+   * This component re-renders on every keystroke and on every unrelated render of the app
+   * above it, and an element per line meant a 3,000-line file reconciled 3,000 nodes each
+   * time, for a column of text that changes only when a line is added or removed. Counting
+   * without `split` avoids allocating the lines themselves just to count them.
+   */
+  const lineCount = useMemo(() => {
+    let lines = 1;
+    for (let index = 0; index < content.length; index++)
+      if (content.charCodeAt(index) === 10) lines++;
+    return lines;
+  }, [content]);
+  const gutterText = useMemo(
+    () => Array.from({ length: lineCount }, (_, index) => index + 1).join("\n"),
+    [lineCount],
+  );
   const beforeInput = useRef<TextSelection | null>(null);
   const [search, setSearch] = useState<"find" | "replace" | null>(null);
   const [query, setQuery] = useState("");
@@ -241,11 +260,9 @@ export function TextEditor({
           <div
             ref={gutter}
             aria-hidden="true"
-            className="w-14 shrink-0 overflow-hidden border-r border-zinc-900 py-3 pr-3 text-right text-zinc-600"
+            className="w-14 shrink-0 overflow-hidden border-r border-zinc-900 py-3 pr-3 text-right whitespace-pre text-zinc-600"
           >
-            {content.split("\n").map((_, index) => (
-              <div key={index}>{index + 1}</div>
-            ))}
+            {gutterText}
           </div>
         )}
         <textarea

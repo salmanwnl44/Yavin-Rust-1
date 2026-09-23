@@ -25,6 +25,9 @@ async function explorer(page: Page, status = "") {
     entries["/work/a/b/c/d/e/f/g/deep.ts"] = { dir: false, content: "deep" };
 
     const calls: { command: string; args: Record<string, string> }[] = [];
+    // How many listings were ever in flight at once, so a refresh that issues them together
+    // can be told from one that waits for each in turn.
+    const concurrency = { now: 0, peak: 0 };
     const node = (path: string) => ({
       path,
       name: path.slice(path.lastIndexOf("/") + 1),
@@ -33,6 +36,7 @@ async function explorer(page: Page, status = "") {
     });
     Object.assign(window, {
       __calls: calls,
+      __concurrency: concurrency,
       isTauri: true,
       __TAURI_INTERNALS__: {
         metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
@@ -45,6 +49,10 @@ async function explorer(page: Page, status = "") {
             const entry = entries[args.path];
             if (!entry?.dir) throw `Cannot read ${args.path}`;
             if (entry.locked) throw `Cannot read ${args.path}: permission denied`;
+            concurrency.now++;
+            concurrency.peak = Math.max(concurrency.peak, concurrency.now);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            concurrency.now--;
             const children = Object.keys(entries)
               .filter(
                 (path) => path !== args.path && path.slice(0, path.lastIndexOf("/")) === args.path,
@@ -295,4 +303,30 @@ test("opening a file from Quick Open reveals it in the collapsed tree", async ({
   await expect(row).toHaveAttribute("aria-selected", "true");
   // Revealing scrolls the row into view but must not pull focus into the tree.
   await expect(row).not.toBeFocused();
+});
+
+test("refreshing re-lists every loaded folder at once, not one after another", async ({ page }) => {
+  // A workspace someone has browsed into cost one round trip per loaded folder end to end,
+  // and one render of the whole window per result -- for every settled burst of filesystem
+  // events, which a running build produces continuously.
+  await explorer(page);
+  await page.getByLabel("a", { exact: true }).click();
+  await expect(page.getByLabel("b", { exact: true })).toBeVisible();
+
+  await page.evaluate(() => {
+    const seen = (window as unknown as { __concurrency: { peak: number } }).__concurrency;
+    seen.peak = 0;
+  });
+  await page.getByTitle("Refresh Explorer", { exact: true }).click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(
+        () => (window as unknown as { __concurrency: { peak: number } }).__concurrency.peak,
+      ),
+    )
+    .toBeGreaterThan(1);
+  // And the tree is still right afterwards.
+  await expect(page.getByLabel("file.ts", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("b", { exact: true })).toBeVisible();
 });

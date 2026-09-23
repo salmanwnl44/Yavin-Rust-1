@@ -335,3 +335,49 @@ test("a newer refresh of the SAME field still wins over an older, slower one", a
 
   assert.deepEqual(store.getSnapshot().branches, ["fresh"]);
 });
+
+test("a poll that finds the status unchanged keeps the entries it already had", async () => {
+  // The array's identity is what the Source Control panel's effects and the explorer's
+  // decorations key on. Re-parsing identical output made an equal array with a new identity,
+  // so a poll that found nothing rebuilt the decoration maps and re-rendered the whole
+  // window -- every five seconds, for every open repository.
+  const repo = fakeRepository([], { status: () => Promise.resolve(" M a.ts\0") });
+  const store = new RepoStore(repo);
+
+  await store.refresh(["entries"]);
+  const first = store.getSnapshot().entries;
+  await store.refresh(["entries"]);
+  assert.equal(store.getSnapshot().entries, first, "identical status must not rebuild the list");
+});
+
+test("a poll that finds the status changed produces a new list", async () => {
+  let status = " M a.ts\0";
+  const repo = fakeRepository([], { status: () => Promise.resolve(status) });
+  const store = new RepoStore(repo);
+
+  await store.refresh(["entries"]);
+  const first = store.getSnapshot().entries;
+  status = " M a.ts\0 M b.ts\0";
+  await store.refresh(["entries"]);
+  assert.notEqual(store.getSnapshot().entries, first);
+  assert.equal(store.getSnapshot().entries.length, 2);
+});
+
+test("a refresh that changes nothing still clears a failure left by the one before it", async () => {
+  // The early return for a fully superseded refresh used to be "nothing was applied", which
+  // an unchanged status now also satisfies -- and that would have stranded the notice.
+  let fail = true;
+  const repo = fakeRepository([], {
+    status: () => (fail ? Promise.reject(new Error("git exploded")) : Promise.resolve("")),
+  });
+  const store = new RepoStore(repo);
+
+  await store.refresh(["entries"]);
+  assert.match(store.getSnapshot().notice, /git exploded/);
+  assert.equal(store.getSnapshot().stale, true);
+
+  fail = false;
+  await store.refresh(["entries"]);
+  assert.equal(store.getSnapshot().notice, "");
+  assert.equal(store.getSnapshot().stale, false);
+});
