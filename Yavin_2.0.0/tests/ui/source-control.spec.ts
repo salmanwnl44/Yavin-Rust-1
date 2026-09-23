@@ -22,7 +22,7 @@ async function panel(page: Page, scenario: Partial<Scenario> = {}) {
     const state: Scenario = {
       status: "",
       branchInfo: "# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n",
-      branches: "main\nfeature\n",
+      branches: "refs/heads/main\nrefs/heads/feature\n",
       remotes: "",
       state: "",
       fail: {},

@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { RepoEntry } from "../../services/git/registry";
 import { useCommitGraph, useRepoSnapshot } from "../../services/git/hooks";
 import { guardedAffecting } from "../../services/git/sync";
 import { GRAPH_COLOR_COUNT } from "../../services/git/graph/model";
 import type { GraphScope } from "../../services/git/graph/incremental.ts";
 import { parseCommitDetails } from "../../services/git/parsers/log";
+import { CommitHoverCard } from "./CommitHoverCard";
+import { useCommitHover } from "./useCommitHover";
 import type {
   CommitDetailedInfo,
   CommitFileChange,
@@ -84,7 +86,6 @@ function InlineCommitDetail({
   onToggleViewAsTree: () => void;
 }) {
   const [detail, setDetail] = useState<CommitDetailedInfo | null>(null);
-  const [body, setBody] = useState("");
   const [remoteLink, setRemoteLink] = useState<RemoteWebLink | null>(null);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
@@ -93,21 +94,16 @@ function InlineCommitDetail({
   useEffect(() => {
     let cancelled = false;
     setDetail(null);
-    setBody("");
     setError("");
+    // The message body is deliberately not fetched here: the hover card carries it, and this
+    // view is about the files.
     Promise.all([
       repository.commitDetails(commit.fullHash),
-      repository.commitBody(commit.fullHash).catch(() => ""),
       defaultRemoteWebLink(repository).catch(() => null),
     ])
-      .then(([output, fullBody, link]) => {
+      .then(([output, link]) => {
         if (cancelled) return;
         setDetail(parseCommitDetails(output));
-        // Everything after the first blank line. Not a slice by the subject's length:
-        // the row's subject comes from `%s`, which collapses whitespace, so its length
-        // does not line up with the raw `%B` text.
-        const blankLine = fullBody.search(/\n\s*\n/);
-        setBody(blankLine === -1 ? "" : fullBody.slice(blankLine).trim());
         setRemoteLink(link);
       })
       .catch((reason) => !cancelled && setError(String(reason)));
@@ -171,11 +167,10 @@ function InlineCommitDetail({
           <CloseIcon size={11} />
         </button>
       </div>
+      {/* The message and the author are not repeated here: they are in the hover card, and
+          in this width a multi-paragraph commit message pushed the changed files -- the
+          reason for expanding a commit at all -- off the bottom of the panel. */}
       <div className="px-2 pb-1.5 space-y-1">
-        {body && <p className="whitespace-pre-wrap text-ink-2">{body}</p>}
-        <p className="text-ink-3">
-          {commit.authorName} · {commit.relativeTime} ({commit.date})
-        </p>
         <div className="flex items-center gap-1.5 text-ink-3">
           <span className="font-mono">{commit.hash}</span>
           <button
@@ -287,6 +282,27 @@ export function InlineGraphSection({
   // items drive the same state the panel's own Tree/List button does -- the menu entry was
   // previously a permanently-disabled label with nothing behind it.
   const [filesAsTree, setFilesAsTree] = useState(false);
+  // Resting on a commit shows what it is without opening it; see `CommitHoverCard`. Declared
+  // with the other hooks, above the early return for "no repository open".
+  // Given the section's own box so the card can sit beside it rather than over the commits.
+  const sectionRef = useRef<HTMLElement | null>(null);
+  const { hovered, rowHandlers, cardHandlers } = useCommitHover(sectionRef);
+  // Measured rather than guessed: the detail's height depends on the commit's message and
+  // how many files it touched, both of which arrive after it first renders.
+  const [detailHeight, setDetailHeight] = useState(0);
+  const detailRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const element = detailRef.current;
+    if (!element) {
+      setDetailHeight(0);
+      return;
+    }
+    const measure = () => setDetailHeight(element.getBoundingClientRect().height);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [selected]);
 
   useEffect(() => {
     setSelected((current) =>
@@ -300,6 +316,20 @@ export function InlineGraphSection({
   const edges = snapshot.layout.edges.filter((e) => e.fromRow < VISIBLE_COUNT);
   const gutterWidth = Math.max(1, Math.min(snapshot.layout.laneCount, 4)) * LANE_WIDTH + 6;
   const totalHeight = visible.length * ROW_HEIGHT;
+  /**
+   * Where the selected commit sits, and how far everything below it has to move.
+   *
+   * The detail belongs under the commit it describes -- shown after the whole list, the
+   * files for the commit you clicked appeared thirty rows further down. Rows are positioned
+   * at `row * ROW_HEIGHT` and the connectors are keyed to the same coordinates, so opening
+   * one means offsetting both by the detail's measured height, which is what `shift` is.
+   * A selected commit that is not in the visible slice offsets nothing.
+   */
+  const selectedRow = selected
+    ? visible.findIndex((node) => node.commit.fullHash === selected.fullHash)
+    : -1;
+  const expanded = selectedRow >= 0 ? detailHeight : 0;
+  const shift = (row: number) => (selectedRow >= 0 && row > selectedRow ? expanded : 0);
   // The incoming-changes node sits in HEAD's own lane, so it reads as the commits that are
   // about to land on this branch rather than a stray mark in lane 0.
   const incomingLane =
@@ -317,19 +347,27 @@ export function InlineGraphSection({
   const openScopePicker = () => {
     if (!onDialog) return;
     const branches = repo?.branches ?? [];
+    const remoteBranches = repo?.remoteBranches ?? [];
     onDialog({
       title: "Show history for",
       options: [
         { value: "auto", label: "Auto", description: "The current branch's own history" },
         { value: "all", label: "All", description: "Every branch and remote-tracking ref" },
         ...branches.map((name) => ({ value: name, label: name })),
+        // Remote-tracking branches are the other half of the question this picker asks:
+        // "what does origin have that I do not" is answered by picking `origin/main`.
+        ...remoteBranches.map((name) => ({
+          value: name,
+          label: name,
+          description: "Remote branch",
+        })),
       ],
       submit: (value) => void setScope(value as GraphScope),
     });
   };
 
   return (
-    <section aria-label="Graph" className="text-xs flex flex-col min-h-0">
+    <section ref={sectionRef} aria-label="Graph" className="text-xs flex flex-col min-h-0">
       <div
         onClick={onToggleCollapse}
         className="flex items-center gap-1.5 px-2 h-7 cursor-pointer hover:bg-surface-hover transition-colors shrink-0 border-t border-border"
@@ -465,20 +503,19 @@ export function InlineGraphSection({
               </div>
             </div>
           )}
-          <div style={{ position: "relative", height: totalHeight }}>
+          <div style={{ position: "relative", height: totalHeight + expanded }}>
             <svg
               width={gutterWidth}
-              height={totalHeight}
+              height={totalHeight + expanded}
               style={{ position: "absolute", top: 0, left: 0, pointerEvents: "none" }}
             >
               {edges.map((edge, i) => {
                 const x1 = laneX(edge.fromLane);
-                const y1 = edge.fromRow * ROW_HEIGHT + ROW_HEIGHT / 2;
+                const y1 = edge.fromRow * ROW_HEIGHT + ROW_HEIGHT / 2 + shift(edge.fromRow);
                 const x2 = laneX(edge.toLane);
-                const y2 =
-                  (edge.toRow !== null && edge.toRow < VISIBLE_COUNT ? edge.toRow : VISIBLE_COUNT) *
-                    ROW_HEIGHT +
-                  ROW_HEIGHT / 2;
+                const toRow =
+                  edge.toRow !== null && edge.toRow < VISIBLE_COUNT ? edge.toRow : VISIBLE_COUNT;
+                const y2 = toRow * ROW_HEIGHT + ROW_HEIGHT / 2 + shift(toRow);
                 const color = colorFor(edge.color);
                 if (x1 === x2)
                   return (
@@ -509,7 +546,7 @@ export function InlineGraphSection({
                   <circle
                     key={node.commit.fullHash}
                     cx={laneX(node.lane)}
-                    cy={node.row * ROW_HEIGHT + ROW_HEIGHT / 2}
+                    cy={node.row * ROW_HEIGHT + ROW_HEIGHT / 2 + shift(node.row)}
                     r={NODE_RADIUS}
                     fill={isHead ? "#000" : colorFor(node.color)}
                     stroke={colorFor(node.color)}
@@ -537,20 +574,19 @@ export function InlineGraphSection({
                         }
                       : undefined
                   }
+                  {...rowHandlers(node.commit)}
                   style={{
                     position: "absolute",
-                    top: node.row * ROW_HEIGHT,
+                    top: node.row * ROW_HEIGHT + shift(node.row),
                     left: gutterWidth,
                     right: 0,
                     height: ROW_HEIGHT,
                   }}
-                  title={node.commit.subject}
                   className={`flex items-center gap-1.5 px-1.5 text-[11px] truncate ${
                     onDiff ? "cursor-pointer" : ""
                   } ${isSelected ? "bg-accent/15" : "hover:bg-surface-hover"}`}
                 >
                   <span className="truncate text-ink">{node.commit.subject}</span>
-                  <span className="shrink-0 truncate text-ink-3">{node.commit.authorName}</span>
                   <span className="flex-1" />
                   {/* Ref pills sit at the right edge: remote branches orange with a cloud, the
                       current/local branch in the accent colour -- like the Antigravity graph. */}
@@ -573,8 +609,40 @@ export function InlineGraphSection({
                 </div>
               );
             })}
+            {/* Directly under the row it describes, inside the positioned list: the rows
+                below it are offset by exactly this element's measured height. */}
+            {selected && onDiff && selectedRow >= 0 && (
+              <div
+                ref={detailRef}
+                style={{
+                  position: "absolute",
+                  top: (selectedRow + 1) * ROW_HEIGHT,
+                  left: 0,
+                  right: 0,
+                }}
+              >
+                <InlineCommitDetail
+                  commit={selected}
+                  repository={entry.store.repository}
+                  onClose={() => setSelected(null)}
+                  onDiff={onDiff}
+                  viewAsTree={filesAsTree}
+                  onToggleViewAsTree={() => setFilesAsTree((v) => !v)}
+                />
+              </div>
+            )}
           </div>
-          {selected && onDiff && (
+          {hovered && (
+            <CommitHoverCard
+              commit={hovered.commit}
+              repository={entry.store.repository}
+              anchor={hovered.anchor}
+              {...cardHandlers}
+            />
+          )}
+          {/* Below the list only when the selected commit is not one of the rows on screen
+              -- otherwise it is rendered inside the list, directly under its own row. */}
+          {selected && onDiff && selectedRow < 0 && (
             <InlineCommitDetail
               commit={selected}
               repository={entry.store.repository}

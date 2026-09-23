@@ -23,6 +23,7 @@ function fakeRepository(
     status: method("status", ""),
     branchInfo: method("branchInfo", "# branch.head main\n"),
     branches: method("branches", [] as string[]),
+    refs: method("refs", { local: [] as string[], remote: [] as string[] }),
     remotes: method("remotes", [] as string[]),
     stashList: method("stashList", ""),
     state: method("state", ""),
@@ -282,11 +283,11 @@ test("a refresh success does not erase an operation's own notice", async () => {
 for (const order of ["branches first", "status first"] as const) {
   test(`overlapping refreshes of different fields each apply (${order})`, async () => {
     const calls: string[] = [];
-    let resolveBranches!: (v: string[]) => void;
+    let resolveBranches!: (v: { local: string[]; remote: string[] }) => void;
     let resolveStatus!: (v: string) => void;
     let resolveInfo!: (v: string) => void;
     const repo = fakeRepository(calls, {
-      branches: () => new Promise<string[]>((r) => (resolveBranches = r)),
+      refs: () => new Promise<{ local: string[]; remote: string[] }>((r) => (resolveBranches = r)),
       status: () => new Promise<string>((r) => (resolveStatus = r)),
       branchInfo: () => new Promise<string>((r) => (resolveInfo = r)),
     });
@@ -294,7 +295,7 @@ for (const order of ["branches first", "status first"] as const) {
 
     const refs = store.refresh(["branches"]);
     const head = store.refresh(["entries", "branch"]); // starts while the first is in flight
-    const settleBranches = () => resolveBranches(["main", "probe-br-1"]);
+    const settleBranches = () => resolveBranches({ local: ["main", "probe-br-1"], remote: [] });
     const settleHead = () => {
       resolveStatus(" M a.ts\0");
       resolveInfo("# branch.head probe-br-1\n");
@@ -318,9 +319,9 @@ for (const order of ["branches first", "status first"] as const) {
 
 test("a newer refresh of the SAME field still wins over an older, slower one", async () => {
   const calls: string[] = [];
-  const resolvers: Array<(v: string[]) => void> = [];
+  const resolvers: Array<(v: { local: string[]; remote: string[] }) => void> = [];
   const repo = fakeRepository(calls, {
-    branches: () => new Promise<string[]>((r) => resolvers.push(r)),
+    refs: () => new Promise<{ local: string[]; remote: string[] }>((r) => resolvers.push(r)),
   });
   const store = new RepoStore(repo);
 
@@ -328,9 +329,9 @@ test("a newer refresh of the SAME field still wins over an older, slower one", a
   // Force a second, independent request for the same field (a full refresh is not a subset
   // match for a scoped one, so it runs its own fetch).
   const newer = store.refresh();
-  resolvers[1](["fresh"]);
+  resolvers[1]({ local: ["fresh"], remote: [] });
   await newer;
-  resolvers[0](["stale"]); // the older call finishes last with older data
+  resolvers[0]({ local: ["stale"], remote: [] }); // the older call finishes last with older data
   await older;
 
   assert.deepEqual(store.getSnapshot().branches, ["fresh"]);

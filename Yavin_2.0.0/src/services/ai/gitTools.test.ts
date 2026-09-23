@@ -34,6 +34,7 @@ async function fixture(f: Fixture = {}) {
     branchInfo: async () =>
       f.branchInfo ?? "# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n",
     branches: async () => f.branches ?? ["main", "feature"],
+    refs: async () => ({ local: f.branches ?? ["main", "feature"], remote: ["origin/main"] }),
     remotes: async () => f.remotes ?? ["origin"],
     stashList: async () => f.stash ?? "",
     state: async () => f.state ?? "",

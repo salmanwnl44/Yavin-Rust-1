@@ -27,7 +27,7 @@ function repo(branchName: string, status = ""): RepoScenario {
   return {
     status,
     branchInfo: `# branch.head ${branchName}\n`,
-    branches: `${branchName}\n`,
+    branches: `refs/heads/${branchName}\n`,
     remotes: "",
   };
 }

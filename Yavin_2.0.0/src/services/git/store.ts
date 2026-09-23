@@ -44,6 +44,8 @@ export interface RepoSnapshot {
   entries: GitEntry[];
   branch: Branch;
   branches: string[];
+  /** Remote-tracking branches, as `origin/main`. Fetched with `branches`. */
+  remoteBranches: string[];
   remotes: string[];
   stashes: StashEntry[];
   operationInProgress: GitOperation;
@@ -136,6 +138,7 @@ const initialSnapshot: RepoSnapshot = {
   entries: [],
   branch: EMPTY_BRANCH,
   branches: [],
+  remoteBranches: [],
   remotes: [],
   stashes: [],
   operationInProgress: "",
@@ -314,22 +317,26 @@ export class RepoStore {
     // Still ours: no newer refresh (or mutation) has claimed this field since.
     const live = (field: RefreshField) => this.fieldGeneration[field] === claimed.get(field);
     try {
-      const [status, branchInfo, branches, remotes, stashList, operationInProgress] =
-        await Promise.all([
+      const [status, branchInfo, refs, remotes, stashList, operationInProgress] = await Promise.all(
+        [
           wants("entries") ? this.repository.status() : undefined,
           wants("branch") ? this.repository.branchInfo() : undefined,
-          wants("branches") ? this.repository.branches() : undefined,
+          wants("branches") ? this.repository.refs() : undefined,
           wants("remotes") ? this.repository.remotes() : undefined,
           wants("stashes") ? this.repository.stashList() : undefined,
           wants("operationInProgress") ? this.repository.state() : undefined,
-        ]);
+        ],
+      );
       const next: Partial<RepoSnapshot> = {};
       if (status !== undefined && live("entries") && status !== this.lastStatus) {
         this.lastStatus = status;
         next.entries = parseGitEntries(status, this.repository.root);
       }
       if (branchInfo !== undefined && live("branch")) next.branch = parseBranch(branchInfo);
-      if (branches !== undefined && live("branches")) next.branches = branches;
+      if (refs !== undefined && live("branches")) {
+        next.branches = refs.local;
+        next.remoteBranches = refs.remote;
+      }
       if (remotes !== undefined && live("remotes")) next.remotes = remotes;
       if (stashList !== undefined && live("stashes")) next.stashes = parseStashList(stashList);
       if (operationInProgress !== undefined && live("operationInProgress"))

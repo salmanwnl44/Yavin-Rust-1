@@ -1569,6 +1569,8 @@ export default function App() {
               <CommitGraphPanel
                 key={activeRepo.repoId}
                 repository={activeRepo.store.repository}
+                entry={activeRepo}
+                onDialog={setDialog}
                 onClose={() => setShowGraph(false)}
                 onDiff={setDiff}
                 onApplyCommit={(kind, commit) => {

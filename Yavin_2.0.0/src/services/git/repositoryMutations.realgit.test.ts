@@ -138,12 +138,12 @@ test("renameBranch renames the branch, including the one currently checked out",
 
     // Renaming a branch that is NOT checked out here.
     await r.repository.renameBranch("feature-old", "feature-new");
-    assert.deepEqual(await r.repository.branches(), ["feature-new", "main"]);
+    assert.deepEqual((await r.repository.refs()).local, ["feature-new", "main"]);
 
     // Renaming the branch that IS checked out here moves HEAD's own name along with it.
     await r.repository.renameBranch("main", "trunk");
     assert.equal(r.git("branch", "--show-current").trim(), "trunk");
-    assert.deepEqual((await r.repository.branches()).sort(), ["feature-new", "trunk"]);
+    assert.deepEqual((await r.repository.refs()).local.sort(), ["feature-new", "trunk"]);
   } finally {
     r.dispose();
   }

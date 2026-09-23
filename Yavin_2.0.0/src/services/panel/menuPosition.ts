@@ -18,9 +18,14 @@ export function clampToViewport(
     width: typeof window === "undefined" ? 1024 : window.innerWidth,
     height: typeof window === "undefined" ? 768 : window.innerHeight,
   },
+  /** For anything that is not a menu of rows -- the commit hover card, say. */
+  size: { width: number; rowHeight: number } = {
+    width: MENU_WIDTH,
+    rowHeight: MENU_ROW_HEIGHT,
+  },
 ): { left: number; top: number } {
-  const height = itemCount * MENU_ROW_HEIGHT + MENU_EDGE_GAP;
+  const height = itemCount * size.rowHeight + MENU_EDGE_GAP;
   const maxTop = Math.max(MENU_EDGE_GAP, viewport.height - height - MENU_EDGE_GAP);
-  const maxLeft = Math.max(MENU_EDGE_GAP, viewport.width - MENU_WIDTH - MENU_EDGE_GAP);
+  const maxLeft = Math.max(MENU_EDGE_GAP, viewport.width - size.width - MENU_EDGE_GAP);
   return { left: Math.min(at.x, maxLeft), top: Math.min(at.y, maxTop) };
 }

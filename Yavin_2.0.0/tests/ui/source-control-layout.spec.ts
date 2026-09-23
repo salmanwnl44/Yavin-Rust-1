@@ -22,21 +22,33 @@ async function panel(page: Page) {
             if (argv[0] === "status" && argv.includes("--porcelain=v2"))
               return ok("# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n");
             if (argv[0] === "status") return ok(" M a.ts\0");
-            if (argv[0] === "for-each-ref") return ok("main\n");
+            // One `for-each-ref` covers both patterns, in the full `%(refname)` form.
+            if (argv[0] === "for-each-ref")
+              return ok("refs/heads/main\nrefs/remotes/origin/main\nrefs/remotes/origin/HEAD\n");
+            // What the hover card reads: the numstat summary and the full message.
+            if (argv[0] === "show" && argv.includes("--numstat"))
+              // `show --numstat -z`: the header on the first line, then NUL-separated records.
+              return ok("c1\x1fFirst commit\n2\t1\tsrc/a.ts\x000\t3\tsrc/b.ts\x00");
+            if (argv[0] === "show") return ok("First commit\n\nWhy it was made.\n");
             if (argv[0] === "remote") return ok("");
             if (argv[0] === "log")
               return ok(
                 [
-                  "c1",
-                  "c1",
-                  "",
-                  "Author",
-                  "a@x.test",
-                  "Jan 1",
-                  "1 day ago",
-                  "First commit",
-                  "",
-                ].join("\x1f"),
+                  [
+                    "c2",
+                    "c2",
+                    "c1",
+                    "Author",
+                    "a@x.test",
+                    "Jan 2",
+                    "1 hour ago",
+                    "Second commit",
+                    "",
+                  ],
+                  ["c1", "c1", "", "Author", "a@x.test", "Jan 1", "1 day ago", "First commit", ""],
+                ]
+                  .map((fields) => fields.join("\x1f"))
+                  .join("\n"),
               );
             return ok("");
           }
@@ -248,4 +260,112 @@ test("a branch behind its upstream shows an Incoming Changes row in the sidebar 
 test("a branch up to date with its upstream shows no Incoming Changes row", async ({ page }) => {
   const region = await panel(page);
   await expect(region.getByText("Incoming Changes")).toHaveCount(0);
+});
+
+test("resting on a commit shows a card with its author, message and size", async ({ page }) => {
+  // The graph row can only show a truncated subject; everything else about a commit needed
+  // a click before this. Hovering answers "what is this" without leaving where you are.
+  const region = await panel(page);
+  const row = region.getByRole("button").filter({ hasText: "First commit" }).first();
+  await row.hover();
+
+  const card = page.getByRole("dialog", { name: /^Commit / });
+  await expect(card).toBeVisible();
+  await expect(card).toContainText("Author");
+  await expect(card).toContainText("First commit");
+  await expect(card).toContainText("1 day ago");
+  await expect(card).toContainText("2 files changed");
+  await expect(card.getByRole("button", { name: "Copy commit hash" })).toBeVisible();
+});
+
+test("the card goes away when the pointer leaves, and on Escape", async ({ page }) => {
+  const region = await panel(page);
+  const row = region.getByRole("button").filter({ hasText: "First commit" }).first();
+  await row.hover();
+  const card = page.getByRole("dialog", { name: /^Commit / });
+  await expect(card).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await expect(card).toHaveCount(0);
+});
+
+test("reaching a commit by keyboard shows the card too", async ({ page }) => {
+  // It holds the only copy button and the only link to the hosting site, so it cannot be
+  // reachable by mouse alone.
+  const region = await panel(page);
+  await region.getByRole("button").filter({ hasText: "First commit" }).first().focus();
+  await expect(page.getByRole("dialog", { name: /^Commit / })).toBeVisible();
+});
+
+test("the scope picker offers remote-tracking branches, and not origin/HEAD", async ({ page }) => {
+  const region = await panel(page);
+  await region.getByRole("button", { name: "Change which history is shown" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("option", { name: /origin\/main/ })).toBeVisible();
+  // `origin/HEAD` is a pointer at the remote's default branch, not a branch to pick.
+  await expect(dialog.getByRole("option", { name: /origin\/HEAD/ })).toHaveCount(0);
+});
+
+test("a commit's files open directly under its own row, not below the whole list", async ({
+  page,
+}) => {
+  // Shown after the list, the files for the commit you clicked appeared however many rows
+  // further down the graph happened to be -- which is not where anyone looks for them.
+  const region = await panel(page);
+  const second = region.getByRole("button").filter({ hasText: "Second commit" }).first();
+  const older = region.getByRole("button").filter({ hasText: "First commit" }).first();
+  await second.click();
+
+  const file = region.getByRole("button", { name: /src\/a\.ts/ }).first();
+  await expect(file).toBeVisible();
+
+  const clicked = await second.boundingBox();
+  const files = await file.boundingBox();
+  const below = await older.boundingBox();
+  expect(files!.y).toBeGreaterThan(clicked!.y);
+  // The commit below it has been pushed down past the detail, rather than the detail being
+  // parked underneath everything.
+  expect(below!.y).toBeGreaterThan(files!.y);
+});
+
+test("the card opens beside the graph, not on top of the commits", async ({ page }) => {
+  // A card over the rows hides the commits either side of the one being read, which is the
+  // context that makes reading it worth anything.
+  const region = await panel(page);
+  const graph = region.locator("section[aria-label='Graph']");
+  await region.getByRole("button").filter({ hasText: "Second commit" }).first().hover();
+
+  const card = page.getByRole("dialog", { name: /^Commit / });
+  await expect(card).toBeVisible();
+  const cardBox = await card.boundingBox();
+  const graphBox = await graph.boundingBox();
+  // Clear of the list horizontally, either to its right or to its left.
+  const clear =
+    cardBox!.x >= graphBox!.x + graphBox!.width || cardBox!.x + cardBox!.width <= graphBox!.x;
+  expect(clear).toBe(true);
+});
+
+test("a commit row shows its subject, without the author repeated on every line", async ({
+  page,
+}) => {
+  // In a repository with one author that was the same name on every row, crowding out the
+  // subject -- which is the only thing that tells the commits apart. It is in the card.
+  const region = await panel(page);
+  const row = region.getByRole("button").filter({ hasText: "Second commit" }).first();
+  await expect(row).toContainText("Second commit");
+  await expect(row).not.toContainText("Author");
+
+  await row.hover();
+  await expect(page.getByRole("dialog", { name: /^Commit / })).toContainText("Author");
+});
+
+test("expanding a commit shows its files, not its whole message", async ({ page }) => {
+  // A multi-paragraph commit message rendered in a 300px sidebar pushed the changed files --
+  // the reason for expanding a commit at all -- off the bottom of the panel. The message is
+  // in the hover card.
+  const region = await panel(page);
+  await region.getByRole("button").filter({ hasText: "Second commit" }).first().click();
+
+  await expect(region.getByRole("button", { name: /src\/a\.ts/ })).toBeVisible();
+  await expect(region).not.toContainText("Why it was made");
 });

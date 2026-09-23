@@ -1,8 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { UIEvent } from "react";
 import type { Repository } from "../../services/git/repository";
-import { useCommitGraph } from "../../services/git/hooks";
+import { useCommitGraph, useRepoSnapshot } from "../../services/git/hooks";
+import { CommitHoverCard } from "./CommitHoverCard";
+import { useCommitHover } from "./useCommitHover";
+import { GitMenu } from "./GitMenu";
 import type { GraphNode } from "../../services/git/graph/model";
+import type { GraphScope } from "../../services/git/graph/incremental";
+import type { RepoEntry } from "../../services/git/registry";
+import type { DialogRequest } from "../ui/AppDialog";
+import { MoreIcon } from "../ui/Icons";
 import { GRAPH_COLOR_COUNT } from "../../services/git/graph/model";
 import { parseCommitDetails } from "../../services/git/parsers/log";
 import type {
@@ -57,6 +64,8 @@ function CommitDetail({
   onClose,
   onDiff,
   onApplyCommit,
+  viewAsTree,
+  onToggleViewAsTree,
 }: {
   node: GraphNode;
   repository: Repository;
@@ -65,6 +74,9 @@ function CommitDetail({
   /** Cherry-picks or reverts the commit. Omitted where there is no repository entry to run
    * it through (the panel is given a bare `Repository`, not a `RepoEntry`). */
   onApplyCommit?: (kind: "cherryPick" | "revertCommit", commit: RawCommit) => void;
+  /** Owned by the panel, so the toolbar's view menu and this list cannot disagree. */
+  viewAsTree: boolean;
+  onToggleViewAsTree: () => void;
 }) {
   const [detail, setDetail] = useState<CommitDetailedInfo | null>(null);
   const [body, setBody] = useState("");
@@ -73,7 +85,6 @@ function CommitDetail({
   const [loading, setLoading] = useState(true);
   const [diffError, setDiffError] = useState("");
   const [copied, setCopied] = useState(false);
-  const [viewAsTree, setViewAsTree] = useState(false);
   const [collapsedFolders, setCollapsedFolders] = useState<ReadonlySet<string>>(new Set());
 
   const openFileDiff = ({ path, oldPath }: CommitFileChange) => {
@@ -268,7 +279,7 @@ function CommitDetail({
                 <button
                   title={viewAsTree ? "View as List" : "View as Tree"}
                   aria-label={viewAsTree ? "View as List" : "View as Tree"}
-                  onClick={() => setViewAsTree((v) => !v)}
+                  onClick={onToggleViewAsTree}
                   className="rounded px-1 py-0.5 text-[10px] text-zinc-500 hover:text-zinc-300 hover:bg-[#121212]"
                 >
                   {viewAsTree ? "List" : "Tree"}
@@ -307,16 +318,28 @@ function CommitDetail({
 
 export function CommitGraphPanel({
   repository,
+  entry,
   onClose,
   onDiff,
   onApplyCommit,
+  onDialog,
 }: {
   repository: Repository;
+  /** The repository this graph belongs to, for its branches and its upstream state. */
+  entry?: RepoEntry | null;
   onClose: () => void;
   onDiff: (document: DiffDocument) => void;
   onApplyCommit?: (kind: "cherryPick" | "revertCommit", commit: RawCommit) => void;
+  /** Opens the shared picker, for choosing whose history to show. */
+  onDialog?: (request: DialogRequest) => void;
 }) {
-  const { snapshot, loadMore } = useCommitGraph(repository);
+  const { snapshot, loadMore, setScope } = useCommitGraph(repository);
+  const [viewAsTree, setViewAsTree] = useState(false);
+  const repo = useRepoSnapshot(entry?.store);
+  // The same card the sidebar graph shows; the two views must not disagree about a commit.
+  // Given the graph's own box, so the card sits beside the list rather than over it.
+  const graphRef = useRef<HTMLDivElement | null>(null);
+  const { hovered, rowHandlers, cardHandlers } = useCommitHover(graphRef);
   const [selected, setSelected] = useState<GraphNode | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -356,6 +379,30 @@ export function CommitGraphPanel({
     );
   }, [snapshot.commits]);
 
+  const scopeLabel =
+    snapshot.scope === "auto" ? "Auto" : snapshot.scope === "all" ? "All" : snapshot.scope;
+  const openScopePicker = () => {
+    if (!onDialog) return;
+    onDialog({
+      title: "Show history for",
+      options: [
+        { value: "auto", label: "Auto", description: "The current branch's own history" },
+        { value: "all", label: "All", description: "Every branch and remote-tracking ref" },
+        ...(repo?.branches ?? []).map((name) => ({
+          value: name,
+          label: name,
+          description: "Branch",
+        })),
+        ...(repo?.remoteBranches ?? []).map((name) => ({
+          value: name,
+          label: name,
+          description: "Remote branch",
+        })),
+      ],
+      submit: (value) => void setScope(value as GraphScope),
+    });
+  };
+
   const { nodes, edges } = snapshot.layout;
   const totalHeight = nodes.length * ROW_HEIGHT;
   const gutterWidth = Math.max(1, Math.min(snapshot.layout.laneCount, 12)) * LANE_WIDTH + 8;
@@ -383,25 +430,108 @@ export function CommitGraphPanel({
 
   return (
     <div className="flex h-full w-full min-w-0 bg-black">
-      <div className="flex flex-col flex-1 min-w-0">
+      <div ref={graphRef} className="flex flex-col flex-1 min-w-0">
         <div className="flex h-9 items-center justify-between px-3 border-b border-[#141414] shrink-0">
           <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400 flex items-center gap-1.5">
             <GitCommitIcon size={13} />
             Commit Graph
+            {onDialog ? (
+              <button
+                title="Change which history is shown"
+                aria-label="Change which history is shown"
+                onClick={openScopePicker}
+                className="rounded px-1 text-[10px] font-normal normal-case text-zinc-500 hover:bg-[#121212] hover:text-zinc-300"
+              >
+                {scopeLabel}
+              </button>
+            ) : (
+              <span className="text-[10px] font-normal normal-case text-zinc-500">
+                {scopeLabel}
+              </span>
+            )}
           </span>
-          <button
-            onClick={onClose}
-            title="Close graph"
-            aria-label="Close graph"
-            className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#121212]"
-          >
-            <CloseIcon size={13} />
-          </button>
+          <div className="flex items-center gap-1">
+            <GitMenu
+              icon={<MoreIcon size={14} />}
+              label="Graph view options"
+              buttonClassName="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#121212]"
+              items={[
+                {
+                  label: "View as List",
+                  checked: !viewAsTree,
+                  onSelect: () => setViewAsTree(false),
+                },
+                {
+                  label: "View as Tree",
+                  checked: viewAsTree,
+                  onSelect: () => setViewAsTree(true),
+                },
+              ]}
+            />
+            <button
+              onClick={onClose}
+              title="Close graph"
+              aria-label="Close graph"
+              className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-[#121212]"
+            >
+              <CloseIcon size={13} />
+            </button>
+          </div>
         </div>
         {snapshot.notice && (
           <p role="status" className="px-3 py-1 text-[11px] text-red-400 break-words">
             {snapshot.notice}
           </p>
+        )}
+        {/* "Incoming Changes": the same hollow dashed node the sidebar graph draws, above
+            HEAD and connected down to it. Kept outside the scrolling list so the graph's
+            own `row * ROW_HEIGHT` geometry -- and every connector keyed to it -- is
+            untouched. */}
+        {repo && repo.branch.behind > 0 && (
+          <div style={{ position: "relative", height: ROW_HEIGHT }} className="shrink-0">
+            <svg
+              width={gutterWidth}
+              height={ROW_HEIGHT}
+              style={{ position: "absolute", top: 0, left: 0, pointerEvents: "none" }}
+              aria-hidden="true"
+            >
+              <line
+                x1={laneX(0)}
+                y1={ROW_HEIGHT / 2}
+                x2={laneX(0)}
+                y2={ROW_HEIGHT}
+                stroke="#71717a"
+                strokeWidth={1.25}
+                strokeDasharray="2 2"
+              />
+              <circle
+                cx={laneX(0)}
+                cy={ROW_HEIGHT / 2}
+                r={NODE_RADIUS}
+                fill="none"
+                stroke="#71717a"
+                strokeWidth={1.25}
+                strokeDasharray="2 1.5"
+              />
+            </svg>
+            <div
+              title={`${repo.branch.behind} commit${repo.branch.behind === 1 ? "" : "s"} on ${repo.branch.upstream || "the remote"} not yet in this branch`}
+              style={{
+                position: "absolute",
+                top: 0,
+                left: gutterWidth,
+                right: 0,
+                height: ROW_HEIGHT,
+              }}
+              className="flex items-center gap-1.5 px-1.5 text-[11px] text-zinc-500"
+            >
+              <span className="italic">Incoming Changes</span>
+              <span className="truncate">{repo.branch.upstream}</span>
+              <span className="ml-auto mr-2 shrink-0 rounded-full border border-dashed border-zinc-600 px-1.5 text-[9.5px]">
+                {repo.branch.behind}
+              </span>
+            </div>
+          </div>
         )}
         <div
           ref={containerRef}
@@ -465,6 +595,7 @@ export function CommitGraphPanel({
                 role="row"
                 tabIndex={0}
                 aria-selected={selected?.commit.fullHash === node.commit.fullHash}
+                {...rowHandlers(node.commit)}
                 onClick={() => setSelected(node)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ") {
@@ -527,10 +658,21 @@ export function CommitGraphPanel({
         </div>
       </div>
 
+      {hovered && (
+        <CommitHoverCard
+          commit={hovered.commit}
+          repository={repository}
+          anchor={hovered.anchor}
+          {...cardHandlers}
+        />
+      )}
+
       {selected && (
         <CommitDetail
           repository={repository}
           node={selected}
+          viewAsTree={viewAsTree}
+          onToggleViewAsTree={() => setViewAsTree((tree) => !tree)}
           onApplyCommit={onApplyCommit}
           onClose={() => setSelected(null)}
           onDiff={(document) => {

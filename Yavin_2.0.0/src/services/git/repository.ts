@@ -137,9 +137,33 @@ export class Repository {
     }
   }
 
-  async branches(): Promise<string[]> {
-    const out = await this.run(["for-each-ref", "--format=%(refname:short)", "refs/heads/"]);
-    return out.trim().split("\n").filter(Boolean);
+  /**
+   * Every branch this repository has: local heads and remote-tracking refs, in one process.
+   *
+   * `%(refname)` rather than the short form because the short form cannot tell a local
+   * branch literally named `origin/main` from the remote-tracking ref of the same name --
+   * and because one `for-each-ref` is one Git process, where asking twice doubled what the
+   * five-second poll costs for every open worktree.
+   */
+  async refs(): Promise<{ local: string[]; remote: string[] }> {
+    const out = await this.run([
+      "for-each-ref",
+      "--format=%(refname)",
+      "refs/heads/",
+      "refs/remotes/",
+    ]);
+    const local: string[] = [];
+    const remote: string[] = [];
+    for (const line of out.split(/\r?\n/)) {
+      if (line.startsWith("refs/heads/")) local.push(line.slice("refs/heads/".length));
+      else if (line.startsWith("refs/remotes/")) {
+        const name = line.slice("refs/remotes/".length);
+        // `origin/HEAD` is a pointer at the remote's default branch, not a branch anyone
+        // means to pick: listing it would show the same history twice under two names.
+        if (!name.endsWith("/HEAD")) remote.push(name);
+      }
+    }
+    return { local, remote };
   }
 
   async remotes(): Promise<string[]> {
