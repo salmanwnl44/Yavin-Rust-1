@@ -381,3 +381,53 @@ test("a refresh that changes nothing still clears a failure left by the one befo
   assert.equal(store.getSnapshot().notice, "");
   assert.equal(store.getSnapshot().stale, false);
 });
+
+test("a refresh nobody asked for does not announce itself", async () => {
+  // `loading` spins the refresh icon, shows "Refreshing…" and disables every control in the
+  // panel. The five-second poll setting it meant the whole view flickered and went dead for
+  // the length of a `git status`, twelve times a minute, for ever.
+  let resolveStatus!: (value: string) => void;
+  const repo = fakeRepository([], {
+    status: () => new Promise<string>((resolve) => (resolveStatus = resolve)),
+  });
+  const store = new RepoStore(repo);
+
+  const polling = store.refresh(["entries"], { silent: true });
+  assert.equal(store.getSnapshot().loading, false, "a background poll is invisible");
+  resolveStatus(" M a.ts\0");
+  await polling;
+  assert.equal(store.getSnapshot().entries.length, 1, "and still applies its result");
+});
+
+test("a refresh the user asked for does announce itself", async () => {
+  let resolveStatus!: (value: string) => void;
+  const repo = fakeRepository([], {
+    status: () => new Promise<string>((resolve) => (resolveStatus = resolve)),
+  });
+  const store = new RepoStore(repo);
+
+  const asked = store.refresh(["entries"]);
+  assert.equal(store.getSnapshot().loading, true);
+  resolveStatus("");
+  await asked;
+  assert.equal(store.getSnapshot().loading, false);
+});
+
+test("a poll overlapping a refresh the user asked for does not hold the spinner on", async () => {
+  const pending: ((value: string) => void)[] = [];
+  const repo = fakeRepository([], {
+    status: () => new Promise<string>((resolve) => pending.push(resolve)),
+  });
+  const store = new RepoStore(repo);
+
+  const asked = store.refresh(["entries"]);
+  const polling = store.refresh(["entries"], { silent: true });
+  assert.equal(store.getSnapshot().loading, true);
+
+  // The visible one finishes first; the silent one is still running.
+  pending[0]?.("");
+  await asked;
+  assert.equal(store.getSnapshot().loading, false, "the spinner stops with the visible refresh");
+  pending[1]?.("");
+  await polling;
+});

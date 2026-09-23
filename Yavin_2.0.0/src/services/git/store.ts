@@ -174,6 +174,8 @@ export class RepoStore {
     operationInProgress: 0,
   };
   private inFlight = false;
+  /** How many refreshes the user can see, which is what `loading` reports. */
+  private visibleRefreshes = 0;
   /**
    * The currently-running bare `refresh()` call (if any), and exactly which
    * fields it's fetching -- lets a second, overlapping `refresh()` call (e.g. a
@@ -191,6 +193,7 @@ export class RepoStore {
     fields: ReadonlySet<RefreshField>;
     promise: Promise<void>;
     epoch: number;
+    silent: boolean;
   } | null = null;
   /**
    * Bumped when a mutation starts and again when it finishes. A refresh may only be
@@ -253,19 +256,31 @@ export class RepoStore {
    * and the panel's periodic/focus-triggered poll). `guarded()` passes the narrower
    * set `INVALIDATES` implies for its `kind`, so e.g. staging one file spawns one
    * `git` process here instead of five.
+   *
+   * `silent` is for the refreshes nobody asked for -- the five-second poll, the window
+   * regaining focus, a file being saved, the watcher reporting a change. Those must not
+   * announce themselves: `loading` spins the refresh icon, shows "Refreshing…", and
+   * disables every control in the panel, so a background poll made the whole view flicker
+   * and go dead for the length of a `git status`, twelve times a minute, for ever.
    */
-  async refresh(fields: readonly RefreshField[] = ALL_REFRESH_FIELDS): Promise<void> {
+  async refresh(
+    fields: readonly RefreshField[] = ALL_REFRESH_FIELDS,
+    { silent = false }: { silent?: boolean } = {},
+  ): Promise<void> {
     const requested = new Set(fields);
     const inFlight = this.inFlightRefresh;
     if (
       inFlight &&
       inFlight.epoch === this.mutationEpoch &&
-      isSubsetOf(requested, inFlight.fields)
+      isSubsetOf(requested, inFlight.fields) &&
+      // A refresh the user asked for does not hide behind a silent one already running:
+      // it would finish without ever having said it was working.
+      inFlight.silent === silent
     ) {
       return inFlight.promise;
     }
-    const promise = this.doRefresh(fields);
-    this.inFlightRefresh = { fields: requested, promise, epoch: this.mutationEpoch };
+    const promise = this.doRefresh(fields, silent);
+    this.inFlightRefresh = { fields: requested, promise, epoch: this.mutationEpoch, silent };
     try {
       await promise;
     } finally {
@@ -273,18 +288,24 @@ export class RepoStore {
     }
   }
 
-  private async doRefresh(fields: readonly RefreshField[]): Promise<void> {
+  private async doRefresh(fields: readonly RefreshField[], silent = false): Promise<void> {
     const claimed = new Map<RefreshField, number>();
     for (const field of fields) claimed.set(field, ++this.fieldGeneration[field]);
     this.activeRefreshes++;
-    this.patch({ loading: true });
+    // Counted apart from `activeRefreshes`: a silent refresh overlapping a visible one must
+    // not hold `loading` on after the visible one has finished.
+    if (!silent) {
+      this.visibleRefreshes++;
+      this.patch({ loading: true });
+    }
     try {
       await this.fetchAndApply(claimed);
     } finally {
       this.activeRefreshes--;
+      if (!silent) this.visibleRefreshes--;
       // A superseded refresh discards its data, but must still hand `loading` back
       // once nothing newer is running (the newer one may already have finished).
-      if (this.activeRefreshes === 0 && this.snapshot.loading) this.patch({ loading: false });
+      if (this.visibleRefreshes === 0 && this.snapshot.loading) this.patch({ loading: false });
     }
   }
 
@@ -376,7 +397,9 @@ export class RepoStore {
       this.inFlight = false;
       this.mutationEpoch++;
       this.patch({ busy: false });
-      await this.refresh(INVALIDATES[kind] ?? ALL_REFRESH_FIELDS);
+      // Silent: the operation itself already holds `busy`, which is what the panel shows
+      // and what disables its controls. Adding `loading` on top only kept them dead longer.
+      await this.refresh(INVALIDATES[kind] ?? ALL_REFRESH_FIELDS, { silent: true });
     }
     return ok;
   }

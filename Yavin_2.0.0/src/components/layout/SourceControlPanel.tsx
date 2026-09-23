@@ -312,9 +312,11 @@ export function SourceControlPanel({
       setRecovery(null);
       setRowLimits({});
       if (Date.now() - activeRepo.store.lastRefreshedAt < 5000) return;
-      void activeRepo.store.refresh();
+      // Silent, like every other refresh nobody asked for: this repository already has
+      // data on screen, and announcing the top-up would disable the panel over it.
+      void activeRepo.store.refresh(undefined, { silent: true });
     } else if (revisionChanged) {
-      void activeRepo.store.refresh(["entries"]);
+      void activeRepo.store.refresh(["entries"], { silent: true });
     }
   }, [activeRepo, revision]);
 
@@ -351,7 +353,9 @@ export function SourceControlPanel({
           fields &&
           entry.repoId !== registrySnapshot.activeRepoId &&
           !gitRegistry.isWatcherDown(entry.repoId);
-        void entry.store.refresh(background ? fields : undefined);
+        // The poll and the focus refresh are both silent: they happen whether or not
+        // anyone is looking, and a view that flickers every five seconds reads as broken.
+        void entry.store.refresh(background ? fields : undefined, { silent: true });
       }
     };
     const onFocus = () => update();
