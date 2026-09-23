@@ -4,13 +4,16 @@
 //! folder, the same editor tabs, the same part of the tree unfolded. That is the whole point
 //! of this module, and it is why the state lives in the user's own config directory rather
 //! than in the webview's storage: it has to survive a cleared cache, and it should be
-//! readable and removable by hand.
+//! readable and removable by hand. It is read once, when it is first needed, and written
+//! through from there -- so an edit made by hand while Yavin is running is overwritten by
+//! the next save rather than picked up.
 //!
 //! Everything here is bounded. A session file that grew with every folder ever opened, or
 //! with every folder ever unfolded inside a large project, would eventually cost more to read
 //! at startup than the feature is worth, so the lists are capped and the oldest entries fall
 //! off. The caps are the only reason this cannot become a slow startup.
 
+use crate::config::write_atomically;
 use crate::paths::normalise;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -38,7 +41,13 @@ pub struct WorkspaceSession {
     /// Directories the explorer had unfolded.
     pub expanded: Vec<String>,
     /// Where the explorer was scrolled, in pixels.
-    pub scroll: u32,
+    ///
+    /// A float because that is what the browser measures: `scrollTop` is fractional at a
+    /// fractional device pixel ratio or any zoom level other than 100%. Declaring it as an
+    /// integer made serde refuse the whole call -- and since saving is deliberately
+    /// fire-and-forget, the session would simply have stopped being written, silently, for
+    /// everyone not at 100% zoom.
+    pub scroll: f64,
 }
 
 /// The whole session. `folders` is the recent list, most recent first; its head is the
@@ -71,7 +80,10 @@ impl Session {
             .retain(|state| normalise(Path::new(&state.folder)) != key);
     }
 
-    fn remember(&mut self, mut state: WorkspaceSession) {
+    /// Records what a folder looks like now. Returns whether anything actually changed, so
+    /// that the file is not rewritten for a save that says exactly what it already says --
+    /// the UI reports a snapshot whenever the explorer moves, and most of those are noise.
+    fn remember(&mut self, mut state: WorkspaceSession) -> bool {
         state.files.truncate(MAX_FILES);
         state.expanded.truncate(MAX_EXPANDED);
         // An active tab that is not open is not a tab; dropping it here means the UI never
@@ -82,11 +94,36 @@ impl Session {
             }
         }
         let key = normalise(Path::new(&state.folder));
-        self.workspaces
-            .retain(|existing| normalise(Path::new(&existing.folder)) != key);
+        let unchanged = self
+            .folders
+            .first()
+            .map(|first| normalise(Path::new(first)))
+            == Some(key)
+            && self.workspace(&state.folder) == Some(&state);
+        if unchanged {
+            return false;
+        }
+        self.drop_state_for(&state.folder);
         self.promote(&state.folder);
         self.workspaces.push(state);
         self.prune();
+        true
+    }
+
+    /// Brings a session that came from the file inside the caps, whoever wrote it.
+    fn trim(&mut self) {
+        self.folders.truncate(MAX_FOLDERS);
+        for state in &mut self.workspaces {
+            state.files.truncate(MAX_FILES);
+            state.expanded.truncate(MAX_EXPANDED);
+        }
+        self.prune();
+    }
+
+    fn drop_state_for(&mut self, folder: &str) {
+        let key = normalise(Path::new(folder));
+        self.workspaces
+            .retain(|existing| normalise(Path::new(&existing.folder)) != key);
     }
 
     /// Drops state for folders that are no longer in the recent list: they can never be
@@ -101,10 +138,7 @@ impl Session {
             .retain(|state| keys.contains(&normalise(Path::new(&state.folder))));
     }
 
-    /// The state remembered for one folder. The UI is handed the whole session in a single
-    /// call and looks its folder up there, so this is here for the tests that assert what
-    /// was actually stored.
-    #[cfg(test)]
+    /// The state remembered for one folder, however either path is spelled.
     fn workspace(&self, folder: &str) -> Option<&WorkspaceSession> {
         let key = normalise(Path::new(folder));
         self.workspaces
@@ -126,27 +160,21 @@ impl Store {
     fn load(file: PathBuf) -> Store {
         // A session that cannot be read is not worth failing to start over: the worst case
         // is opening the way a first run does.
-        let session = fs::read_to_string(&file)
+        let mut session = fs::read_to_string(&file)
             .ok()
             .and_then(|text| serde_json::from_str::<Session>(&text).ok())
             .unwrap_or_default();
+        // The caps are applied on the way in as well as on the way out: a file that was
+        // hand-edited, or written by a future version, must not be able to make startup slow.
+        session.trim();
         Store { file, session }
     }
 
-    /// Writes through a temporary file, so a crash or a full disk mid-write leaves the
-    /// previous session intact rather than a half-written one that reads as empty.
+    /// Written whole, atomically: a torn write would lose the folders someone works in.
     fn save(&self) -> Result<(), String> {
-        if let Some(parent) = self.file.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("Cannot save the session: {e}"))?;
-        }
         let text = serde_json::to_string_pretty(&self.session)
             .map_err(|e| format!("Cannot save the session: {e}"))?;
-        let temporary = self.file.with_extension("json.writing");
-        fs::write(&temporary, text).map_err(|e| format!("Cannot save the session: {e}"))?;
-        fs::rename(&temporary, &self.file).map_err(|e| {
-            let _ = fs::remove_file(&temporary);
-            format!("Cannot save the session: {e}")
-        })
+        write_atomically(&self.file, &text).map_err(|e| format!("Cannot save the session: {e}"))
     }
 }
 
@@ -165,14 +193,14 @@ fn store<'a>(
     Ok(guard)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_session(app: AppHandle, sessions: State<'_, Sessions>) -> Result<Session, String> {
     let guard = store(&app, &sessions)?;
     Ok(guard.as_ref().expect("loaded").session.clone())
 }
 
 /// Records what a folder looks like now, and makes it the folder to reopen.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_workspace_session(
     app: AppHandle,
     sessions: State<'_, Sessions>,
@@ -183,12 +211,14 @@ pub fn save_workspace_session(
     }
     let mut guard = store(&app, &sessions)?;
     let held = guard.as_mut().expect("loaded");
-    held.session.remember(state);
+    if !held.session.remember(state) {
+        return Ok(());
+    }
     held.save()
 }
 
 /// Removes a folder from the recent list, for "Remove from Recently Opened".
-#[tauri::command]
+#[tauri::command(async)]
 pub fn forget_workspace(
     app: AppHandle,
     sessions: State<'_, Sessions>,
@@ -222,7 +252,7 @@ mod tests {
             files: files.iter().map(|file| file.to_string()).collect(),
             active: files.first().map(|file| file.to_string()),
             expanded: Vec::new(),
-            scroll: 0,
+            scroll: 0.0,
         }
     }
 
@@ -301,7 +331,7 @@ mod tests {
             expanded: (0..MAX_EXPANDED + 200)
                 .map(|n| format!("/work/{n}"))
                 .collect(),
-            scroll: 0,
+            scroll: 0.0,
         });
         let state = session.workspace("/work").unwrap();
         assert_eq!(state.files.len(), MAX_FILES);
@@ -328,6 +358,71 @@ mod tests {
         session.forget("/work/one");
         assert_eq!(session.folders, vec!["/work/two"]);
         assert!(session.workspace("/work/one").is_none());
+    }
+
+    #[test]
+    fn a_scroll_position_is_taken_as_the_browser_measures_it() {
+        // `scrollTop` is a double, and is fractional at any zoom level other than 100%.
+        // Declaring it an integer made serde refuse the whole call, and because saving is
+        // fire-and-forget the session simply stopped being written, without a word.
+        let state: WorkspaceSession =
+            serde_json::from_str(r#"{"folder":"/work","scroll":12.5}"#).unwrap();
+        assert_eq!(state.scroll, 12.5);
+    }
+
+    #[test]
+    fn a_save_that_says_what_the_file_already_says_does_not_rewrite_it() {
+        // The explorer reports a snapshot whenever it moves, and most of those are noise.
+        let mut session = Session::default();
+        assert!(session.remember(workspace("/work", &["/work/a.ts"])));
+        assert!(!session.remember(workspace("/work", &["/work/a.ts"])));
+        assert!(session.remember(workspace("/work", &["/work/a.ts", "/work/b.ts"])));
+    }
+
+    #[test]
+    fn reopening_an_older_folder_is_a_change_even_when_nothing_in_it_moved() {
+        // It has to reach the front of the recent list, or the wrong folder reopens.
+        let mut session = Session::default();
+        session.remember(workspace("/work/one", &[]));
+        session.remember(workspace("/work/two", &[]));
+        assert!(session.remember(workspace("/work/one", &[])));
+        assert_eq!(session.folders, vec!["/work/one", "/work/two"]);
+    }
+
+    #[test]
+    fn a_file_from_outside_is_brought_inside_the_caps_when_it_is_read() {
+        // Hand-edited, or written by a later version. The caps are what keep startup quick,
+        // so enforcing them only on the way out would leave them unenforced where it counts.
+        let dir = temp("oversized");
+        let folders: Vec<String> = (0..MAX_FOLDERS + 10)
+            .map(|n| format!("/work/p{n}"))
+            .collect();
+        let expanded: Vec<String> = (0..MAX_EXPANDED + 100)
+            .map(|n| format!("/work/{n}"))
+            .collect();
+        let session = Session {
+            folders: folders.clone(),
+            workspaces: vec![WorkspaceSession {
+                folder: folders[0].clone(),
+                files: (0..MAX_FILES + 20)
+                    .map(|n| format!("/work/{n}.ts"))
+                    .collect(),
+                expanded,
+                ..Default::default()
+            }],
+        };
+        fs::write(
+            dir.join("session.json"),
+            serde_json::to_string(&session).unwrap(),
+        )
+        .unwrap();
+
+        let store = store_at(&dir);
+        assert_eq!(store.session.folders.len(), MAX_FOLDERS);
+        let state = store.session.workspace(&folders[0]).unwrap();
+        assert_eq!(state.files.len(), MAX_FILES);
+        assert_eq!(state.expanded.len(), MAX_EXPANDED);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

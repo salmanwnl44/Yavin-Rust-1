@@ -29,6 +29,8 @@ async function desktop(
     missing?: string[];
     /** Folders `open_workspace` refuses, as a moved or deleted folder would be. */
     unopenable?: string[];
+    /** Milliseconds each file read takes, for watching what happens during a restore. */
+    slowReads?: number;
   } = {},
 ) {
   await page.addInitScript((setup) => {
@@ -108,6 +110,8 @@ async function desktop(
           if (command === "read_file_content") {
             const path = args.path as string;
             if (missing.has(path) || files[path] === undefined) throw `Cannot read ${path}`;
+            if (setup.slowReads)
+              await new Promise((resolve) => setTimeout(resolve, setup.slowReads));
             return files[path];
           }
           if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
@@ -277,6 +281,90 @@ test("a folder opened through the dialog comes back the way it was left too", as
   await expect(page.getByRole("tab", { name: /only\.ts/ })).toBeVisible();
 });
 
+test("a folder reopened later in the run comes back as it was, not as it was at startup", async ({
+  page,
+}) => {
+  // The UI restored from the session it read at startup, so everything done to a folder
+  // after that -- the whole reason to leave and come back -- was silently discarded.
+  await desktop(page, {
+    session: {
+      folders: ["/work", "/other"],
+      workspaces: [{ folder: "/work", files: [] }],
+    },
+  });
+  await expect(entry(page, "a.ts")).toBeVisible();
+
+  // Open a file in /work, leave for /other, then come back to /work.
+  await entry(page, "a.ts").dblclick();
+  await expect(page.getByRole("tab", { name: /a\.ts/ })).toBeVisible();
+  await page.getByRole("tab", { name: "Welcome" }).click();
+  await welcome(page)
+    .getByRole("button", { name: /^other/ })
+    .click();
+  await expect(entry(page, "only.ts")).toBeVisible();
+
+  await page.getByRole("tab", { name: "Welcome" }).click();
+  await welcome(page).getByRole("button", { name: /^work/ }).click();
+  await expect(page.getByRole("tab", { name: /a\.ts/ })).toBeVisible();
+});
+
+test("a folder that cannot be opened stays in the recent list", async ({ page }) => {
+  // A folder can fail to open because a drive is not mounted or a VPN is down; deleting
+  // someone's project from the list over that is not a trade worth making.
+  await desktop(page, { session: { folders: ["/work", "/gone"] }, unopenable: ["/gone"] });
+  await page.getByRole("tab", { name: "Welcome" }).click();
+  await welcome(page).getByRole("button", { name: /^gone/ }).click();
+
+  await expect(page.getByRole("alert")).toContainText("Cannot open /gone");
+  await expect(welcome(page).getByRole("button", { name: /^gone/ })).toBeVisible();
+  expect(await calls(page, "forget_workspace")).toEqual([]);
+});
+
+test("a folder whose tabs are still being restored is not saved as empty", async ({ page }) => {
+  // The window passes through "this folder has no tabs" on the way to reopening them, and
+  // saving that erased the folder's tabs on disk for the length of the restore.
+  await desktop(page, {
+    session: {
+      folders: ["/work"],
+      workspaces: [{ folder: "/work", files: ["/work/a.ts"], active: "/work/a.ts" }],
+    },
+    slowReads: 400,
+  });
+
+  await expect(page.getByRole("tab", { name: /a\.ts/ })).toBeVisible();
+  const saved = (await calls(page, "save_workspace_session")).map(
+    (call) => (call.args.state as StoredWorkspace).files,
+  );
+  expect(saved.every((files) => files?.length)).toBe(true);
+});
+
+test("the tab strip is one tab stop, with the arrows moving between tabs", async ({ page }) => {
+  await desktop(page, {
+    session: {
+      folders: ["/work"],
+      workspaces: [{ folder: "/work", files: ["/work/a.ts", "/work/b.ts"], active: "/work/a.ts" }],
+    },
+  });
+  const strip = page.getByRole("tablist", { name: "Open editors" });
+  await expect(strip.getByRole("tab", { name: /a\.ts/ })).toHaveAttribute("aria-selected", "true");
+
+  // The arrows move focus along the strip, and Enter opens what they land on: selecting as
+  // focus moved would hand focus straight to the opened editor, ending the walk at one press.
+  // (The editor takes focus when a tab opens, so wait for the restore to settle first.)
+  await expect(page.getByRole("textbox")).toContainText("the contents of a");
+  await strip.getByRole("tab", { name: /a\.ts/ }).focus();
+  await expect(strip.getByRole("tab", { name: /a\.ts/ })).toBeFocused();
+  await page.keyboard.press("ArrowRight");
+  await expect(strip.getByRole("tab", { name: /b\.ts/ })).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(strip.getByRole("tab", { name: /b\.ts/ })).toHaveAttribute("aria-selected", "true");
+
+  await expect(page.getByRole("textbox")).toContainText("the contents of b");
+  await strip.getByRole("tab", { name: /b\.ts/ }).focus();
+  await page.keyboard.press("Home");
+  await expect(strip.getByRole("tab", { name: "Welcome" })).toBeFocused();
+});
+
 test("the welcome page can be reopened after its tab is closed", async ({ page }) => {
   await desktop(page, { session: { folders: ["/work"], workspaces: [{ folder: "/work" }] } });
   await expect(welcome(page)).toBeVisible();
@@ -284,4 +372,8 @@ test("the welcome page can be reopened after its tab is closed", async ({ page }
   await page.getByRole("menubar").getByRole("menuitem", { name: "Help", exact: true }).click();
   await page.getByRole("menuitem", { name: "Welcome", exact: true }).click();
   await expect(welcome(page)).toBeVisible();
+  // And its tab is back, selected: a strip whose selected tab does not exist has no tab stop.
+  await expect(
+    page.getByRole("tablist", { name: "Open editors" }).getByRole("tab", { name: "Welcome" }),
+  ).toHaveAttribute("aria-selected", "true");
 });

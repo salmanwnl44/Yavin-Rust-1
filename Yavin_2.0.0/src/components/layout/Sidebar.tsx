@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FileNode } from "../../types";
 import type { Decorations } from "../../services/git";
 import { folderName, parentPath } from "../../services/paths";
@@ -196,26 +196,54 @@ export function Sidebar(props: SidebarProps) {
     };
   }, []);
 
-  // Restoring the scroll waits for rows to exist: a viewport with nothing in it cannot be
-  // scrolled, and the attempt would silently land at zero.
-  const restoredScroll = useRef(false);
+  /**
+   * Restoring the saved scroll offset.
+   *
+   * Two things make this harder than one assignment. The tree arrives a directory at a time,
+   * so a viewport that is still short silently clamps the offset to what little it can
+   * scroll; and this component remounts on every folder change, when the tree is momentarily
+   * null. So the target is captured once at mount -- never re-read from the prop, which the
+   * reporting below would otherwise have overwritten with the current zero -- and reapplied
+   * as rows arrive until the offset actually sticks.
+   */
+  const wantedScroll = useRef(props.initialScroll ?? 0);
+  const restored = useRef(wantedScroll.current === 0);
+  const attempts = useRef(0);
   useLayoutEffect(() => {
     const element = viewportRef.current;
-    const wanted = props.initialScroll ?? 0;
-    if (restoredScroll.current || !element || !rows.length || !wanted) return;
-    restoredScroll.current = true;
-    element.scrollTop = wanted;
-  }, [rows.length, props.initialScroll]);
+    if (restored.current || !element || !rows.length) return;
+    element.scrollTop = wantedScroll.current;
+    // Give up after a few tries so that an offset into rows that no longer exist -- files
+    // deleted since -- cannot stop the explorer reporting its state forever.
+    attempts.current += 1;
+    if (element.scrollTop >= wantedScroll.current - 1 || attempts.current > 10)
+      restored.current = true;
+  }, [rows.length]);
 
-  // Reported outside render: the session writer coalesces the bursts that scrolling makes.
+  const expandedRef = useRef(expandedPaths);
+  expandedRef.current = expandedPaths;
   const reportState = props.onExplorerState;
-  useEffect(() => {
-    if (!reportState) return;
+  const report = useCallback(() => {
+    // Nothing is reported until the restore has settled: a report before then says the
+    // explorer is at the top, which is exactly what would overwrite the offset being
+    // restored -- and it is written back to the session, losing it for good.
+    if (!reportState || !restored.current) return;
     reportState({
-      expanded: [...expandedPaths],
-      scroll: viewportRef.current?.scrollTop ?? 0,
+      expanded: [...expandedRef.current],
+      // Rounded because sub-pixel scroll is meaningless to restore, and a whole number is
+      // what someone reading the session file by hand expects to find.
+      scroll: Math.round(viewportRef.current?.scrollTop ?? 0),
     });
-  }, [expandedPaths, view.top, reportState]);
+  }, [reportState]);
+
+  // Unfolding is reported as it happens; it is a deliberate act and there is one of them.
+  useEffect(report, [expandedPaths, report]);
+  // Scrolling is reported once it settles. Reporting every frame wrote the session file
+  // every 400ms for as long as a drag lasted, for a value that was about to change again.
+  useEffect(() => {
+    const timer = setTimeout(report, 600);
+    return () => clearTimeout(timer);
+  }, [view.top, report]);
 
   const first = Math.max(0, Math.floor(view.top / ROW_HEIGHT) - OVERSCAN);
   const last = Math.min(rows.length, Math.ceil((view.top + view.height) / ROW_HEIGHT) + OVERSCAN);

@@ -68,79 +68,99 @@ export function EditorArea({
   return (
     <div className="flex flex-1 flex-col min-w-0 bg-[#000000] select-none text-[12px] overflow-hidden font-sans">
       {/* Tab Bar */}
-      <div
-        role="tablist"
-        aria-label="Open editors"
-        className="flex h-9 items-center border-b border-[#151515] bg-[#050505] px-1 overflow-x-auto no-scrollbar gap-0.5 shrink-0"
-      >
-        {tabs.map((tab) => {
-          const isActive = tab.id === activeTabId;
+      <div className="flex h-9 items-center border-b border-[#151515] bg-[#050505] px-1 overflow-x-auto no-scrollbar gap-0.5 shrink-0">
+        <div role="tablist" aria-label="Open editors" className="flex h-full items-center gap-0.5">
+          {tabs.map((tab) => {
+            const isActive = tab.id === activeTabId;
 
-          return (
-            <div
-              key={tab.id}
-              role="tab"
-              aria-selected={isActive}
-              tabIndex={isActive ? 0 : -1}
-              onClick={() => onSelectTab(tab.id)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") {
+            return (
+              <div
+                key={tab.id}
+                role="tab"
+                id={`tab-${tab.id}`}
+                aria-controls="editor-panel"
+                aria-selected={isActive}
+                // One tab stop for the whole strip, with the arrows moving inside it: the
+                // pattern every tablist uses, and the reason a tab that is not selected is
+                // not separately tabbable.
+                tabIndex={isActive ? 0 : -1}
+                onClick={() => onSelectTab(tab.id)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onSelectTab(tab.id);
+                    return;
+                  }
+                  const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+                  if (!step && event.key !== "Home" && event.key !== "End") return;
                   event.preventDefault();
-                  onSelectTab(tab.id);
-                }
-              }}
-              className={`group relative flex h-full items-center gap-2 px-3 border-r border-[#141414] cursor-pointer transition-all ${
-                isActive
-                  ? "bg-[#000000] text-zinc-100 font-medium"
-                  : "bg-[#070707] text-zinc-400 hover:bg-[#0c0c0c] hover:text-zinc-200"
-              }`}
-            >
-              {/* Active top line */}
-              {isActive && (
-                <span className="absolute top-0 left-0 right-0 h-[2px] bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.6)]" />
-              )}
+                  // The arrows move focus and Enter opens it -- the tabs pattern's manual
+                  // activation. Selecting as focus moved would be the other half of the
+                  // pattern, but opening a tab hands focus to its editor, which would end
+                  // the walk along the strip after a single press.
+                  const index = tabs.findIndex((one) => one.id === tab.id);
+                  const next =
+                    event.key === "Home"
+                      ? 0
+                      : event.key === "End"
+                        ? tabs.length - 1
+                        : (index + step + tabs.length) % tabs.length;
+                  const target = tabs[next];
+                  if (target) document.getElementById(`tab-${target.id}`)?.focus();
+                }}
+                className={`group relative flex h-full items-center gap-2 px-3 border-r border-[#141414] cursor-pointer transition-all ${
+                  isActive
+                    ? "bg-[#000000] text-zinc-100 font-medium"
+                    : "bg-[#070707] text-zinc-400 hover:bg-[#0c0c0c] hover:text-zinc-200"
+                }`}
+              >
+                {/* Active top line */}
+                {isActive && (
+                  <span className="absolute top-0 left-0 right-0 h-[2px] bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.6)]" />
+                )}
 
-              {tab.id === "welcome" ? (
-                <span className="text-indigo-400 font-mono text-[11px]">✦</span>
-              ) : (
-                <FileIcon name={tab.name} className="size-3.5" />
-              )}
+                {tab.id === "welcome" ? (
+                  <span className="text-indigo-400 font-mono text-[11px]">✦</span>
+                ) : (
+                  <FileIcon name={tab.name} className="size-3.5" />
+                )}
 
-              <span className="truncate max-w-[140px] text-[12px]">{tab.name}</span>
+                <span className="truncate max-w-[140px] text-[12px]">{tab.name}</span>
 
-              {/* Dirty indicator dot */}
-              {tab.dirty ? (
-                <span
-                  title="Unsaved changes (Ctrl+S to save)"
-                  className="size-2 rounded-full bg-amber-400 hover:bg-amber-300"
-                />
-              ) : null}
+                {/* Dirty indicator dot */}
+                {tab.dirty ? (
+                  <span
+                    title="Unsaved changes (Ctrl+S to save)"
+                    className="size-2 rounded-full bg-amber-400 hover:bg-amber-300"
+                  />
+                ) : null}
 
-              {tabs.length > 1 && (
-                <button
-                  aria-label={`Close ${tab.name}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onCloseTab(tab.id);
-                  }}
-                  className="rounded p-0.5 text-zinc-500 opacity-0 group-hover:opacity-100 hover:bg-[#1a1a1a] hover:text-white transition-all ml-0.5"
-                >
-                  <svg
-                    width="10"
-                    height="10"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2.5"
+                {tabs.length > 1 && (
+                  <button
+                    aria-label={`Close ${tab.name}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onCloseTab(tab.id);
+                    }}
+                    className="rounded p-0.5 text-zinc-500 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-[#1a1a1a] hover:text-white transition-all ml-0.5"
                   >
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                  </svg>
-                </button>
-              )}
-            </div>
-          );
-        })}
+                    <svg
+                      width="10"
+                      height="10"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.5"
+                    >
+                      <line x1="18" y1="6" x2="6" y2="18" />
+                      <line x1="6" y1="6" x2="18" y2="18" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
 
         {/* Action icons */}
         <div className="ml-auto flex items-center gap-1 text-zinc-500 pr-2">
@@ -208,35 +228,42 @@ export function EditorArea({
         </div>
       </div>
 
-      {/* Main Content Area */}
-      {!activeTab || activeTab.id === "welcome" ? (
-        <WelcomePage
-          workspace={workspacePath}
-          recentFolders={recentFolders}
-          recentFiles={recentFiles}
-          hints={hints}
-          onOpenFolder={onOpenFolderDialog}
-          onOpenRecentFolder={onOpenRecentFolder}
-          onForgetRecentFolder={onForgetRecentFolder}
-          onCloneRepository={onCloneRepository}
-          onNewFile={onNewFile}
-          onOpenCommandPalette={onOpenCommandPalette}
-          onOpenFile={(path, name) => onSelectTab(path, name)}
-        />
-      ) : (
-        <TextEditor
-          key={activeTab.path}
-          path={activeTab.path}
-          name={activeTab.name}
-          content={currentContent}
-          onChange={(text) => onContentChange(activeTab.path, text)}
-          editorRef={editorRef}
-          histories={histories}
-          onState={onEditorState}
-          wordWrap={wordWrap}
-          zoom={zoom}
-        />
-      )}
+      {/* Main Content Area: the panel the tabs above control. */}
+      <div
+        id="editor-panel"
+        role="tabpanel"
+        aria-labelledby={activeTab ? `tab-${activeTab.id}` : undefined}
+        className="flex min-h-0 flex-1 flex-col"
+      >
+        {!activeTab || activeTab.id === "welcome" ? (
+          <WelcomePage
+            workspace={workspacePath}
+            recentFolders={recentFolders}
+            recentFiles={recentFiles}
+            hints={hints}
+            onOpenFolder={onOpenFolderDialog}
+            onOpenRecentFolder={onOpenRecentFolder}
+            onForgetRecentFolder={onForgetRecentFolder}
+            onCloneRepository={onCloneRepository}
+            onNewFile={onNewFile}
+            onOpenCommandPalette={onOpenCommandPalette}
+            onOpenFile={(path, name) => onSelectTab(path, name)}
+          />
+        ) : (
+          <TextEditor
+            key={activeTab.path}
+            path={activeTab.path}
+            name={activeTab.name}
+            content={currentContent}
+            onChange={(text) => onContentChange(activeTab.path, text)}
+            editorRef={editorRef}
+            histories={histories}
+            onState={onEditorState}
+            wordWrap={wordWrap}
+            zoom={zoom}
+          />
+        )}
+      </div>
     </div>
   );
 }

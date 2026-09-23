@@ -7,15 +7,42 @@
 //! a fixed set of checkers, each with a fixed argv that the caller cannot influence. The
 //! caller picks an id from the list and nothing else.
 
-use crate::trust::{require_trust, Trust};
+use crate::trust::{is_trusted, require_trust, Trust};
 use crate::{with_workspace, Workspace};
 use ide_workspace::process::capture_within;
 use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::Duration;
 use tauri::{AppHandle, State};
+
+/// The cancel flag of the checker that is running, if one is.
+///
+/// A checker is the longest-running thing Yavin starts -- a cold `cargo check` is minutes --
+/// and until this existed there was no way to stop one: the flag was constructed inline and
+/// dropped, so nothing could ever set it. Closing the panel, changing folder or quitting left
+/// a build running with no way to reach it.
+#[derive(Default)]
+pub struct Checks(pub Mutex<Option<Arc<AtomicBool>>>);
+
+/// Stops whatever checker is running. Harmless when none is.
+pub fn cancel_running(checks: &Checks) {
+    if let Ok(guard) = checks.0.lock() {
+        if let Some(flag) = guard.as_ref() {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+#[tauri::command(async)]
+pub fn cancel_checker(checks: State<'_, Checks>) -> Result<(), String> {
+    cancel_running(&checks);
+    Ok(())
+}
 
 /// A checker, its exact command line, and how to tell it applies to a project.
 struct Checker {
@@ -68,6 +95,16 @@ pub struct CheckerInfo {
     pub label: String,
 }
 
+/// What a checker run produced. The exit code comes back because a checker that finds
+/// problems and a checker that could not run both exit nonzero, and only the output tells
+/// them apart -- without it, `npx --no-install tsc` in a project with no local TypeScript
+/// reported "No problems found", which is the most misleading thing the view could say.
+#[derive(Serialize)]
+pub struct CheckerOutput {
+    pub output: String,
+    pub code: i32,
+}
+
 fn find(id: &str) -> Option<&'static Checker> {
     CHECKERS.iter().find(|checker| checker.id == id)
 }
@@ -82,7 +119,9 @@ pub async fn available_checkers(
     state: State<'_, Workspace>,
     trust: State<'_, Trust>,
 ) -> Result<Vec<CheckerInfo>, String> {
-    if require_trust(&app, &state, &trust).is_err() {
+    // Only a deliberate "no" means no checkers. Trust settings that cannot be read at all
+    // are a real failure and are reported, rather than looking like a project with no tools.
+    if !is_trusted(&app, &state, &trust)? {
         return Ok(Vec::new());
     }
     let root = with_workspace(&state, |manager| Ok(manager.root().to_path_buf()))?;
@@ -106,30 +145,41 @@ pub async fn run_checker(
     app: AppHandle,
     state: State<'_, Workspace>,
     trust: State<'_, Trust>,
+    checks: State<'_, Checks>,
     id: String,
-) -> Result<String, String> {
+) -> Result<CheckerOutput, String> {
     // Checked here as well as in `available_checkers`, because that one only decides what to
     // offer; this is the call that actually starts the project's build tooling.
     require_trust(&app, &state, &trust)?;
     let checker = find(&id).ok_or_else(|| format!("No checker named {id}."))?;
     let root = with_workspace(&state, |manager| Ok(manager.root().to_path_buf()))?;
 
-    tauri::async_runtime::spawn_blocking(move || {
+    // Starting a second checker cancels the first: they publish into the same view, and two
+    // builds competing for one target directory is worse than useless.
+    let cancel = Arc::new(AtomicBool::new(false));
+    cancel_running(&checks);
+    *checks.0.lock().map_err(|e| e.to_string())? = Some(cancel.clone());
+
+    let finished = tauri::async_runtime::spawn_blocking(move || {
         let mut command = Command::new(checker.program);
         command.current_dir(&root).args(checker.args);
         // Long enough for a cold `cargo check` or a whole-project `tsc`, which is minutes of
         // legitimate work, but still bounded so a watch-mode tool cannot hang the view.
-        let output = capture_within(
-            command,
-            None,
-            Arc::new(AtomicBool::new(false)),
-            Duration::from_secs(10 * 60),
-        )
-        .map_err(|e| format!("Could not run {}: {e}", checker.program))?;
-        Ok(format!("{}\n{}", output.stdout, output.stderr))
+        capture_within(command, None, cancel, Duration::from_secs(10 * 60))
+            .map_err(|e| format!("Could not run {}: {e}", checker.program))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    // Cleared whatever the outcome, so a run that has finished cannot be cancelled later.
+    if let Ok(mut guard) = checks.0.lock() {
+        *guard = None;
+    }
+    let output = finished?;
+    Ok(CheckerOutput {
+        output: format!("{}\n{}", output.stdout, output.stderr),
+        code: output.code,
+    })
 }
 
 #[cfg(test)]

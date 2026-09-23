@@ -15,6 +15,7 @@
 //!   people to click Trust without reading. What is blocked is running the project's
 //!   toolchain.
 
+use crate::config::write_atomically;
 use crate::paths::normalise;
 use crate::{with_workspace, Workspace};
 use serde::Serialize;
@@ -67,10 +68,9 @@ impl Store {
         Store { file, entries }
     }
 
+    /// Written atomically. A torn write here is worse than losing the file: truncation just
+    /// after a path separator would leave an entry covering more than the user agreed to.
     fn save(&self) -> Result<(), String> {
-        if let Some(parent) = self.file.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("Cannot save trust settings: {e}"))?;
-        }
         let text: String = self
             .entries
             .iter()
@@ -82,7 +82,7 @@ impl Store {
                 format!("{kind}\t{}\n", path.to_string_lossy())
             })
             .collect();
-        fs::write(&self.file, text).map_err(|e| format!("Cannot save trust settings: {e}"))
+        write_atomically(&self.file, &text).map_err(|e| format!("Cannot save trust settings: {e}"))
     }
 
     /// The decision covering `folder`: its own, or the nearest ancestor's. The longest match
@@ -155,14 +155,12 @@ fn state_for(store: &Store, root: Option<PathBuf>) -> TrustState {
     TrustState {
         trusted: decision == Some(Decision::Trusted),
         decided: decision.is_some(),
-        parent: root
-            .parent()
-            .map(|parent| parent.to_string_lossy().into_owned()),
-        root: Some(root.to_string_lossy().into_owned()),
+        parent: root.parent().map(ide_workspace::file_tree::clean_path_str),
+        root: Some(ide_workspace::file_tree::clean_path_str(&root)),
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn workspace_trust(
     app: AppHandle,
     state: State<'_, Workspace>,
@@ -178,7 +176,7 @@ pub fn workspace_trust(
 /// Records the decision for the open folder, or for its parent when `parent` is set -- the
 /// "trust everything under here" case, which is how someone with all their projects in one
 /// directory avoids being asked about each of them.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_workspace_trust(
     app: AppHandle,
     state: State<'_, Workspace>,
@@ -213,7 +211,7 @@ pub fn set_workspace_trust(
     Ok(state_for(held, Some(root)))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn trusted_folders(app: AppHandle, trust: State<'_, Trust>) -> Result<Vec<String>, String> {
     let guard = store(&app, &trust)?;
     Ok(guard
@@ -222,11 +220,11 @@ pub fn trusted_folders(app: AppHandle, trust: State<'_, Trust>) -> Result<Vec<St
         .entries
         .iter()
         .filter(|(decision, _)| *decision == Decision::Trusted)
-        .map(|(_, path)| path.to_string_lossy().into_owned())
+        .map(|(_, path)| ide_workspace::file_tree::clean_path_str(path))
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn forget_trusted_folder(
     app: AppHandle,
     state: State<'_, Workspace>,
@@ -240,6 +238,21 @@ pub fn forget_trusted_folder(
     Ok(state_for(held, workspace_root(&state)))
 }
 
+/// Whether the open folder may have its own toolchain run.
+///
+/// Separate from `require_trust` so that a caller deciding what to *offer* can tell "the user
+/// said no" from "the trust settings could not be read at all" -- reporting the second as the
+/// first told people a project had no checkers when what it really had was a broken config
+/// directory.
+pub fn is_trusted(
+    app: &AppHandle,
+    state: &State<'_, Workspace>,
+    trust: &State<'_, Trust>,
+) -> Result<bool, String> {
+    let guard = store(app, trust)?;
+    Ok(state_for(guard.as_ref().expect("loaded"), workspace_root(state)).trusted)
+}
+
 /// Refuses when the open folder has not been trusted. Called by anything that would run the
 /// project's own toolchain.
 pub fn require_trust(
@@ -247,8 +260,7 @@ pub fn require_trust(
     state: &State<'_, Workspace>,
     trust: &State<'_, Trust>,
 ) -> Result<(), String> {
-    let guard = store(app, trust)?;
-    if state_for(guard.as_ref().expect("loaded"), workspace_root(state)).trusted {
+    if is_trusted(app, state, trust)? {
         return Ok(());
     }
     Err("This folder is open in Restricted Mode, so its build tools are not run. Trust the folder to enable them.".into())
@@ -263,7 +275,13 @@ mod tests {
     }
 
     fn temp() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("yavin-trust-{}", std::process::id()));
+        // One directory per test. Tests run in parallel threads, and a directory shared
+        // between them that each one wipes on entry meant they deleted each other's files:
+        // an occasional failure in whichever test happened to lose the race.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("yavin-trust-{}-{ordinal}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

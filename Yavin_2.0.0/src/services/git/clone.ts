@@ -25,7 +25,11 @@ export function suggestedCloneFolder(url: string): string {
  * is one of the three things there is to do in a window with no folder open, and it would be
  * odd to have to find the Source Control view first.
  */
-export function cloneRepository(onDialog: (request: DialogRequest) => void): void {
+export function cloneRepository(
+  onDialog: (request: DialogRequest) => void,
+  /** Told where the clone landed, for callers that want to open it as the workspace. */
+  onCloned?: (root: string) => void,
+): void {
   onDialog({
     title: "Clone repository",
     message: "The repository URL to clone from.",
@@ -48,6 +52,7 @@ export function cloneRepository(onDialog: (request: DialogRequest) => void): voi
           // explains itself instead of closing as though it had worked.
           const info = await native("git_clone_repo", { parent, url: trimmed, folder: name });
           await gitRegistry.open(info.root, { makeActive: true });
+          onCloned?.(info.root);
         },
       });
     },

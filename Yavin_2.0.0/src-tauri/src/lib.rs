@@ -4,6 +4,7 @@ use ide_workspace::watcher::{self, RecommendedWatcher};
 use std::{env, path::Path, sync::Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 mod checkers;
+mod config;
 mod external;
 mod git;
 mod paths;
@@ -12,7 +13,7 @@ mod session;
 mod terminal;
 mod trust;
 mod workbench;
-use checkers::{available_checkers, run_checker};
+use checkers::{available_checkers, cancel_checker, run_checker, Checks};
 use external::open_external_url;
 use git::{
     git_cancel_repo, git_clone_repo, git_close_repo, git_exec, git_init_repo, git_open_repo,
@@ -164,11 +165,13 @@ fn open_folder_dialog(
 /// Opens a folder the user has already chosen once -- restoring the last session, or a pick
 /// from the recent list -- without putting a dialog in front of them.
 ///
-/// It is as powerful as `open_folder_dialog`, so it validates the same way: `WorkspaceManager`
-/// canonicalizes the path and refuses anything that is not a directory, which is what keeps a
-/// stale or hand-edited session entry from opening something unexpected. A folder that has
-/// been moved or deleted since is reported as an error rather than silently leaving the
-/// previous workspace in place.
+/// It is as powerful as `open_folder_dialog` and grants the same access: from here on, every
+/// file command is bounded by this root rather than the previous one. What it checks is only
+/// that the path exists and is a directory (`WorkspaceManager` canonicalizes it) -- not that
+/// the user ever chose it, which no command can tell. The protection against opening
+/// something unexpected is that the only paths sent here come from the user's own session
+/// file. A folder that has been moved or deleted since is reported as an error rather than
+/// silently leaving the previous workspace in place.
 #[tauri::command(async)]
 fn open_workspace(
     app: AppHandle,
@@ -226,6 +229,7 @@ pub fn run() {
         .manage(Terminals::default())
         .manage(Trust::default())
         .manage(Sessions::default())
+        .manage(Checks::default())
         .invoke_handler(tauri::generate_handler![
             get_default_workspace,
             list_workspace_files,
@@ -261,6 +265,7 @@ pub fn run() {
             save_workspace_session,
             forget_workspace,
             run_checker,
+            cancel_checker,
             list_listening_ports,
             stop_listening_process,
             git_repo_state,
@@ -283,6 +288,9 @@ pub fn run() {
                     tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
                 ) {
                     terminal::close_all(&handle.state::<Terminals>());
+                    // A checker is a child process too, and a cold `cargo check` outlives
+                    // the window by minutes if nothing stops it.
+                    checkers::cancel_running(&handle.state::<Checks>());
                 }
             })
         })

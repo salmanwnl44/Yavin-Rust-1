@@ -18,6 +18,13 @@ const SEVERITY_STYLE: Record<Severity, string> = {
 };
 const SEVERITY_MARK: Record<Severity, string> = { error: "×", warning: "!", info: "i" };
 
+/** The first line with anything on it, which is where a tool says why it could not run. */
+const firstLine = (text: string): string =>
+  text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0) ?? "";
+
 /** What the view was showing last time it was mounted. See the comment where it is read. */
 let kept: {
   filter: string;
@@ -84,17 +91,28 @@ export function ProblemsView({
     setRunning(id);
     setError("");
     try {
-      const output = await native("run_checker", { id });
+      const result = await native("run_checker", { id });
       const matcher = MATCHERS[id];
       if (!matcher) throw new Error(`No matcher for ${id}.`);
+      const found = parseProblems(matcher, result.output);
+      // A checker that finds problems exits nonzero, so a nonzero exit on its own means
+      // nothing. A nonzero exit with nothing to show, however, is a tool that did not run --
+      // `npx --no-install tsc` with no local TypeScript, a broken config, a missing binary --
+      // and reporting that as "No problems found" is the most misleading thing to say.
+      if (result.code !== 0 && found.length === 0) {
+        throw new Error(firstLine(result.output) || `${label} exited with code ${result.code}.`);
+      }
       // Publishing an empty list is meaningful: it clears what this tool said last time.
-      publishProblems(matcher.owner, label, parseProblems(matcher, output));
+      publishProblems(matcher.owner, label, found);
     } catch (reason) {
       setError(String(reason));
     } finally {
       setRunning("");
     }
   }, []);
+
+  /** Stops a checker that is still running -- a cold `cargo check` is minutes of work. */
+  const stop = useCallback(() => void native("cancel_checker").catch(() => undefined), []);
 
   const files = useMemo(
     () =>
@@ -189,6 +207,15 @@ export function ProblemsView({
               {running === checker.id ? `Running ${checker.label}…` : checker.label}
             </button>
           ))}
+          {running && (
+            <button
+              onClick={stop}
+              title="Stop the checker that is running"
+              className="rounded bg-[#151515] px-2 py-0.5 text-[11px] text-amber-300 hover:bg-[#1d1d1d]"
+            >
+              Stop
+            </button>
+          )}
         </div>
       </div>
 

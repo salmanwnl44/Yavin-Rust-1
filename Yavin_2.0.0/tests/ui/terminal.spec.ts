@@ -38,6 +38,8 @@ async function desktop(
     ports?: unknown[];
     checkers?: { id: string; label: string }[];
     checkerOutput?: string;
+    /** What the checker exits with. Nonzero and no diagnostics means it did not run. */
+    checkerCode?: number;
     trust?: { trusted: boolean; decided: boolean; root: string | null; parent: string | null };
   } = {},
 ) {
@@ -99,9 +101,13 @@ async function desktop(
           // A restricted folder is offered no checkers, matching the native side.
           if (command === "available_checkers") return trust.trusted ? (setup.checkers ?? []) : [];
           if (command === "run_checker") {
-            const override = (window as unknown as { __scenarioCheckerOutput?: string })
-              .__scenarioCheckerOutput;
-            return override !== undefined ? override : (setup.checkerOutput ?? "");
+            const scenario = window as unknown as {
+              __scenarioCheckerOutput?: string;
+              __scenarioCheckerCode?: number;
+            };
+            const output = scenario.__scenarioCheckerOutput ?? setup.checkerOutput ?? "";
+            // A checker exits nonzero when it finds problems, so the tests say which.
+            return { output, code: scenario.__scenarioCheckerCode ?? setup.checkerCode ?? 0 };
           }
           if (command === "stop_listening_process") return null;
           if (command === "terminal_shells")
@@ -931,6 +937,48 @@ test("running a checker lists its diagnostics grouped by file", async ({ page })
   await expect(problems.getByRole("button", { name: /src\/other\.ts/ })).toBeVisible();
   await expect(problems.getByText(/not assignable/)).toBeVisible();
   await expect(problems.getByText(/Ln 12, Col 7/)).toBeVisible();
+});
+
+test("a checker that could not run says so instead of reporting a clean project", async ({
+  page,
+}) => {
+  // `npx --no-install tsc` in a project with no local TypeScript exits 1 and explains itself
+  // on stderr. Nothing in that text is a diagnostic, so the view had nothing to show and said
+  // "No problems found" -- the most misleading thing it could say.
+  await desktop(page, {
+    checkers: [{ id: "tsc", label: "TypeScript" }],
+    checkerOutput: "npm error could not determine executable to run",
+    checkerCode: 1,
+  });
+  await showView(page, "PROBLEMS");
+  await page
+    .getByRole("region", { name: "Problems" })
+    .getByRole("button", { name: "TypeScript", exact: true })
+    .click();
+
+  await expect(page.getByRole("alert")).toContainText("could not determine executable");
+  await expect(page.getByRole("region", { name: "Problems" })).not.toContainText(
+    "No problems found",
+  );
+});
+
+test("a checker that exits nonzero because it found problems still lists them", async ({
+  page,
+}) => {
+  // The other half of the rule: a nonzero exit is a checker's normal way of reporting work.
+  await desktop(page, {
+    checkers: [{ id: "tsc", label: "TypeScript" }],
+    checkerOutput: "src/a.ts(3,10): error TS2304: Cannot find name 'x'.",
+    checkerCode: 2,
+  });
+  await showView(page, "PROBLEMS");
+  await page
+    .getByRole("region", { name: "Problems" })
+    .getByRole("button", { name: "TypeScript", exact: true })
+    .click();
+
+  await expect(page.getByRole("region", { name: "Problems" })).toContainText("Cannot find name");
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("the Problems tab is badged with the error and warning count", async ({ page }) => {

@@ -7,12 +7,24 @@
 
 use std::path::Path;
 
-/// A comparison key for a path: lowercased, with `/` separators. Case is folded because
-/// Windows and macOS both hand back either case for the same folder; on a case-sensitive
-/// filesystem this makes two genuinely different folders compare equal, which costs a
-/// needlessly shared session entry and never anything worse.
+/// A comparison key for a path: lowercased, `/` separators, no trailing separator. Case is
+/// folded because Windows and macOS both hand back either case for the same folder; on a
+/// case-sensitive filesystem this makes two genuinely different folders compare equal, which
+/// costs a needlessly shared session entry and never anything worse.
+///
+/// The UI folds the same way (`src/services/paths.ts`), and the two have to agree exactly: a
+/// folder the UI counts as one entry and this counts as two shows a recent entry that comes
+/// back after being removed, and a trust decision that does not cover what it appears to.
 pub fn normalise(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/").to_lowercase()
+    let key = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    let trimmed = key.trim_end_matches('/');
+    // A path of nothing but separators is the root, not the empty string: an empty key is a
+    // prefix of every path, which in the trust store would read as trusting the whole machine.
+    if trimmed.is_empty() {
+        "/".into()
+    } else {
+        trimmed.into()
+    }
 }
 
 #[cfg(test)]
@@ -25,6 +37,28 @@ mod tests {
             normalise(Path::new("C:\\Work\\Project")),
             normalise(Path::new("c:/work/project"))
         );
+    }
+
+    #[test]
+    fn a_trailing_separator_does_not_make_a_second_folder() {
+        // The UI strips them, so this has to as well: otherwise one folder to the user is
+        // two entries here, and removing the one they can see leaves the other behind.
+        assert_eq!(
+            normalise(Path::new("/work/project/")),
+            normalise(Path::new("/work/project"))
+        );
+        assert_eq!(
+            normalise(Path::new(r"C:\Work\")),
+            normalise(Path::new("c:/work"))
+        );
+    }
+
+    #[test]
+    fn a_path_of_nothing_but_separators_is_the_root_rather_than_empty() {
+        // An empty key is a prefix of every path, which in the trust store would read as a
+        // decision covering the whole machine.
+        assert_eq!(normalise(Path::new("/")), "/");
+        assert_eq!(normalise(Path::new("//")), "/");
     }
 
     #[test]

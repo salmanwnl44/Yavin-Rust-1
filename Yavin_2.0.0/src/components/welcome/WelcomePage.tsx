@@ -184,10 +184,10 @@ export function WelcomePage({
             {hints
               .filter((hint) => hint.shortcut)
               .map((hint) => (
-                <span key={hint.label} className="flex items-center gap-2">
+                <div key={hint.label} className="flex items-center gap-2">
                   <dt className="text-zinc-400">{hint.label}</dt>
                   <dd className="font-mono text-[10.5px] text-zinc-500">{hint.shortcut}</dd>
-                </span>
+                </div>
               ))}
           </dl>
         )}

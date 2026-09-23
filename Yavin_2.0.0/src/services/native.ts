@@ -36,7 +36,8 @@ interface Commands {
   open_external_url: { args: { url: string }; result: void };
   list_listening_ports: { args: undefined; result: ListeningPort[] };
   available_checkers: { args: undefined; result: { id: string; label: string }[] };
-  run_checker: { args: { id: string }; result: string };
+  run_checker: { args: { id: string }; result: { output: string; code: number } };
+  cancel_checker: { args: undefined; result: void };
   open_workspace: { args: { path: string }; result: string };
   read_session: { args: undefined; result: Session };
   save_workspace_session: { args: { state: WorkspaceSession }; result: void };

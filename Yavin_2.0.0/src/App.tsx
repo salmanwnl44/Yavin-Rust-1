@@ -139,6 +139,19 @@ export default function App() {
   const [session, setSession] = useState<Session>(EMPTY_SESSION);
   /** What the explorer looks like now, kept out of render: it changes on every scroll. */
   const explorerRef = useRef<{ expanded: string[]; scroll: number }>({ expanded: [], scroll: 0 });
+  /**
+   * The session as it stands now, which is not the same as `session`: that is React state for
+   * the recent list, updated only when the list itself changes, while this tracks every save
+   * so that reopening a folder restores what it had a moment ago rather than at startup.
+   */
+  const sessionRef = useRef<Session>(EMPTY_SESSION);
+  /** True while a folder's tabs are being reopened. See `writeSession`. */
+  const restoring = useRef(false);
+  /** Kept in step with `session`, so both the list and the lookups see the same thing. */
+  const rememberSession = useCallback((next: Session) => {
+    sessionRef.current = next;
+    setSession(next);
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isTerminalOpen, setIsTerminalOpen] = useState(false);
@@ -295,7 +308,12 @@ export default function App() {
   }, []);
   const loadWorkspace = useCallback(
     async (target: string) => {
+      const revision = workspaceRevision.current;
       await loadDirectory(target);
+      // A folder opened while this listing was in flight owns the window now. Setting the
+      // path here would aim the explorer, Source Control and the trust check at the folder
+      // that has just been left, while the tree and the native side show the new one.
+      if (revision !== workspaceRevision.current) return;
       setWorkspacePath(treeRef.current?.path ?? target);
       setQuickOpen(null);
       setGitRevision((value) => value + 1);
@@ -336,20 +354,34 @@ export default function App() {
    */
   const restoreTabs = useCallback(async (state: WorkspaceSession) => {
     const revision = workspaceRevision.current;
+    // Read together rather than one after another: this is startup, and fifty files read in
+    // series is fifty round trips the window waits through before it is usable. `Promise.all`
+    // keeps the results in tab order.
+    const read = await Promise.all(
+      state.files.map((path) =>
+        native("read_file_content", { path }).then(
+          (content) => ({ path, content }),
+          // Gone since last time; nothing to reopen and nothing worth saying.
+          () => null,
+        ),
+      ),
+    );
+    if (revision !== workspaceRevision.current) return;
+
     const opened: EditorTab[] = [];
     const contents: Record<string, string> = {};
-    for (const path of state.files) {
-      try {
-        const content = await native("read_file_content", { path });
-        if (revision !== workspaceRevision.current) return;
-        contents[path] = content;
-        savedContents.current[path] = content;
-        opened.push({ id: path, path, name: path.split(/[\\/]/).pop() || path, dirty: false });
-      } catch {
-        // Gone since last time; nothing to reopen and nothing worth saying.
-      }
+    for (const file of read) {
+      if (!file) continue;
+      contents[file.path] = file.content;
+      savedContents.current[file.path] = file.content;
+      opened.push({
+        id: file.path,
+        path: file.path,
+        name: file.path.split(/[\\/]/).pop() || file.path,
+        dirty: false,
+      });
     }
-    if (!opened.length || revision !== workspaceRevision.current) return;
+    if (!opened.length) return;
     updateContents({ ...contentsRef.current, ...contents });
     setTabs((previous) => [
       ...previous,
@@ -358,40 +390,6 @@ export default function App() {
     setRecentFiles(opened.map((tab) => ({ name: tab.name, path: tab.path })).reverse());
     if (state.active && contents[state.active] !== undefined) setActiveTabId(state.active);
   }, []);
-
-  // Startup: reopen the folder from last time, with what was open in it. A folder that has
-  // since been moved or deleted falls back to opening no folder rather than failing to start.
-  useEffect(() => {
-    if (!isTauri()) return;
-    let cancelled = false;
-    void (async () => {
-      const saved = await readSession().catch(() => EMPTY_SESSION);
-      if (cancelled) return;
-      setSession(saved);
-      const target = lastFolder(saved);
-      if (target) {
-        try {
-          const root = await native("open_workspace", { path: target });
-          if (cancelled) return;
-          const state = workspaceIn(saved, target);
-          if (state) explorerRef.current = { expanded: state.expanded, scroll: state.scroll };
-          await loadWorkspace(root);
-          if (!cancelled && state) await restoreTabs(state);
-          return;
-        } catch {
-          // Moved, deleted, or on a drive that is not mounted right now.
-        }
-      }
-      if (cancelled) return;
-      // Development builds open the directory Yavin was started from; release builds open
-      // nothing, which is what puts the welcome page in front of a first run.
-      const fallback = await native("get_default_workspace").catch(() => null);
-      if (!cancelled && fallback) await loadWorkspace(fallback);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [loadWorkspace, restoreTabs]);
 
   /**
    * Records what this folder looks like now. Called from the effect below and from the
@@ -402,14 +400,29 @@ export default function App() {
   sessionState.current = { workspacePath, tabs, activeTabId };
   const writeSession = useCallback(() => {
     const { workspacePath: folder, tabs: open, activeTabId: active } = sessionState.current;
-    if (!isTauri() || !folder) return;
-    saveWorkspaceSession({
+    // Nothing is written while a folder is still being restored. The window passes through
+    // "this folder has no tabs" on its way to reopening them, and saving that -- which took
+    // one debounce interval, less than a slow restore -- erased the folder's tabs on disk.
+    if (!isTauri() || !folder || restoring.current) return;
+    const state: WorkspaceSession = {
       folder,
       files: open.filter((tab) => tab.id !== "welcome").map((tab) => tab.path),
       active: active === "welcome" ? null : active,
       expanded: explorerRef.current.expanded,
       scroll: explorerRef.current.scroll,
-    });
+    };
+    // Kept here as well as sent, because reopening a folder later in the same run restores
+    // from this -- reading the startup snapshot would bring back the tabs it had then.
+    sessionRef.current = {
+      folders: sessionRef.current.folders,
+      workspaces: [
+        ...sessionRef.current.workspaces.filter(
+          (one) => folderKey(one.folder) !== folderKey(folder),
+        ),
+        state,
+      ],
+    };
+    saveWorkspaceSession(state);
   }, []);
   useEffect(writeSession, [workspacePath, tabs, activeTabId, writeSession]);
 
@@ -421,6 +434,54 @@ export default function App() {
     },
     [writeSession],
   );
+
+  // Startup: reopen the folder from last time, with what was open in it. A folder that has
+  // since been moved or deleted falls back to opening no folder rather than failing to start.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    // Opening a folder by hand while this is still running takes precedence: the revision
+    // it bumps is what tells the restore its work is no longer wanted.
+    const revision = workspaceRevision.current;
+    const superseded = () => cancelled || revision !== workspaceRevision.current;
+    void (async () => {
+      const saved = await readSession().catch(() => EMPTY_SESSION);
+      if (superseded()) return;
+      rememberSession(saved);
+      const target = lastFolder(saved);
+      if (target) {
+        try {
+          const root = await native("open_workspace", { path: target });
+          if (superseded()) return;
+          const state = workspaceIn(saved, target);
+          if (state) explorerRef.current = { expanded: state.expanded, scroll: state.scroll };
+          restoring.current = true;
+          try {
+            // The tree listing and the files' contents are independent once the folder is
+            // open, so they are fetched at the same time rather than one behind the other.
+            await Promise.all([loadWorkspace(root), state ? restoreTabs(state) : undefined]);
+          } finally {
+            restoring.current = false;
+          }
+          writeSession();
+          return;
+        } catch (reason) {
+          // Moved, deleted, on a drive that is not mounted, or unreadable. Worth saying:
+          // otherwise the project someone closed the window on is simply gone, with the
+          // welcome page offering no hint as to why.
+          if (!superseded()) reportError(`Could not reopen ${target}: ${String(reason)}`);
+        }
+      }
+      if (superseded()) return;
+      // Development builds open the directory Yavin was started from; release builds open
+      // nothing, which is what puts the welcome page in front of a first run.
+      const fallback = await native("get_default_workspace").catch(() => null);
+      if (!superseded() && fallback) await loadWorkspace(fallback).catch(reportError);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [loadWorkspace, restoreTabs, rememberSession, reportError, writeSession]);
 
   // Edits made outside the app (a checkout, a build, another editor) re-list the tree.
   const refreshTreeRef = useRef(refreshTree);
@@ -442,6 +503,13 @@ export default function App() {
     run(async () => {
       setDiff(null);
       if (path === "welcome") {
+        // Its tab may have been closed -- Help > Welcome is how it comes back -- and
+        // selecting a tab that is not there leaves the strip with nothing selected.
+        setTabs((previous) =>
+          previous.some((tab) => tab.id === "welcome")
+            ? previous
+            : [{ id: "welcome", name: "Welcome", path: "welcome", dirty: false }, ...previous],
+        );
         setActiveTabId(path);
         return;
       }
@@ -519,6 +587,9 @@ export default function App() {
    */
   const enterWorkspace = async (selected: string, restore?: WorkspaceSession) => {
     workspaceRevision.current++;
+    // Held across the whole switch so the empty tab list this passes through is not saved
+    // over the folder's real one; released in the `finally` below.
+    restoring.current = true;
     setDiff(null);
     setPendingHit(null);
     updateContents({});
@@ -533,15 +604,22 @@ export default function App() {
     // Seeded before the explorer mounts for the new folder, so it unfolds where it was.
     explorerRef.current = { expanded: restore?.expanded ?? [], scroll: restore?.scroll ?? 0 };
     // Optimistic, so the recent list is in the right order before the file is written.
-    setSession((previous) => ({
-      ...previous,
+    rememberSession({
+      ...sessionRef.current,
       folders: [
         selected,
-        ...previous.folders.filter((folder) => folderKey(folder) !== folderKey(selected)),
+        ...sessionRef.current.folders.filter((folder) => folderKey(folder) !== folderKey(selected)),
       ].slice(0, RECENT_FOLDERS),
-    }));
-    await loadWorkspace(selected);
-    if (restore) await restoreTabs(restore);
+    });
+    try {
+      await loadWorkspace(selected);
+      if (restore) await restoreTabs(restore);
+    } finally {
+      restoring.current = false;
+    }
+    // Written once the folder is actually open, so a folder that failed to list is not
+    // recorded as the one to reopen next time.
+    writeSession();
   };
 
   /** Refuses to leave a folder while saves are in flight, and asks about unsaved edits. */
@@ -561,7 +639,7 @@ export default function App() {
       if (!selected) return;
       // A folder picked from the dialog restores what it had open just as one picked from
       // the recent list does: how the folder was chosen should not change what comes back.
-      await enterWorkspace(selected, workspaceIn(session, selected));
+      await enterWorkspace(selected, workspaceIn(sessionRef.current, selected));
     });
 
   /** Opening a folder from the recent list: the same thing, without the dialog. */
@@ -572,15 +650,17 @@ export default function App() {
       try {
         root = await native("open_workspace", { path: folder });
       } catch (reason) {
-        // Most often the folder has been moved or deleted, and the entry is now noise.
-        setSession(await forgetFolder(folder).catch(() => session));
+        // The entry is kept. A folder can fail to open because it is gone, but just as
+        // easily because a drive is not mounted or a VPN is down, and silently deleting
+        // someone's project from the list -- along with its tabs -- over a transient
+        // failure is not a trade worth making. Removing it is one click away.
         throw new Error(`Cannot open ${folder}: ${String(reason)}`);
       }
-      await enterWorkspace(root, workspaceIn(session, folder));
+      await enterWorkspace(root, workspaceIn(sessionRef.current, folder));
     });
 
   const handleForgetRecentFolder = (folder: string) =>
-    run(async () => setSession(await forgetFolder(folder)));
+    run(async () => rememberSession(await forgetFolder(folder)));
   const handleCreateFile = (path: string) =>
     run(async () => {
       await native("create_file", { path });
@@ -826,6 +906,13 @@ export default function App() {
       updateContents({ ...contentsRef.current, [path]: "" });
       setTabs((prev) => [...prev, { id: path, path, name, dirty: false }]);
       setActiveTabId(path);
+      return;
+    }
+    if (!workspacePath) {
+      // Reachable from the welcome page, which is precisely the window with no folder in it.
+      // The dialog would have asked for a path relative to a workspace that is not open, and
+      // the save would have failed with "Open a workspace first" after the typing was done.
+      handleOpenFolderDialog();
       return;
     }
     setDialog({
@@ -1493,7 +1580,13 @@ export default function App() {
                 hints={welcomeHints}
                 onOpenRecentFolder={handleOpenRecentFolder}
                 onForgetRecentFolder={handleForgetRecentFolder}
-                onCloneRepository={() => cloneRepository(setDialog)}
+                onCloneRepository={() =>
+                  cloneRepository(setDialog, (root) => {
+                    // From the welcome page there is no folder open, so the point of
+                    // cloning is to work in what was cloned.
+                    if (!workspacePath) void handleOpenRecentFolder(root);
+                  })
+                }
                 editorRef={editorRef}
                 histories={histories.current}
                 onEditorState={setEditorState}
