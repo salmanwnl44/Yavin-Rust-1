@@ -200,7 +200,40 @@ pub fn terminal_shells() -> Vec<Shell> {
     available_shells()
 }
 
+/// A terminal profile's extra launch settings, all optional.
+///
+/// None of these widen what a terminal can do: whoever can open a terminal can already type
+/// any command into it, so arguments, environment and working directory are the same authority
+/// expressed up front. They are still validated, because a NUL or a newline smuggled into an
+/// argument or a variable name is a way to confuse the process launcher rather than the user.
+fn check_launch_text(what: &str, value: &str) -> Result<(), String> {
+    if value.chars().any(|c| c == '\0' || c == '\n' || c == '\r') {
+        return Err(format!(
+            "A terminal {what} cannot contain a line break or NUL."
+        ));
+    }
+    Ok(())
+}
+
+/// Where a terminal starts. Must be a directory that exists: a missing or file path would
+/// otherwise fail deep inside the spawn with a message that names nothing useful.
+fn resolve_cwd(requested: Option<&str>, fallback: PathBuf) -> Result<PathBuf, String> {
+    let Some(requested) = requested.filter(|path| !path.is_empty()) else {
+        return Ok(fallback);
+    };
+    check_launch_text("working directory", requested)?;
+    let path = PathBuf::from(requested);
+    if !path.is_dir() {
+        return Err(format!(
+            "{requested} is not a folder this terminal can start in."
+        ));
+    }
+    path.canonicalize()
+        .map_err(|e| format!("Cannot use {requested}: {e}"))
+}
+
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn terminal_open(
     app: AppHandle,
     state: State<'_, Workspace>,
@@ -209,6 +242,9 @@ pub fn terminal_open(
     shell: Option<String>,
     cols: u16,
     rows: u16,
+    args: Option<Vec<String>>,
+    env: Option<Vec<(String, String)>>,
+    cwd: Option<String>,
 ) -> Result<String, String> {
     if id.is_empty() {
         return Err("A terminal needs an identifier.".into());
@@ -217,18 +253,38 @@ pub fn terminal_open(
     // integrated terminal -- it just starts in the user's home directory instead.
     let root = with_workspace(&state, |manager| Ok(manager.root().to_path_buf()))
         .unwrap_or_else(|_| default_cwd());
+    let root = resolve_cwd(cwd.as_deref(), root)?;
     let shell = resolve_shell(shell.as_deref(), &available_shells())?;
+
+    let args = args.unwrap_or_default();
+    for argument in &args {
+        check_launch_text("argument", argument)?;
+    }
+    let env = env.unwrap_or_default();
+    for (name, value) in &env {
+        if name.is_empty() || name.contains('=') {
+            return Err("A terminal environment variable needs a plain name.".into());
+        }
+        check_launch_text("environment variable", name)?;
+        check_launch_text("environment value", value)?;
+    }
 
     let pair = native_pty_system()
         .openpty(size_of(cols, rows))
         .map_err(|e| format!("Cannot open a terminal: {e}"))?;
 
-    // The shell is started as itself, with no arguments and no interpolated command
-    // line, so nothing the panel sends can become part of how the process is launched.
+    // The shell is started as itself. Arguments come only from a terminal profile, never
+    // from an interpolated command line, so there is no string for the panel to inject into.
     let mut command = CommandBuilder::new(&shell);
+    for argument in &args {
+        command.arg(argument);
+    }
     command.cwd(&root);
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
+    for (name, value) in &env {
+        command.env(name, value);
+    }
     let mut child = pair
         .slave
         .spawn_command(command)
@@ -503,5 +559,43 @@ mod tests {
             seen.matches(MARKER).count() >= 2,
             "{shell} did not run the command; saw {seen:?}"
         );
+    }
+
+    /// A profile's launch settings are the same authority as typing into the terminal, but a
+    /// NUL or line break in one is a way to confuse the launcher rather than the user.
+    #[test]
+    fn launch_text_refuses_line_breaks_and_nul() {
+        assert!(check_launch_text("argument", "-NoLogo").is_ok());
+        assert!(check_launch_text("argument", "--flag=value with spaces").is_ok());
+        assert!(check_launch_text("argument", "ok\u{0}evil").is_err());
+        assert!(check_launch_text("argument", "ok\nevil").is_err());
+        assert!(check_launch_text("argument", "ok\revil").is_err());
+    }
+
+    #[test]
+    fn a_terminal_starts_in_a_real_folder_or_says_why_not() {
+        let dir = std::env::temp_dir().join(format!("yavin-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fallback = std::env::current_dir().unwrap();
+
+        // No request: the caller's fallback is used untouched.
+        assert_eq!(resolve_cwd(None, fallback.clone()).unwrap(), fallback);
+        assert_eq!(resolve_cwd(Some(""), fallback.clone()).unwrap(), fallback);
+
+        // A real folder is accepted, and canonicalised so later comparisons agree.
+        let resolved = resolve_cwd(Some(&dir.to_string_lossy()), fallback.clone()).unwrap();
+        assert_eq!(resolved, dir.canonicalize().unwrap());
+
+        // A file, and a folder that is not there, each fail by name rather than deep inside
+        // the spawn with a message that identifies nothing.
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        let as_file = resolve_cwd(Some(&file.to_string_lossy()), fallback.clone());
+        assert!(as_file.is_err());
+        assert!(as_file.unwrap_err().contains("not a folder"));
+        assert!(resolve_cwd(Some("/definitely/not/here/at/all"), fallback.clone()).is_err());
+        assert!(resolve_cwd(Some("ok\u{0}evil"), fallback).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

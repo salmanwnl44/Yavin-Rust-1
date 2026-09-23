@@ -61,7 +61,12 @@ async function desktop(page: Page, options: { failOpen?: string } = {}) {
           }
           if (command === "get_default_workspace") return "/work";
           if (command === "list_workspace_files")
-            return { path: "/work", name: "work", is_dir: true, children: [] };
+            return {
+              path: "/work",
+              name: "work",
+              is_dir: true,
+              children: [{ path: "/work/file.ts", name: "file.ts", is_dir: false, children: null }],
+            };
           if (command === "terminal_shells")
             return [
               { name: "Command Prompt", path: "C:\\Windows\\System32\\cmd.exe" },
@@ -699,4 +704,16 @@ test("output reaches only the terminal it belongs to, with one native subscripti
   await page.getByLabel("New Terminal").click();
   await terminalIds(page, 4);
   expect(await outputListens()).toBe(before);
+});
+
+test("Open in Integrated Terminal starts a shell in the chosen folder", async ({ page }) => {
+  await desktop(page);
+  // The explorer's own context menu; the panel need not be open beforehand.
+  await page.getByText("file.ts", { exact: true }).click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Open in Integrated Terminal" }).click();
+
+  await expect.poll(async () => (await calls(page, "terminal_open")).length).toBeGreaterThan(0);
+  const opened = await calls(page, "terminal_open");
+  // A file opens a terminal in the folder holding it, not in the file.
+  expect(opened.some((call) => call.args.cwd === "/work")).toBe(true);
 });

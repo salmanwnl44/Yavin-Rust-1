@@ -26,7 +26,7 @@ import { CommitGraphPanel } from "./components/git/CommitGraphPanel";
 import { GitOutputPanel } from "./components/git/GitOutputPanel";
 import type { SearchHit } from "./services/search";
 import { recordEdit } from "./services/editor";
-import { requestTerminal } from "./services/terminal";
+import { requestTerminal, onTerminalRequestObserved } from "./services/terminal";
 
 import { isTauri } from "@tauri-apps/api/core";
 import type { FileNode, EditorTab, RecentFile } from "./types";
@@ -135,6 +135,18 @@ export default function App() {
     });
   }, []);
   const [isTerminalMaximized, setIsTerminalMaximized] = useState(false);
+
+  // Any request for a new terminal reveals the panel. Observed rather than handled: the
+  // panel itself is the handler, and it may not be mounted yet -- `requestTerminal` holds
+  // the request until it is.
+  useEffect(
+    () =>
+      onTerminalRequestObserved((request) => {
+        if (request === "new" || (typeof request === "object" && request.name === "new"))
+          showTerminal(true);
+      }),
+    [showTerminal],
+  );
   const [isAIOpen, setIsAIOpen] = useState(false);
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const [activeActivityTab, setActiveActivityTab] = useState("explorer");

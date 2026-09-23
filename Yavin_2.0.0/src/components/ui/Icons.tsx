@@ -276,3 +276,11 @@ export const ChevronDownIcon = (props: IconProps) => (
     <polyline points="6 9 12 15 18 9" />
   </Stroke>
 );
+
+/** A shell prompt: used for "Open in Integrated Terminal". */
+export const TerminalIcon = (props: IconProps) => (
+  <Stroke {...props}>
+    <path d="M4 17l6-5-6-5" />
+    <path d="M12 19h8" />
+  </Stroke>
+);

@@ -10,9 +10,11 @@ import {
   describeExit,
   onExitFor,
   onOutputFor,
+  openArgsFor,
   terminalKeyAction,
   usableSize,
   type TerminalKeyAction,
+  type TerminalSession,
 } from "../../services/terminal";
 
 export interface SearchSettings {
@@ -48,8 +50,8 @@ const DECORATIONS = {
 export const TerminalView = forwardRef<
   TerminalHandle,
   {
-    id: string;
-    shell: string;
+    /** The whole session, so a profile's arguments, environment and folder reach the shell. */
+    session: TerminalSession;
     visible: boolean;
     fontSize: number;
     onStatus: (message: string) => void;
@@ -59,9 +61,10 @@ export const TerminalView = forwardRef<
     onSearchResults: (results: { index: number; count: number }) => void;
   }
 >(function TerminalView(
-  { id, shell, visible, fontSize, onStatus, onBell, onShortcut, onContextMenu, onSearchResults },
+  { session, visible, fontSize, onStatus, onBell, onShortcut, onContextMenu, onSearchResults },
   ref,
 ) {
+  const { id, shell } = session;
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<{ term: XTerm; fit: FitAddon; search: SearchAddon } | null>(null);
   /** True only while a shell is attached, so nothing is sent into the void. */
@@ -71,6 +74,11 @@ export const TerminalView = forwardRef<
   // Kept in refs so the effect below never re-runs and restarts the shell.
   const report = useRef({ onStatus, onBell, onShortcut, onContextMenu, onSearchResults });
   report.current = { onStatus, onBell, onShortcut, onContextMenu, onSearchResults };
+  // Read at open time rather than captured in the effect's dependencies: the effect starts
+  // and disposes the shell, so adding the session object to its deps would restart the user's
+  // shell whenever anything about the session changed.
+  const launch = useRef(session);
+  launch.current = session;
   const start = useRef<(clear: boolean) => void>(() => {});
 
   // Declared before the effect below so xterm's custom key handler, which is attached there,
@@ -179,7 +187,7 @@ export const TerminalView = forwardRef<
       if (clear) term.clear();
       setExited("");
       const size = usableSize(term.cols, term.rows);
-      void native("terminal_open", { id, shell, ...size })
+      void native("terminal_open", openArgsFor(launch.current, size))
         .then(() => {
           running.current = true;
           report.current.onStatus("Running");

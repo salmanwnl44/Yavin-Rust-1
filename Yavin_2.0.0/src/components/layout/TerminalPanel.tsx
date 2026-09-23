@@ -126,22 +126,26 @@ export function TerminalPanel({
   const findInput = useRef<HTMLInputElement>(null);
   const body = useRef<HTMLDivElement>(null);
 
-  const create = useCallback((shell: Shell | undefined, focus = true) => {
-    const session: TerminalSession = {
-      id: createTerminalId(),
-      name: "",
-      shell: shell?.path ?? "",
-    };
-    setSessions((previous) => {
-      session.name = nextTerminalName(
-        previous.map((one) => one.name),
-        shell?.name ?? "Terminal",
-      );
-      return [...previous, session];
-    });
-    if (focus) setActiveId(session.id);
-    return session;
-  }, []);
+  const create = useCallback(
+    (shell: Shell | undefined, focus = true, extras: Partial<TerminalSession> = {}) => {
+      const session: TerminalSession = {
+        id: createTerminalId(),
+        name: "",
+        shell: shell?.path ?? "",
+        ...extras,
+      };
+      setSessions((previous) => {
+        session.name = nextTerminalName(
+          previous.map((one) => one.name),
+          shell?.name ?? "Terminal",
+        );
+        return [...previous, session];
+      });
+      if (focus) setActiveId(session.id);
+      return session;
+    },
+    [],
+  );
 
   // Detected shells decide what New Terminal can offer; the first one opens at once.
   useEffect(() => {
@@ -183,12 +187,22 @@ export function TerminalPanel({
   // torn down and rebuilt as sessions come and go.
   const actions = useRef({
     new: () => {},
+    newIn: (_cwd: string) => {},
     split: () => {},
     clear: () => {},
     find: () => {},
     kill: () => {},
   });
-  useEffect(() => onTerminalRequest((request) => actions.current[request]()), []);
+  useEffect(
+    () =>
+      onTerminalRequest((request) => {
+        // "Open in Integrated Terminal" carries the folder it wants; everything else is a
+        // bare action name.
+        if (typeof request === "object") actions.current.newIn(request.cwd);
+        else actions.current[request]();
+      }),
+    [],
+  );
 
   // Closing anything that floats above the terminal when focus moves elsewhere.
   useEffect(() => {
@@ -333,6 +347,11 @@ export function TerminalPanel({
     new: () => {
       setActiveTab("terminal");
       create(shells[0]);
+    },
+    // "Open in Integrated Terminal": the same shell, started in the chosen folder.
+    newIn: (cwd: string) => {
+      setActiveTab("terminal");
+      create(shells[0], true, { cwd });
     },
     split: toggleSplit,
     clear: () => active()?.clear(),
@@ -713,8 +732,7 @@ export function TerminalPanel({
                   ref={(handle) => {
                     handles.current.set(session.id, handle);
                   }}
-                  id={session.id}
-                  shell={session.shell}
+                  session={session}
                   visible={!hidden && activeTab === "terminal" && position !== -1}
                   fontSize={fontSize}
                   onStatus={setStatus}

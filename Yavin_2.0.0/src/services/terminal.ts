@@ -17,11 +17,65 @@ export interface TerminalExit {
   code: number | null;
 }
 
+/**
+ * How a terminal is launched. A profile is a shell plus the extras VS Code lets a profile
+ * carry -- arguments, environment and a starting folder. None of these widen what a terminal
+ * can do (anyone who can open one can type any command into it); they just save typing the
+ * same setup every time.
+ */
+export interface TerminalProfile {
+  /** Shown on the tab and in the New Terminal menu. */
+  name: string;
+  /** Absolute path to the shell. Must be one the native side detected. */
+  shell: string;
+  args?: string[];
+  env?: Record<string, string>;
+  /** Where the shell starts. The workspace root when omitted. */
+  cwd?: string;
+}
+
 /** One terminal in the panel. The id is what every native call is keyed by. */
 export interface TerminalSession {
   id: string;
   name: string;
   shell: string;
+  /** Present when the terminal was started from a profile with extras. */
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+}
+
+/** A detected shell as a profile, which is what "New Terminal" offers by default. */
+export function profileForShell(shell: Shell): TerminalProfile {
+  return { name: shell.name, shell: shell.path };
+}
+
+/**
+ * The arguments `terminal_open` takes for a session. Environment is sent as pairs rather than
+ * an object so the native side keeps the author's ordering, which matters when one variable
+ * is written in terms of another.
+ */
+export function openArgsFor(
+  session: TerminalSession,
+  size: { cols: number; rows: number },
+): {
+  id: string;
+  shell: string;
+  cols: number;
+  rows: number;
+  args?: string[];
+  env?: [string, string][];
+  cwd?: string;
+} {
+  const env = session.env ? Object.entries(session.env) : undefined;
+  return {
+    id: session.id,
+    shell: session.shell,
+    ...size,
+    ...(session.args?.length ? { args: session.args } : {}),
+    ...(env?.length ? { env } : {}),
+    ...(session.cwd ? { cwd: session.cwd } : {}),
+  };
 }
 
 /**
@@ -233,20 +287,60 @@ export function zoomFontSize(current: number, action: TerminalKeyAction): number
 }
 
 /** Panel actions that the Terminal menu and the terminal itself can ask for. */
-export type TerminalRequest = "new" | "split" | "clear" | "find" | "kill";
+export type TerminalRequestName = "new" | "split" | "clear" | "find" | "kill";
+
+/** A request, optionally carrying the folder a new terminal should start in. */
+export type TerminalRequest = TerminalRequestName | { name: "new"; cwd: string };
 
 const REQUEST = "yavin.terminal.request";
+
+/** How many panels are currently listening, and a request that arrived while none were. */
+let panelListeners = 0;
+let undelivered: TerminalRequest | null = null;
 
 /**
  * Asks the panel to do something. A message keeps the menu in `App` independent of
  * how the panel tracks its sessions, which is the panel's own business.
+ *
+ * The panel is mounted lazily, so the first request of a session -- "Open in Integrated
+ * Terminal" from the explorer, say -- is sent before there is anything to receive it. Rather
+ * than drop it, it is held and delivered as soon as a panel subscribes.
  */
 export function requestTerminal(request: TerminalRequest): void {
+  // Dispatched first and unconditionally, so observers -- the app shell, which reveals the
+  // panel -- always see it. Only then is it held for a panel that has yet to mount.
   window.dispatchEvent(new CustomEvent(REQUEST, { detail: request }));
+  if (panelListeners === 0) undelivered = request;
 }
 
+/** Subscribes the panel. Only the panel should use this: it is what "delivered" means. */
 export function onTerminalRequest(handler: (request: TerminalRequest) => void): () => void {
   const listener = (event: Event) => handler((event as CustomEvent<TerminalRequest>).detail);
   window.addEventListener(REQUEST, listener);
+  panelListeners += 1;
+  if (undelivered !== null) {
+    const held = undelivered;
+    undelivered = null;
+    // After the caller has finished mounting, so the handler sees a settled component.
+    queueMicrotask(() => handler(held));
+  }
+  return () => {
+    panelListeners -= 1;
+    window.removeEventListener(REQUEST, listener);
+  };
+}
+
+/**
+ * Watches requests without counting as the panel's handler, so the app shell can reveal the
+ * panel for a request the panel does not exist yet to receive.
+ */
+export function onTerminalRequestObserved(handler: (request: TerminalRequest) => void): () => void {
+  const listener = (event: Event) => handler((event as CustomEvent<TerminalRequest>).detail);
+  window.addEventListener(REQUEST, listener);
   return () => window.removeEventListener(REQUEST, listener);
+}
+
+/** Test seam: forgets a request that was never delivered. */
+export function resetTerminalRequests(): void {
+  undelivered = null;
 }

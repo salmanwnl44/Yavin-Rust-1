@@ -5,6 +5,8 @@ import {
   describeExit,
   nextTerminalName,
   terminalKeyAction,
+  openArgsFor,
+  profileForShell,
   usableSize,
 } from "./terminal.ts";
 
@@ -133,4 +135,55 @@ test("the navigation keys do not collide with the existing copy and zoom binding
   assert.equal(terminalKeyAction(key("=", { ctrl: true }), false), "zoom-in");
   assert.equal(terminalKeyAction(key("`", { ctrl: true, shift: true }), false), "new");
   assert.equal(terminalKeyAction(key("5", { ctrl: true, shift: true }), false), "split");
+});
+
+test("a plain session sends no profile extras, so the native side keeps its defaults", () => {
+  const args = openArgsFor({ id: "t1", name: "Shell", shell: "/bin/bash" }, { cols: 80, rows: 24 });
+  assert.deepEqual(args, { id: "t1", shell: "/bin/bash", cols: 80, rows: 24 });
+  assert.equal("args" in args, false);
+  assert.equal("env" in args, false);
+  assert.equal("cwd" in args, false);
+});
+
+test("a profile's arguments, environment and folder all reach the native call", () => {
+  const args = openArgsFor(
+    {
+      id: "t2",
+      name: "PowerShell",
+      shell: "pwsh.exe",
+      args: ["-NoLogo"],
+      env: { YAVIN: "1", TERM_PROGRAM: "Yavin" },
+      cwd: "C:/work/sub",
+    },
+    { cols: 100, rows: 30 },
+  );
+  assert.deepEqual(args, {
+    id: "t2",
+    shell: "pwsh.exe",
+    cols: 100,
+    rows: 30,
+    args: ["-NoLogo"],
+    // Pairs, not an object: the native side keeps the author's ordering, which matters when
+    // one variable is written in terms of another.
+    env: [
+      ["YAVIN", "1"],
+      ["TERM_PROGRAM", "Yavin"],
+    ],
+    cwd: "C:/work/sub",
+  });
+});
+
+test("empty profile extras are omitted rather than sent as empty", () => {
+  const args = openArgsFor(
+    { id: "t3", name: "Shell", shell: "/bin/sh", args: [], env: {}, cwd: "" },
+    { cols: 80, rows: 24 },
+  );
+  assert.deepEqual(args, { id: "t3", shell: "/bin/sh", cols: 80, rows: 24 });
+});
+
+test("a detected shell becomes a profile with no extras", () => {
+  assert.deepEqual(profileForShell({ name: "Git Bash", path: "C:/Git/bash.exe" }), {
+    name: "Git Bash",
+    shell: "C:/Git/bash.exe",
+  });
 });

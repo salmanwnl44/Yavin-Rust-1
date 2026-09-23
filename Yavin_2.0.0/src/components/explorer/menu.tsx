@@ -13,6 +13,7 @@ import {
   PlusIcon,
   RefreshIcon,
   RelativePathIcon,
+  TerminalIcon,
   TrashIcon,
 } from "../ui/Icons";
 import { cleanPath, containingDir, getRelativePath } from "./paths";
@@ -35,6 +36,8 @@ export interface MenuActions {
   openFolderDialog(): void;
   refresh(): void;
   collapseAll(): void;
+  /** Starts a terminal in `directory` -- "Open in Integrated Terminal". */
+  openTerminal(directory: string): void;
 }
 
 const divider: MenuItem = { divider: true };
@@ -96,6 +99,14 @@ function pathItems(node: FileNode, actions: MenuActions): MenuItem[] {
       icon: <FolderOpenIcon name={node.name} className="size-4" />,
       label: "Reveal in File Explorer",
       onClick: () => actions.reveal(node.path),
+    },
+    {
+      icon: <TerminalIcon className="text-zinc-400" />,
+      label: "Open in Integrated Terminal",
+      // A file opens a terminal in the folder holding it, which is what VS Code does and
+      // what anyone asking for a terminal "here" means.
+      onClick: () =>
+        actions.openTerminal(node.is_dir ? node.path : node.path.replace(/[\\/][^\\/]*$/, "")),
     },
   ];
 }

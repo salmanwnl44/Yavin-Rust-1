@@ -45,7 +45,18 @@ interface Commands {
   git_unwatch_repo: { args: { repositoryId: string }; result: void };
   terminal_shells: { args: undefined; result: Shell[] };
   terminal_open: {
-    args: { id: string; shell?: string; cols: number; rows: number };
+    args: {
+      id: string;
+      shell?: string;
+      cols: number;
+      rows: number;
+      /** Extra arguments from a terminal profile, e.g. `-NoLogo`. */
+      args?: string[];
+      /** Profile environment, as pairs so ordering is preserved on the native side. */
+      env?: [string, string][];
+      /** Where the shell starts; the workspace root when omitted. */
+      cwd?: string;
+    };
     result: string;
   };
   terminal_write: { args: { id: string; data: string }; result: void };

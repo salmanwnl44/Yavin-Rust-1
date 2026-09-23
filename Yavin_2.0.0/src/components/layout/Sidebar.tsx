@@ -2,6 +2,7 @@ import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "re
 import type { FileNode } from "../../types";
 import type { Decorations } from "../../services/git";
 import { isWithin, parentOf, validateEntryName } from "../../services/workspace";
+import { requestTerminal } from "../../services/terminal";
 import { ContextMenu } from "../ui/ContextMenu";
 import { FolderClosedIcon, ChevronIcon } from "../ui/FileIcons";
 import { CollapseIcon, MoreIcon, PlusIcon, FolderPlusIcon, RefreshIcon } from "../ui/Icons";
@@ -390,6 +391,9 @@ export function Sidebar(props: SidebarProps) {
     openFolderDialog: props.onOpenFolderDialog,
     refresh: props.onRefresh,
     collapseAll: () => setExpandedPaths(new Set(rootPath ? [rootPath] : [])),
+    // Goes through the panel's own request channel, so the explorer stays unaware of how
+    // terminals are tracked.
+    openTerminal: (directory) => requestTerminal({ name: "new", cwd: directory }),
   };
 
   // --- Keyboard ------------------------------------------------------------
