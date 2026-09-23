@@ -5,6 +5,7 @@ import {
   findNode,
   isWithin,
   loadedDirectories,
+  mergeChildren,
   nearestLoadedDirectory,
   parentOf,
   parseGitStatus,
@@ -106,4 +107,69 @@ test("entry names are rejected when they are invalid on any supported platform",
   assert.notEqual(validateEntryName("../b.ts", true), null);
   assert.equal(validateEntryName(".gitignore"), null);
   assert.equal(validateEntryName("console.ts"), null);
+});
+
+const file = (path: string, extra: Partial<FileNode> = {}): FileNode => ({
+  name: path.slice(path.lastIndexOf("/") + 1),
+  path,
+  is_dir: false,
+  size: 10,
+  modified: 1000,
+  ...extra,
+});
+const dir = (path: string, children?: FileNode[] | null): FileNode => ({
+  ...file(path, { is_dir: true, size: 0 }),
+  children: children ?? null,
+});
+
+test("re-listing a directory hands back the entries that did not change", () => {
+  // The explorer memoizes a row on the node it renders, so an equal copy costs a re-render
+  // of every row in the directory -- and a refresh walks every loaded directory.
+  const previous = [file("/work/a.ts"), file("/work/b.ts")];
+  const merged = mergeChildren(previous, [file("/work/a.ts"), file("/work/b.ts")]);
+  assert.equal(merged[0], previous[0]);
+  assert.equal(merged[1], previous[1]);
+});
+
+test("an entry that changed on disk is a new object, and its neighbours are not", () => {
+  const previous = [file("/work/a.ts"), file("/work/b.ts")];
+  const merged = mergeChildren(previous, [
+    file("/work/a.ts", { size: 20, modified: 2000 }),
+    file("/work/b.ts"),
+  ]);
+  assert.notEqual(merged[0], previous[0], "the edited file is not the old object");
+  assert.equal(merged[0].size, 20);
+  assert.equal(merged[1], previous[1], "its neighbour is untouched");
+});
+
+test("a folder that was loaded keeps both its children and its identity", () => {
+  const inner = [file("/work/src/inner.ts")];
+  const previous = [dir("/work/src", inner)];
+  const merged = mergeChildren(previous, [dir("/work/src", null)]);
+  assert.equal(merged[0], previous[0], "same object, so the row stays memoized");
+  assert.equal(merged[0].children, inner);
+});
+
+test("a new entry appears without disturbing the ones already there", () => {
+  const previous = [file("/work/a.ts")];
+  const merged = mergeChildren(previous, [file("/work/a.ts"), file("/work/new.ts")]);
+  assert.equal(merged.length, 2);
+  assert.equal(merged[0], previous[0]);
+  assert.equal(merged[1].path, "/work/new.ts");
+});
+
+test("a listing that changes nothing leaves the whole tree as it was", () => {
+  // Nothing above the directory re-renders either, so a refresh that finds no changes is
+  // free to apply rather than rebuilding every ancestor.
+  const tree = dir("/work", [dir("/work/src", [file("/work/src/inner.ts")]), file("/work/a.ts")]);
+  const next = setChildren(tree, "/work/src", [file("/work/src/inner.ts")]);
+  assert.equal(next, tree);
+});
+
+test("a listing that changes something rebuilds the path to it, and nothing else", () => {
+  const sibling = file("/work/a.ts");
+  const tree = dir("/work", [dir("/work/src", [file("/work/src/inner.ts")]), sibling]);
+  const next = setChildren(tree, "/work/src", [file("/work/src/inner.ts", { modified: 2000 })]);
+  assert.notEqual(next, tree, "the root is new, so React sees the change");
+  assert.equal(next.children![1], sibling, "the untouched sibling is the same object");
 });

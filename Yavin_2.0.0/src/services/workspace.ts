@@ -23,27 +23,63 @@ export function findNode(tree: FileNode, path: string): FileNode | null {
   return null;
 }
 
-// A fresh listing replaces a directory's children; subfolders that were already loaded keep theirs.
-export function mergeChildren(previous: FileNode[] | null | undefined, listed: FileNode[]) {
-  const loaded = new Map(
-    (previous ?? []).filter((node) => node.is_dir && node.children).map((n) => [n.path, n]),
-  );
-  return listed.map((node) =>
-    node.is_dir && !node.children && loaded.has(node.path)
-      ? { ...node, children: loaded.get(node.path)!.children }
-      : node,
+/**
+ * Everything about an entry that a fresh listing could have changed. `children` is compared
+ * by identity, which is what makes the reuse below propagate up a subtree rather than
+ * stopping at the first directory.
+ */
+function sameEntry(a: FileNode, b: FileNode): boolean {
+  return (
+    a.name === b.name &&
+    a.is_dir === b.is_dir &&
+    a.size === b.size &&
+    a.modified === b.modified &&
+    a.readonly === b.readonly &&
+    a.children === b.children
   );
 }
 
+function sameNodes(a: FileNode[] | null | undefined, b: FileNode[]): boolean {
+  if (!a || a.length !== b.length) return false;
+  return a.every((node, index) => node === b[index]);
+}
+
+/**
+ * A fresh listing replaces a directory's children; subfolders that were already loaded keep
+ * theirs.
+ *
+ * An entry that has not changed is handed back as the object it already was, rather than as
+ * an equal copy. The explorer's rows are memoized on the node they render, so re-listing a
+ * directory used to re-render every row inside it -- and a refresh walks every loaded
+ * directory, so that was the whole visible tree, on every settled burst of filesystem events.
+ */
+export function mergeChildren(previous: FileNode[] | null | undefined, listed: FileNode[]) {
+  const before = new Map((previous ?? []).map((node) => [node.path, node]));
+  return listed.map((node) => {
+    const existing = before.get(node.path);
+    // A listing of the parent says nothing about what is inside a subfolder, so one that was
+    // already loaded keeps the children it had.
+    const children =
+      node.is_dir && !node.children && existing?.is_dir && existing.children
+        ? existing.children
+        : node.children;
+    const merged = children === node.children ? node : { ...node, children };
+    return existing && sameEntry(existing, merged) ? existing : merged;
+  });
+}
+
 export function setChildren(tree: FileNode, dir: string, listed: FileNode[]): FileNode {
-  if (tree.path === dir) return { ...tree, children: mergeChildren(tree.children, listed) };
+  if (tree.path === dir) {
+    const children = mergeChildren(tree.children, listed);
+    // Unchanged all the way down: hand back the same tree, so nothing above re-renders
+    // either. A refresh that finds nothing new then costs nothing to apply.
+    return sameNodes(tree.children, children) ? tree : { ...tree, children };
+  }
   if (!tree.children || !isWithin(dir, tree.path)) return tree;
-  return {
-    ...tree,
-    children: tree.children.map((child) =>
-      isWithin(dir, child.path) ? setChildren(child, dir, listed) : child,
-    ),
-  };
+  const children = tree.children.map((child) =>
+    isWithin(dir, child.path) ? setChildren(child, dir, listed) : child,
+  );
+  return sameNodes(tree.children, children) ? tree : { ...tree, children };
 }
 
 /** Directories whose children are loaded, parents before their descendants. */
