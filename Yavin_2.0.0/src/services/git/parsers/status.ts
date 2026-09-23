@@ -41,6 +41,20 @@ export interface Decorations {
 }
 
 /** Explorer badges keyed by path, plus the folders that contain changes. Built once per status refresh. */
+/**
+ * Whether two sets of decorations say the same thing.
+ *
+ * Rebuilding them produces equal maps with new identities, and the explorer takes them as a
+ * prop -- so a rebuild that changed nothing still re-rendered the tree. Comparing is O(n) in
+ * the number of changed files, which is the small number here; rendering is not.
+ */
+export function sameDecorations(a: Decorations, b: Decorations): boolean {
+  if (a.files.size !== b.files.size || a.folders.size !== b.folders.size) return false;
+  for (const [path, mark] of a.files) if (b.files.get(path) !== mark) return false;
+  for (const folder of a.folders) if (!b.folders.has(folder)) return false;
+  return true;
+}
+
 export function buildDecorations(entries: GitEntry[], workspace: string): Decorations {
   const files = new Map<string, string>();
   const folders = new Set<string>();

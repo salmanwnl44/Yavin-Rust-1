@@ -6,6 +6,7 @@ import type { GitOperation } from "../../services/git/backend";
 import { cloneRepository as cloneRepositoryFlow } from "../../services/git/clone";
 import { gitRegistry } from "../../services/git/registry";
 import { useActiveRepo, useGitRegistry, useRepoSnapshot } from "../../services/git/hooks";
+import { useGitRevision } from "../../services/git/revision";
 import { guardedAffecting } from "../../services/git/sync";
 import type { RefreshField } from "../../services/git/store";
 import { RepositoriesSection } from "../git/RepositoriesSection";
@@ -131,7 +132,6 @@ export function SourceControlPanel({
   visible,
   buffers,
   dirty,
-  revision,
   onDiff,
   onChanged,
   onEntries,
@@ -145,7 +145,6 @@ export function SourceControlPanel({
   visible: boolean;
   buffers: Record<string, string>;
   dirty: boolean;
-  revision: number;
   onDiff: (diff: DiffDocument | null) => void;
   onChanged: () => Promise<void>;
   onEntries: (entries: GitEntry[]) => void;
@@ -159,6 +158,9 @@ export function SourceControlPanel({
    * rest of the app already uses for New File/Delete/Go to Line. */
   onDialog: (request: DialogRequest) => void;
 }) {
+  // Subscribed here rather than taken as a prop: a counter held by the root component
+  // re-rendered the whole window every time anything asked Git to look again.
+  const revision = useGitRevision();
   const registrySnapshot = useGitRegistry();
   const activeRepo = useActiveRepo();
   const snapshot = useRepoSnapshot(activeRepo?.store);

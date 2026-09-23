@@ -2,7 +2,8 @@ export type { GitOperation, RepoInfo } from "./backend.ts";
 export { openRepo, closeRepo, gitExec, repoState } from "./backend.ts";
 
 export type { GitEntry, Decorations } from "./parsers/status.ts";
-export { parseGitEntries, buildDecorations } from "./parsers/status.ts";
+export { parseGitEntries, buildDecorations, sameDecorations } from "./parsers/status.ts";
+export { bumpGitRevision, useGitRevision } from "./revision.ts";
 
 export type { Branch } from "./parsers/branch.ts";
 export { parseBranch, divergence } from "./parsers/branch.ts";

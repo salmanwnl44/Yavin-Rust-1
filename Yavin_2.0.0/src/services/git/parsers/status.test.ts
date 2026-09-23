@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildDecorations, parseGitEntries } from "./status.ts";
+import { buildDecorations, parseGitEntries, sameDecorations } from "./status.ts";
 
 test("decorations cover every status, use workspace casing and mark ancestor folders", () => {
   const entries = parseGitEntries(
@@ -64,4 +64,27 @@ test("non-ASCII filenames pass through untouched, needing no escaping logic", ()
     entries.map((e) => e.path),
     ["/work/\u00e9\u00e9\u00e9.ts", "/work/\u65e5\u672c\u8a9e.ts"],
   );
+});
+
+test("decorations that say the same thing compare equal", () => {
+  // The explorer takes them as a prop, so a rebuilt-but-identical map re-rendered the tree.
+  const entries = parseGitEntries(" M src/a.ts\0?? b.ts\0", "C:/Work");
+  const first = buildDecorations(entries, "C:/Work");
+  const second = buildDecorations(entries, "C:/Work");
+  assert.notEqual(first, second, "they really are different objects");
+  assert.equal(sameDecorations(first, second), true);
+});
+
+test("a changed mark, a new file and a lost folder all compare unequal", () => {
+  const base = buildDecorations(parseGitEntries(" M src/a.ts\0", "C:/Work"), "C:/Work");
+  const changedMark = buildDecorations(parseGitEntries("?? src/a.ts\0", "C:/Work"), "C:/Work");
+  const extraFile = buildDecorations(
+    parseGitEntries(" M src/a.ts\0 M b.ts\0", "C:/Work"),
+    "C:/Work",
+  );
+  const noFolder = buildDecorations(parseGitEntries(" M a.ts\0", "C:/Work"), "C:/Work");
+
+  assert.equal(sameDecorations(base, changedMark), false, "the mark changed");
+  assert.equal(sameDecorations(base, extraFile), false, "a file was added");
+  assert.equal(sameDecorations(base, noFolder), false, "a marked folder went away");
 });

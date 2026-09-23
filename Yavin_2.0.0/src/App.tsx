@@ -57,8 +57,10 @@ import {
 } from "./services/workspace";
 import {
   buildDecorations,
+  bumpGitRevision,
   gitRegistry,
   guardedAffecting,
+  sameDecorations,
   useActiveRepo,
   useGitRegistry,
   useTotalChanges,
@@ -221,7 +223,6 @@ export default function App() {
     setPanelRequest((previous) => ({ nonce: previous.nonce + 1, view, channel }));
   }, []);
   const [searchFocus, setSearchFocus] = useState(0);
-  const [gitRevision, setGitRevision] = useState(0);
   const [pendingHit, setPendingHit] = useState<SearchHit | null>(null);
   const hasUnsavedChanges = tabs.some((tab) => tab.dirty);
   const totalGitChanges = useTotalChanges();
@@ -314,7 +315,7 @@ export default function App() {
       if (revision !== workspaceRevision.current) return;
       setWorkspacePath(treeRef.current?.path ?? target);
       setQuickOpen(null);
-      setGitRevision((value) => value + 1);
+      bumpGitRevision();
     },
     [loadDirectory],
   );
@@ -367,7 +368,7 @@ export default function App() {
       refreshingTree.current = false;
     }
     setQuickOpen(null);
-    setGitRevision((value) => value + 1);
+    bumpGitRevision();
   };
   // Re-lists the loaded folders that hold `paths` after a file operation.
   const refreshAround = async (...paths: string[]) => {
@@ -376,7 +377,7 @@ export default function App() {
     for (const directory of new Set(paths.map((path) => nearestLoadedDirectory(tree, path))))
       await loadDirectory(directory);
     setQuickOpen(null);
-    setGitRevision((value) => value + 1);
+    bumpGitRevision();
   };
 
   /**
@@ -528,7 +529,7 @@ export default function App() {
   // Git decorations refresh on focus when the Source Control panel is not polling.
   useEffect(() => {
     if (isSidebarOpen && activeActivityTab === "git") return;
-    const refresh = () => setGitRevision((value) => value + 1);
+    const refresh = () => bumpGitRevision();
     window.addEventListener("focus", refresh);
     return () => window.removeEventListener("focus", refresh);
   }, [isSidebarOpen, activeActivityTab]);
@@ -610,7 +611,7 @@ export default function App() {
             tab.path === path ? { ...tab, dirty: contentsRef.current[path] !== content } : tab,
           ),
         );
-        setGitRevision((value) => value + 1);
+        bumpGitRevision();
       } finally {
         saving.current.delete(path);
       }
@@ -847,7 +848,7 @@ export default function App() {
         errors.push(`${change.path}: ${String(error)}`);
       }
     }
-    setGitRevision((value) => value + 1);
+    bumpGitRevision();
     return { applied, errors };
   };
 
@@ -895,7 +896,7 @@ export default function App() {
     if (ok) {
       try {
         await reconcileWorkspace();
-        setGitRevision((value) => value + 1);
+        bumpGitRevision();
       } catch (error) {
         entry.store.setNotice(String(error));
       }
@@ -1084,7 +1085,7 @@ export default function App() {
         // op) already bumps this once its own writes settle; Save All omitted
         // it, leaving Git status to fall back entirely on the ~300ms watcher
         // latency instead of the immediate trigger every other path gets.
-        if (dirtyTabs.length) setGitRevision((value) => value + 1);
+        if (dirtyTabs.length) bumpGitRevision();
       },
     },
     {
@@ -1513,11 +1514,15 @@ export default function App() {
             buffers={fileContents}
             visible={isSidebarOpen && activeActivityTab === "git"}
             dirty={hasUnsavedChanges}
-            revision={gitRevision}
             onDiff={setDiff}
             onChanged={reconcileWorkspace}
             apply={(changes) => applyReplacements(changes, true)}
-            onEntries={(entries) => setDecorations(buildDecorations(entries, workspacePath))}
+            onEntries={(entries) => {
+              // Kept when it says the same thing: the explorer takes these as a prop, and a
+              // rebuilt-but-identical map re-rendered the whole tree for nothing.
+              const next = buildDecorations(entries, workspacePath);
+              setDecorations((previous) => (sameDecorations(previous, next) ? previous : next));
+            }}
             activeDiffPath={diff?.path}
             onOpenGraph={() => {
               setDiff(null);
