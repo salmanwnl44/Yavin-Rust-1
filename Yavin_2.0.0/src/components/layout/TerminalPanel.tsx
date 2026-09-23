@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { native } from "../../services/native";
 import { TerminalView } from "../terminal/TerminalView";
 import type { TerminalHandle } from "../terminal/TerminalView";
@@ -16,6 +16,7 @@ import { PANEL_VIEWS, readActiveView, saveActiveView, stepView } from "../../ser
 import type { PanelViewId } from "../../services/panel/views";
 import { clampToViewport } from "../../services/panel/menuPosition";
 import { ProblemsView } from "../panel/views/ProblemsView";
+import { problemCounts, problemsVersion, subscribeProblems } from "../../services/panel/problems";
 import { OutputView } from "../panel/views/OutputView";
 import { DebugConsoleView } from "../panel/views/DebugConsoleView";
 import { PortsView } from "../panel/views/PortsView";
@@ -91,6 +92,9 @@ export function TerminalPanel({
   isMaximized,
   onToggleMaximize,
   outputChannel,
+  requestedView,
+  activeFile,
+  onOpenProblem,
 }: {
   hidden: boolean;
   onClose: () => void;
@@ -98,7 +102,15 @@ export function TerminalPanel({
   onToggleMaximize: () => void;
   /** Channel the Output view should show, when something asked for a specific one. */
   outputChannel?: string;
+  /** A view something asked to see, e.g. the status bar's problem counts. */
+  requestedView?: PanelViewId;
+  /** The file in the editor, for the Problems view's "current file only" toggle. */
+  activeFile?: string;
+  /** Opens a file at a position, for clicking a problem. */
+  onOpenProblem?: (file: string, line: number, column: number) => void;
 }) {
+  // Re-renders the tab strip as diagnostics change, so the badge stays accurate.
+  useSyncExternalStore(subscribeProblems, problemsVersion, problemsVersion);
   const [activeTab, setActiveTabState] = useState<PanelViewId>(readActiveView);
   const setActiveTab = useCallback((id: PanelViewId) => {
     setActiveTabState(id);
@@ -212,6 +224,10 @@ export function TerminalPanel({
     if (outputChannel) setActiveTab("output");
   }, [outputChannel, setActiveTab]);
 
+  useEffect(() => {
+    if (requestedView) setActiveTab(requestedView);
+  }, [requestedView, setActiveTab]);
+
   // Closing anything that floats above the terminal when focus moves elsewhere.
   useEffect(() => {
     if (!menu && !shellMenu) return;
@@ -284,8 +300,10 @@ export function TerminalPanel({
 
   /** Per-view tab counts. Only the terminal has something to count so far; Problems and
    * Ports fill these in as those views gain real data. */
+  const counts = problemCounts();
   const badges: Record<PanelViewId, number> = {
-    problems: 0,
+    // Errors and warnings, matching VS Code's badge; informational entries are not counted.
+    problems: counts.error + counts.warning,
     output: 0,
     debug: 0,
     terminal: sessions.length > 1 ? sessions.length : 0,
@@ -769,7 +787,9 @@ export function TerminalPanel({
             />
           )}
         </div>
-        {activeTab === "problems" && <ProblemsView />}
+        {activeTab === "problems" && (
+          <ProblemsView activeFile={activeFile} onOpen={onOpenProblem} />
+        )}
         {activeTab === "output" && <OutputView initialChannel={outputChannel} />}
         {activeTab === "debug" && <DebugConsoleView />}
         {activeTab === "ports" && <PortsView />}

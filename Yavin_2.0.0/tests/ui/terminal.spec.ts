@@ -32,7 +32,13 @@ async function terminalMenu(page: Page, item: string) {
  */
 async function desktop(
   page: Page,
-  options: { failOpen?: string; failGit?: string; ports?: unknown[] } = {},
+  options: {
+    failOpen?: string;
+    failGit?: string;
+    ports?: unknown[];
+    checkers?: { id: string; label: string }[];
+    checkerOutput?: string;
+  } = {},
 ) {
   await page.addInitScript((setup) => {
     const calls: Call[] = [];
@@ -71,6 +77,12 @@ async function desktop(
               children: [{ path: "/work/file.ts", name: "file.ts", is_dir: false, children: null }],
             };
           if (command === "list_listening_ports") return setup.ports ?? [];
+          if (command === "available_checkers") return setup.checkers ?? [];
+          if (command === "run_checker") {
+            const override = (window as unknown as { __scenarioCheckerOutput?: string })
+              .__scenarioCheckerOutput;
+            return override !== undefined ? override : (setup.checkerOutput ?? "");
+          }
           if (command === "stop_listening_process") return null;
           if (command === "terminal_shells")
             return [
@@ -866,4 +878,104 @@ test("confirming the stop ends the process holding that port", async ({ page }) 
   await expect
     .poll(async () => (await calls(page, "stop_listening_process")).map((c) => c.args.port))
     .toContain(5173);
+});
+
+const TSC_OUTPUT = [
+  "src/app.ts(12,7): error TS2345: Argument of type 'string' is not assignable.",
+  "src/app.ts(20,1): warning TS6133: 'unused' is declared but never read.",
+  "src/other.ts(3,2): error TS1005: ';' expected.",
+  "Found 3 errors.",
+].join("\n");
+
+test("Problems explains how diagnostics are collected when no checker applies", async ({
+  page,
+}) => {
+  await desktop(page, { checkers: [] });
+  await showView(page, "PROBLEMS");
+  await expect(page.getByRole("region", { name: "Problems" })).toContainText(
+    "running your project's own compiler or linter",
+  );
+});
+
+test("running a checker lists its diagnostics grouped by file", async ({ page }) => {
+  await desktop(page, {
+    checkers: [{ id: "tsc", label: "TypeScript" }],
+    checkerOutput: TSC_OUTPUT,
+  });
+  await showView(page, "PROBLEMS");
+
+  const problems = page.getByRole("region", { name: "Problems" });
+  await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
+
+  await expect(problems.getByRole("button", { name: /src\/app\.ts/ })).toBeVisible();
+  await expect(problems.getByRole("button", { name: /src\/other\.ts/ })).toBeVisible();
+  await expect(problems.getByText(/not assignable/)).toBeVisible();
+  await expect(problems.getByText(/Ln 12, Col 7/)).toBeVisible();
+});
+
+test("the Problems tab is badged with the error and warning count", async ({ page }) => {
+  await desktop(page, {
+    checkers: [{ id: "tsc", label: "TypeScript" }],
+    checkerOutput: TSC_OUTPUT,
+  });
+  await showView(page, "PROBLEMS");
+  await page
+    .getByRole("region", { name: "Problems" })
+    .getByRole("button", { name: "TypeScript", exact: true })
+    .click();
+
+  // Two errors and one warning.
+  await expect(page.getByRole("tab", { name: /PROBLEMS/ })).toContainText("3");
+});
+
+test("severity toggles narrow the list", async ({ page }) => {
+  await desktop(page, {
+    checkers: [{ id: "tsc", label: "TypeScript" }],
+    checkerOutput: TSC_OUTPUT,
+  });
+  await showView(page, "PROBLEMS");
+  const problems = page.getByRole("region", { name: "Problems" });
+  await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
+  await expect(problems.getByText(/never read/)).toBeVisible();
+
+  await problems.getByRole("button", { name: "warnings" }).click();
+  await expect(problems.getByText(/never read/)).toHaveCount(0);
+  await expect(problems.getByText(/not assignable/)).toBeVisible();
+});
+
+test("the filter accepts text and a negated glob", async ({ page }) => {
+  await desktop(page, {
+    checkers: [{ id: "tsc", label: "TypeScript" }],
+    checkerOutput: TSC_OUTPUT,
+  });
+  await showView(page, "PROBLEMS");
+  const problems = page.getByRole("region", { name: "Problems" });
+  await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
+
+  await problems.getByLabel("Filter problems").fill("other");
+  await expect(problems.getByRole("button", { name: /src\/other\.ts/ })).toBeVisible();
+  await expect(problems.getByRole("button", { name: /src\/app\.ts/ })).toHaveCount(0);
+
+  await problems.getByLabel("Filter problems").fill("!*other*");
+  await expect(problems.getByRole("button", { name: /src\/app\.ts/ })).toBeVisible();
+  await expect(problems.getByRole("button", { name: /src\/other\.ts/ })).toHaveCount(0);
+});
+
+test("a second run replaces that checker's earlier findings", async ({ page }) => {
+  await desktop(page, {
+    checkers: [{ id: "tsc", label: "TypeScript" }],
+    checkerOutput: TSC_OUTPUT,
+  });
+  await showView(page, "PROBLEMS");
+  const problems = page.getByRole("region", { name: "Problems" });
+  await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
+  await expect(problems.getByText(/not assignable/)).toBeVisible();
+
+  // The tool now reports nothing, which must clear what it said before rather than
+  // leaving stale diagnostics behind.
+  await page.evaluate(() => {
+    (window as unknown as { __scenarioCheckerOutput: string }).__scenarioCheckerOutput = "";
+  });
+  await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
+  await expect(problems.getByText(/No problems match|No checker has run/)).toBeVisible();
 });

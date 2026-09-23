@@ -1,13 +1,24 @@
-﻿import type { Branch } from "../../services/git";
+﻿import { useSyncExternalStore } from "react";
+import type { Branch } from "../../services/git";
 import { GitBranchIcon } from "../ui/Icons";
+import { problemCounts, problemsVersion, subscribeProblems } from "../../services/panel/problems";
 
 interface StatusBarProps {
   activeFile: string;
   onToggleTerminal: () => void;
   branch?: Branch;
+  /** Opens the Problems view, as clicking the count does in VS Code. */
+  onShowProblems?: () => void;
 }
 
-export function StatusBar({ activeFile, onToggleTerminal, branch }: StatusBarProps) {
+export function StatusBar({
+  activeFile,
+  onToggleTerminal,
+  branch,
+  onShowProblems,
+}: StatusBarProps) {
+  useSyncExternalStore(subscribeProblems, problemsVersion, problemsVersion);
+  const counts = problemCounts();
   const language = activeFile.endsWith(".tsx")
     ? "TypeScript React"
     : activeFile.endsWith(".ts")
@@ -37,6 +48,18 @@ export function StatusBar({ activeFile, onToggleTerminal, branch }: StatusBarPro
               </span>
             )}
           </span>
+        )}
+        {/* Errors and warnings, clicking through to the Problems view -- but only once a
+            checker has run, so an empty bar does not imply a clean build that never happened. */}
+        {(counts.error > 0 || counts.warning > 0) && (
+          <button
+            onClick={onShowProblems}
+            title={`${counts.error} error${counts.error === 1 ? "" : "s"}, ${counts.warning} warning${counts.warning === 1 ? "" : "s"}`}
+            className="flex shrink-0 items-center gap-1.5 hover:text-zinc-200"
+          >
+            <span className={counts.error ? "text-red-400" : ""}>× {counts.error}</span>
+            <span className={counts.warning ? "text-amber-400" : ""}>! {counts.warning}</span>
+          </button>
         )}
         <span className="truncate">{activeFile || "Yavin IDE"}</span>
       </div>

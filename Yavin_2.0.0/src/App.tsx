@@ -26,6 +26,7 @@ import { CommitGraphPanel } from "./components/git/CommitGraphPanel";
 import type { SearchHit } from "./services/search";
 import { recordEdit } from "./services/editor";
 import { requestTerminal, onTerminalRequestObserved } from "./services/terminal";
+import type { PanelViewId } from "./services/panel/views";
 
 import { isTauri } from "@tauri-apps/api/core";
 import type { FileNode, EditorTab, RecentFile } from "./types";
@@ -153,6 +154,8 @@ export default function App() {
   const [showGraph, setShowGraph] = useState(false);
   /** Set when something asked to see a particular Output channel, e.g. "Show Git Output". */
   const [outputChannel, setOutputChannel] = useState<string | undefined>(undefined);
+  /** Set when something asked for a particular panel view, e.g. the status bar's counts. */
+  const [panelView, setPanelView] = useState<PanelViewId | undefined>(undefined);
   const [searchFocus, setSearchFocus] = useState(0);
   const [gitRevision, setGitRevision] = useState(0);
   const [pendingHit, setPendingHit] = useState<SearchHit | null>(null);
@@ -1283,6 +1286,13 @@ export default function App() {
                   isMaximized={isTerminalMaximized}
                   onToggleMaximize={() => setIsTerminalMaximized((prev) => !prev)}
                   outputChannel={outputChannel}
+                  requestedView={panelView}
+                  activeFile={activeTab?.path}
+                  onOpenProblem={(file, line) => {
+                    // Opening is asynchronous, so the jump waits for the editor to hold the
+                    // file; otherwise it would scroll whatever was open before.
+                    void handleOpenFile(file).then(() => editorRef.current?.goToLine(line));
+                  }}
                 />
               </Suspense>
             )}
@@ -1296,6 +1306,10 @@ export default function App() {
         <StatusBar
           activeFile={activeTab?.path || ""}
           onToggleTerminal={() => showTerminal((prev) => !prev)}
+          onShowProblems={() => {
+            showTerminal(true);
+            setPanelView("problems");
+          }}
           branch={activeRepoSnapshot?.branch}
         />
 
