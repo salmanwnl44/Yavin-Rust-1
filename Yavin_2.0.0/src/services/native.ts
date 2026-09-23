@@ -32,6 +32,8 @@ interface Commands {
   git_close_repo: { args: { repoId: string }; result: void };
   git_probe_worktree: { args: { repoId: string }; result: "ready" | "missing" | "invalid" };
   open_external_url: { args: { url: string }; result: void };
+  list_listening_ports: { args: undefined; result: ListeningPort[] };
+  stop_listening_process: { args: { port: number }; result: void };
   git_exec: {
     args: { repoId: string; args: string[]; id: string; input?: string };
     result: ToolOutput;
@@ -63,6 +65,16 @@ interface Commands {
   terminal_resize: { args: { id: string; cols: number; rows: number }; result: void };
   terminal_close: { args: { id: string }; result: void };
   terminal_close_all: { args: undefined; result: void };
+}
+
+/** A local TCP port something is listening on, as the Ports view shows it. */
+export interface ListeningPort {
+  port: number;
+  /** The interface it listens on, e.g. `127.0.0.1` or `0.0.0.0` (any). */
+  address: string;
+  pid: number;
+  /** Empty when the owning process could not be named -- normal for system-owned ports. */
+  process: string;
 }
 
 export interface ToolOutput {

@@ -30,7 +30,10 @@ async function terminalMenu(page: Page, item: string) {
  * Installs a Tauri mock that can deliver events, so shells can be driven from the test.
  * `failOpen` makes a spawn fail the way a missing workspace would.
  */
-async function desktop(page: Page, options: { failOpen?: string; failGit?: string } = {}) {
+async function desktop(
+  page: Page,
+  options: { failOpen?: string; failGit?: string; ports?: unknown[] } = {},
+) {
   await page.addInitScript((setup) => {
     const calls: Call[] = [];
     const callbacks: Record<number, (event: unknown) => void> = {};
@@ -67,6 +70,8 @@ async function desktop(page: Page, options: { failOpen?: string; failGit?: strin
               is_dir: true,
               children: [{ path: "/work/file.ts", name: "file.ts", is_dir: false, children: null }],
             };
+          if (command === "list_listening_ports") return setup.ports ?? [];
+          if (command === "stop_listening_process") return null;
           if (command === "terminal_shells")
             return [
               { name: "Command Prompt", path: "C:\\Windows\\System32\\cmd.exe" },
@@ -789,4 +794,76 @@ test("clearing one output channel does not touch another", async ({ page }) => {
   await expect(output.getByRole("listitem").first()).toBeVisible();
   await output.getByRole("button", { name: "Clear" }).click();
   await expect(output.getByText("This channel has produced no output yet.")).toBeVisible();
+});
+
+/** Selects a panel view by its tab label. */
+async function showView(page: Page, label: string) {
+  await openPanel(page);
+  await page
+    .getByRole("tablist", { name: "Panel views" })
+    .getByRole("tab", { name: label })
+    .click();
+}
+
+test("Ports lists what is listening, with the process holding each one", async ({ page }) => {
+  await desktop(page, {
+    ports: [
+      { port: 5173, address: "127.0.0.1", pid: 23188, process: "node.exe" },
+      { port: 8080, address: "0.0.0.0", pid: 9012, process: "" },
+    ],
+  });
+  await showView(page, "PORTS");
+
+  const ports = page.getByRole("region", { name: "Ports" });
+  await expect(ports.getByRole("row")).toHaveCount(3); // header plus two services
+  await expect(ports.getByRole("cell", { name: "5173", exact: true })).toBeVisible();
+  await expect(ports.getByText("http://localhost:5173")).toBeVisible();
+  await expect(ports.getByText("node.exe")).toBeVisible();
+  // A port whose owner could not be named still lists, rather than being hidden.
+  await expect(ports.getByText("Unknown")).toBeVisible();
+});
+
+test("Ports says what it is for when nothing is listening", async ({ page }) => {
+  await desktop(page, { ports: [] });
+  await showView(page, "PORTS");
+  await expect(page.getByRole("region", { name: "Ports" })).toContainText("Start a dev server");
+});
+
+test("a port opens over http on loopback, which is how a dev server is served", async ({
+  page,
+}) => {
+  await desktop(page, { ports: [{ port: 5173, address: "127.0.0.1", pid: 1, process: "node" }] });
+  await showView(page, "PORTS");
+
+  await page.getByRole("button", { name: "Open port 5173 in your browser" }).click();
+  await expect
+    .poll(async () => (await calls(page, "open_external_url")).map((c) => c.args.url))
+    .toContain("http://localhost:5173");
+});
+
+test("stopping a process asks first and names what it will end", async ({ page }) => {
+  await desktop(page, { ports: [{ port: 5173, address: "127.0.0.1", pid: 1, process: "node" }] });
+  await showView(page, "PORTS");
+
+  let asked = "";
+  page.on("dialog", (dialog) => {
+    asked = dialog.message();
+    void dialog.dismiss();
+  });
+  await page.getByRole("button", { name: "Stop the process on port 5173" }).click();
+  expect(asked).toContain("node");
+  expect(asked).toContain("5173");
+  // Dismissed, so nothing was stopped.
+  expect(await countCalls(page, "stop_listening_process")).toBe(0);
+});
+
+test("confirming the stop ends the process holding that port", async ({ page }) => {
+  await desktop(page, { ports: [{ port: 5173, address: "127.0.0.1", pid: 1, process: "node" }] });
+  await showView(page, "PORTS");
+
+  page.on("dialog", (dialog) => void dialog.accept());
+  await page.getByRole("button", { name: "Stop the process on port 5173" }).click();
+  await expect
+    .poll(async () => (await calls(page, "stop_listening_process")).map((c) => c.args.port))
+    .toContain(5173);
 });

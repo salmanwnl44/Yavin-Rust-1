@@ -5,6 +5,7 @@ use std::{env, path::Path, sync::Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 mod external;
 mod git;
+mod ports;
 mod terminal;
 mod workbench;
 use external::open_external_url;
@@ -13,6 +14,7 @@ use git::{
     git_probe_worktree, git_repo_state, git_unwatch_repo, git_watch_repo, GitJobs, GitWatches,
     NetworkLocks, Repos, StashLocks,
 };
+use ports::{list_listening_ports, stop_listening_process};
 use terminal::{
     terminal_close, terminal_close_all, terminal_open, terminal_resize, terminal_shells,
     terminal_write, Terminals,
@@ -218,6 +220,8 @@ pub fn run() {
             git_cancel_repo,
             git_probe_worktree,
             open_external_url,
+            list_listening_ports,
+            stop_listening_process,
             git_repo_state,
             git_watch_repo,
             git_unwatch_repo,

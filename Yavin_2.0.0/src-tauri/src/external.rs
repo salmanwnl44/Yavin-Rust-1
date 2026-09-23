@@ -18,8 +18,16 @@ use std::process::Command;
 /// of them are refused rather than escaped.
 pub fn is_openable_web_url(url: &str) -> bool {
     const MAX_URL: usize = 2048;
-    let Some(rest) = url.strip_prefix("https://") else {
-        return false;
+    // `https` anywhere, and `http` only to the loopback address. A local dev server is
+    // almost never served over TLS, and the Ports view exists to open exactly those -- but
+    // plain http to an arbitrary host is the case worth refusing, so the exception is
+    // confined to the one host that cannot be somebody else's machine.
+    let rest = match url.strip_prefix("https://") {
+        Some(rest) => rest,
+        None => match url.strip_prefix("http://") {
+            Some(rest) if is_loopback(rest) => rest,
+            _ => return false,
+        },
     };
     if url.len() > MAX_URL || rest.is_empty() {
         return false;
@@ -33,6 +41,22 @@ pub fn is_openable_web_url(url: &str) -> bool {
     let host = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host = host.rsplit('@').next().unwrap_or("");
     !host.is_empty() && !host.starts_with('-')
+}
+
+/// Whether the authority names this machine's loopback interface, and nothing else. Compared
+/// against the whole host so `localhost.evil.test` is not mistaken for `localhost`.
+fn is_loopback(rest: &str) -> bool {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    let host = host
+        .strip_prefix('[')
+        .map_or(host, |bracketed| bracketed.split(']').next().unwrap_or(""));
+    let host = if host.starts_with("::") {
+        host
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 pub fn open_in_browser(url: &str) -> Result<(), String> {
@@ -88,9 +112,22 @@ mod tests {
         ] {
             assert!(is_openable_web_url(good), "should be openable: {good}");
         }
+        // Plain http is allowed to the loopback address only, so the Ports view can open a
+        // local dev server -- which is essentially never served over TLS.
+        for good in [
+            "http://localhost:5173/",
+            "http://127.0.0.1:8080",
+            "http://[::1]:3000/path",
+        ] {
+            assert!(is_openable_web_url(good), "loopback http: {good}");
+        }
         for bad in [
             "",
             "http://github.com/x",
+            // Not loopback, however much the name looks like it.
+            "http://localhost.evil.test/x",
+            "http://127.0.0.1.evil.test/x",
+            "http://evil.test/?x=localhost",
             "file:///etc/passwd",
             "javascript:alert(1)",
             "https://",
