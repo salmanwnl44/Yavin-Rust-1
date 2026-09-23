@@ -23,7 +23,6 @@ import { SourceControlPanel } from "./components/layout/SourceControlPanel";
 import { DiffEditor } from "./components/layout/DiffEditor";
 import type { DiffDocument } from "./components/layout/DiffEditor";
 import { CommitGraphPanel } from "./components/git/CommitGraphPanel";
-import { GitOutputPanel } from "./components/git/GitOutputPanel";
 import type { SearchHit } from "./services/search";
 import { recordEdit } from "./services/editor";
 import { requestTerminal, onTerminalRequestObserved } from "./services/terminal";
@@ -152,7 +151,8 @@ export default function App() {
   const [activeActivityTab, setActiveActivityTab] = useState("explorer");
   const [diff, setDiff] = useState<DiffDocument | null>(null);
   const [showGraph, setShowGraph] = useState(false);
-  const [showGitOutput, setShowGitOutput] = useState(false);
+  /** Set when something asked to see a particular Output channel, e.g. "Show Git Output". */
+  const [outputChannel, setOutputChannel] = useState<string | undefined>(undefined);
   const [searchFocus, setSearchFocus] = useState(0);
   const [gitRevision, setGitRevision] = useState(0);
   const [pendingHit, setPendingHit] = useState<SearchHit | null>(null);
@@ -1177,9 +1177,10 @@ export default function App() {
               setShowGraph(true);
             }}
             onShowOutput={() => {
-              setDiff(null);
-              setShowGraph(false);
-              setShowGitOutput(true);
+              // The Output view in the bottom panel, with Git selected -- where VS Code
+              // shows it, rather than a second, Git-only view of the same log.
+              showTerminal(true);
+              setOutputChannel("git");
             }}
             onDialog={setDialog}
           />
@@ -1207,9 +1208,7 @@ export default function App() {
 
           {/* Center: Editor + Bottom Terminal Panel */}
           <div className="flex flex-1 flex-col min-w-0 bg-[#000000]">
-            {showGitOutput ? (
-              <GitOutputPanel onClose={() => setShowGitOutput(false)} />
-            ) : showGraph && activeRepo ? (
+            {showGraph && activeRepo ? (
               <CommitGraphPanel
                 key={activeRepo.repoId}
                 repository={activeRepo.store.repository}
@@ -1283,6 +1282,7 @@ export default function App() {
                   onClose={() => setIsTerminalOpen(false)}
                   isMaximized={isTerminalMaximized}
                   onToggleMaximize={() => setIsTerminalMaximized((prev) => !prev)}
+                  outputChannel={outputChannel}
                 />
               </Suspense>
             )}

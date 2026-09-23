@@ -90,11 +90,14 @@ export function TerminalPanel({
   onClose,
   isMaximized,
   onToggleMaximize,
+  outputChannel,
 }: {
   hidden: boolean;
   onClose: () => void;
   isMaximized: boolean;
   onToggleMaximize: () => void;
+  /** Channel the Output view should show, when something asked for a specific one. */
+  outputChannel?: string;
 }) {
   const [activeTab, setActiveTabState] = useState<PanelViewId>(readActiveView);
   const setActiveTab = useCallback((id: PanelViewId) => {
@@ -203,6 +206,11 @@ export function TerminalPanel({
       }),
     [],
   );
+
+  // "Show Git Output" and friends name a channel; showing it means showing the Output view.
+  useEffect(() => {
+    if (outputChannel) setActiveTab("output");
+  }, [outputChannel, setActiveTab]);
 
   // Closing anything that floats above the terminal when focus moves elsewhere.
   useEffect(() => {
@@ -762,7 +770,7 @@ export function TerminalPanel({
           )}
         </div>
         {activeTab === "problems" && <ProblemsView />}
-        {activeTab === "output" && <OutputView />}
+        {activeTab === "output" && <OutputView initialChannel={outputChannel} />}
         {activeTab === "debug" && <DebugConsoleView />}
         {activeTab === "ports" && <PortsView />}
       </div>

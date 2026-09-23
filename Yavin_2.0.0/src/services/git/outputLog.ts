@@ -6,6 +6,9 @@
  * work and no way for a new caller to forget to log itself.
  */
 
+import { createOutputChannel } from "../panel/output.ts";
+import type { OutputChannel } from "../panel/output.ts";
+
 /** The largest number of entries kept. Old entries are dropped, oldest first. */
 const CAPACITY = 500;
 /** Git's stderr on a failure is the useful part; a runaway one is not worth keeping whole. */
@@ -136,6 +139,21 @@ export function recordGitEnd(
         }),
   };
   changed();
+
+  // Mirrored into the panel's Output view, where VS Code shows the same thing. The
+  // structured buffer above stays the source of truth -- it holds the redaction and the
+  // running/finished distinction -- and this is its readable form.
+  const finished = entries[index];
+  const failed = finished.code !== 0;
+  gitChannel().appendLine(formatGitLogEntry(finished), failed ? "error" : "info");
+  if (finished.stderr) gitChannel().appendLine(`  ${finished.stderr}`, "error");
+}
+
+/** Resolved lazily so importing this module does not force the channel registry to load. */
+let channel: OutputChannel | null = null;
+function gitChannel(): OutputChannel {
+  channel ??= createOutputChannel("Git");
+  return channel;
 }
 
 /** The command line as it would be typed, for display and for copying out of the view. */

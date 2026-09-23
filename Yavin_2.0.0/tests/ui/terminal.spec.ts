@@ -30,7 +30,7 @@ async function terminalMenu(page: Page, item: string) {
  * Installs a Tauri mock that can deliver events, so shells can be driven from the test.
  * `failOpen` makes a spawn fail the way a missing workspace would.
  */
-async function desktop(page: Page, options: { failOpen?: string } = {}) {
+async function desktop(page: Page, options: { failOpen?: string; failGit?: string } = {}) {
   await page.addInitScript((setup) => {
     const calls: Call[] = [];
     const callbacks: Record<number, (event: unknown) => void> = {};
@@ -78,7 +78,10 @@ async function desktop(page: Page, options: { failOpen?: string } = {}) {
           }
           if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
           if (command === "git_repo_state") return "";
-          if (command === "git_exec") return { stdout: "", stderr: "", code: 0, truncated: false };
+          if (command === "git_exec")
+            return setup.failGit
+              ? { stdout: "", stderr: setup.failGit, code: 128, truncated: false }
+              : { stdout: "", stderr: "", code: 0, truncated: false };
           return null;
         },
       },
@@ -716,4 +719,74 @@ test("Open in Integrated Terminal starts a shell in the chosen folder", async ({
   const opened = await calls(page, "terminal_open");
   // A file opens a terminal in the folder holding it, not in the file.
   expect(opened.some((call) => call.args.cwd === "/work")).toBe(true);
+});
+
+test("Show Git Output opens the Output view with the Git channel", async ({ page }) => {
+  // VS Code shows this in the Output view rather than a second Git-only log view.
+  await desktop(page);
+  await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
+  await page
+    .getByRole("complementary", { name: "Source control" })
+    .getByLabel("Changes actions")
+    .click();
+  await page.getByRole("menuitem", { name: "Show Git Output" }).click();
+
+  const output = page.getByRole("region", { name: "Output" });
+  await expect(output).toBeVisible();
+  await expect(output.getByLabel("Output channel")).toHaveValue("git");
+  // Real content: the Git commands the panel already ran on startup.
+  await expect(output.getByRole("listitem").first()).toContainText("git");
+});
+
+test("the Output view filters by level, so ordinary output can be hidden", async ({ page }) => {
+  // Every mocked Git command succeeds here, so every line is info: raising the minimum level
+  // to error must empty the view, and lowering it must bring the lines back.
+  await desktop(page);
+  await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
+  await page
+    .getByRole("complementary", { name: "Source control" })
+    .getByLabel("Changes actions")
+    .click();
+  await page.getByRole("menuitem", { name: "Show Git Output" }).click();
+
+  const output = page.getByRole("region", { name: "Output" });
+  await expect(output.getByRole("listitem").first()).toBeVisible();
+
+  await output.getByLabel("Minimum log level").selectOption("error");
+  await expect(output.getByText("Nothing at this level.")).toBeVisible();
+
+  await output.getByLabel("Minimum log level").selectOption("info");
+  await expect(output.getByRole("listitem").first()).toBeVisible();
+});
+
+test("a failed Git command is recorded at error level, so it survives the filter", async ({
+  page,
+}) => {
+  await desktop(page, { failGit: "fatal: could not read from remote" });
+  await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
+  await page
+    .getByRole("complementary", { name: "Source control" })
+    .getByLabel("Changes actions")
+    .click();
+  await page.getByRole("menuitem", { name: "Show Git Output" }).click();
+
+  const output = page.getByRole("region", { name: "Output" });
+  await output.getByLabel("Minimum log level").selectOption("error");
+  await expect(output.getByRole("listitem").first()).toBeVisible();
+  await expect(output.getByText(/could not read from remote/).first()).toBeVisible();
+});
+
+test("clearing one output channel does not touch another", async ({ page }) => {
+  await desktop(page);
+  await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
+  await page
+    .getByRole("complementary", { name: "Source control" })
+    .getByLabel("Changes actions")
+    .click();
+  await page.getByRole("menuitem", { name: "Show Git Output" }).click();
+
+  const output = page.getByRole("region", { name: "Output" });
+  await expect(output.getByRole("listitem").first()).toBeVisible();
+  await output.getByRole("button", { name: "Clear" }).click();
+  await expect(output.getByText("This channel has produced no output yet.")).toBeVisible();
 });
