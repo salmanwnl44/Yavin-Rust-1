@@ -321,8 +321,11 @@ mod tests {
             flag.store(true, Ordering::Relaxed);
         });
 
+        // `ping`, not `timeout`: `timeout` refuses to run without a console for its input
+        // ("Input redirection is not supported") and exits at once, so on the CI runner there
+        // was nothing left to cancel and the test failed there only.
         let mut command = Command::new("cmd");
-        command.args(["/C", "timeout", "/t", "30"]);
+        command.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
         let start = Instant::now();
         let result = capture(command, None, cancel);
         assert_eq!(result.unwrap_err(), "Cancelled");
