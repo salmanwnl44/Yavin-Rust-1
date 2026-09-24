@@ -2,6 +2,7 @@ import { cancelRepoOperations, closeRepo, gitExec, openRepo, repoState } from ".
 import type { GitOperation, RepoInfo } from "./backend.ts";
 import { describeGitError } from "./parsers/errors.ts";
 import { buildPatch, parseUnifiedDiff } from "./diffHunks.ts";
+import { relativePath } from "../resource.ts";
 
 /**
  * Rust's `git_exec` no longer knows about the workspace tree, so pathspecs have to be
@@ -18,11 +19,9 @@ function requireHash(hash: string): string {
 }
 
 function relativeToRoot(root: string, absolutePath: string): string {
-  const withSlash = root.endsWith("/") ? root : `${root}/`;
-  const lower = absolutePath.toLowerCase();
-  if (lower === root.toLowerCase()) return ".";
-  if (lower.startsWith(withSlash.toLowerCase())) return absolutePath.slice(withSlash.length);
-  throw new Error(`Path is outside the repository: ${absolutePath}`);
+  const relative = relativePath(root, absolutePath);
+  if (relative === undefined) throw new Error(`Path is outside the repository: ${absolutePath}`);
+  return relative;
 }
 
 /**

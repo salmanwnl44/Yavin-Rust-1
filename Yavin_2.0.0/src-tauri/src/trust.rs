@@ -382,6 +382,33 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_recorded_in_extended_length_form_is_forgotten_by_its_plain_path() {
+        // The store records the canonical root (`\\?\C:\...` on Windows); the trust list in the
+        // UI shows, and sends back, the cleaned `C:/...`. Forgetting used to match nothing.
+        let dir = temp();
+        let mut store = store_at(&dir);
+        store.remember(Path::new(r"\\?\C:\Work\Project"), Decision::Trusted);
+        store.save().unwrap();
+        let mut reloaded = store_at(&dir);
+        assert!(state_for(&reloaded, Some(PathBuf::from("C:/Work/Project"))).trusted);
+        reloaded.forget(Path::new("C:/Work/Project"));
+        assert!(reloaded.entries.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_extended_length_decision_covers_only_its_own_folder_and_below() {
+        let dir = temp();
+        let mut store = store_at(&dir);
+        store.remember(Path::new(r"\\?\C:\Work"), Decision::Trusted);
+        assert!(state_for(&store, Some(PathBuf::from(r"\\?\C:\Work\a"))).trusted);
+        assert!(state_for(&store, Some(PathBuf::from("c:/work/a"))).trusted);
+        assert!(!state_for(&store, Some(PathBuf::from(r"\\?\C:\Work2"))).trusted);
+        assert!(!state_for(&store, Some(PathBuf::from("C:/Work2/a"))).trusted);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_corrupt_or_missing_store_reads_as_nothing_trusted() {
         // Failing open would be the one unacceptable outcome.
         let dir = temp();

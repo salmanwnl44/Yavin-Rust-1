@@ -1,11 +1,15 @@
 import type { FileNode } from "../types.ts";
+import { containsPath, relativePath } from "./resource.ts";
 
+/** Whether `path` is `parent` itself or lies inside it, by the rules in `resource.ts`. */
 export function isWithin(path: string, parent: string): boolean {
-  return path === parent || path.startsWith(parent + "/");
+  return containsPath(parent, path);
 }
 
 export function remapPath(path: string, oldPath: string, newPath: string): string {
-  return isWithin(path, oldPath) ? newPath + path.slice(oldPath.length) : path;
+  const rel = relativePath(oldPath, path);
+  if (rel === undefined) return path;
+  return rel === "." ? newPath : `${newPath.replace(/\/+$/, "")}/${rel}`;
 }
 
 export function parentOf(path: string): string {

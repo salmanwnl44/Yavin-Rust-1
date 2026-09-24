@@ -10,6 +10,8 @@ import { createGitMutatingTools, TOOL_TIERS } from "./gitToolsMutating.ts";
 import { resolveInRoot } from "./toolTypes.ts";
 
 interface Fixture {
+  /** The worktree root; `/work` unless a test needs a Windows-shaped one. */
+  root?: string;
   status?: string;
   branchInfo?: string;
   branches?: string[];
@@ -28,8 +30,9 @@ async function fixture(f: Fixture = {}) {
       if (f.fail?.[name]) throw new Error(f.fail[name]);
       return `${name} ok`;
     };
+  const root = f.root ?? "/work";
   const repository = {
-    root: "/work",
+    root,
     status: async () => f.status ?? "",
     branchInfo: async () =>
       f.branchInfo ?? "# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n",
@@ -38,7 +41,8 @@ async function fixture(f: Fixture = {}) {
     remotes: async () => f.remotes ?? ["origin"],
     stashList: async () => f.stash ?? "",
     state: async () => f.state ?? "",
-    diff: async (path: string, staged: boolean) => `diff ${path} ${staged}`,
+    diff: async (path: string, staged: boolean, originalPath?: string) =>
+      `diff ${path} ${staged}${originalPath ? ` from ${originalPath}` : ""}`,
     graphLog: async () => "aaa\x1faaa1\x1f\x1fA\x1fa@x\x1fJan\x1f1d\x1fFirst\x1f",
     commitDetails: async (h: string) => `${h}\x1fSubject`,
     commitFileDiff: async (h: string, p: string) => `show ${h} ${p}`,
@@ -62,7 +66,7 @@ async function fixture(f: Fixture = {}) {
   } as unknown as Repository;
   const store = new RepoStore(repository);
   await store.refresh();
-  const entry: RepoEntry = { repoId: "/work", root: "/work", status: "ready", store };
+  const entry: RepoEntry = { repoId: root, root, status: "ready", store };
   const registry = { getSnapshot: () => ({ repos: [entry] }) };
   const dirty = { value: false };
   const tools = createGitMutatingTools({ isDirty: () => dirty.value, registry });
@@ -112,6 +116,23 @@ test("stage only touches files that actually have that change, resolved inside t
   const ok = await tools.stage(ref, { paths: ["a.ts"] });
   assert.ok(ok.ok);
   assert.deepEqual(calls, ["stage(/work/a.ts)"]);
+});
+
+test("a path spelled differently from the root still finds its change", async () => {
+  // Windows reports drive letters and folders in either case. `resolveInRoot` accepted
+  // `c:/work/a.ts` under `C:/Work`, but the change lookup compared strings exactly, so the
+  // tool refused with "has no changes to stage" for a file that plainly had them.
+  const { tools, calls, reads } = await fixture({
+    root: "C:/Work",
+    status: " M a.ts\0R  new.ts\0old.ts\0",
+  });
+  const windowsRef = { repoId: "C:/Work" };
+  const staged = await tools.stage(windowsRef, { paths: ["c:/work/a.ts"] });
+  assert.ok(staged.ok, staged.ok ? "" : staged.message);
+  assert.deepEqual(calls, ["stage(c:/work/a.ts)"]);
+  // The read side finds the rename's source the same way.
+  const diff = await reads.getDiff(windowsRef, { path: "C:\\WORK\\new.ts", staged: true });
+  assert.ok(diff.ok && diff.data.text.endsWith("from C:/Work/old.ts"), JSON.stringify(diff));
 });
 
 test("commit needs staged changes, no conflicts and a message", async () => {

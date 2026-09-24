@@ -7,9 +7,19 @@
  * so what the UI considers "the same folder" cannot drift from what the session file does.
  */
 
-/** A comparison key for a folder: lowercased, `/` separators, no trailing separator. */
+import { unprefixed } from "./resource.ts";
+
+/**
+ * A comparison key for a folder: `/` separators, no extended-length prefix, lowercased, no
+ * trailing separator, and `/` rather than empty for a root. Lowercased on every platform,
+ * unlike a `ResourceId` (`resource.ts`): these keys are what the session and trust files were
+ * written with, and changing the rule would orphan what they remember.
+ *
+ * The native `normalise` must produce exactly the same keys. Both are checked against
+ * `folderKeys.fixtures.json`, so the two cannot drift apart without a test failing.
+ */
 export function folderKey(path: string): string {
-  return path.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  return unprefixed(path).toLowerCase().replace(/\/+$/, "") || "/";
 }
 
 /** The last segment, for naming a folder without showing its whole path. */

@@ -21,6 +21,19 @@ test("folder rename remaps descendants without matching sibling prefixes", () =>
   assert.equal(isWithin("/work/src-old", "/work/src"), false);
 });
 
+test("Windows paths are within and remapped whatever their case and separators", () => {
+  assert.equal(isWithin("c:/work/src/a.ts", "C:/Work/src"), true);
+  assert.equal(isWithin("C:\\Work\\src\\a.ts", "C:/Work/src"), true);
+  assert.equal(isWithin("C:/Work/src/a.ts", "C:/Work/src/"), true);
+  assert.equal(isWithin("C:/Work/src-old/a.ts", "C:/Work/src"), false);
+  // POSIX paths still compare exactly: `/Work` and `/work` can be two real folders.
+  assert.equal(isWithin("/work/src", "/Work"), false);
+  assert.equal(isWithin("/a", ""), false);
+  assert.equal(remapPath("c:/work/src/a.ts", "C:/Work/src", "C:/Work/lib"), "C:/Work/lib/a.ts");
+  assert.equal(remapPath("C:/Work/src", "C:/Work/src/", "C:/Work/lib"), "C:/Work/lib");
+  assert.equal(remapPath("C:/Work/srcx/a.ts", "C:/Work/src", "C:/Work/lib"), "C:/Work/srcx/a.ts");
+});
+
 test("Git status preserves special filenames and consumes rename source records", () => {
   const result = parseGitStatus(
     ' M file with spaces.ts\0?? quote"name.ts\0R  new.ts\0old.ts\0 M line\nbreak.ts\0',

@@ -1,3 +1,5 @@
+import { relativePath } from "../../services/resource.ts";
+
 /**
  * Strips Windows extended-length prefixes (`\?\`, `//?/`, `\??\`) and normalizes separators.
  * The backend already returns clean paths, so the common case exits without allocating.
@@ -15,9 +17,7 @@ export function cleanPath(path: string): string {
 export function getRelativePath(fullPath: string, workspacePath: string): string {
   if (!fullPath) return "";
   const full = cleanPath(fullPath);
-  const root = cleanPath(workspacePath);
-  if (!root || (full !== root && !full.startsWith(root + "/"))) return full;
-  return full.slice(root.length).replace(/^\//, "") || ".";
+  return relativePath(cleanPath(workspacePath), full) ?? full;
 }
 
 /** The directory a node lives in: itself for a folder, its parent for a file. */

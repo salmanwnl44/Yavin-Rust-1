@@ -1,5 +1,6 @@
 import type { RepoEntry } from "../git/registry.ts";
 import type { GitErrorCategory } from "../git/parsers/errors.ts";
+import { relativePath } from "../resource.ts";
 
 /** Names a worktree explicitly -- never "whichever one is active". */
 export interface WorktreeRef {
@@ -42,14 +43,15 @@ export function resolveWorktree(
 export function resolveInRoot(root: string, path: string): string | null {
   const normalizedRoot = root.replace(/\\/g, "/").replace(/\/$/, "");
   const p = path.replace(/\\/g, "/");
-  // Case-insensitively, matching `relativeToRoot` in `repository.ts`. A case-sensitive
-  // comparison meant an absolute path whose drive letter merely differed in case
-  // (`c:/work/a.ts` against a root of `C:/work`, routine on Windows) failed the
+  // By the same rules as `relativeToRoot` in `repository.ts` (see `resource.ts`). A
+  // case-sensitive comparison meant an absolute path whose drive letter merely differed in
+  // case (`c:/work/a.ts` against a root of `C:/work`, routine on Windows) failed the
   // already-inside-the-root test and was treated as relative, producing the nonsense
   // `C:/work/c:/work/a.ts` and a misleading "has no changes to stage".
-  const alreadyInside = p.toLowerCase().startsWith(`${normalizedRoot.toLowerCase()}/`);
+  const inside = relativePath(normalizedRoot, p);
+  const alreadyInside = inside !== undefined && inside !== ".";
   const absolute = alreadyInside ? p : `${normalizedRoot}/${p.replace(/^\/+/, "")}`;
-  const relative = absolute.slice(normalizedRoot.length + 1);
+  const relative = alreadyInside ? inside : absolute.slice(normalizedRoot.length + 1);
   if (!relative || relative.split("/").some((seg) => seg === ".." || seg === "")) return null;
   return absolute;
 }

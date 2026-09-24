@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { chooseActiveWorktree, GitRegistry, gitRegistry } from "./registry.ts";
 import type { RepoEntry, RepositoryEntry } from "./registry.ts";
 import type { WorktreeStatus } from "./backend.ts";
-import { overrideNative, realRepo, resetNativeOverrides } from "./testing/realGit.ts";
+import { nativeCalls, overrideNative, realRepo, resetNativeOverrides } from "./testing/realGit.ts";
 
 /** Lets any rejection that was left unhandled reach `process`'s `unhandledRejection`. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 60));
@@ -330,6 +330,29 @@ test("a lone worktree that disappears stays selected as missing so the panel can
     assert.equal(only.status, "missing");
     assert.equal(registry.getSnapshot().activeWorktreePath, before, "nothing else to select");
     renameSync(moved, r.root);
+  } finally {
+    storage.restore();
+    r.dispose();
+  }
+});
+
+test("reopening a worktree by another spelling of its path reuses the open entry", async () => {
+  const storage = withStorage();
+  const r = realRepo();
+  try {
+    const registry = new GitRegistry();
+    const first = await registry.open(r.root, { makeActive: true });
+    assert.ok(first);
+    // Backslashes and a trailing separator, as a dialog or a typed path hands them over. The
+    // lookup used to fold case but not separators, so this spelling missed the open entry.
+    // A miss was not visible in the result -- the native open found the same worktree again --
+    // but it cost a second `git_open_repo` for a repository already open.
+    const respelled = `${r.root.replace(/\//g, "\\")}\\`;
+    const opensBefore = nativeCalls.filter((call) => call.command === "git_open_repo").length;
+    assert.equal(await registry.open(respelled), first);
+    const opensAfter = nativeCalls.filter((call) => call.command === "git_open_repo").length;
+    assert.equal(opensAfter, opensBefore, "found without asking native again");
+    assert.equal(registry.getSnapshot().repos.length, 1);
   } finally {
     storage.restore();
     r.dispose();

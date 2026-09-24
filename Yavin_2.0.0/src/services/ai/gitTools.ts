@@ -8,6 +8,7 @@ import { categorizeGitError, describeGitError } from "../git/parsers/errors.ts";
 import { getGitContext } from "./gitContext.ts";
 import type { GitBaselineContext } from "./gitContext.ts";
 import { fail, isFailure, resolveInRoot, resolveWorktree } from "./toolTypes.ts";
+import { samePathString } from "../resource.ts";
 import type { ToolResult, WorktreeRef, WorktreeRegistry } from "./toolTypes.ts";
 
 export const MAX_CHANGES = 200;
@@ -65,7 +66,9 @@ export function createGitReadTools(registry: WorktreeRegistry = gitRegistry) {
       withEntry(ref, async (entry) => {
         const absolute = resolveInRoot(entry.root, args.path);
         if (!absolute) throw new Error("Path must stay inside the worktree.");
-        const match = entry.store.getSnapshot().entries.find((e) => e.path === absolute);
+        const match = entry.store
+          .getSnapshot()
+          .entries.find((e) => samePathString(e.path, absolute));
         return truncate(
           await entry.store.repository.diff(absolute, args.staged, match?.originalPath),
         );

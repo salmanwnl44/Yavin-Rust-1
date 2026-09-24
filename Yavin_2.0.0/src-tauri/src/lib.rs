@@ -152,14 +152,37 @@ fn open_folder_dialog(
     state: State<'_, Workspace>,
     watch: State<'_, Watch>,
 ) -> Result<Option<String>, String> {
-    let selected = file_tree::pick_workspace_folder()?;
-    if let Some(path) = &selected {
-        let manager = WorkspaceManager::new(path)?;
-        let root = manager.root().to_path_buf();
-        *state.0.lock().map_err(|e| e.to_string())? = Some(manager);
-        watch_workspace(&app, &watch, &root);
-    }
-    Ok(selected)
+    file_tree::pick_workspace_folder()?
+        .map(|path| enter_workspace(&app, &state, &watch, &path))
+        .transpose()
+}
+
+/// A chosen folder as a workspace, and the one spelling of its root the UI is given back.
+///
+/// That spelling is the canonical root, cleaned for the UI -- the same string the tree's root
+/// node carries -- never the spelling the folder arrived in. The dialog hands back the path as
+/// the user navigated to it (a junction, a `subst` drive, a short name, a different case), and
+/// returning that meant one folder had two spellings: the recent list and the session kept the
+/// dialog's while the tree and every later lookup used the canonical one, and the explorer and
+/// Source Control, keyed on the workspace path, mounted twice as it changed from one to the other.
+fn workspace_for(path: &Path) -> Result<(WorkspaceManager, String), String> {
+    let manager = WorkspaceManager::new(path)?;
+    let root = file_tree::clean_path_str(manager.root());
+    Ok((manager, root))
+}
+
+/// Makes `path` the window's workspace and starts watching it, whichever way it was chosen.
+fn enter_workspace(
+    app: &AppHandle,
+    state: &State<'_, Workspace>,
+    watch: &State<'_, Watch>,
+    path: &str,
+) -> Result<String, String> {
+    let (manager, root) = workspace_for(Path::new(path))?;
+    let watched = manager.root().to_path_buf();
+    *state.0.lock().map_err(|e| e.to_string())? = Some(manager);
+    watch_workspace(app, watch, &watched);
+    Ok(root)
 }
 
 /// Opens a folder the user has already chosen once -- restoring the last session, or a pick
@@ -179,11 +202,7 @@ fn open_workspace(
     watch: State<'_, Watch>,
     path: String,
 ) -> Result<String, String> {
-    let manager = WorkspaceManager::new(&path)?;
-    let root = manager.root().to_path_buf();
-    *state.0.lock().map_err(|e| e.to_string())? = Some(manager);
-    watch_workspace(&app, &watch, &root);
-    Ok(file_tree::clean_path_str(&root))
+    enter_workspace(&app, &state, &watch, &path)
 }
 
 // A side-effect-free folder picker: unlike `open_folder_dialog`, this never replaces
@@ -297,5 +316,57 @@ pub fn run() {
     {
         eprintln!("Failed to run Yavin: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_folder(name: &str) -> PathBuf {
+        let dir = env::temp_dir()
+            .join(format!("yavin-open-{}", std::process::id()))
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        dir
+    }
+
+    /// What the UI is told the workspace root is, for a folder chosen spelled as `spelling`,
+    /// checked against the root node the explorer then lists for it -- the two have to be one
+    /// string, or the recent list, the session and the explorer each hold a different one.
+    fn opened_as(spelling: &str) -> String {
+        let (manager, root) = workspace_for(Path::new(spelling)).unwrap();
+        let tree = manager.list_directory(&root, 1).unwrap();
+        assert_eq!(root, tree.path, "the root returned for {spelling}");
+        root
+    }
+
+    #[test]
+    fn every_spelling_of_a_chosen_folder_opens_as_the_explorers_root() {
+        let dir = temp_folder("Spelled");
+        let canonical = opened_as(&dir.to_string_lossy());
+        let spellings = if cfg!(windows) {
+            let plain = dir.to_string_lossy().to_string();
+            vec![
+                format!(r"{plain}\"),
+                plain.replace('\\', "/"),
+                plain.to_uppercase(),
+                plain.to_lowercase(),
+                format!(r"\\?\{plain}"),
+                format!(r"{plain}\src\.."),
+            ]
+        } else {
+            let plain = dir.to_string_lossy().to_string();
+            vec![format!("{plain}/"), format!("{plain}/src/..")]
+        };
+        for spelling in spellings {
+            assert_eq!(opened_as(&spelling), canonical, "{spelling}");
+        }
+        // The one spelling is the cleaned form the rest of the UI compares against: no
+        // extended-length prefix, `/` separators.
+        assert!(!canonical.starts_with("//?/") && !canonical.contains('\\'));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

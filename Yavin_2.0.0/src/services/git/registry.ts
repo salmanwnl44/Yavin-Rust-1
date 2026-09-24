@@ -8,6 +8,7 @@ import type { WorktreeInfo } from "./parsers/worktree.ts";
 import { probeWorktree, unwatchRepo, watchRepo } from "./backend.ts";
 import type { WorktreeStatus } from "./backend.ts";
 import { dropLoader } from "./graph/shared.ts";
+import { samePathString } from "../resource.ts";
 
 /**
  * One open worktree. Kept under this name (rather than `WorktreeEntry`) so every
@@ -80,8 +81,7 @@ function flatten(repositories: RepositoryEntry[]): RepoEntry[] {
   return repositories.flatMap((repository) => repository.worktrees);
 }
 
-const samePath = (a: string, b: string) =>
-  a.replace(/\\/g, "/").toLowerCase() === b.replace(/\\/g, "/").toLowerCase();
+const samePath = samePathString;
 
 /** A repository's preferred worktree: its main worktree if usable, else its first usable one. */
 function preferredWorktree(repository: RepositoryEntry): RepoEntry | undefined {
@@ -327,8 +327,7 @@ export class GitRegistry {
   }
 
   private findByRoot(path: string): RepoEntry | undefined {
-    const lower = path.toLowerCase();
-    return this.snapshot.repos.find((r) => r.root.toLowerCase() === lower);
+    return this.snapshot.repos.find((r) => samePathString(r.root, path));
   }
 
   /**

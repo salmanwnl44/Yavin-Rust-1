@@ -6,6 +6,7 @@ import { categorizeGitError } from "../git/parsers/errors.ts";
 import { getGitContext } from "./gitContext.ts";
 import type { GitBaselineContext } from "./gitContext.ts";
 import { fail, isFailure, resolveInRoot, resolveWorktree } from "./toolTypes.ts";
+import { samePathString } from "../resource.ts";
 import type {
   ToolFailure,
   ToolResult,
@@ -149,7 +150,9 @@ export function createGitMutatingTools(options: {
       tool,
       (snap) => {
         for (const path of targets) {
-          const e = snap.entries.find((x) => x.path === path);
+          // Compared as resources: `resolveInRoot` keeps the caller's spelling (`c:/work/a.ts`)
+          // and the entries carry the root's (`C:/work/a.ts`).
+          const e = snap.entries.find((x) => samePathString(x.path, path));
           if (!e) return pre(`"${path}" has no changes to ${tool}.`);
           if (tool === "stage" && e.conflict === false && !e.untracked && e.worktree === " ") {
             return pre(`"${path}" has no unstaged changes to stage.`);

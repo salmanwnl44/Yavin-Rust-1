@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { replaceHits, searchWorkspace } from "../../services/search";
 import type { SearchHit, SearchResult } from "../../services/search";
 import type { SearchOptions } from "../../services/native";
+import { relativePath as relativeTo } from "../../services/resource";
 import { ChevronIcon, FileIcon } from "../ui/FileIcons";
 import {
   ArrowDownIcon,
@@ -889,9 +890,9 @@ export function SearchPanel({
         )}
 
         {groupedHits.map((group) => {
-          const relativePath = group.path.startsWith(workspace)
-            ? group.path.slice(workspace.length + 1)
-            : group.path;
+          // Per segment, so a hit in `/work-two` is not shown relative to `/work`.
+          const inside = relativeTo(workspace, group.path);
+          const relativePath = inside === undefined || inside === "." ? group.path : inside;
           const parts = relativePath.split(/[/\\]/);
           const fileName = parts.pop() || relativePath;
           const dirPath = parts.join("/");

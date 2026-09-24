@@ -1,0 +1,78 @@
+[
+  {
+    "input": "C:\\Work\\Project",
+    "key": "c:/work/project"
+  },
+  {
+    "input": "c:/work/project/",
+    "key": "c:/work/project"
+  },
+  {
+    "input": "C:\\Work\\Project\\",
+    "key": "c:/work/project"
+  },
+  {
+    "input": "\\\\?\\C:\\Work\\Project",
+    "key": "c:/work/project"
+  },
+  {
+    "input": "//?/C:/Work/Project",
+    "key": "c:/work/project"
+  },
+  {
+    "input": "\\??\\C:\\Work\\Project",
+    "key": "c:/work/project"
+  },
+  {
+    "input": "\\\\?\\UNC\\Server\\Share\\Project",
+    "key": "//server/share/project"
+  },
+  {
+    "input": "\\\\Server\\Share\\Project",
+    "key": "//server/share/project"
+  },
+  {
+    "input": "C:\\",
+    "key": "c:"
+  },
+  {
+    "input": "/",
+    "key": "/"
+  },
+  {
+    "input": "//",
+    "key": "/"
+  },
+  {
+    "input": "/work/project",
+    "key": "/work/project"
+  },
+  {
+    "input": "/work/project-two",
+    "key": "/work/project-two"
+  },
+  {
+    "input": "/Work/Ünïcode",
+    "key": "/work/ünïcode"
+  },
+  {
+    "input": "C:\\Work\\..\\Other",
+    "key": "c:/work/../other"
+  },
+  {
+    "input": "project\\Sub",
+    "key": "project/sub"
+  },
+  {
+    "input": "./project/",
+    "key": "./project"
+  },
+  {
+    "input": "/Work/ΟΔΟΣ",
+    "key": "/work/οδος"
+  },
+  {
+    "input": "/Work/İ",
+    "key": "/work/i̇"
+  }
+]

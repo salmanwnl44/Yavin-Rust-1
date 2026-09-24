@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { folderKey, folderName, parentPath } from "./paths.ts";
 
@@ -33,4 +34,15 @@ test("the same folder spelled differently has the same key", () => {
 
 test("folders that only share a prefix keep different keys", () => {
   assert.notEqual(folderKey("/work/project"), folderKey("/work/project-two"));
+});
+
+test("folder keys match the shared fixture the native normalise is also checked against", () => {
+  // `src-tauri/src/paths.rs` reads the same file. A key that differs between the two shows a
+  // recent folder that comes back after being removed, or a trust decision that does not
+  // cover what it appears to.
+  const fixture = JSON.parse(
+    readFileSync(new URL("./folderKeys.fixtures.json", import.meta.url), "utf8"),
+  ) as { input: string; key: string }[];
+  assert.ok(fixture.length > 0);
+  for (const { input, key } of fixture) assert.equal(folderKey(input), key, input);
 });

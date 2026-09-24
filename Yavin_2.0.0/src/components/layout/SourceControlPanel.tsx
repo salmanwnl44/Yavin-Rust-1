@@ -5,6 +5,7 @@ import type { GitEntry } from "../../services/git/parsers/status";
 import type { GitOperation } from "../../services/git/backend";
 import { cloneRepository as cloneRepositoryFlow } from "../../services/git/clone";
 import { gitRegistry } from "../../services/git/registry";
+import { containsPath, relativePath as relativeTo } from "../../services/resource";
 import { useActiveRepo, useGitRegistry, useRepoSnapshot } from "../../services/git/hooks";
 import { useGitRevision } from "../../services/git/revision";
 import { guardedAffecting } from "../../services/git/sync";
@@ -77,12 +78,8 @@ const OPERATION_LABEL: Record<Exclude<GitOperation, "">, string> = {
   revert: "Revert",
 };
 
-/** Whether `path` is `root` itself or lies inside it (case-insensitive). */
-function rootContains(root: string, path: string): boolean {
-  const lowerRoot = root.toLowerCase();
-  const lowerPath = path.toLowerCase();
-  return lowerPath === lowerRoot || lowerPath.startsWith(`${lowerRoot}/`);
-}
+/** Whether `path` is `root` itself or lies inside it, by the rules in `resource.ts`. */
+const rootContains = (root: string, path: string): boolean => containsPath(root, path);
 
 /**
  * Rows drawn per group before "Show more". Every row is ~22 DOM nodes and measured
@@ -671,15 +668,15 @@ export function SourceControlPanel({
     setSectionCollapsed((prev) => ({ ...prev, [name]: !prev[name] }));
 
   /**
-   * A repo-relative path for display and for tree grouping. Case-insensitive, via the same
-   * `rootContains` every other path comparison here uses: a plain `startsWith` meant that when
-   * Git reported a differently-cased drive letter or root (routine on Windows, and on
-   * case-insensitive macOS volumes) every row fell back to its full absolute path and the
-   * tree grouped them under a bogus root.
+   * A repo-relative path for display and for tree grouping, compared by the same rules as
+   * `rootContains`: a plain `startsWith` meant that when Git reported a differently-cased
+   * drive letter or root (routine on Windows) every row fell back to its full absolute path
+   * and the tree grouped them under a bogus root.
    */
   const relativePath = (path: string): string => {
-    const root = activeRepo?.root ?? "";
-    return root && rootContains(root, path) ? path.slice(root.length + 1) : path;
+    const rel = relativeTo(activeRepo?.root ?? "", path);
+    // The root itself has no repo-relative name; it was "" before this used `relativeTo`.
+    return rel === undefined ? path : rel === "." ? "" : rel;
   };
 
   // "View as Tree": the same flat `listed` entries, grouped into folders (single-child chains

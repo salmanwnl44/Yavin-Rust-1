@@ -219,7 +219,9 @@ fn check_launch_text(what: &str, value: &str) -> Result<(), String> {
 /// otherwise fail deep inside the spawn with a message that names nothing useful.
 fn resolve_cwd(requested: Option<&str>, fallback: PathBuf) -> Result<PathBuf, String> {
     let Some(requested) = requested.filter(|path| !path.is_empty()) else {
-        return Ok(fallback);
+        // The fallback is usually the workspace root, which is canonical and so, on Windows,
+        // in the extended-length form a shell cannot start in (see `process_cwd`).
+        return Ok(process_cwd(fallback));
     };
     check_launch_text("working directory", requested)?;
     let path = PathBuf::from(requested);
@@ -228,12 +230,74 @@ fn resolve_cwd(requested: Option<&str>, fallback: PathBuf) -> Result<PathBuf, St
             "{requested} is not a folder this terminal can start in."
         ));
     }
-    // Deliberately NOT canonicalised. On Windows `canonicalize` returns the extended-length
-    // `\\?\C:\...` form, and `cmd.exe` refuses to use such a path as a working directory --
-    // it prints a warning and starts somewhere else entirely, so "Open in Integrated
-    // Terminal" would silently land in the wrong folder. The path has already been shown to
-    // be a real directory, which is what actually needed checking.
-    Ok(path)
+    // Deliberately NOT canonicalised: that would produce the extended-length form. The path
+    // has already been shown to be a real directory, which is what actually needed checking.
+    Ok(process_cwd(path))
+}
+
+/// `path` in the form a process can be started in.
+///
+/// On Windows, `canonicalize` -- and so the workspace root -- returns the extended-length
+/// `\\?\C:\...` / `\\?\UNC\server\share\...` form. That is the right form for identity and for
+/// file I/O, but not for a working directory: `cmd.exe` refuses it with "UNC paths are not
+/// supported" and starts in the Windows directory instead, so the terminal silently lands in
+/// the wrong folder. The prefix is removed when the plain form names the same folder, and kept
+/// when it would not -- a path too long for the plain form, or a component that plain Win32
+/// paths cannot express -- so the shell is never quietly given a different folder.
+///
+/// Anywhere else a path has no such prefix, and this returns it unchanged.
+fn process_cwd(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let plain = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => format!("{}:", drive as char),
+            Prefix::VerbatimUNC(server, share) => format!(
+                r"\\{}\{}",
+                server.to_string_lossy(),
+                share.to_string_lossy()
+            ),
+            _ => return path,
+        },
+        _ => return path,
+    };
+    let mut result = PathBuf::from(plain);
+    for component in components {
+        match component {
+            Component::RootDir => result.push(component),
+            Component::Normal(name) if plain_name_is_safe(&name.to_string_lossy()) => {
+                result.push(name)
+            }
+            // `.`/`..` are literal names under the prefix but not without it, and a name the
+            // plain form cannot hold would be read as something else.
+            _ => return path,
+        }
+    }
+    // MAX_PATH less the terminator, which is the limit a working directory has to respect.
+    if result.as_os_str().len() >= 259 {
+        return path;
+    }
+    result
+}
+
+/// Whether `name` means the same thing without the extended-length prefix: plain Win32 paths
+/// trim trailing dots and spaces, and treat the reserved device names as devices.
+fn plain_name_is_safe(name: &str) -> bool {
+    if name.ends_with('.') || name.ends_with(' ') {
+        return false;
+    }
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+    !reserved
 }
 
 #[tauri::command]
@@ -586,15 +650,10 @@ mod tests {
         assert_eq!(resolve_cwd(None, fallback.clone()).unwrap(), fallback);
         assert_eq!(resolve_cwd(Some(""), fallback.clone()).unwrap(), fallback);
 
-        // A real folder is accepted as given. Not canonicalised: on Windows that yields the
-        // extended-length `\?\C:\...` form, which cmd.exe refuses as a working directory
-        // and silently starts elsewhere.
+        // A real folder is accepted as given, not canonicalised. (What happens to a folder
+        // that arrives in extended-length form is `a_shell_starts_in_the_workspace_root_...`.)
         let resolved = resolve_cwd(Some(&dir.to_string_lossy()), fallback.clone()).unwrap();
         assert_eq!(resolved, dir);
-        assert!(
-            !resolved.to_string_lossy().starts_with("\\?\\"),
-            "must not hand cmd.exe an extended-length path"
-        );
 
         // A file, and a folder that is not there, each fail by name rather than deep inside
         // the spawn with a message that identifies nothing.
@@ -607,5 +666,146 @@ mod tests {
         assert!(resolve_cwd(Some("ok\u{0}evil"), fallback).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_shell_starts_in_the_workspace_root_rather_than_its_extended_length_form() {
+        let dir = std::env::temp_dir().join(format!("yavin-cwd-root-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The workspace root, as `terminal_open` falls back to it: canonical, and so in the
+        // extended-length form.
+        let root = dir.canonicalize().unwrap();
+        assert!(
+            root.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            root.display()
+        );
+
+        let cwd = resolve_cwd(None, root.clone()).unwrap();
+        assert!(
+            !cwd.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            cwd.display()
+        );
+        assert!(cwd.is_dir());
+        assert_eq!(cwd.canonicalize().unwrap(), root, "still the same folder");
+        // A requested folder in that form is handled the same way.
+        let requested = resolve_cwd(Some(&root.to_string_lossy()), PathBuf::new()).unwrap();
+        assert_eq!(requested, cwd);
+
+        // And a shell started the way `terminal_open` starts one really is in that folder.
+        let printed = cmd_cd_in_pty(&cwd).to_lowercase();
+        let expected = cwd.to_string_lossy().to_lowercase();
+        assert!(
+            printed.contains(&expected) && !printed.contains("unc paths are not supported"),
+            "cmd.exe did not start in {expected}:\n{printed}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What `cmd /c cd` prints when started in `cwd` through the same PTY and `CommandBuilder`
+    /// the terminal uses -- which, unlike `std::process::Command`, passes the directory to the
+    /// OS exactly as given.
+    #[cfg(windows)]
+    fn cmd_cd_in_pty(cwd: &Path) -> String {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        use std::time::{Duration, Instant};
+
+        let pair = native_pty_system().openpty(size_of(200, 24)).unwrap();
+        let mut command = CommandBuilder::new("cmd.exe");
+        command.args(["/d", "/c", "cd"]);
+        command.cwd(cwd);
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let mut writer = pair.master.take_writer().unwrap();
+        let (sender, chunks) = channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 8192];
+            while let Ok(count) = reader.read(&mut buffer) {
+                if count == 0
+                    || sender
+                        .send(String::from_utf8_lossy(&buffer[..count]).into_owned())
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let mut seen = String::new();
+        let mut answered = false;
+        let mut exited_at = None;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            match chunks.recv_timeout(Duration::from_millis(100)) {
+                Ok(text) => seen.push_str(&text),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            // ConPTY asks for the cursor position before it lets output through.
+            if !answered && seen.contains("\u{1b}[6n") {
+                writer.write_all(b"\x1b[1;1R").unwrap();
+                writer.flush().unwrap();
+                answered = true;
+            }
+            if exited_at.is_none() && matches!(child.try_wait(), Ok(Some(_))) {
+                exited_at = Some(Instant::now());
+            }
+            // Output can trail the exit slightly; give it a moment, then stop.
+            if exited_at.is_some_and(|at| at.elapsed() > Duration::from_millis(750)) {
+                break;
+            }
+        }
+        let _ = child.kill();
+        seen
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_extended_length_prefix_is_kept_where_the_plain_form_would_name_something_else() {
+        let same = |path: &str| process_cwd(PathBuf::from(path));
+        assert_eq!(
+            same(r"\\?\C:\Work\Project"),
+            PathBuf::from(r"C:\Work\Project")
+        );
+        assert_eq!(same(r"\\?\C:\"), PathBuf::from(r"C:\"));
+        assert_eq!(
+            same(r"\\?\UNC\server\share\project"),
+            PathBuf::from(r"\\server\share\project")
+        );
+        // Already plain: untouched.
+        assert_eq!(same(r"C:\Work"), PathBuf::from(r"C:\Work"));
+        assert_eq!(
+            same(r"\\server\share\x"),
+            PathBuf::from(r"\\server\share\x")
+        );
+        // Plain Win32 would trim the dot, or read a device, or overflow MAX_PATH: kept as is.
+        for kept in [
+            r"\\?\C:\Work\trailing.",
+            r"\\?\C:\Work\trailing ",
+            r"\\?\C:\Work\CON",
+        ] {
+            assert_eq!(same(kept), PathBuf::from(kept), "{kept}");
+        }
+        assert_eq!(
+            same(r"\\?\C:\Work\com1.txt"),
+            PathBuf::from(r"\\?\C:\Work\com1.txt")
+        );
+        assert_eq!(same(r"\\?\C:\Work\com0"), PathBuf::from(r"C:\Work\com0"));
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        assert_eq!(same(&long), PathBuf::from(&long));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_working_directory_elsewhere_is_left_exactly_as_it_is() {
+        // Without Windows path prefixes there is nothing to translate, and a name that looks
+        // like one is just a (strange) relative file name.
+        for path in ["/home/me/project", r"\\?\C:\x", "relative/dir"] {
+            assert_eq!(process_cwd(PathBuf::from(path)), PathBuf::from(path));
+        }
     }
 }
