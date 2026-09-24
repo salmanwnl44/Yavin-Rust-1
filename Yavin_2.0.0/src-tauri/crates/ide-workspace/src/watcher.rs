@@ -234,7 +234,14 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("yavin-watch-{label}-{nanos}"))
+        // Canonical, as every folder the app watches is (the workspace root, a repository's
+        // root and common dir). The temp directory can be spelled with an 8.3 short name
+        // (`C:\Users\RUNNER~1\...` on the CI runner), and a watch through that spelling reports
+        // some changes twice -- a spelling the app never watches, so not what is under test.
+        let base = std::env::temp_dir();
+        base.canonicalize()
+            .unwrap_or(base)
+            .join(format!("yavin-watch-{label}-{nanos}"))
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Repository } from "../repository.ts";
@@ -125,7 +125,11 @@ export interface RealRepo {
 /** A fresh repository on `main` with one identity configured and CRLF conversion off. */
 export function realRepo(): RealRepo {
   install();
-  const root = mkdtempSync(join(tmpdir(), "yavin-real-"));
+  // Resolved to its final path, as the native side canonicalises a folder before Git sees it.
+  // The temp directory can be spelled with an 8.3 short name (`C:\Users\RUNNER~1\...` on the
+  // CI runner), which Git reports back in long form; a fixture that kept the short spelling
+  // compared two names for one folder and failed only on machines that have one.
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), "yavin-real-")));
   git(root, "init", "-q", "-b", "main");
   git(root, "config", "user.email", "t@example.com");
   git(root, "config", "user.name", "Tester");
