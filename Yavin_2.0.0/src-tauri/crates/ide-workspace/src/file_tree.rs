@@ -500,6 +500,14 @@ pub fn delete_path(path: &str, recursive: bool) -> Result<(), String> {
 
 /// Duplicates a file or directory with a unique `_copy` name.
 pub fn duplicate_path(path_str: &str) -> Result<String, String> {
+    let destination = duplicate_destination(path_str)?;
+    copy_path(path_str, &destination)?;
+    Ok(destination)
+}
+
+/// The path `duplicate_path` would copy `path_str` to: the first free `_copy` name beside it.
+/// Separate so a caller can know the destination before anything is written.
+pub fn duplicate_destination(path_str: &str) -> Result<String, String> {
     let p = Path::new(path_str);
     if !p.exists() {
         return Err(format!("Path does not exist: {}", path_str));
@@ -530,9 +538,7 @@ pub fn duplicate_path(path_str: &str) -> Result<String, String> {
 
         let candidate = parent.join(&new_name);
         if !candidate.exists() {
-            let candidate_str = clean_path_str(&candidate);
-            copy_path(path_str, &candidate_str)?;
-            return Ok(candidate_str);
+            return Ok(clean_path_str(&candidate));
         }
         counter += 1;
     }

@@ -5,6 +5,6 @@ edition = "2021"
 description = "Project management: file tree, search, git integration, and FS operations"
 
 [dependencies]
-notify = "8"
+notify = "=9.0.0-rc.5"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }

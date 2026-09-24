@@ -92,6 +92,44 @@ export function loadedDirectories(tree: FileNode): string[] {
   return [tree.path, ...tree.children.flatMap(loadedDirectories)];
 }
 
+/**
+ * The loaded folders whose listings a batch of watcher changes can have made stale -- the
+ * explorer's own policy for which changes it shows.
+ *
+ * A change is visible in the tree only as an entry of its parent folder, so only a loaded
+ * parent is re-listed. A change deep inside a folder that is not expanded -- a build writing
+ * into `target/`, `npm install` into `node_modules/` -- touches nothing on screen and costs
+ * nothing. That is a decision about display, made here: the watcher reports those changes
+ * like any other, for consumers that care. A folder in `rescan` had changes nobody itemised,
+ * so every loaded folder inside it is re-listed, and its own parent, where it may have
+ * appeared or gone.
+ */
+export function directoriesToRefresh(
+  tree: FileNode,
+  changes: readonly { path: string; from?: string }[],
+  rescan: readonly string[],
+): string[] {
+  const refresh = new Set<string>();
+  const addParentOf = (path: string) => {
+    const parent = parentOf(path);
+    if (parent !== path && findNode(tree, parent)?.children) refresh.add(parent);
+  };
+  for (const change of changes) {
+    addParentOf(change.path);
+    if (change.from) addParentOf(change.from);
+  }
+  if (rescan.length) {
+    for (const directory of loadedDirectories(tree)) {
+      if (rescan.some((scope) => isWithin(directory, scope))) refresh.add(directory);
+    }
+    for (const scope of rescan) addParentOf(scope);
+  }
+  // Parents before children, as `loadedDirectories` lists them, so a re-listing that removes
+  // a folder happens before any attempt to re-list inside it.
+  const order = loadedDirectories(tree);
+  return order.filter((directory) => refresh.has(directory));
+}
+
 /** The closest loaded folder containing `path`; refreshing it shows a change to `path`. */
 export function nearestLoadedDirectory(tree: FileNode, path: string): string {
   for (

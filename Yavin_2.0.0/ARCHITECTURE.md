@@ -35,7 +35,7 @@ The seven excluded crates (`ide-core`, `ide-config`, `ide-syntax`, `ide-lsp`, `i
 1. Replace the textarea with a TypeScript editor integration when syntax, structured undo, large-file virtualization, and language tooling are implemented. Existing inactive Rust buffers were never connected to the UI.
 2. Implement actual language-server, debugging, AI, and extension services in TypeScript. Keep any Rust process transport small and restrict process spawning to explicit user actions and validated arguments. The terminal follows this shape: `src-tauri/src/terminal.rs` only opens a PTY, starts the user's own shell with no arguments, and streams bytes; xterm.js does the emulation in TypeScript. One session exists per window, started by an explicit user action and ended when the panel closes.
 3. Add desktop end-to-end coverage for folder selection, CRUD, unsaved-close prompts, window controls, and failure recovery. Exercise nested Git repositories, UNC paths, read-only files, symlinks/junctions, and non-ASCII names on supported platforms.
-4. Add file-change reconciliation and conflict detection before enabling autosave. Today refresh is manual, and saving can overwrite changes made externally since opening the file.
+4. Add conflict detection for open documents before enabling autosave. The watcher reports external changes (see [Filesystem events](#filesystem-events)) and the explorer follows them, but an open, dirty document is not yet told that its file changed on disk; the guarded save still refuses to overwrite it.
 5. Measure large-workspace traversal and memory use. Native scans currently run synchronously and stop at a bounded depth; add incremental loading or background execution when needed.
 6. Complete accessibility and responsive-layout review. Disable or implement remaining decorative controls. Configure installer signing, release automation, dependency/license auditing, and platform testing before a production release.
 
@@ -73,7 +73,7 @@ A filesystem path is an input. `src/services/resource.ts` decides which resource
 
 **Workspace folders.** `WorkspaceFolder`, `folderFor` and `relativeToFolders` take a list of folders; the innermost folder wins when folders nest. The window still opens one folder (`workspacePath` in `App.tsx`).
 
-**Not yet on this model:** path-keyed maps and sets in `App.tsx`/`Sidebar.tsx`, inline joins and splits, the Git `repositoryId` (`normalizeCommonDir`; persisted as `commonDirHint`), and the `workspace-changed` watcher event, which carries no paths. These are safe today only because each gets every path from native in one spelling.
+**Not yet on this model:** path-keyed maps and sets in `App.tsx`/`Sidebar.tsx`, inline joins and splits, and the Git `repositoryId` (`normalizeCommonDir`; persisted as `commonDirHint`). These are safe today only because each gets every path from native in one spelling.
 
 **Invariants**
 
@@ -86,6 +86,116 @@ A filesystem path is an input. `src/services/resource.ts` decides which resource
 7. Comparing resources performs no filesystem I/O. Physical resolution is a separate, explicit native step.
 8. Serialization is deterministic: one resource, one `fsPath`, one `formatUri`.
 9. Nothing assumes a single workspace root in the identity layer.
+
+## Filesystem events
+
+The watcher reports what happened to the filesystem under the open folder. It owns nothing else: the explorer, Git and (later) documents each decide what a change means to them.
+
+**Where it lives.** `src-tauri/crates/ide-workspace/src/resource_events.rs`, an exception to TypeScript owning behavior. It has to sit next to the event source, for three reasons:
+
+- A burst of thousands of raw events cannot be sent over IPC just to be merged on the other side.
+- The two halves of a rename are recognisable only as adjacent notifications.
+- Yavin's writes happen in native commands, which must register what they expect before touching the disk.
+
+TypeScript receives typed, bounded batches (`src/services/resourceEvents.ts`).
+
+**Pipeline**
+
+```text
+notify 9 (ReadDirectoryChangesW / inotify / FSEvents), recursive on the canonical root
+  -> normalize   each OS event -> operations on paths cleaned by clean_path_str; .git internals dropped
+  -> pair        a rename's old-name and new-name notifications -> one rename
+  -> coalesce    the burst -> at most one change per resource, in order; bounded
+  -> attribute   a change whose resulting disk state matches a Yavin operation's expectation
+  -> emit        "resource-changes" { generation, root, changes, rescan }, only while the watch is live
+```
+
+**Contract.** Each change is one of the following. `operation` is present only when a Yavin operation accounts for the change.
+
+| `kind`     | Fields                                  |
+| ---------- | --------------------------------------- |
+| `created`  | `path`, `operation?`                    |
+| `modified` | `path`, `operation?`                    |
+| `deleted`  | `path`, `operation?`                    |
+| `renamed`  | `path` (new name), `from`, `operation?` |
+
+`rescan` lists folders whose changes were not all observed. `watcher-status` { generation, root, state: `watching` or `failed`, message? } reports the watch's health; generation 0 means it never started. No file contents are ever sent.
+
+**Filtering.** Only paths inside a `.git` directory are dropped. Git's machinery churns on every Git command, and `watcher::start_git_watcher` follows the parts of it that matter. `build`, `dist`, `target`, `node_modules` and `.cache` are ordinary folders to the watcher, since a folder with one of those names can hold hand-written source. Deciding what matters is each consumer's job:
+
+- **The explorer** re-lists only loaded parents of changed paths (`directoriesToRefresh`). A build writing into a collapsed `target/` therefore re-lists nothing.
+- **Git** is asked for status after any external change and applies its own ignore rules. During a long build that is at most one status per batch, alongside the panel's existing 5-second poll.
+
+**Batching.** A burst ends after `SETTLE` (300 ms, the value the workspace watcher already used) without events, or after `MAX_BATCH_LATENCY` (1 s), whichever comes first. The cap means a build that never pauses is still reported.
+
+**Coalescing.** Changes keep the order in which their paths first changed, never a map's order.
+
+- A creation followed by writes is `created`.
+- Repeated writes are one `modified`.
+- A creation then a deletion cancels out.
+- A deletion then a re-creation is `modified`.
+- A rename of a file created in the same burst is a creation at the new name. This is an atomic save: the temporary file never surfaces.
+- A rename followed by writes is the rename, then `modified`.
+- Chained renames collapse into one. A rename back to the original name is `modified`.
+- A rename onto a path replaces whatever was held for that path.
+- A folder rename is one change, with nothing for its contents; consumers re-list if they need to.
+
+**Rename pairing.**
+
+- A pending old name pairs only with the next notification, and only if that is a new name. On Windows the two are consecutive records of one completion; on Linux they share an inotify cookie, and both cookies must match.
+- Anything else arriving first means the pair is not trusted: the old name becomes `deleted` and the new name `created`. Unrelated files are never guessed to be a rename.
+- At most one old name is pending at a time, and none outlives its batch.
+- On Windows, a move between folders is reported as a removal plus a creation, and stays that way.
+
+**Bounds and rescans.**
+
+- Past `MAX_PENDING_CHANGES` (4096), a batch stops itemising. It reports `rescan` of the deepest folder containing everything it saw: a build flooding `target/debug` becomes a rescan of `target/debug`.
+- A batch keeps at most 16 rescan scopes before collapsing them into the root.
+- notify 9 reports lost notifications (`ReadDirectoryChangesW` discarding its buffer) as a rescan. notify 8 dropped them silently, which is why the version is pinned to `=9.0.0-rc.5`.
+- An error from the watch, or the root being removed, produces a rescan of the root and a `failed` status.
+- A consumer re-reads each `rescan` scope. For the explorer, that means every loaded folder inside the scope, plus the scope's parent.
+
+**Generations.** Every watch gets a process-wide increasing generation.
+
+- Starting a watch first stops the previous one.
+- Dropping a watch clears its live flag under the same lock every emission takes. Nothing from it is delivered afterwards, and a burst it was still collecting is discarded.
+- The UI's `createWatchTracker` also applies a batch only if it is for the open folder (compared as a resource) and from the newest generation seen.
+- The window opens one folder, so there is one watch. The contract names its root so that several can coexist.
+
+**Yavin's own writes.** Each command registers what it will leave (`ExpectedWrites`) before it touches the disk:
+
+| Command                       | Registers                                                                      |
+| ----------------------------- | ------------------------------------------------------------------------------ |
+| `write_file_guarded`          | these bytes (size + hash)                                                      |
+| `create_file`                 | empty content                                                                  |
+| `create_directory`            | a directory                                                                    |
+| `rename_path`                 | the old name absent (present, for a case-only rename) and the new name present |
+| `delete_path`                 | absent                                                                         |
+| `copy_path`, `duplicate_path` | the destination present                                                        |
+
+- A reported change is credited to the operation only if the disk, read when the change is reported, is in that state. A file is read only when an expectation names its exact size.
+- There is no time-based suppression. Another program writing different bytes a moment later is reported as external, whatever the timing.
+- A deletion inside a folder an operation deleted is credited to it. A creation inside a folder an operation created or copied is not, because it cannot be distinguished from another program writing there.
+- Failed operations' expectations are dropped at once. Settled ones are forgotten 10 s after the operation finishes, and at most 1024 are kept. Timing only frees memory; it never decides attribution.
+- Attribution grants nothing. Every operation is still checked by its command.
+- The explorer skips changes credited to an operation, since each operation re-lists what it changed.
+
+**Invariants**
+
+1. The watcher reports filesystem changes; it does not own explorer, Git, document or index state.
+2. Every watcher path is cleaned exactly as every other native path (`clean_path_str`). Identity beyond that is `resource.ts`.
+3. Consumers decide visibility. The watcher hides nothing but `.git` internals.
+4. A stale generation never updates current state.
+5. Rename pairing is bounded, and nothing pending outlives its batch.
+6. An unpaired rename degrades to a deletion and a creation.
+7. Lost notifications, overflow and failure produce an explicit rescan, and `failed` where the watch is down.
+8. Rescans are scoped to the smallest folder known to cover what was missed.
+9. Yavin's writes are attributed by the state they leave, never by timing.
+10. A failed or expired expectation cannot suppress an external change.
+11. Watcher state is bounded: one pending rename, 4096 changes and 16 rescan scopes per batch, and 1024 expectations.
+12. Replacing or closing a watch invalidates it and discards its pending burst.
+13. Events carry resource paths, never contents, and ordinary events cost no file reads.
+14. Changes reach the UI only through the typed `resource-changes` and `watcher-status` contract.
 
 ## Rules and references
 

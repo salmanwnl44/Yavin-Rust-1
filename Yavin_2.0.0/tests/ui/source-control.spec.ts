@@ -39,7 +39,7 @@ async function panel(page: Page, scenario: Partial<Scenario> = {}) {
     });
     const ok = (stdout: string) => ({ stdout, stderr: "", code: 0, truncated: false });
     // Real native-event plumbing (mirrors terminal.spec.ts's/multi-repo.spec.ts's
-    // proven pattern) -- needed to simulate a "workspace-changed" event from the
+    // proven pattern) -- needed to simulate a "resource-changes" batch from the
     // general filesystem watcher.
     const callbacks: Record<number, (event: unknown) => void> = {};
     const listeners: Record<string, number[]> = {};
@@ -589,17 +589,64 @@ test("an external filesystem change only re-fetches status, not every sub-fetch 
   };
 
   // Simulates the general workspace watcher noticing a save/create/delete/
-  // rename it didn't itself trigger (an external edit, or the fallback path
-  // for Yavin's own writes) -- a plain filesystem change can only ever affect
-  // this worktree's own status entries, never branch/branches/remotes/
-  // stashes/operation state.
-  await emit(page, "workspace-changed", undefined);
+  // rename it didn't itself trigger (an external edit) -- a plain filesystem
+  // change can only ever affect this worktree's own status entries, never
+  // branch/branches/remotes/stashes/operation state.
+  await emit(page, "resource-changes", {
+    generation: 1,
+    root: "/work",
+    changes: [{ kind: "modified", path: "/work/file.ts" }],
+    rescan: [],
+  });
 
   await expect.poll(() => gitCalls(page, "status")).toBe(before.status + 1);
   expect(await gitCalls(page, "branchInfo")).toBe(before.branchInfo);
   expect(await gitCalls(page, "branches")).toBe(before.branches);
   expect(await gitCalls(page, "remotes")).toBe(before.remotes);
   expect(await gitCalls(page, "state")).toBe(before.state);
+});
+
+test("watcher batches re-list only what they touched, and only from the current watch of this folder", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: " M a.ts\0" });
+  await expect(region.getByLabel("Commit message")).toBeVisible();
+  const listings = () =>
+    page.evaluate(
+      () =>
+        (window as unknown as { __calls: { command: string }[] }).__calls.filter(
+          (call) => call.command === "list_workspace_files",
+        ).length,
+    );
+  const batch = (generation: number, root: string, changes: unknown[], rescan: string[] = []) =>
+    emit(page, "resource-changes", { generation, root, changes, rescan });
+
+  // An external change to a file in a loaded folder re-lists that folder, once.
+  let before = await listings();
+  await batch(5, "/work", [{ kind: "created", path: "/work/new.ts" }]);
+  await expect.poll(listings).toBe(before + 1);
+
+  // Changes Yavin itself made are already shown -- the operation re-listed them -- and a
+  // change deep inside a folder that is not expanded touches nothing on screen.
+  before = await listings();
+  const status = await gitCalls(page, "status");
+  await batch(5, "/work", [
+    { kind: "modified", path: "/work/file.ts", operation: 3 },
+    { kind: "created", path: "/work/target/debug/app.o" },
+  ]);
+  // The build output still reaches Git: it is a real change, and Git decides what it ignores.
+  await expect.poll(() => gitCalls(page, "status")).toBe(status + 1);
+  expect(await listings()).toBe(before);
+
+  // A batch from an older watch, or for another folder, is not applied at all.
+  await batch(4, "/work", [{ kind: "created", path: "/work/stale.ts" }]);
+  await batch(6, "/elsewhere", [{ kind: "created", path: "/elsewhere/x.ts" }]);
+  await page.waitForTimeout(300);
+  expect(await listings()).toBe(before);
+
+  // A rescan of the root re-lists every loaded folder.
+  await batch(5, "/work", [], ["/work"]);
+  await expect.poll(listings).toBe(before + 1);
 });
 
 test("Save All bumps the active repository's revision, not just individual saves", async ({

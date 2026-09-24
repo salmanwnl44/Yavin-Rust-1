@@ -4,6 +4,8 @@ import type { FileNode } from "../types";
 import type { Shell } from "./terminal";
 import type { Session, WorkspaceSession } from "./session";
 import type { TrustState } from "./trust";
+import { asResourceChangeBatch, asWatcherStatus } from "./resourceEvents.ts";
+import type { ResourceChangeBatch, WatcherStatus } from "./resourceEvents.ts";
 
 interface Commands {
   get_default_workspace: { args: undefined; result: string | null };
@@ -111,20 +113,35 @@ export interface SearchOptions {
 }
 
 /**
- * Subscribes to edits made outside the app. Returns an unsubscribe function that
- * is safe to call before the listener has finished registering.
+ * Subscribes to a native event whose payload `parse` checks, dropping any that do not parse.
+ * Returns an unsubscribe function that is safe to call before the listener has finished
+ * registering.
  */
-export function onWorkspaceChanged(handler: () => void): () => void {
+function onNativeEvent<T>(
+  name: string,
+  parse: (payload: unknown) => T | null,
+  handler: (value: T) => void,
+): () => void {
   if (!isTauri()) return () => {};
   let cancelled = false;
-  const pending = listen("workspace-changed", () => {
-    if (!cancelled) handler();
+  const pending = listen(name, (event) => {
+    if (cancelled) return;
+    const value = parse(event.payload);
+    if (value) handler(value);
   }).catch(() => undefined);
   return () => {
     cancelled = true;
     void pending.then((unlisten) => unlisten?.());
   };
 }
+
+/** Changes under the watched folder, as the native watcher batches them. */
+export const onResourceChanges = (handler: (batch: ResourceChangeBatch) => void) =>
+  onNativeEvent("resource-changes", asResourceChangeBatch, handler);
+
+/** The watcher starting, or failing to keep watching. */
+export const onWatcherStatus = (handler: (status: WatcherStatus) => void) =>
+  onNativeEvent("watcher-status", asWatcherStatus, handler);
 
 /** The payload `git_watch_repo`'s Rust-side watcher emits -- see the Git State &
  * Synchronization plan's Section H/Z. `worktreeRoot` is only present for the two
@@ -137,8 +154,8 @@ export interface GitChangeEvent {
 
 /**
  * Subscribes to external Git ref changes reported by the per-repository `.git`
- * watcher (see `backend.ts`'s `watchRepo`/`unwatchRepo`). Mirrors
- * `onWorkspaceChanged`'s exact shape.
+ * watcher (see `backend.ts`'s `watchRepo`/`unwatchRepo`). Returns an unsubscribe
+ * function that is safe to call before the listener has finished registering.
  */
 export function onGitChanged(handler: (event: GitChangeEvent) => void): () => void {
   if (!isTauri()) return () => {};

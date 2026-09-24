@@ -1,5 +1,6 @@
-use crate::{with_workspace, Workspace};
+use crate::{expecting, with_workspace, Watch, Workspace};
 use ide_workspace::process::{capture, ToolOutput};
+use ide_workspace::resource_events::Expectation;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -143,6 +144,7 @@ pub async fn search_project(
 #[tauri::command(async)]
 pub fn write_file_guarded(
     state: State<'_, Workspace>,
+    watch: State<'_, Watch>,
     path: String,
     expected: String,
     content: String,
@@ -153,6 +155,11 @@ pub fn write_file_guarded(
                 "File changed on disk. Reopen or review its current contents before saving.".into(),
             );
         }
-        manager.write_file(&path, &content)
+        let target = manager.validate_path(&path)?;
+        expecting(
+            &watch,
+            vec![(target, Expectation::content(content.as_bytes()))],
+            || manager.write_file(&path, &content),
+        )
     })
 }

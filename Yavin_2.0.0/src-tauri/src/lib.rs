@@ -1,6 +1,10 @@
 use file_tree::WorkspaceManager;
 use ide_workspace::file_tree::{self, FileNode};
-use ide_workspace::watcher::{self, RecommendedWatcher};
+use ide_workspace::resource_events::{
+    self, Expectation, ExpectedWrites, ResourceWatch, WatchOutput, WatcherState, WatcherStatus,
+};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::{env, path::Path, sync::Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 mod checkers;
@@ -31,25 +35,69 @@ use workbench::{cancel_search, search_project, write_file_guarded};
 
 struct Workspace(Mutex<Option<WorkspaceManager>>);
 
-/// Holds the live filesystem watcher; replacing it stops watching the previous root.
+/// The live filesystem watch, and what Yavin's own file operations expect it to see.
+/// Replacing the watch stops the previous one before anything else can be emitted from it.
 #[derive(Default)]
-struct Watch(Mutex<Option<RecommendedWatcher>>);
+pub(crate) struct Watch {
+    current: Mutex<Option<ResourceWatch>>,
+    expected: Arc<ExpectedWrites>,
+}
 
-/// Reports edits made outside the app (a checkout, a build, another editor) to the UI.
+/// Reports every change under `root` to the UI as `resource-changes` batches, and the watch's
+/// health as `watcher-status` (see `resource_events`).
 fn watch_workspace(app: &AppHandle, watch: &Watch, root: &Path) {
+    // The previous watch ends first, so none of its events can follow the new one's.
+    if let Ok(mut guard) = watch.current.lock() {
+        guard.take();
+    }
     let handle = app.clone();
-    let started = watcher::start_watcher(root, move || {
-        let _ = handle.emit("workspace-changed", ());
-    });
+    let started =
+        resource_events::start_resource_watcher(root, Arc::clone(&watch.expected), move |output| {
+            let _ = match output {
+                WatchOutput::Changes(batch) => handle.emit("resource-changes", batch),
+                WatchOutput::Status(status) => handle.emit("watcher-status", status),
+            };
+        });
     match started {
         Ok(active) => {
-            if let Ok(mut guard) = watch.0.lock() {
+            if let Ok(mut guard) = watch.current.lock() {
                 *guard = Some(active);
             }
         }
-        // Losing live updates is not fatal; the explorer still has manual Refresh.
-        Err(error) => eprintln!("Cannot watch workspace: {error}"),
+        // Losing live updates is not fatal -- the explorer still has manual Refresh -- but
+        // the UI is told, rather than left believing the folder is watched.
+        Err(error) => {
+            eprintln!("Cannot watch workspace: {error}");
+            let _ = app.emit(
+                "watcher-status",
+                WatcherStatus {
+                    generation: 0,
+                    root: file_tree::clean_path_str(root),
+                    state: WatcherState::Failed,
+                    message: Some(error),
+                },
+            );
+        }
     }
+}
+
+/// Runs a file operation with its results registered first, so the watcher can recognise the
+/// changes it causes as Yavin's (`ExpectedWrites`). The expectations are settled whatever the
+/// outcome: a failed operation's are dropped at once.
+pub(crate) fn expecting<T>(
+    watch: &Watch,
+    results: Vec<(PathBuf, Expectation)>,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let id = watch.expected.expect(
+        results
+            .into_iter()
+            .map(|(path, expectation)| (file_tree::clean_path_str(path), expectation))
+            .collect(),
+    );
+    let result = operation();
+    watch.expected.settle(id, result.is_ok());
+    result
 }
 
 /// Runs `action` on a copy of the workspace so long filesystem work does not hold the lock.
@@ -104,37 +152,94 @@ fn read_file_content(state: State<'_, Workspace>, path: String) -> Result<String
 }
 
 #[tauri::command(async)]
-fn create_file(state: State<'_, Workspace>, path: String) -> Result<(), String> {
-    with_workspace(&state, |manager| manager.create_file(&path))
+fn create_file(
+    state: State<'_, Workspace>,
+    watch: State<'_, Watch>,
+    path: String,
+) -> Result<(), String> {
+    with_workspace(&state, |manager| {
+        let target = manager.validate_path(&path)?;
+        expecting(&watch, vec![(target, Expectation::content(b""))], || {
+            manager.create_file(&path)
+        })
+    })
 }
 
 #[tauri::command(async)]
-fn create_directory(state: State<'_, Workspace>, path: String) -> Result<(), String> {
-    with_workspace(&state, |manager| manager.create_directory(&path))
+fn create_directory(
+    state: State<'_, Workspace>,
+    watch: State<'_, Watch>,
+    path: String,
+) -> Result<(), String> {
+    with_workspace(&state, |manager| {
+        let target = manager.validate_path(&path)?;
+        expecting(&watch, vec![(target, Expectation::Directory)], || {
+            manager.create_directory(&path)
+        })
+    })
 }
 
 #[tauri::command(async)]
 fn rename_path(
     state: State<'_, Workspace>,
+    watch: State<'_, Watch>,
     old_path: String,
     new_path: String,
 ) -> Result<(), String> {
-    with_workspace(&state, |manager| manager.rename_path(&old_path, &new_path))
+    with_workspace(&state, |manager| {
+        let old = manager.validate_entry(&old_path)?;
+        let new = manager.validate_entry(&new_path)?;
+        // A case-only rename leaves the old spelling resolving, on a case-insensitive disk, to
+        // the same entry -- so it cannot be expected to be gone.
+        let case_only = file_tree::clean_path_str(&old).to_lowercase()
+            == file_tree::clean_path_str(&new).to_lowercase();
+        let old_after = if case_only {
+            Expectation::Present
+        } else {
+            Expectation::Absent
+        };
+        expecting(
+            &watch,
+            vec![(old, old_after), (new, Expectation::Present)],
+            || manager.rename_path(&old_path, &new_path),
+        )
+    })
 }
 
 #[tauri::command(async)]
-fn delete_path(state: State<'_, Workspace>, path: String, recursive: bool) -> Result<(), String> {
-    with_workspace(&state, |manager| manager.delete_path(&path, recursive))
+fn delete_path(
+    state: State<'_, Workspace>,
+    watch: State<'_, Watch>,
+    path: String,
+    recursive: bool,
+) -> Result<(), String> {
+    with_workspace(&state, |manager| {
+        let target = manager.validate_entry(&path)?;
+        expecting(&watch, vec![(target, Expectation::Absent)], || {
+            manager.delete_path(&path, recursive)
+        })
+    })
 }
 
 #[tauri::command(async)]
-fn duplicate_path(state: State<'_, Workspace>, path: String) -> Result<String, String> {
+fn duplicate_path(
+    state: State<'_, Workspace>,
+    watch: State<'_, Watch>,
+    path: String,
+) -> Result<String, String> {
     with_workspace(&state, |manager| {
         let p = manager.validate_path(&path)?;
         if p == manager.root() {
             return Err("Cannot duplicate the workspace root".into());
         }
-        file_tree::duplicate_path(&file_tree::clean_path_str(p))
+        let source = file_tree::clean_path_str(p);
+        let destination = file_tree::duplicate_destination(&source)?;
+        expecting(
+            &watch,
+            vec![(PathBuf::from(&destination), Expectation::Present)],
+            || file_tree::copy_path(&source, &destination),
+        )?;
+        Ok(destination)
     })
 }
 
@@ -225,12 +330,19 @@ fn open_file_dialog(state: State<'_, Workspace>) -> Result<Option<String>, Strin
 }
 
 #[tauri::command(async)]
-fn copy_path(state: State<'_, Workspace>, src: String, dest: String) -> Result<(), String> {
+fn copy_path(
+    state: State<'_, Workspace>,
+    watch: State<'_, Watch>,
+    src: String,
+    dest: String,
+) -> Result<(), String> {
     with_workspace(&state, |manager| {
-        file_tree::copy_path(
-            &file_tree::clean_path_str(manager.validate_path(&src)?),
-            &file_tree::clean_path_str(manager.validate_path(&dest)?),
-        )
+        let destination = manager.validate_path(&dest)?;
+        let source = file_tree::clean_path_str(manager.validate_path(&src)?);
+        let target = file_tree::clean_path_str(&destination);
+        expecting(&watch, vec![(destination, Expectation::Present)], || {
+            file_tree::copy_path(&source, &target)
+        })
     })
 }
 

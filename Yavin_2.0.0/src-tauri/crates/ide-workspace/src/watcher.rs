@@ -1,6 +1,6 @@
 use notify::{RecursiveMode, Watcher};
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::time::Duration;
 
@@ -10,33 +10,13 @@ pub use notify::RecommendedWatcher;
 /// so a refresh reads the finished state instead of a half-written tree.
 const SETTLE: Duration = Duration::from_millis(300);
 
-/// Directories that churn constantly and are never shown in the tree.
-/// `build`/`dist` (bundler/compiler output -- the same "generated, high-churn,
-/// never hand-edited" profile that already justifies excluding `target`,
-/// Rust's own build directory) and `.cache` (Parcel/Babel/linter caches) were
-/// added by the Filesystem Watcher & Invalidation Architecture plan: none of
-/// the five are ever meaningfully hand-edited, so watching them only produces
-/// event bursts for output nobody asked to see change.
-fn is_noise(path: &Path) -> bool {
-    path.components().any(|component| {
-        matches!(component, Component::Normal(name)
-            if name == ".git"
-                || name == "node_modules"
-                || name == "target"
-                || name == "build"
-                || name == "dist"
-                || name == ".cache")
-    })
-}
-
 /// Blocks for the first event, drains the rest of the burst (waiting up to
 /// `SETTLE` between events), classifies every event in the whole burst via
 /// `classify`, and -- once the burst settles -- reports the distinct set of
 /// classifications found via `report`, skipping the call entirely if nothing
-/// classified as relevant. Shared by `start_watcher` (the general recursive
-/// workspace watcher) and `start_git_watcher` (the narrow per-repository Git-ref
-/// watcher) so the coalescing behavior, and the one test that already proves it
-/// coalesces a real burst correctly, is defined in exactly one place.
+/// classified as relevant. Used by `start_git_watcher`, the narrow per-repository
+/// Git-ref watcher. The workspace watcher is `resource_events::start_resource_watcher`,
+/// which keeps each change rather than only its category.
 fn coalesce_events<T, C, R>(
     receiver: &Receiver<notify::Result<notify::Event>>,
     classify: C,
@@ -59,43 +39,6 @@ fn coalesce_events<T, C, R>(
             report(changed);
         }
     }
-}
-
-/// Watches `root` recursively and calls `on_change` once per settled burst of edits.
-///
-/// Watching stops when the returned handle is dropped.
-pub fn start_watcher<F>(root: &Path, on_change: F) -> Result<RecommendedWatcher, String>
-where
-    F: Fn() + Send + 'static,
-{
-    if !root.is_dir() {
-        return Err(format!("Cannot watch {}: not a directory", root.display()));
-    }
-
-    let (sender, receiver) = channel();
-    let mut watcher = notify::recommended_watcher(sender).map_err(|e| e.to_string())?;
-    watcher
-        .watch(root, RecursiveMode::Recursive)
-        .map_err(|e| e.to_string())?;
-
-    std::thread::spawn(move || {
-        coalesce_events(
-            &receiver,
-            |result| {
-                let relevant = result
-                    .as_ref()
-                    .is_ok_and(|event| event.paths.iter().any(|path| !is_noise(path)));
-                if relevant {
-                    vec![()]
-                } else {
-                    vec![]
-                }
-            },
-            |_changed: HashSet<()>| on_change(),
-        );
-    });
-
-    Ok(watcher)
 }
 
 /// Which category of Git-relevant path changed, matching the Git State &
@@ -166,9 +109,8 @@ fn classify_git_path(
 /// whatever a missing directory means this watcher can't see yet.
 ///
 /// `on_change` is called once per distinct `GitChangeKind` found in a settled
-/// burst (never once per raw filesystem event) -- reusing `coalesce_events`, the
-/// exact mechanism `start_watcher` already uses and already has a passing test
-/// for. Watching stops when the returned handle is dropped.
+/// burst (never once per raw filesystem event), via `coalesce_events`. Watching
+/// stops when the returned handle is dropped.
 pub fn start_git_watcher<F>(
     common_dir: &Path,
     worktree_gitdirs: &[PathBuf],
@@ -242,56 +184,6 @@ mod tests {
         base.canonicalize()
             .unwrap_or(base)
             .join(format!("yavin-watch-{label}-{nanos}"))
-    }
-
-    #[test]
-    fn noise_matches_whole_components_only() {
-        assert!(is_noise(Path::new("/w/.git/HEAD")));
-        assert!(is_noise(Path::new("/w/node_modules/react/index.js")));
-        assert!(is_noise(Path::new("/w/target/debug/app.exe")));
-        // A real source file is not noise just because its name contains one of the words.
-        assert!(!is_noise(Path::new("/w/src/target.rs")));
-        assert!(!is_noise(Path::new("/w/.github/workflows/ci.yml")));
-        assert!(!is_noise(Path::new("/w/src/git.rs")));
-    }
-
-    #[test]
-    fn noise_excludes_common_generated_output_and_cache_directories() {
-        assert!(is_noise(Path::new("/w/dist/bundle.js")));
-        assert!(is_noise(Path::new("/w/build/index.html")));
-        assert!(is_noise(Path::new("/w/.cache/babel/x.json")));
-        // A real source file/directory is not noise just because its name
-        // contains one of the words as a substring, not a whole path component.
-        assert!(!is_noise(Path::new("/w/src/build.rs")));
-        assert!(!is_noise(Path::new("/w/src/distance.ts")));
-        assert!(!is_noise(Path::new("/w/.cache-config/settings.json")));
-    }
-
-    #[test]
-    fn a_burst_of_writes_reports_at_least_once() {
-        let root = temp_dir("workspace");
-        fs::create_dir_all(&root).unwrap();
-
-        let hits = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&hits);
-        let watcher = start_watcher(&root, move || {
-            counter.fetch_add(1, Ordering::SeqCst);
-        })
-        .unwrap();
-
-        for index in 0..5 {
-            fs::write(root.join(format!("file{index}.txt")), "x").unwrap();
-        }
-        std::thread::sleep(SETTLE * 5);
-
-        let reported = hits.load(Ordering::SeqCst);
-        drop(watcher);
-        fs::remove_dir_all(&root).ok();
-        // Coalesced: five writes must never mean five refreshes of the whole tree.
-        assert!(
-            (1..=2).contains(&reported),
-            "expected 1-2 reports, got {reported}"
-        );
     }
 
     #[test]

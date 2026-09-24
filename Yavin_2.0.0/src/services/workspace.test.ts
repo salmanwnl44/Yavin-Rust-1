@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { FileNode } from "../types.ts";
 import {
+  directoriesToRefresh,
   findNode,
   isWithin,
   loadedDirectories,
@@ -32,6 +33,43 @@ test("Windows paths are within and remapped whatever their case and separators",
   assert.equal(remapPath("c:/work/src/a.ts", "C:/Work/src", "C:/Work/lib"), "C:/Work/lib/a.ts");
   assert.equal(remapPath("C:/Work/src", "C:/Work/src/", "C:/Work/lib"), "C:/Work/lib");
   assert.equal(remapPath("C:/Work/srcx/a.ts", "C:/Work/src", "C:/Work/lib"), "C:/Work/srcx/a.ts");
+});
+
+test("watcher changes re-list only the loaded folders they appear in", () => {
+  const file = (path: string): FileNode => ({ name: path, path, is_dir: false });
+  const dir = (path: string, children: FileNode[] | null): FileNode => ({
+    name: path,
+    path,
+    is_dir: true,
+    children,
+  });
+  const tree = dir("/w", [
+    dir("/w/src", [file("/w/src/a.ts"), dir("/w/src/deep", null)]),
+    dir("/w/target", null), // not expanded
+    dir("/w/lib", []),
+    file("/w/README.md"),
+  ]);
+
+  // A change is shown as an entry of its parent, so the parent is what is re-listed.
+  assert.deepEqual(directoriesToRefresh(tree, [{ path: "/w/src/b.ts" }], []), ["/w/src"]);
+  assert.deepEqual(directoriesToRefresh(tree, [{ path: "/w/README.md" }], []), ["/w"]);
+  // Inside a folder that is not expanded: nothing on screen changes.
+  assert.deepEqual(directoriesToRefresh(tree, [{ path: "/w/target/debug/app.o" }], []), []);
+  assert.deepEqual(directoriesToRefresh(tree, [{ path: "/w/src/deep/x.ts" }], []), []);
+  // A rename touches both folders, listed parents first.
+  assert.deepEqual(directoriesToRefresh(tree, [{ path: "/w/src/x.ts", from: "/w/lib/x.ts" }], []), [
+    "/w/src",
+    "/w/lib",
+  ]);
+  // A rescan re-lists every loaded folder inside it, and the folder's own parent.
+  assert.deepEqual(directoriesToRefresh(tree, [], ["/w/src"]), ["/w", "/w/src"]);
+  assert.deepEqual(directoriesToRefresh(tree, [], ["/w"]), ["/w", "/w/src", "/w/lib"]);
+  assert.deepEqual(directoriesToRefresh(tree, [], ["/w/target"]), ["/w"]);
+  // Each folder once.
+  assert.deepEqual(
+    directoriesToRefresh(tree, [{ path: "/w/src/a.ts" }, { path: "/w/src/b.ts" }], ["/w/src"]),
+    ["/w", "/w/src"],
+  );
 });
 
 test("Git status preserves special filenames and consumes rename source records", () => {

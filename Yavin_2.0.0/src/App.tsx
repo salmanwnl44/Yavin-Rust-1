@@ -45,8 +45,11 @@ import { WorkspaceTrustDialog } from "./components/trust/WorkspaceTrustDialog";
 
 import { isTauri } from "@tauri-apps/api/core";
 import type { FileNode, EditorTab, RecentFile } from "./types";
-import { native, onWorkspaceChanged } from "./services/native";
+import { native, onResourceChanges, onWatcherStatus } from "./services/native";
+import { createWatchTracker } from "./services/resourceEvents";
+import { createOutputChannel } from "./services/panel/output";
 import {
+  directoriesToRefresh,
   findNode,
   isWithin,
   loadedDirectories,
@@ -328,15 +331,26 @@ export default function App() {
    * settled burst of filesystem events, which a running build produces continuously.
    */
   const refreshingTree = useRef(false);
-  const refreshTree = async () => {
+  /** Folders asked for while a refresh was running, or "all"; run as soon as it finishes. */
+  const queuedRefresh = useRef<Set<string> | "all" | null>(null);
+  /**
+   * Re-lists `only` (default: every loaded folder). A request made while another refresh is
+   * running is queued and run after it, rather than dropped: the running one may have read
+   * those folders before the change that prompted the request.
+   */
+  const refreshTree = async (only?: readonly string[]) => {
     const tree = treeRef.current;
     if (!tree) return;
-    // Overlapping refreshes would each re-list everything and fight over the result; the
-    // one already running is about to re-read the same directories anyway.
-    if (refreshingTree.current) return;
+    if (only && !only.length) return;
+    if (refreshingTree.current) {
+      const queued = queuedRefresh.current;
+      if (!only || queued === "all") queuedRefresh.current = "all";
+      else queuedRefresh.current = new Set([...(queued ?? []), ...only]);
+      return;
+    }
     refreshingTree.current = true;
     try {
-      const directories = loadedDirectories(tree).filter(
+      const directories = (only ?? loadedDirectories(tree)).filter(
         (directory) => treeRef.current && findNode(treeRef.current, directory),
       );
       const revision = workspaceRevision.current;
@@ -369,6 +383,9 @@ export default function App() {
     }
     setQuickOpen(null);
     bumpGitRevision();
+    const queued = queuedRefresh.current;
+    queuedRefresh.current = null;
+    if (queued) await refreshTree(queued === "all" ? undefined : [...queued]);
   };
   // Re-lists the loaded folders that hold `paths` after a file operation.
   const refreshAround = async (...paths: string[]) => {
@@ -518,13 +535,40 @@ export default function App() {
     };
   }, [loadWorkspace, restoreTabs, rememberSession, reportError, writeSession]);
 
-  // Edits made outside the app (a checkout, a build, another editor) re-list the tree.
+  // Changes on disk re-list the loaded folders they touched (`directoriesToRefresh`).
+  // Changes the watcher credits to one of Yavin's own operations are skipped: each operation
+  // already re-lists what it changed as soon as it finishes (`refreshAround`).
   const refreshTreeRef = useRef(refreshTree);
   refreshTreeRef.current = refreshTree;
-  useEffect(
-    () => onWorkspaceChanged(() => void refreshTreeRef.current().catch(reportError)),
-    [reportError],
-  );
+  const watchTracker = useRef(createWatchTracker());
+  useEffect(() => {
+    const log = createOutputChannel("Workspace");
+    const stopChanges = onResourceChanges((batch) => {
+      const tree = treeRef.current;
+      if (!tree || !watchTracker.current.accept(batch, tree.path)) return;
+      for (const scope of batch.rescan)
+        log.appendLine(`Changes under ${scope} were not all reported; re-reading it.`, "info");
+      const external = batch.changes.filter((change) => change.operation === undefined);
+      const directories = directoriesToRefresh(tree, external, batch.rescan);
+      if (directories.length) void refreshTreeRef.current(directories).catch(reportError);
+      else if (external.length) bumpGitRevision();
+    });
+    const stopStatus = onWatcherStatus((status) => {
+      const current = watchTracker.current.status(status);
+      if (!current) return;
+      if (current.state === "watching") log.appendLine(`Watching ${current.root}.`, "info");
+      else
+        log.appendLine(
+          `Stopped watching ${current.root}: ${current.message ?? "unknown error"}. Changes ` +
+            "made outside Yavin will not appear until the explorer is refreshed.",
+          "warn",
+        );
+    });
+    return () => {
+      stopChanges();
+      stopStatus();
+    };
+  }, [reportError]);
 
   // Git decorations refresh on focus when the Source Control panel is not polling.
   useEffect(() => {
