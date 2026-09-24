@@ -1,0 +1,4 @@
+# Every text file is checked out with LF, on every platform. Prettier requires LF, and the
+# Windows CI runner's default (core.autocrlf=true) otherwise checks out CRLF, failing
+# `format:check` on every file. The repository already stores LF throughout.
+* text=auto eol=lf
