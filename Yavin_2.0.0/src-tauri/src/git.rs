@@ -1954,8 +1954,10 @@ mod tests {
         // A long-running command in the same shape `run_command` spawns internally
         // (via `capture`), so this exercises real process termination end-to-end,
         // through the exact flag the job registry hands out.
+        // `ping`, not `timeout`, which exits at once without a console for its input
+        // ("Input redirection is not supported") -- as on the CI runner.
         let mut sleepy = Command::new("cmd");
-        sleepy.args(["/C", "timeout", "/t", "30"]);
+        sleepy.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
         let started = Instant::now();
         let result = capture(sleepy, None, flag);
         let elapsed = started.elapsed();
