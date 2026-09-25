@@ -1,7 +1,8 @@
 use file_tree::WorkspaceManager;
 use ide_workspace::file_tree::{self, FileNode};
 use ide_workspace::resource_events::{
-    self, Expectation, ExpectedWrites, ResourceWatch, WatchOutput, WatcherState, WatcherStatus,
+    self, Expectation, ExpectedWrites, OperationKind, ResourceWatch, WatchOutput, WatcherState,
+    WatcherStatus,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -81,23 +82,30 @@ fn watch_workspace(app: &AppHandle, watch: &Watch, root: &Path) {
     }
 }
 
-/// Runs a file operation with its results registered first, so the watcher can recognise the
-/// changes it causes as Yavin's (`ExpectedWrites`). The expectations are settled whatever the
-/// outcome: a failed operation's are dropped at once.
+/// Runs one file operation with everything it will leave on disk registered first, so the
+/// watcher can recognise the changes it causes as Yavin's (see `operations`). The operation is
+/// completed or failed with its result: a failed one's expectations are dropped at once.
 pub(crate) fn expecting<T>(
     watch: &Watch,
+    kind: OperationKind,
     results: Vec<(PathBuf, Expectation)>,
-    operation: impl FnOnce() -> Result<T, String>,
+    run: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    let id = watch.expected.expect(
-        results
-            .into_iter()
-            .map(|(path, expectation)| (file_tree::clean_path_str(path), expectation))
-            .collect(),
-    );
-    let result = operation();
-    watch.expected.settle(id, result.is_ok());
+    let operation = watch.expected.begin(kind);
+    for (path, expectation) in results {
+        operation.expect(file_tree::clean_path_str(path), expectation);
+    }
+    let result = run();
+    operation.finish(&result);
     result
+}
+
+/// The folders a create of `target` will make on the way, as expectations of that create.
+pub(crate) fn made_folders(target: &Path) -> Vec<(PathBuf, Expectation)> {
+    file_tree::missing_ancestors(target)
+        .into_iter()
+        .map(|folder| (folder, Expectation::Directory))
+        .collect()
 }
 
 /// Runs `action` on a copy of the workspace so long filesystem work does not hold the lock.
@@ -159,7 +167,9 @@ fn create_file(
 ) -> Result<(), String> {
     with_workspace(&state, |manager| {
         let target = manager.validate_path(&path)?;
-        expecting(&watch, vec![(target, Expectation::content(b""))], || {
+        let mut results = made_folders(&target);
+        results.push((target, Expectation::content(b"")));
+        expecting(&watch, OperationKind::CreateFile, results, || {
             manager.create_file(&path)
         })
     })
@@ -173,7 +183,9 @@ fn create_directory(
 ) -> Result<(), String> {
     with_workspace(&state, |manager| {
         let target = manager.validate_path(&path)?;
-        expecting(&watch, vec![(target, Expectation::Directory)], || {
+        let mut results = made_folders(&target);
+        results.push((target, Expectation::Directory));
+        expecting(&watch, OperationKind::CreateDirectory, results, || {
             manager.create_directory(&path)
         })
     })
@@ -200,6 +212,7 @@ fn rename_path(
         };
         expecting(
             &watch,
+            OperationKind::Rename,
             vec![(old, old_after), (new, Expectation::Present)],
             || manager.rename_path(&old_path, &new_path),
         )
@@ -215,9 +228,12 @@ fn delete_path(
 ) -> Result<(), String> {
     with_workspace(&state, |manager| {
         let target = manager.validate_entry(&path)?;
-        expecting(&watch, vec![(target, Expectation::Absent)], || {
-            manager.delete_path(&path, recursive)
-        })
+        expecting(
+            &watch,
+            OperationKind::Delete,
+            vec![(target, Expectation::Absent)],
+            || manager.delete_path(&path, recursive),
+        )
     })
 }
 
@@ -234,9 +250,15 @@ fn duplicate_path(
         }
         let source = file_tree::clean_path_str(p);
         let destination = file_tree::duplicate_destination(&source)?;
+        // Everything written below the destination is the copy's, checked file by file
+        // against the source.
+        let copy = Expectation::CopyOf {
+            source: source.clone(),
+        };
         expecting(
             &watch,
-            vec![(PathBuf::from(&destination), Expectation::Present)],
+            OperationKind::Copy,
+            vec![(PathBuf::from(&destination), copy)],
             || file_tree::copy_path(&source, &destination),
         )?;
         Ok(destination)
@@ -340,7 +362,12 @@ fn copy_path(
         let destination = manager.validate_path(&dest)?;
         let source = file_tree::clean_path_str(manager.validate_path(&src)?);
         let target = file_tree::clean_path_str(&destination);
-        expecting(&watch, vec![(destination, Expectation::Present)], || {
+        let copy = Expectation::CopyOf {
+            source: source.clone(),
+        };
+        let mut results = made_folders(&destination);
+        results.push((destination, copy));
+        expecting(&watch, OperationKind::Copy, results, || {
             file_tree::copy_path(&source, &target)
         })
     })

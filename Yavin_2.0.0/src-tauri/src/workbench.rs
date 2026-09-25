@@ -1,6 +1,7 @@
-use crate::{expecting, with_workspace, Watch, Workspace};
+use crate::{expecting, made_folders, with_workspace, Watch, Workspace};
+use ide_workspace::file_tree::{temp_nonce, temp_path_for};
 use ide_workspace::process::{capture, ToolOutput};
-use ide_workspace::resource_events::Expectation;
+use ide_workspace::resource_events::{Expectation, OperationKind};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -155,11 +156,18 @@ pub fn write_file_guarded(
                 "File changed on disk. Reopen or review its current contents before saving.".into(),
             );
         }
+        // One operation: the temporary file the bytes are written to first (gone again, or
+        // holding exactly them), the rename onto the target, and the target's final bytes.
         let target = manager.validate_path(&path)?;
-        expecting(
-            &watch,
-            vec![(target, Expectation::content(content.as_bytes()))],
-            || manager.write_file(&path, &content),
-        )
+        let nonce = temp_nonce();
+        let mut results = made_folders(&target);
+        results.push((
+            temp_path_for(&target, nonce),
+            Expectation::transient(content.as_bytes()),
+        ));
+        results.push((target, Expectation::content(content.as_bytes())));
+        expecting(&watch, OperationKind::Save, results, || {
+            manager.write_file_with(&path, &content, nonce)
+        })
     })
 }

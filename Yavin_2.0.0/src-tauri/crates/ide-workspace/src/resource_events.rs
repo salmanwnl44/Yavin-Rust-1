@@ -8,7 +8,7 @@
 //!   -> coalesce    a burst -> at most one change per resource, in order; bounded, with overflow
 //!                  collapsing into a scoped rescan
 //!   -> attribute   a change whose resulting disk state is what a Yavin operation said it would
-//!                  leave carries that operation's id
+//!                  leave carries that operation's id (see `operations`)
 //!   -> batch       emitted with the watcher's generation, only while that generation is live
 //! ```
 //!
@@ -28,11 +28,11 @@
 //! `resource.ts`; nothing here normalises paths a third way.
 
 use crate::file_tree::clean_path_str;
+pub use crate::operations::{Expectation, ExpectedWrites, Operation, OperationKind};
 use notify::event::{EventKind, ModifyKind, RenameMode};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
-use std::hash::{DefaultHasher, Hasher};
+use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError};
@@ -68,7 +68,7 @@ pub enum ChangeKind {
 
 /// One resource that changed. `path` is the resource as it is now (the new name, for a rename);
 /// `from` is set only for a rename. `operation` is set when the change is the result of a Yavin
-/// operation (see `ExpectedWrites`) and absent for anything else -- another program, Git, or a
+/// operation (see `operations`) and absent for anything else -- another program, Git, or a
 /// change nothing can vouch for.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -551,186 +551,6 @@ fn common_folder(folder: &str, path: &str, root: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Attribute: which changes a Yavin operation accounts for
-// ---------------------------------------------------------------------------------------------
-
-/// What a Yavin operation leaves at a path when it succeeds.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Expectation {
-    /// A file with exactly these bytes.
-    Content { size: u64, hash: u64 },
-    /// A directory.
-    Directory,
-    /// Something (a file or a folder, as a copy or a rename's destination).
-    Present,
-    /// Nothing.
-    Absent,
-}
-
-impl Expectation {
-    pub fn content(bytes: &[u8]) -> Self {
-        Expectation::Content {
-            size: bytes.len() as u64,
-            hash: content_hash(bytes),
-        }
-    }
-
-    /// Whether the disk now holds what the operation said it would. Reads a file only when an
-    /// expectation names its exact size, so ordinary events cost no I/O at all.
-    fn holds(&self, path: &Path) -> bool {
-        match self {
-            Expectation::Content { size, hash } => {
-                std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() == *size)
-                    && std::fs::read(path).is_ok_and(|bytes| content_hash(&bytes) == *hash)
-            }
-            Expectation::Directory => path.is_dir(),
-            Expectation::Present => std::fs::symlink_metadata(path).is_ok(),
-            Expectation::Absent => std::fs::symlink_metadata(path)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
-        }
-    }
-}
-
-/// An identity for file content. Not cryptographic -- it only has to tell Yavin's own bytes
-/// from anything else that lands at the same path, and it is checked together with the size.
-fn content_hash(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    hasher.write(bytes);
-    hasher.finish()
-}
-
-/// Expected results older than this after their operation finished are forgotten. Only memory
-/// is at stake: an expectation is matched by the disk state it describes, never by timing, so
-/// keeping one longer could not hide a change and dropping one earlier could only leave a
-/// Yavin change unattributed.
-const EXPECTATION_TTL: Duration = Duration::from_secs(10);
-/// An operation that registered and never reported back (it panicked, say).
-const UNSETTLED_TTL: Duration = Duration::from_secs(120);
-/// At most this many outstanding expectations; the oldest go first.
-const MAX_EXPECTATIONS: usize = 1024;
-
-#[derive(Debug)]
-struct Expected {
-    operation: u64,
-    path: String,
-    expectation: Expectation,
-    registered: Instant,
-    settled: Option<Instant>,
-}
-
-/// The results of Yavin's own filesystem operations, registered before the operation touches
-/// the disk, so that when the watcher reports the change it can be recognised as Yavin's.
-///
-/// A change is credited to an operation only when the disk, read at the time the change is
-/// reported, is in the state the operation said it would leave: the bytes it wrote, the folder
-/// it created, the path it deleted gone. A change that leaves anything else -- another program
-/// writing the same file a moment later -- is not credited, whatever the timing. There is no
-/// "ignore this path for a while": a real external change is never hidden.
-///
-/// Attribution grants nothing. It only labels an observed change; every operation is still
-/// checked by the command that performs it.
-#[derive(Debug, Default)]
-pub struct ExpectedWrites {
-    entries: Mutex<VecDeque<Expected>>,
-    next: AtomicU64,
-}
-
-impl ExpectedWrites {
-    /// Registers what one operation will leave, before it runs, and returns its id.
-    pub fn expect(&self, results: Vec<(String, Expectation)>) -> u64 {
-        let operation = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-        let now = Instant::now();
-        if let Ok(mut entries) = self.entries.lock() {
-            prune(&mut entries, now);
-            for (path, expectation) in results {
-                if entries.len() >= MAX_EXPECTATIONS {
-                    entries.pop_front();
-                }
-                entries.push_back(Expected {
-                    operation,
-                    path,
-                    expectation,
-                    registered: now,
-                    settled: None,
-                });
-            }
-        }
-        operation
-    }
-
-    /// Reports how the operation ended. A failed one's expectations are dropped at once, so
-    /// they cannot account for anything that happens at those paths afterwards.
-    pub fn settle(&self, operation: u64, succeeded: bool) {
-        let now = Instant::now();
-        if let Ok(mut entries) = self.entries.lock() {
-            if succeeded {
-                for entry in entries.iter_mut().filter(|e| e.operation == operation) {
-                    entry.settled = Some(now);
-                }
-            } else {
-                entries.retain(|entry| entry.operation != operation);
-            }
-        }
-    }
-
-    /// The operation that accounts for `change`, if one does.
-    fn attribute(&self, change: &ResourceChange) -> Option<u64> {
-        let Ok(mut entries) = self.entries.lock() else {
-            return None;
-        };
-        prune(&mut entries, Instant::now());
-        let holds = |path: &str| {
-            entries
-                .iter()
-                .rev()
-                .find(|entry| entry.path == path)
-                .filter(|entry| entry.expectation.holds(Path::new(path)))
-                .map(|entry| entry.operation)
-        };
-        // A deletion inside a folder an operation removed is that operation's too: the folder
-        // being gone is exactly what it said it would leave. (Nothing similar is assumed for a
-        // file appearing inside a folder an operation created or copied -- that cannot be told
-        // apart from another program writing into it.)
-        let removed_with_folder = || {
-            (change.kind == ChangeKind::Deleted)
-                .then(|| {
-                    entries
-                        .iter()
-                        .rev()
-                        .filter(|entry| entry.expectation == Expectation::Absent)
-                        .find(|entry| is_same_or_inside(&change.path, &entry.path))
-                        .filter(|entry| entry.expectation.holds(Path::new(&entry.path)))
-                        .map(|entry| entry.operation)
-                })
-                .flatten()
-        };
-        let operation = holds(&change.path).or_else(removed_with_folder)?;
-        if let Some(from) = &change.from {
-            // Both ends of a rename, and by the same operation.
-            if holds(from) != Some(operation) {
-                return None;
-            }
-        }
-        Some(operation)
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries
-            .lock()
-            .map(|entries| entries.len())
-            .unwrap_or(0)
-    }
-}
-
-fn prune(entries: &mut VecDeque<Expected>, now: Instant) {
-    entries.retain(|entry| match entry.settled {
-        Some(settled) => now.duration_since(settled) < EXPECTATION_TTL,
-        None => now.duration_since(entry.registered) < UNSETTLED_TTL,
-    });
-}
-
-// ---------------------------------------------------------------------------------------------
 // The watcher: one generation per watch, emitting only while it is live
 // ---------------------------------------------------------------------------------------------
 
@@ -837,9 +657,7 @@ where
                 }
             }
             let (mut changes, rescan, failures, root_removed) = burst.finish();
-            for change in &mut changes {
-                change.operation = expected.attribute(change);
-            }
+            expected.attribute(&mut changes);
             if !changes.is_empty() || !rescan.is_empty() {
                 emit_if_live(
                     &thread_live,
@@ -1241,8 +1059,6 @@ mod tests {
         assert!(matches!(failed.as_slice(), [Raw::Failure(message)] if message.contains("gone")));
     }
 
-    // --- attribution -------------------------------------------------------------------------
-
     fn temp(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1254,116 +1070,6 @@ mod tests {
             .join(format!("yavin-events-{label}-{nanos}"));
         fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    fn at(kind: ChangeKind, path: &Path) -> ResourceChange {
-        ResourceChange::new(kind, clean_path_str(path))
-    }
-
-    #[test]
-    fn a_write_is_credited_only_while_the_disk_holds_exactly_what_it_wrote() {
-        let dir = temp("attribute");
-        let file = dir.join("a.ts");
-        let expected = ExpectedWrites::default();
-        let operation =
-            expected.expect(vec![(clean_path_str(&file), Expectation::content(b"mine"))]);
-        fs::write(&file, "mine").unwrap();
-        expected.settle(operation, true);
-        assert_eq!(
-            expected.attribute(&at(ChangeKind::Modified, &file)),
-            Some(operation)
-        );
-
-        // Another program writes the same file: that change is not Yavin's, however soon after.
-        fs::write(&file, "theirs").unwrap();
-        assert_eq!(expected.attribute(&at(ChangeKind::Modified, &file)), None);
-        // Same length, different bytes.
-        fs::write(&file, "mind").unwrap();
-        assert_eq!(expected.attribute(&at(ChangeKind::Modified, &file)), None);
-        // A path nothing was expected at.
-        assert_eq!(
-            expected.attribute(&at(ChangeKind::Created, &dir.join("b.ts"))),
-            None
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn a_failed_operation_accounts_for_nothing() {
-        let dir = temp("failed");
-        let file = dir.join("a.ts");
-        let expected = ExpectedWrites::default();
-        let operation = expected.expect(vec![(clean_path_str(&file), Expectation::content(b"x"))]);
-        expected.settle(operation, false);
-        // Something else then writes exactly those bytes: still not credited to the failure.
-        fs::write(&file, "x").unwrap();
-        assert_eq!(expected.attribute(&at(ChangeKind::Created, &file)), None);
-        assert_eq!(expected.len(), 0);
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn deletions_renames_and_folders_are_credited_by_the_state_they_leave() {
-        let dir = temp("kinds");
-        let expected = ExpectedWrites::default();
-
-        let folder = dir.join("gone");
-        fs::create_dir_all(folder.join("inner")).unwrap();
-        let op = expected.expect(vec![(clean_path_str(&folder), Expectation::Absent)]);
-        fs::remove_dir_all(&folder).unwrap();
-        expected.settle(op, true);
-        assert_eq!(
-            expected.attribute(&at(ChangeKind::Deleted, &folder)),
-            Some(op)
-        );
-        // Its contents went with it.
-        let inner = folder.join("inner");
-        assert_eq!(
-            expected.attribute(&at(ChangeKind::Deleted, &inner)),
-            Some(op)
-        );
-        // But not a sibling that merely shares the name's prefix.
-        let sibling = dir.join("gone2");
-        assert_eq!(expected.attribute(&at(ChangeKind::Deleted, &sibling)), None);
-
-        let (old, new) = (dir.join("old.ts"), dir.join("new.ts"));
-        fs::write(&old, "x").unwrap();
-        let op = expected.expect(vec![
-            (clean_path_str(&old), Expectation::Absent),
-            (clean_path_str(&new), Expectation::Present),
-        ]);
-        fs::rename(&old, &new).unwrap();
-        expected.settle(op, true);
-        let mut rename = at(ChangeKind::Renamed, &new);
-        rename.from = Some(clean_path_str(&old));
-        assert_eq!(expected.attribute(&rename), Some(op));
-        // The same rename seen as two halves is credited half by half.
-        assert_eq!(expected.attribute(&at(ChangeKind::Deleted, &old)), Some(op));
-        assert_eq!(expected.attribute(&at(ChangeKind::Created, &new)), Some(op));
-
-        let made = dir.join("made");
-        let op = expected.expect(vec![(clean_path_str(&made), Expectation::Directory)]);
-        fs::create_dir(&made).unwrap();
-        expected.settle(op, true);
-        assert_eq!(
-            expected.attribute(&at(ChangeKind::Created, &made)),
-            Some(op)
-        );
-        // Something created inside it is not assumed to be Yavin's.
-        assert_eq!(
-            expected.attribute(&at(ChangeKind::Created, &made.join("x"))),
-            None
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn outstanding_expectations_are_bounded() {
-        let expected = ExpectedWrites::default();
-        for index in 0..MAX_EXPECTATIONS * 2 {
-            expected.expect(vec![(format!("/w/{index}"), Expectation::Absent)]);
-        }
-        assert_eq!(expected.len(), MAX_EXPECTATIONS);
     }
 
     // --- the real watcher --------------------------------------------------------------------
@@ -1561,18 +1267,23 @@ mod tests {
     #[test]
     fn a_yavin_save_is_credited_and_an_external_write_is_not() {
         let dir = temp("real-attribution");
-        let file = dir.join("a.ts");
+        // In a folder below the root, so any report about the folder itself is seen too.
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("sub/a.ts");
         fs::write(&file, "before").unwrap();
         let expected = Arc::new(ExpectedWrites::default());
         let (recorder, watch) = Recorder::start(&dir, Arc::clone(&expected));
 
-        // The same path the command registers: the canonical path, cleaned.
-        let operation = expected.expect(vec![(
-            clean_path_str(&file),
-            Expectation::content(b"saved"),
-        )]);
-        let written = crate::file_tree::atomic_write_file(&file, "saved");
-        expected.settle(operation, written.is_ok());
+        // Registered the way the save command does: the target and its temporary file, as
+        // the canonical paths, cleaned.
+        let nonce = crate::file_tree::temp_nonce();
+        let temporary = crate::file_tree::temp_path_for(&file, nonce);
+        let operation = expected.begin(OperationKind::Save);
+        let id = operation.id();
+        operation.expect(clean_path_str(&temporary), Expectation::transient(b"saved"));
+        operation.expect(clean_path_str(&file), Expectation::content(b"saved"));
+        let written = crate::file_tree::atomic_write_file_via(&file, &temporary, "saved");
+        operation.finish(&written);
         let changes = recorder.settled();
         let saved: Vec<_> = changes
             .iter()
@@ -1580,7 +1291,7 @@ mod tests {
             .collect();
         assert!(!saved.is_empty(), "{changes:?}");
         assert!(
-            saved.iter().all(|c| c.operation == Some(operation)),
+            changes.iter().all(|c| c.operation == Some(id)),
             "{changes:?}"
         );
         assert!(
@@ -1593,6 +1304,119 @@ mod tests {
         let changes = recorder.settled();
         assert!(has(&changes, ChangeKind::Modified, &file), "{changes:?}");
         assert!(changes.iter().all(|c| c.operation.is_none()), "{changes:?}");
+
+        // Another program writing while a Yavin save is still open is reported as theirs.
+        recorder.clear();
+        let operation = expected.begin(OperationKind::Save);
+        operation.expect(clean_path_str(&file), Expectation::content(b"yavin"));
+        fs::write(&file, "editor").unwrap();
+        let changes = recorder.settled();
+        operation.complete();
+        assert!(has(&changes, ChangeKind::Modified, &file), "{changes:?}");
+        assert!(changes.iter().all(|c| c.operation.is_none()), "{changes:?}");
+        drop(watch);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Multi-step operations, as the commands register them, through a real watch: every
+    /// change they cause arrives credited to the one operation -- none of it looks external.
+    #[test]
+    fn a_create_with_new_folders_and_a_tree_copy_arrive_as_one_operation_each() {
+        let dir = temp("real-operations");
+        let source = dir.join("src");
+        fs::create_dir_all(source.join("deep/deeper")).unwrap();
+        fs::write(source.join("a.ts"), "a").unwrap();
+        fs::write(source.join("deep/deeper/b.ts"), "b").unwrap();
+        let expected = Arc::new(ExpectedWrites::default());
+        let (recorder, watch) = Recorder::start(&dir, Arc::clone(&expected));
+
+        // A file two new folders down, the way `create_file` registers it.
+        let file = dir.join("x/y/new.ts");
+        let create = expected.begin(OperationKind::CreateFile);
+        let create_id = create.id();
+        for folder in crate::file_tree::missing_ancestors(&file) {
+            create.expect(clean_path_str(&folder), Expectation::Directory);
+        }
+        create.expect(clean_path_str(&file), Expectation::content(b""));
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "").unwrap();
+        create.complete();
+        let changes = recorder.settled();
+        assert!(!changes.is_empty());
+        assert!(
+            changes.iter().all(|c| c.operation == Some(create_id)),
+            "{changes:?}"
+        );
+
+        // A tree, the way `copy_path` registers it.
+        recorder.clear();
+        let copy_to = dir.join("src_copy");
+        let copy = expected.begin(OperationKind::Copy);
+        let copy_id = copy.id();
+        copy.expect(
+            clean_path_str(&copy_to),
+            Expectation::CopyOf {
+                source: clean_path_str(&source),
+            },
+        );
+        crate::file_tree::copy_path(&clean_path_str(&source), &clean_path_str(&copy_to)).unwrap();
+        copy.complete();
+        let changes = recorder.settled();
+        assert!(
+            has(
+                &changes,
+                ChangeKind::Created,
+                &copy_to.join("deep/deeper/b.ts")
+            ) || has(&changes, ChangeKind::Created, &copy_to),
+            "{changes:?}"
+        );
+        assert!(
+            changes.iter().all(|c| c.operation == Some(copy_id)),
+            "{changes:?}"
+        );
+
+        // Another program then writing into the copy is reported as theirs.
+        recorder.clear();
+        fs::write(copy_to.join("a.ts"), "edited").unwrap();
+        let changes = recorder.settled();
+        assert!(
+            has(&changes, ChangeKind::Modified, &copy_to.join("a.ts")),
+            "{changes:?}"
+        );
+        assert!(changes.iter().all(|c| c.operation.is_none()), "{changes:?}");
+
+        // A rename and a delete inside a folder, the way `rename_path` and `delete_path`
+        // register them: nothing about them -- the folder's own change included -- is external.
+        recorder.clear();
+        let (old, new) = (
+            copy_to.join("deep/deeper/b.ts"),
+            copy_to.join("deep/deeper/c.ts"),
+        );
+        let rename = expected.begin(OperationKind::Rename);
+        let rename_id = rename.id();
+        rename.expect(clean_path_str(&old), Expectation::Absent);
+        rename.expect(clean_path_str(&new), Expectation::Present);
+        fs::rename(&old, &new).unwrap();
+        rename.complete();
+        let changes = recorder.settled();
+        assert!(!changes.is_empty());
+        assert!(
+            changes.iter().all(|c| c.operation == Some(rename_id)),
+            "{changes:?}"
+        );
+        recorder.clear();
+        let doomed = copy_to.join("deep");
+        let delete = expected.begin(OperationKind::Delete);
+        let delete_id = delete.id();
+        delete.expect(clean_path_str(&doomed), Expectation::Absent);
+        fs::remove_dir_all(&doomed).unwrap();
+        delete.complete();
+        let changes = recorder.settled();
+        assert!(has(&changes, ChangeKind::Deleted, &doomed), "{changes:?}");
+        assert!(
+            changes.iter().all(|c| c.operation == Some(delete_id)),
+            "{changes:?}"
+        );
         drop(watch);
         fs::remove_dir_all(&dir).ok();
     }

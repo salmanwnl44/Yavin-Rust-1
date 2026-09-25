@@ -9,6 +9,7 @@
 use ide_workspace::{
     file_tree::clean_path_str,
     process::{capture, capture_within, ToolOutput},
+    resource_events::{Expectation, OperationKind},
     watcher,
 };
 use serde::Serialize;
@@ -457,16 +458,28 @@ fn clone_repository(parent: &Path, url: &str, folder: &str) -> Result<PathBuf, S
 #[tauri::command]
 pub async fn git_clone_repo(
     state: State<'_, Repos>,
+    watch: State<'_, crate::Watch>,
     parent: String,
     url: String,
     folder: String,
 ) -> Result<RepoInfo, String> {
     let parent = PathBuf::from(parent);
+    // A clone checks a whole tree out: what lands there as Git's index holds it is this
+    // operation's, should the clone be inside the watched folder.
+    let operation = watch.expected.begin(OperationKind::Git);
+    if let Ok(canonical) = parent.canonicalize() {
+        operation.expect(
+            clean_path_str(canonical.join(&folder)),
+            Expectation::GitClean,
+        );
+    }
     let toplevel =
         tauri::async_runtime::spawn_blocking(move || clone_repository(&parent, &url, &folder))
             .await
-            .map_err(|e| e.to_string())??;
-    register_repo(&state, toplevel)
+            .map_err(|e| e.to_string())
+            .and_then(|cloned| cloned);
+    operation.finish(&toplevel);
+    register_repo(&state, toplevel?)
 }
 
 #[tauri::command]
@@ -894,6 +907,31 @@ fn rules_for(subcommand: &str) -> Option<&'static [FlagRule]> {
     })
 }
 
+/// Whether an (allowed) Git argv writes files in the working tree -- the commands whose
+/// results the watcher then sees, and which are therefore registered as a Yavin operation.
+///
+/// Deliberately not every command that is not a read. `add` and `commit` change the index, not
+/// the working tree; an operation for them would make an external edit that `add` then staged
+/// look exactly like a checkout Git wrote, and be credited to Yavin.
+pub(crate) fn writes_worktree(args: &[String]) -> bool {
+    let Some((subcommand, rest)) = args.split_first() else {
+        return false;
+    };
+    let has = |flag: &str| rest.iter().any(|arg| arg == flag);
+    match subcommand.as_str() {
+        "switch" | "pull" | "merge" | "rebase" | "cherry-pick" | "revert" => true,
+        // Bare `git stash` is `git stash push`.
+        "stash" => matches!(
+            rest.first().map(String::as_str),
+            None | Some("push" | "pop" | "apply")
+        ),
+        "restore" => has("--worktree") || has("-W"),
+        "rm" | "apply" => !has("--cached"),
+        "reset" => has("--hard") || has("--merge") || has("--keep"),
+        _ => false,
+    }
+}
+
 fn validate_args(subcommand: &str, rest: &[String]) -> Result<(), String> {
     let rules = rules_for(subcommand)
         .ok_or_else(|| format!("Git operation '{subcommand}' is not supported"))?;
@@ -1239,6 +1277,7 @@ pub async fn git_exec(
     stash_locks: State<'_, StashLocks>,
     network_locks: State<'_, NetworkLocks>,
     jobs: State<'_, GitJobs>,
+    watch: State<'_, crate::Watch>,
     repo_id: String,
     args: Vec<String>,
     input: Option<String>,
@@ -1254,9 +1293,27 @@ pub async fn git_exec(
         jobs: &jobs,
         id: id.clone(),
     };
-    tauri::async_runtime::spawn_blocking(move || exec_on(&repo, scope_lock, &args, input, cancel))
-        .await
-        .map_err(|e| e.to_string())?
+    // A command that writes the working tree is one Yavin operation: what it leaves there,
+    // exactly as Git's index holds it, is credited to it (see `operations`). It fails -- and
+    // is forgotten -- if Git does, including a merge stopped by conflicts.
+    let operation = writes_worktree(&args).then(|| {
+        let operation = watch.expected.begin(OperationKind::Git);
+        operation.expect(clean_path_str(&repo.root), Expectation::GitClean);
+        operation
+    });
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        exec_on(&repo, scope_lock, &args, input, cancel)
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|ran| ran);
+    if let Some(operation) = operation {
+        match &result {
+            Ok(output) if output.code == 0 => operation.complete(),
+            _ => operation.fail(),
+        }
+    }
+    result
 }
 
 /// Cancels every operation currently registered against one repository -- what the
@@ -1353,6 +1410,92 @@ mod tests {
             input,
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    #[test]
+    fn only_commands_that_write_the_working_tree_become_operations() {
+        for writes in [
+            &["switch", "main"][..],
+            &["stash"],
+            &["stash", "push", "-u"],
+            &["stash", "pop"],
+            &["stash", "apply"],
+            &["restore", "--staged", "--worktree", "--", "a.txt"],
+            &["rm", "--", "a.txt"],
+            &["apply", "-R"],
+            &["pull", "--ff-only"],
+            &["merge", "--abort"],
+            &["rebase", "--continue"],
+            &["cherry-pick", "--abort"],
+            &["revert", "--skip"],
+        ] {
+            assert!(writes_worktree(&args(writes)), "{writes:?}");
+        }
+        for reads_or_index_only in [
+            &[][..],
+            &["status"],
+            &["diff"],
+            &["add", "--", "a.txt"],
+            &["commit", "-m", "x"],
+            &["restore", "--staged", "--", "a.txt"],
+            &["rm", "--cached", "--", "a.txt"],
+            &["apply", "--cached"],
+            &["reset", "--soft", "HEAD~1"],
+            &["stash", "list"],
+            &["stash", "drop"],
+            &["fetch"],
+            &["push"],
+            &["branch", "-d", "x"],
+        ] {
+            assert!(
+                !writes_worktree(&args(reads_or_index_only)),
+                "{reads_or_index_only:?}"
+            );
+        }
+    }
+
+    /// The whole path `git_exec` takes for a switch: registered as an operation on the working
+    /// tree, run through `exec_on`, completed -- and the files it checked out credited to it,
+    /// while a file another program wrote meanwhile is not.
+    #[test]
+    fn a_switch_yavin_runs_is_credited_and_an_edit_made_meanwhile_is_not() {
+        use ide_workspace::resource_events::{ChangeKind, ExpectedWrites, ResourceChange};
+        let (dir, git) = fixture();
+        assert!(git(&["switch", "-qc", "other"]));
+        fs::write(dir.join("a.txt"), "other\n").unwrap();
+        fs::write(dir.join("b.txt"), "b\n").unwrap();
+        assert!(git(&["add", "."]));
+        assert!(git(&["commit", "-qm", "other"]));
+        assert!(git(&["switch", "-q", "-"]));
+        let repo = open(&dir);
+        let root = clean_path_str(&repo.root);
+
+        let expected = ExpectedWrites::default();
+        let switch = args(&["switch", "other"]);
+        assert!(writes_worktree(&switch));
+        let operation = expected.begin(OperationKind::Git);
+        let id = operation.id();
+        operation.expect(root.clone(), Expectation::GitClean);
+        let ran = exec(&repo, &switch, None).unwrap();
+        assert_eq!(ran.code, 0, "{}", ran.stderr);
+        fs::write(repo.root.join("stray.txt"), "someone else\n").unwrap();
+        operation.complete();
+
+        let change = |kind, name: &str| ResourceChange {
+            kind,
+            path: format!("{root}/{name}"),
+            from: None,
+            operation: None,
+        };
+        let mut changes = vec![
+            change(ChangeKind::Modified, "a.txt"),
+            change(ChangeKind::Created, "b.txt"),
+            change(ChangeKind::Created, "stray.txt"),
+        ];
+        expected.attribute(&mut changes);
+        let credited: Vec<_> = changes.iter().map(|c| c.operation).collect();
+        assert_eq!(credited, [Some(id), Some(id), None]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

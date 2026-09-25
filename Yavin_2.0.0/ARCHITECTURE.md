@@ -162,23 +162,7 @@ notify 9 (ReadDirectoryChangesW / inotify / FSEvents), recursive on the canonica
 - The UI's `createWatchTracker` also applies a batch only if it is for the open folder (compared as a resource) and from the newest generation seen.
 - The window opens one folder, so there is one watch. The contract names its root so that several can coexist.
 
-**Yavin's own writes.** Each command registers what it will leave (`ExpectedWrites`) before it touches the disk:
-
-| Command                       | Registers                                                                      |
-| ----------------------------- | ------------------------------------------------------------------------------ |
-| `write_file_guarded`          | these bytes (size + hash)                                                      |
-| `create_file`                 | empty content                                                                  |
-| `create_directory`            | a directory                                                                    |
-| `rename_path`                 | the old name absent (present, for a case-only rename) and the new name present |
-| `delete_path`                 | absent                                                                         |
-| `copy_path`, `duplicate_path` | the destination present                                                        |
-
-- A reported change is credited to the operation only if the disk, read when the change is reported, is in that state. A file is read only when an expectation names its exact size.
-- There is no time-based suppression. Another program writing different bytes a moment later is reported as external, whatever the timing.
-- A deletion inside a folder an operation deleted is credited to it. A creation inside a folder an operation created or copied is not, because it cannot be distinguished from another program writing there.
-- Failed operations' expectations are dropped at once. Settled ones are forgotten 10 s after the operation finishes, and at most 1024 are kept. Timing only frees memory; it never decides attribution.
-- Attribution grants nothing. Every operation is still checked by its command.
-- The explorer skips changes credited to an operation, since each operation re-lists what it changed.
+**Yavin's own writes** are credited to the operation that made them (see [File operations](#file-operations)). The explorer skips credited changes, since each operation re-lists what it changed.
 
 **Invariants**
 
@@ -190,12 +174,65 @@ notify 9 (ReadDirectoryChangesW / inotify / FSEvents), recursive on the canonica
 6. An unpaired rename degrades to a deletion and a creation.
 7. Lost notifications, overflow and failure produce an explicit rescan, and `failed` where the watch is down.
 8. Rescans are scoped to the smallest folder known to cover what was missed.
-9. Yavin's writes are attributed by the state they leave, never by timing.
-10. A failed or expired expectation cannot suppress an external change.
-11. Watcher state is bounded: one pending rename, 4096 changes and 16 rescan scopes per batch, and 1024 expectations.
+9. Yavin's writes are attributed to their operation by the state they leave, never by timing.
+10. A failed or expired operation cannot account for any change.
+11. Watcher state is bounded: one pending rename, 4096 changes and 16 rescan scopes per batch, and 256 operations of at most 64 expectations each.
 12. Replacing or closing a watch invalidates it and discards its pending burst.
 13. Events carry resource paths, never contents, and ordinary events cost no file reads.
 14. Changes reach the UI only through the typed `resource-changes` and `watcher-status` contract.
+
+## File operations
+
+One logical action -- a save, a create, a copy, a Git switch -- is one **operation** (`src-tauri/crates/ide-workspace/src/operations.rs`), however many filesystem effects it has. The command begins it, registers every effect it will have as an `Expectation` **before** touching the disk, runs, and completes it or fails it with its result. Dropping the guard without either (an early return, a panic) fails it. When the watcher reports a batch, `ExpectedWrites::attribute` credits each change to the newest operation whose expectation the disk, read at that moment, satisfies. Consumers only ever see the resulting `operation` id on a change; expectations never cross the event boundary.
+
+| Operation     | Command                                                               | Registers before acting                                                                                                                   |
+| ------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Save          | `write_file_guarded`                                                  | the temporary file (`Transient`: gone, or holding exactly the bytes), the target (`Content`: exactly the bytes), any folders it must make |
+| Create file   | `create_file`                                                         | every missing ancestor folder (`Directory`), the file (empty `Content`)                                                                   |
+| Create folder | `create_directory`                                                    | every missing ancestor folder, and the folder itself (`Directory`)                                                                        |
+| Rename        | `rename_path`                                                         | old name `Absent` (`Present` for a case-only rename), new name `Present`                                                                  |
+| Delete        | `delete_path`                                                         | `Absent`                                                                                                                                  |
+| Copy          | `copy_path`, `duplicate_path`                                         | the destination `CopyOf` its source, plus missing ancestors for `copy_path`                                                               |
+| Git           | `git_exec` for commands that write the working tree; `git_clone_repo` | the working tree `GitClean`                                                                                                               |
+
+**What each expectation accepts.** Every check reads the disk when the change is reported, and a file is read only when a size already matches:
+
+- **`Content`, `Transient`, `Directory`, `Present`:** the exact path, in that state.
+- **`Absent`:** the path, and deletions below it (a folder's contents go with it).
+- **`CopyOf(source)`:** the destination, and anything created or written below it, only if it holds exactly what the matching path under `source` holds. Also accepted: a `modified` report for a folder at or under `source`, because reading a folder to copy it updates its access time. Deletions are never accepted.
+- **`GitClean`:** paths in the working tree that `git status` reports as exactly what the index holds. The check runs once per batch per tree, in chunks of 100 literal pathspecs, without optional locks and with the repository's `core.fsmonitor` hook disabled. Anything modified, untracked, ignored or conflicted is not accepted, and neither is anything inside a folder Git lists as a whole.
+- **Folder reports.** Adding, removing or renaming an entry changes its folder's modification time, which Windows reports as a change to the folder. A `modified` folder is credited to an operation that changed an entry directly inside it, while that entry is as the operation left it.
+
+**Git.** Only commands that write the working tree become operations:
+
+- `switch`, `pull`, `merge`, `rebase`, `cherry-pick`, `revert`
+- `stash` (bare, `push`, `pop` or `apply`)
+- `restore --worktree`
+- `rm` and `apply` without `--cached`
+- `reset --hard`, `--merge` or `--keep`
+
+Of these, `restore --worktree` and `reset --hard`/`--merge`/`--keep` are defensive: the argv allow-list currently permits only `restore --staged` and `reset --soft`, so they never run today. Discarding a file and accepting one side of a conflict do not run Git at all -- they write the file through the editor's save path, and are credited as a Save.
+
+`add` and `commit` are deliberately excluded. `add` makes the index match the working tree, so an external edit that `add` then staged would look exactly like a checkout Git wrote. A Git command that exits non-zero, including a merge stopped by conflicts, fails its operation.
+
+**Lifecycle and bounds.**
+
+- A failed operation is removed at once.
+- A completed one is removed 10 s after it finished.
+- A started one that never finishes is removed after 30 min, long enough for a slow clone or pull.
+- At most 256 operations are held; the oldest completed ones are evicted first. Evicting a still-running one is logged, because its changes will then look external.
+- An operation registers at most 64 expectations. A tree (a copy, a checkout) is one expectation, not one per file.
+- Timing only frees memory. It never decides attribution.
+
+**Invariants**
+
+1. Every filesystem effect of one logical action is registered to one operation before the effect happens.
+2. A change is credited only when the observed disk state is what the operation said it would leave. There is no path- or time-based suppression.
+3. An external change is reported as external even while an operation on the same path is running.
+4. A failed or abandoned operation accounts for nothing from the moment it fails.
+5. Of two operations that could account for a change, the newer is credited.
+6. Operations and expectations are bounded, and completed operations expire deterministically.
+7. Attribution grants nothing: every operation is still validated by its command, and the event contract is unchanged.
 
 ## Rules and references
 

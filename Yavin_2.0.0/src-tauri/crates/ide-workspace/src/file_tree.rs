@@ -171,11 +171,22 @@ impl WorkspaceManager {
 
     /// Safely and atomically writes content to a file.
     pub fn write_file<P: AsRef<Path>>(&self, path: P, content: &str) -> Result<(), String> {
+        self.write_file_with(path, content, temp_nonce())
+    }
+
+    /// `write_file` through the temporary file `temp_path_for(<validated path>, nonce)`, so a
+    /// caller that needs to know that file in advance can.
+    pub fn write_file_with<P: AsRef<Path>>(
+        &self,
+        path: P,
+        content: &str,
+        nonce: u128,
+    ) -> Result<(), String> {
         if content.len() as u64 > MAX_EDITOR_FILE_SIZE {
             return Err("Content exceeds the editor's 10 MB file size limit".into());
         }
         let validated = self.validate_path(path)?;
-        atomic_write_file(&validated, content)
+        atomic_write_file_via(&validated, &temp_path_for(&validated, nonce), content)
     }
 
     /// Creates a new empty file inside the workspace.
@@ -279,24 +290,55 @@ pub fn read_file_content_guarded(path: &Path) -> Result<String, String> {
     })
 }
 
+/// A fresh value for `temp_path_for`, never the same twice in one process: the clock alone is
+/// not enough -- Windows advances it in 100 ns steps, so two saves of one file in the same step
+/// would pick the same temporary name, and the second would fail to create it. A per-process
+/// sequence number in the low bits keeps every nonce distinct; the time keeps them distinct
+/// across processes and restarts.
+pub fn temp_nonce() -> u128 {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    (nanos << 32) | u128::from(sequence as u32)
+}
+
+/// The temporary file an atomic write of `path` goes through: a hidden sibling, so the final
+/// rename stays on one volume. Derived from `nonce` so a caller can know it before writing.
+pub fn temp_path_for(path: &Path, nonce: u128) -> PathBuf {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    path.with_file_name(format!(".{name}.tmp.{nonce}"))
+}
+
+/// The folders above `path` that do not exist yet -- what creating `path` with its parents
+/// would make -- outermost first. No I/O beyond checking each for existence.
+pub fn missing_ancestors(path: &Path) -> Vec<PathBuf> {
+    let mut missing: Vec<PathBuf> = path
+        .ancestors()
+        .skip(1)
+        .take_while(|ancestor| !ancestor.as_os_str().is_empty() && !ancestor.exists())
+        .map(Path::to_path_buf)
+        .collect();
+    missing.reverse();
+    missing
+}
+
 /// Safely writes file to disk via atomic temp file swap.
 pub fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
+    atomic_write_file_via(path, &temp_path_for(path, temp_nonce()), content)
+}
+
+/// `atomic_write_file` through a given temporary file (see `temp_path_for`).
+pub fn atomic_write_file_via(path: &Path, temp_path: &Path, content: &str) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "Missing parent directory".to_string())?;
     if !parent.exists() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-
-    let temp_name = format!(
-        ".{}.tmp.{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
-        std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let temp_path = parent.join(&temp_name);
+    let temp_path = temp_path.to_path_buf();
 
     {
         let mut temp_file = fs::OpenOptions::new()
