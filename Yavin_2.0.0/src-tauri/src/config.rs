@@ -6,33 +6,23 @@
 //! works in, and a truncated trust file could lose the tail of a path and leave a decision
 //! that reads as covering more than the user ever agreed to.
 
-use std::fs;
 use std::path::Path;
 
 /// Replaces `file` with `text`, or leaves the previous contents entirely alone.
 ///
-/// The write goes to a sibling temporary file and is then renamed over the target, which is
-/// atomic on every platform Yavin runs on. The temporary file is removed on either failure
-/// path, so a full disk cannot leave litter next to a file people are told they may read by
-/// hand.
+/// The write goes to a uniquely named sibling temporary file, is flushed to disk, and is then
+/// renamed over the target, which is atomic on every platform Yavin runs on (see
+/// `ide_workspace::durable`). The temporary file is removed on either failure path, so a full
+/// disk cannot leave litter next to a file people are told they may read by hand, and a crash
+/// that leaves one behind has it swept at the next start.
 pub fn write_atomically(file: &Path, text: &str) -> Result<(), String> {
-    if let Some(parent) = file.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    // Named from the target, so two files in the same directory cannot collide.
-    let temporary = file.with_extension("writing");
-    let written = fs::write(&temporary, text)
-        .and_then(|()| fs::rename(&temporary, file))
-        .map_err(|error| error.to_string());
-    if written.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    written
+    ide_workspace::durable::write_durably(file, text.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn temp(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("yavin-config-{}-{name}", std::process::id()));

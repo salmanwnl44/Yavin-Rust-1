@@ -9,6 +9,7 @@
 use ide_workspace::{
     file_tree::clean_path_str,
     process::{capture, capture_within, ToolOutput},
+    recovery::{DiskState, Effect},
     resource_events::{Expectation, OperationKind},
     watcher,
 };
@@ -467,18 +468,25 @@ pub async fn git_clone_repo(
     // A clone checks a whole tree out: what lands there as Git's index holds it is this
     // operation's, should the clone be inside the watched folder.
     let operation = watch.expected.begin(OperationKind::Git);
+    let mut effects = Vec::new();
     if let Ok(canonical) = parent.canonicalize() {
-        operation.expect(
-            clean_path_str(canonical.join(&folder)),
-            Expectation::GitClean,
-        );
+        let destination = clean_path_str(canonical.join(&folder));
+        operation.expect(destination.clone(), Expectation::GitClean);
+        // For crash recovery: nothing there before, the clone after.
+        effects.push(Effect::new(
+            destination,
+            DiskState::Absent,
+            DiskState::Present,
+        ));
     }
+    let intent = crate::record_intent(&watch, operation.id(), OperationKind::Git, effects)?;
     let toplevel =
         tauri::async_runtime::spawn_blocking(move || clone_repository(&parent, &url, &folder))
             .await
             .map_err(|e| e.to_string())
             .and_then(|cloned| cloned);
     operation.finish(&toplevel);
+    intent.close();
     register_repo(&state, toplevel?)
 }
 
@@ -1301,6 +1309,20 @@ pub async fn git_exec(
         operation.expect(clean_path_str(&repo.root), Expectation::GitClean);
         operation
     });
+    // Recorded for crash recovery before Git runs; if it cannot be, Git does not run.
+    let intent = match &operation {
+        Some(operation) => Some(crate::record_intent(
+            &watch,
+            operation.id(),
+            OperationKind::Git,
+            vec![Effect::new(
+                clean_path_str(&repo.root),
+                DiskState::Unknown,
+                DiskState::Unknown,
+            )],
+        )?),
+        None => None,
+    };
     let result = tauri::async_runtime::spawn_blocking(move || {
         exec_on(&repo, scope_lock, &args, input, cancel)
     })
@@ -1312,6 +1334,9 @@ pub async fn git_exec(
             Ok(output) if output.code == 0 => operation.complete(),
             _ => operation.fail(),
         }
+    }
+    if let Some(intent) = intent {
+        intent.close();
     }
     result
 }

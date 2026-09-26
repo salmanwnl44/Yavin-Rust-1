@@ -1,11 +1,15 @@
 use file_tree::WorkspaceManager;
+use ide_workspace::durable::{prune_backups, sweep_stale_temps};
 use ide_workspace::file_tree::{self, FileNode};
+use ide_workspace::recovery::{
+    self, DiskState, Effect, Intent, IntentLog, RecoveryReport, Role, STALE_TEMP_AGE,
+};
 use ide_workspace::resource_events::{
     self, Expectation, ExpectedWrites, OperationKind, ResourceWatch, WatchOutput, WatcherState,
     WatcherStatus,
 };
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::{env, path::Path, sync::Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 mod checkers;
@@ -42,6 +46,16 @@ struct Workspace(Mutex<Option<WorkspaceManager>>);
 pub(crate) struct Watch {
     current: Mutex<Option<ResourceWatch>>,
     expected: Arc<ExpectedWrites>,
+    /// This process's crash-recovery intent log, opened at startup (see `recover_at_startup`).
+    /// An error here means no operation can be recorded, and so none is performed.
+    intents: OnceLock<Result<IntentLog, String>>,
+}
+
+/// What startup recovery found, for the UI to show (`recovery_report`).
+#[derive(Default)]
+struct Recovery {
+    root: OnceLock<PathBuf>,
+    report: Mutex<RecoveryReport>,
 }
 
 /// Reports every change under `root` to the UI as `resource-changes` batches, and the watch's
@@ -82,29 +96,103 @@ fn watch_workspace(app: &AppHandle, watch: &Watch, root: &Path) {
     }
 }
 
-/// Runs one file operation with everything it will leave on disk registered first, so the
-/// watcher can recognise the changes it causes as Yavin's (see `operations`). The operation is
-/// completed or failed with its result: a failed one's expectations are dropped at once.
+/// One effect of a file operation, described twice: what the watcher's change will be matched
+/// against (`expectation`, Module 03), and what crash recovery compares the disk with --
+/// before the operation (`pre`) and after it (`post`).
+pub(crate) struct Planned {
+    path: PathBuf,
+    expectation: Expectation,
+    pre: DiskState,
+    post: DiskState,
+    role: Role,
+}
+
+impl Planned {
+    /// An effect whose `pre` is whatever is at `path` now.
+    pub(crate) fn new(path: PathBuf, expectation: Expectation, post: DiskState) -> Self {
+        Planned {
+            pre: DiskState::observe(&path),
+            path,
+            expectation,
+            post,
+            role: Role::Target,
+        }
+    }
+
+    pub(crate) fn pre(mut self, pre: DiskState) -> Self {
+        self.pre = pre;
+        self
+    }
+
+    pub(crate) fn role(mut self, role: Role) -> Self {
+        self.role = role;
+        self
+    }
+}
+
+/// Durably records an operation's intent, before it touches the disk. Fails closed: if the
+/// intent cannot be recorded, the caller must not perform the operation.
+pub(crate) fn record_intent<'a>(
+    watch: &'a Watch,
+    operation: u64,
+    kind: OperationKind,
+    effects: Vec<Effect>,
+) -> Result<Intent<'a>, String> {
+    let log = watch
+        .intents
+        .get()
+        .ok_or("Crash recovery has not started yet; try again in a moment.")?
+        .as_ref()
+        .map_err(|error| {
+            format!("Crash recovery is unavailable ({error}), so this was not done.")
+        })?;
+    log.record(operation, kind.into(), effects)
+        .map_err(|error| format!("Cannot record this operation for crash recovery: {error}"))
+}
+
+/// Runs one file operation as Module 03 describes it, with its crash-recovery intent recorded
+/// first:
+///
+/// ```text
+/// begin -> expect every effect -> record the intent durably -> mutate -> finish -> close intent
+/// ```
+///
+/// The watcher credits the changes it causes to it (`operations`); a crash between recording
+/// and closing leaves the record for the next start to settle (`recovery`). If the intent
+/// cannot be recorded, nothing is done and the error says why.
 pub(crate) fn expecting<T>(
     watch: &Watch,
     kind: OperationKind,
-    results: Vec<(PathBuf, Expectation)>,
+    plan: Vec<Planned>,
     run: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
     let operation = watch.expected.begin(kind);
-    for (path, expectation) in results {
-        operation.expect(file_tree::clean_path_str(path), expectation);
+    let mut effects = Vec::with_capacity(plan.len());
+    for planned in plan {
+        let path = file_tree::clean_path_str(&planned.path);
+        operation.expect(path.clone(), planned.expectation);
+        effects.push(Effect {
+            path,
+            pre: planned.pre,
+            post: planned.post,
+            role: planned.role,
+        });
     }
+    // On failure the operation is dropped, which fails it: nothing has touched the disk.
+    let intent = record_intent(watch, operation.id(), kind, effects)?;
     let result = run();
     operation.finish(&result);
+    intent.close();
     result
 }
 
-/// The folders a create of `target` will make on the way, as expectations of that create.
-pub(crate) fn made_folders(target: &Path) -> Vec<(PathBuf, Expectation)> {
+/// The folders a create of `target` will make on the way, as effects of that create.
+pub(crate) fn made_folders(target: &Path) -> Vec<Planned> {
     file_tree::missing_ancestors(target)
         .into_iter()
-        .map(|folder| (folder, Expectation::Directory))
+        .map(|folder| {
+            Planned::new(folder, Expectation::Directory, DiskState::Directory).role(Role::Folder)
+        })
         .collect()
 }
 
@@ -167,9 +255,13 @@ fn create_file(
 ) -> Result<(), String> {
     with_workspace(&state, |manager| {
         let target = manager.validate_path(&path)?;
-        let mut results = made_folders(&target);
-        results.push((target, Expectation::content(b"")));
-        expecting(&watch, OperationKind::CreateFile, results, || {
+        let mut plan = made_folders(&target);
+        plan.push(Planned::new(
+            target,
+            Expectation::content(b""),
+            DiskState::file(b""),
+        ));
+        expecting(&watch, OperationKind::CreateFile, plan, || {
             manager.create_file(&path)
         })
     })
@@ -183,9 +275,13 @@ fn create_directory(
 ) -> Result<(), String> {
     with_workspace(&state, |manager| {
         let target = manager.validate_path(&path)?;
-        let mut results = made_folders(&target);
-        results.push((target, Expectation::Directory));
-        expecting(&watch, OperationKind::CreateDirectory, results, || {
+        let mut plan = made_folders(&target);
+        plan.push(Planned::new(
+            target,
+            Expectation::Directory,
+            DiskState::Directory,
+        ));
+        expecting(&watch, OperationKind::CreateDirectory, plan, || {
             manager.create_directory(&path)
         })
     })
@@ -205,17 +301,18 @@ fn rename_path(
         // the same entry -- so it cannot be expected to be gone.
         let case_only = file_tree::clean_path_str(&old).to_lowercase()
             == file_tree::clean_path_str(&new).to_lowercase();
-        let old_after = if case_only {
-            Expectation::Present
+        let (old_after, old_state) = if case_only {
+            (Expectation::Present, DiskState::Present)
         } else {
-            Expectation::Absent
+            (Expectation::Absent, DiskState::Absent)
         };
-        expecting(
-            &watch,
-            OperationKind::Rename,
-            vec![(old, old_after), (new, Expectation::Present)],
-            || manager.rename_path(&old_path, &new_path),
-        )
+        let plan = vec![
+            Planned::new(old, old_after, old_state),
+            Planned::new(new, Expectation::Present, DiskState::Present),
+        ];
+        expecting(&watch, OperationKind::Rename, plan, || {
+            manager.rename_path(&old_path, &new_path)
+        })
     })
 }
 
@@ -228,12 +325,13 @@ fn delete_path(
 ) -> Result<(), String> {
     with_workspace(&state, |manager| {
         let target = manager.validate_entry(&path)?;
-        expecting(
-            &watch,
-            OperationKind::Delete,
-            vec![(target, Expectation::Absent)],
-            || manager.delete_path(&path, recursive),
-        )
+        // A folder is recorded with its entry count, so an interrupted delete of it can be
+        // told from one that never started.
+        let pre = DiskState::observe_tree(&target);
+        let plan = vec![Planned::new(target, Expectation::Absent, DiskState::Absent).pre(pre)];
+        expecting(&watch, OperationKind::Delete, plan, || {
+            manager.delete_path(&path, recursive)
+        })
     })
 }
 
@@ -255,12 +353,13 @@ fn duplicate_path(
         let copy = Expectation::CopyOf {
             source: source.clone(),
         };
-        expecting(
-            &watch,
-            OperationKind::Copy,
-            vec![(PathBuf::from(&destination), copy)],
-            || file_tree::copy_path(&source, &destination),
-        )?;
+        let copied = DiskState::CopyOf {
+            source: source.clone(),
+        };
+        let plan = vec![Planned::new(PathBuf::from(&destination), copy, copied)];
+        expecting(&watch, OperationKind::Copy, plan, || {
+            file_tree::copy_path(&source, &destination)
+        })?;
         Ok(destination)
     })
 }
@@ -365,12 +464,71 @@ fn copy_path(
         let copy = Expectation::CopyOf {
             source: source.clone(),
         };
-        let mut results = made_folders(&destination);
-        results.push((destination, copy));
-        expecting(&watch, OperationKind::Copy, results, || {
+        let copied = DiskState::CopyOf {
+            source: source.clone(),
+        };
+        let mut plan = made_folders(&destination);
+        plan.push(Planned::new(destination, copy, copied));
+        expecting(&watch, OperationKind::Copy, plan, || {
             file_tree::copy_path(&source, &target)
         })
     })
+}
+
+/// Opens this process's intent log and settles whatever a previous Yavin left in progress,
+/// before any window can start a new operation. Cost follows the number of interrupted
+/// operations, never the size of a project.
+fn recover_at_startup(app: &AppHandle) {
+    let watch = app.state::<Watch>();
+    let state = app.state::<Recovery>();
+    let root = app
+        .path()
+        .app_local_data_dir()
+        .map(|folder| folder.join("recovery"))
+        .map_err(|error| error.to_string());
+    let opened = root.and_then(|root| {
+        let log = IntentLog::open(&root)?;
+        let report = recovery::recover(&root, log.instance());
+        for item in report.actions.iter().chain(&report.unresolved) {
+            eprintln!("Recovery ({:?}): {}", item.outcome, item.message);
+        }
+        if let Ok(mut held) = state.report.lock() {
+            *held = report;
+        }
+        let _ = state.root.set(root);
+        Ok(log)
+    });
+    if let Err(error) = &opened {
+        eprintln!("Crash recovery is unavailable: {error}");
+    }
+    let _ = watch.intents.set(opened);
+    // Leftovers of Yavin's own settings writes; the settings files themselves are never swept.
+    if let Ok(config) = app.path().app_config_dir() {
+        sweep_stale_temps(&config, STALE_TEMP_AGE);
+        prune_backups(&config.join("session.json"));
+        prune_backups(&config.join("trusted-folders.txt"));
+    }
+}
+
+/// What startup recovery did, and everything still waiting for the user.
+#[tauri::command]
+fn recovery_report(state: State<'_, Recovery>) -> Result<RecoveryReport, String> {
+    let mut report = state.report.lock().map_err(|e| e.to_string())?.clone();
+    if let Some(root) = state.root.get() {
+        report.unresolved = recovery::unresolved(root);
+    }
+    Ok(report)
+}
+
+/// The user has dealt with these items: forget them. Nothing else is ever removed.
+#[tauri::command]
+fn recovery_dismiss(
+    state: State<'_, Recovery>,
+    ids: Vec<String>,
+) -> Result<RecoveryReport, String> {
+    let root = state.root.get().ok_or("Crash recovery is unavailable.")?;
+    recovery::dismiss(root, &ids)?;
+    recovery_report(state)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -388,7 +546,14 @@ pub fn run() {
         .manage(Trust::default())
         .manage(Sessions::default())
         .manage(Checks::default())
+        .manage(Recovery::default())
+        .setup(|app| {
+            recover_at_startup(app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
+            recovery_report,
+            recovery_dismiss,
             get_default_workspace,
             list_workspace_files,
             read_file_content,
@@ -449,6 +614,12 @@ pub fn run() {
                     // A checker is a child process too, and a cold `cargo check` outlives
                     // the window by minutes if nothing stops it.
                     checkers::cancel_running(&handle.state::<Checks>());
+                    // Leftover temporary files of this process's own records. The records
+                    // themselves are gone unless an operation is still running, which the
+                    // next start then settles.
+                    if let Some(Ok(log)) = handle.state::<Watch>().intents.get() {
+                        log.sweep();
+                    }
                 }
             })
         })
@@ -506,6 +677,135 @@ mod tests {
         // The one spelling is the cleaned form the rest of the UI compares against: no
         // extended-length prefix, `/` separators.
         assert!(!canonical.starts_with("//?/") && !canonical.contains('\\'));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn records_in(root: &Path) -> usize {
+        std::fs::read_dir(root.join("instances"))
+            .map(|instances| {
+                instances
+                    .flatten()
+                    .flat_map(|i| std::fs::read_dir(i.path()).into_iter().flatten().flatten())
+                    .filter(|f| f.file_name().to_string_lossy().starts_with("op-"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// The whole path, through `expecting` as the save command drives it: the intent is
+    /// recorded, the temporary file is written, and then the process dies. The next start
+    /// finds the target untouched and the temporary file complete, and finishes the save.
+    #[test]
+    fn a_save_interrupted_by_a_crash_is_finished_at_the_next_start() {
+        use ide_workspace::recovery::Outcome;
+        let root = temp_folder("recovery-root");
+        let dir = temp_folder("recovery-files");
+        let target = dir.join("a.ts");
+        std::fs::write(&target, "before").unwrap();
+        let temporary = file_tree::temp_path_for(&target, 7);
+
+        let watch = Watch::default();
+        watch
+            .intents
+            .set(Ok(IntentLog::open(&root).unwrap()))
+            .unwrap();
+        let plan = vec![
+            Planned::new(
+                temporary.clone(),
+                Expectation::transient(b"after"),
+                DiskState::file(b"after"),
+            )
+            .pre(DiskState::Absent)
+            .role(Role::Temporary),
+            Planned::new(
+                target.clone(),
+                Expectation::content(b"after"),
+                DiskState::file(b"after"),
+            )
+            .pre(DiskState::file(b"before")),
+        ];
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            expecting(
+                &watch,
+                OperationKind::Save,
+                plan,
+                || -> Result<(), String> {
+                    std::fs::write(&temporary, "after").unwrap();
+                    panic!("the process dies between writing the temporary file and renaming it");
+                },
+            )
+        }));
+        assert!(died.is_err());
+        assert_eq!(records_in(&root), 1, "the intent outlives the crash");
+        drop(watch); // The process is gone: its instance lock goes with it.
+
+        let report = recovery::recover(&root, "the-next-start");
+        assert_eq!(report.actions.len(), 1, "{report:?}");
+        assert_eq!(report.actions[0].outcome, Outcome::RolledForward);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "after");
+        assert!(!temporary.exists());
+        assert_eq!(records_in(&root), 0);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_operation_whose_intent_cannot_be_recorded_is_not_performed() {
+        let dir = temp_folder("refused");
+        let target = dir.join("new.ts");
+        let watch = Watch::default();
+        watch
+            .intents
+            .set(Err("the recovery folder cannot be created".into()))
+            .unwrap();
+        let mut ran = false;
+        let plan = vec![Planned::new(
+            target.clone(),
+            Expectation::content(b""),
+            DiskState::file(b""),
+        )];
+        let result = expecting(&watch, OperationKind::CreateFile, plan, || {
+            ran = true;
+            std::fs::write(&target, "").map_err(|e| e.to_string())
+        });
+        assert!(result
+            .unwrap_err()
+            .contains("Crash recovery is unavailable"));
+        assert!(!ran, "nothing touched the disk");
+        assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_operation_that_ends_either_way_leaves_no_record() {
+        let root = temp_folder("closed-root");
+        let dir = temp_folder("closed-files");
+        let watch = Watch::default();
+        watch
+            .intents
+            .set(Ok(IntentLog::open(&root).unwrap()))
+            .unwrap();
+        let target = dir.join("made");
+        let plan = || {
+            vec![Planned::new(
+                target.clone(),
+                Expectation::Directory,
+                DiskState::Directory,
+            )]
+        };
+        expecting(&watch, OperationKind::CreateDirectory, plan(), || {
+            std::fs::create_dir(&target).map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert_eq!(records_in(&root), 0);
+        // A failure the live process reports is not a crash: nothing is left for recovery.
+        let failed: Result<(), String> =
+            expecting(&watch, OperationKind::CreateDirectory, plan(), || {
+                Err("already exists".into())
+            });
+        assert!(failed.is_err());
+        assert_eq!(records_in(&root), 0);
+        let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

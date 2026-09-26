@@ -47,6 +47,7 @@ import { isTauri } from "@tauri-apps/api/core";
 import type { FileNode, EditorTab, RecentFile } from "./types";
 import { native, onResourceChanges, onWatcherStatus } from "./services/native";
 import { createWatchTracker } from "./services/resourceEvents";
+import { asRecoveryReport, describeRecovery } from "./services/recovery";
 import { createOutputChannel } from "./services/panel/output";
 import {
   directoriesToRefresh,
@@ -540,6 +541,26 @@ export default function App() {
   // already re-lists what it changed as soon as it finishes (`refreshAround`).
   const refreshTreeRef = useRef(refreshTree);
   refreshTreeRef.current = refreshTree;
+  // What crash recovery did at startup, and what still needs the user (see recovery.ts). Once:
+  // the native side settled everything before this window could exist.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    native("recovery_report")
+      .then((payload) => {
+        if (cancelled) return;
+        const { lines, banner } = describeRecovery(asRecoveryReport(payload));
+        if (!lines.length) return;
+        const log = createOutputChannel("Recovery");
+        for (const line of lines) log.appendLine(line.text, line.level);
+        if (banner) reportError(banner);
+      })
+      .catch(reportError);
+    return () => {
+      cancelled = true;
+    };
+  }, [reportError]);
+
   const watchTracker = useRef(createWatchTracker());
   useEffect(() => {
     const log = createOutputChannel("Workspace");
@@ -1407,6 +1428,25 @@ export default function App() {
             .filter((command) => command.shortcut)
             .map((command) => command.label + " — " + shortcutLabel(command.shortcut!))
             .join("\n"),
+        }),
+    },
+    {
+      // Unresolved recovery items are kept until the user says they have dealt with them.
+      id: "help.dismissRecovery",
+      menu: "Help",
+      label: "Dismiss Recovery Items",
+      disabled: !desktop,
+      reason: "Available in the desktop app",
+      run: () =>
+        run(async () => {
+          const { unresolved } = asRecoveryReport(await native("recovery_report"));
+          await native("recovery_dismiss", { ids: unresolved.map((item) => item.id) });
+          createOutputChannel("Recovery").appendLine(
+            unresolved.length
+              ? `Dismissed ${unresolved.length} recovery item${unresolved.length === 1 ? "" : "s"}.`
+              : "There were no recovery items to dismiss.",
+            "info",
+          );
         }),
     },
     {

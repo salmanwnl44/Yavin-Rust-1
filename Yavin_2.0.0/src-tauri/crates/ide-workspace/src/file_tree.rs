@@ -340,23 +340,21 @@ pub fn atomic_write_file_via(path: &Path, temp_path: &Path, content: &str) -> Re
     }
     let temp_path = temp_path.to_path_buf();
 
-    {
-        let mut temp_file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .map_err(|e| e.to_string())?;
-        temp_file.write_all(content.as_bytes()).map_err(|e| {
-            let _ = fs::remove_file(&temp_path);
-            e.to_string()
-        })?;
-        temp_file.flush().map_err(|e| {
-            let _ = fs::remove_file(&temp_path);
-            e.to_string()
-        })?;
-        temp_file
-            .sync_all()
-            .map_err(|e| format!("Failed to sync saved file: {e}"))?;
+    let mut temp_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|e| e.to_string())?;
+    let written = temp_file
+        .write_all(content.as_bytes())
+        .and_then(|()| temp_file.flush())
+        .and_then(|()| temp_file.sync_all());
+    // Closed before anything else: Windows refuses to remove a file that is still open, so a
+    // failed write used to leave its temporary file behind.
+    drop(temp_file);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("Failed to write the saved file: {error}"));
     }
 
     fs::rename(&temp_path, path).map_err(|e| {

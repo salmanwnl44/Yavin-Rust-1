@@ -11,6 +11,8 @@ interface Scenario {
   fail: Record<string, string>;
   /** What `git_probe_worktree` reports: is the worktree's folder still usable? */
   probe: "ready" | "missing" | "invalid";
+  /** What `recovery_report` returns at startup; nothing to report when absent. */
+  recovery?: unknown;
 }
 
 const diverged = "# branch.head main\n# branch.upstream origin/main\n# branch.ab +2 -3\n";
@@ -107,6 +109,7 @@ async function panel(page: Page, scenario: Partial<Scenario> = {}) {
           const action = actionOfInline(command, args);
           calls.push({ command, args, action });
           if (command === "get_default_workspace") return "/work";
+          if (command === "recovery_report") return state.recovery ?? null;
           if (command === "list_workspace_files")
             return { ...node(args.path as string), children: [node("/work/file.ts")] };
           if (command === "read_file_content") return "contents";
@@ -647,6 +650,42 @@ test("watcher batches re-list only what they touched, and only from the current 
   // A rescan of the root re-lists every loaded folder.
   await batch(5, "/work", [], ["/work"]);
   await expect.poll(listings).toBe(before + 1);
+});
+
+test("an interrupted operation recovery could not settle is announced at startup", async ({
+  page,
+}) => {
+  await panel(page, {
+    recovery: {
+      actions: [
+        {
+          id: "old-1",
+          kind: "save",
+          outcome: "rolledForward",
+          paths: ["/work/b.ts"],
+          message: "Finished an interrupted save of /work/b.ts.",
+          at: 1,
+        },
+      ],
+      unresolved: [
+        {
+          id: "old-2",
+          kind: "save",
+          outcome: "conflict",
+          paths: ["/work/a.ts"],
+          message: "A save of /work/a.ts was interrupted, and the file has changed since.",
+          at: 2,
+        },
+      ],
+    },
+  });
+  await expect(page.getByRole("alert")).toContainText("1 interrupted operation needs attention");
+});
+
+test("a clean start announces nothing", async ({ page }) => {
+  const region = await panel(page);
+  await expect(region.getByLabel("Commit message")).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("Save All bumps the active repository's revision, not just individual saves", async ({

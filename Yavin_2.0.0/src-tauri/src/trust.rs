@@ -18,8 +18,8 @@
 use crate::config::write_atomically;
 use crate::paths::normalise;
 use crate::{with_workspace, Workspace};
+use ide_workspace::durable::{read_versioned, BadVersion, Loaded};
 use serde::Serialize;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
@@ -38,6 +38,9 @@ pub struct Trust(pub Mutex<Option<Store>>);
 pub struct Store {
     file: PathBuf,
     entries: Vec<(Decision, PathBuf)>,
+    /// False when the file on disk could be neither read nor set aside: saving would destroy
+    /// decisions the user made, so this run does not save.
+    writable: bool,
 }
 
 /// Whether `folder` is `ancestor` or sits underneath it. Compared per segment so
@@ -47,40 +50,89 @@ fn within(ancestor: &str, folder: &str) -> bool {
     folder == ancestor || folder.starts_with(&format!("{ancestor}/"))
 }
 
-impl Store {
-    fn load(file: PathBuf) -> Store {
-        let mut entries = Vec::new();
-        if let Ok(text) = fs::read_to_string(&file) {
-            for line in text.lines() {
-                let Some((kind, path)) = line.split_once('\t') else {
-                    continue;
-                };
-                let decision = match kind {
-                    "trust" => Decision::Trusted,
-                    "restrict" => Decision::Restricted,
-                    _ => continue,
-                };
-                if !path.is_empty() {
-                    entries.push((decision, PathBuf::from(path)));
-                }
-            }
+/// The trust file's format, named on its first line (`# yavin-trust 1`). A file without that
+/// line is version 0 -- the same lines, written before versions existed.
+pub const TRUST_VERSION: u32 = 1;
+const TRUST_HEADER: &str = "# yavin-trust ";
+
+fn trust_version(text: &str) -> Result<Option<u32>, BadVersion> {
+    match text
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix(TRUST_HEADER))
+    {
+        None => Ok(None),
+        Some(version) => version.trim().parse().map(Some).map_err(|_| BadVersion),
+    }
+}
+
+/// Every decision in the file, or `None` if any line is not one: a file with a line that
+/// does not parse is set aside whole rather than rewritten without it -- a torn or
+/// hand-damaged line might be a decision the user made.
+fn parse_trust(text: &str, version: u32) -> Option<Vec<(Decision, PathBuf)>> {
+    if version > TRUST_VERSION {
+        return None;
+    }
+    let mut entries = Vec::new();
+    for line in text.lines().filter(|line| !line.starts_with(TRUST_HEADER)) {
+        if line.trim().is_empty() {
+            continue;
         }
-        Store { file, entries }
+        let (kind, path) = line.split_once('\t')?;
+        let decision = match kind {
+            "trust" => Decision::Trusted,
+            "restrict" => Decision::Restricted,
+            _ => return None,
+        };
+        if path.is_empty() {
+            return None;
+        }
+        entries.push((decision, PathBuf::from(path)));
+    }
+    Some(entries)
+}
+
+impl Store {
+    /// Reads the decisions. A file that cannot be read as any version -- or that a newer
+    /// Yavin wrote -- is moved aside (`trusted-folders.txt.corrupt-<ms>.bak`), and the store
+    /// starts empty: nothing trusted, which asks again rather than assuming.
+    fn load(file: PathBuf) -> Store {
+        let loaded = read_versioned(&file, TRUST_VERSION, trust_version, parse_trust);
+        if let Loaded::Corrupt { backup } | Loaded::Future { backup, .. } = &loaded {
+            eprintln!(
+                "The trust settings could not be read and were set aside{}",
+                backup
+                    .as_ref()
+                    .map(|b| format!(" as {}", b.display()))
+                    .unwrap_or_default()
+            );
+        }
+        let writable = loaded.can_replace();
+        let entries = loaded.value().unwrap_or_default();
+        Store {
+            file,
+            entries,
+            writable,
+        }
     }
 
     /// Written atomically. A torn write here is worse than losing the file: truncation just
     /// after a path separator would leave an entry covering more than the user agreed to.
     fn save(&self) -> Result<(), String> {
-        let text: String = self
-            .entries
-            .iter()
-            .map(|(decision, path)| {
+        if !self.writable {
+            return Err(
+                "The trust settings could not be read at startup, so they are not overwritten."
+                    .into(),
+            );
+        }
+        let text: String = std::iter::once(format!("{TRUST_HEADER}{TRUST_VERSION}\n"))
+            .chain(self.entries.iter().map(|(decision, path)| {
                 let kind = match decision {
                     Decision::Trusted => "trust",
                     Decision::Restricted => "restrict",
                 };
                 format!("{kind}\t{}\n", path.to_string_lossy())
-            })
+            }))
             .collect();
         write_atomically(&self.file, &text).map_err(|e| format!("Cannot save trust settings: {e}"))
     }
@@ -269,6 +321,7 @@ pub fn require_trust(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn store_at(dir: &Path) -> Store {
         Store::load(dir.join("trusted-folders.txt"))
@@ -419,6 +472,85 @@ mod tests {
         .unwrap();
         let store = store_at(&dir);
         assert!(!state_for(&store, Some(PathBuf::from("/work/project"))).trusted);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn backups(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".bak"))
+            .collect()
+    }
+
+    #[test]
+    fn decisions_are_written_under_a_version_line_and_read_back() {
+        let dir = temp();
+        let mut store = store_at(&dir);
+        store.remember(Path::new("/work/project"), Decision::Trusted);
+        store.save().unwrap();
+        let text = fs::read_to_string(dir.join("trusted-folders.txt")).unwrap();
+        assert_eq!(text.lines().next(), Some("# yavin-trust 1"));
+        assert!(state_for(&store_at(&dir), Some(PathBuf::from("/work/project"))).trusted);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_from_before_versions_is_read_as_it_stands() {
+        let dir = temp();
+        fs::write(dir.join("trusted-folders.txt"), "trust\t/work/old\n").unwrap();
+        assert!(state_for(&store_at(&dir), Some(PathBuf::from("/work/old"))).trusted);
+        assert!(backups(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_damaged_or_newer_file_is_set_aside_and_nothing_is_trusted() {
+        for (label, text) in [
+            ("torn", "# yavin-trust 1\ntrust\t/work/a\ntru"),
+            ("newer", "# yavin-trust 4\ntrust\t/work/a\nsomething new\n"),
+            ("bad header", "# yavin-trust one\ntrust\t/work/a\n"),
+        ] {
+            let dir = temp();
+            fs::write(dir.join("trusted-folders.txt"), text).unwrap();
+            let store = store_at(&dir);
+            // Unknown means untrusted: the user is asked again, never assumed.
+            assert!(
+                !state_for(&store, Some(PathBuf::from("/work/a"))).trusted,
+                "{label}"
+            );
+            let kept = backups(&dir);
+            assert_eq!(kept.len(), 1, "{label}");
+            assert_eq!(
+                fs::read_to_string(&kept[0]).unwrap(),
+                text,
+                "{label}: kept intact"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// As for the session: a file another program holds unreadable is not replaced.
+    #[cfg(windows)]
+    #[test]
+    fn a_trust_file_that_cannot_be_read_is_never_saved_over() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = temp();
+        let file = dir.join("trusted-folders.txt");
+        fs::write(&file, "# yavin-trust 1\ntrust\t/work/precious\n").unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x4) // FILE_SHARE_DELETE
+            .open(&file)
+            .unwrap();
+        let mut store = store_at(&dir);
+        store.remember(Path::new("/work/project"), Decision::Trusted);
+        let saved = store.save();
+        drop(held);
+        assert!(saved.is_err());
+        assert!(fs::read_to_string(&file)
+            .unwrap()
+            .contains("/work/precious"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

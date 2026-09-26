@@ -8,3 +8,5 @@ description = "Project management: file tree, search, git integration, and FS op
 notify = "=9.0.0-rc.5"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

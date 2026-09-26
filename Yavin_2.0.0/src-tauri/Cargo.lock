@@ -1751,6 +1751,8 @@ dependencies = [
  "notify",
  "rfd",
  "serde",
+ "serde_json",
+ "xxhash-rust",
 ]
 
 [[package]]

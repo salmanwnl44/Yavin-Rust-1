@@ -234,6 +234,154 @@ Of these, `restore --worktree` and `reset --hard`/`--merge`/`--keep` are defensi
 6. Operations and expectations are bounded, and completed operations expire deterministically.
 7. Attribution grants nothing: every operation is still validated by its command, and the event contract is unchanged.
 
+## Recovery and persistence safety
+
+A crash in the middle of one of Yavin's file operations must never cost the user data, and recovery must never overwrite a change it cannot prove is its own. Yavin records what each operation is about to do before it does it, and the next start settles what a crash interrupted, acting only where the disk proves an action safe.
+
+**Ownership**
+
+| Owner                                         | Owns                                                                  |
+| --------------------------------------------- | --------------------------------------------------------------------- |
+| Operation system (`operations.rs`, Module 03) | logical operation identity; attribution of watcher changes            |
+| Intent log (`recovery.rs`, `IntentLog`)       | the durable record of what an operation in flight will change         |
+| Recovery manager (`recovery.rs`, `recover`)   | startup decisions about interrupted operations                        |
+| Durable persistence (`durable.rs`)            | crash-safe writes, versioned reads, backups, sweeping temporary files |
+| Session manager (`session.rs`)                | the session file                                                      |
+| The filesystem                                | the actual state, which every decision is checked against             |
+
+**Lifecycle.** `lib.rs::expecting` runs every file command, and `git_exec` and `git_clone_repo` follow the same order:
+
+```text
+begin (Module 03) -> expect every effect -> record the intent durably -> mutate the disk -> finish -> close the intent
+```
+
+- If the intent cannot be recorded, the operation is **refused** before anything touches the disk. This covers an unusable recovery folder, a failed write, and more than 256 operations in flight.
+- A normal ending, successful or failed, **closes** the intent: its record is removed. The live process knows the outcome and has already reported it.
+- An intent dropped without being closed, which is what a panic does, **keeps** its record. The next start inspects it like a crash.
+
+**Where records live.**
+
+```text
+<app local data>/recovery/instances/<pid>-<start ms>/owner.lock     locked by its live process (std File::try_lock)
+<app local data>/recovery/instances/<pid>-<start ms>/op-<id>.json   one record per operation in flight
+<app local data>/recovery/unresolved/<instance>-<op>.json          what recovery could not settle, until dismissed
+```
+
+**Record format.** Each record (`version: 1`) contains `instance`, `operation`, `kind`, `startedAt`, `hash: "xxh3-128"`, and `effects[]`. Every effect is a `{path, pre, post, role}`, where `pre` and `post` are one of:
+
+- `absent`
+- `file {size, hash}`
+- `directory`
+- `present`
+- `tree {entries}`
+- `copyOf {source}`
+- `unknown`
+
+Records never contain file contents: only paths, kinds, sizes and hashes. The hash is xxh3-128 because it is stable across builds, which std's `DefaultHasher` (used by Module 03's in-memory matching) is not.
+
+What each operation records:
+
+| Operation             | Records                                                                                                                                   |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Save                  | the target's exact bytes before (read from disk) and after; its temporary file absent before and holding the new bytes after; new folders |
+| Create file or folder | missing ancestors and the target, absent before                                                                                           |
+| Rename                | the old name before and after (absent, or still present for a case-only rename); the new name absent before and present after             |
+| Delete                | the target's kind before, with the entry count for a folder, and absent after                                                             |
+| Copy                  | the destination absent before, and after a copy of its source                                                                             |
+| Git                   | the working tree root, whose state is unknown                                                                                             |
+| Clone                 | the destination absent before and present after                                                                                           |
+
+**Crash points.**
+
+| The process dies…                                   | What is left                       | Next start                                 |
+| --------------------------------------------------- | ---------------------------------- | ------------------------------------------ |
+| before or while writing the record                  | nothing, or a stale `.yavin-tmp`   | nothing to do; the temporary file is swept |
+| after the record, before the disk changes           | the record; disk in its pre state  | not applied: finalized                     |
+| while changing the disk                             | the record; disk partly changed    | settled by the table below                 |
+| after the disk change, before the record is removed | the record; disk in its post state | completed: finalized                       |
+| after the record is removed                         | nothing                            | clean                                      |
+
+**Recovery state machine.** A record's owner process ended without closing it, and at the next start the record is settled into exactly one outcome:
+
+- **Finalized** (the record is removed): `completed`, `notApplied`, `rolledForward`, `rolledBack`.
+- **Unresolved** (moved to `unresolved/` until dismissed): `conflict`, `partial`, `interrupted`, `corrupt`.
+
+**Decision matrix.** Recovery compares every effect with the disk as it is now and judges the whole operation, never one path at a time:
+
+| Found                                               | Outcome      | Action                               |
+| --------------------------------------------------- | ------------ | ------------------------------------ |
+| every path in its post state                        | `completed`  | none                                 |
+| every path in its pre state                         | `notApplied` | none                                 |
+| some paths pre, some post                           | `partial`    | reported; nothing touched            |
+| a delete or copy in neither state (half done)       | `partial`    | reported; nothing touched            |
+| any other path in neither state                     | `conflict`   | reported; nothing touched            |
+| a record that cannot be read, or from a newer Yavin | `corrupt`    | backed up, reported; nothing touched |
+
+**Saves** are the one operation recovery can finish or undo. Here P is the target (h0 its bytes before, h1 after) and T is its temporary file:
+
+| P       | T                          | Outcome and action                                                     |
+| ------- | -------------------------- | ---------------------------------------------------------------------- |
+| h1      | anything                   | `completed`; T removed                                                 |
+| h0      | exactly h1                 | `rolledForward`: P re-checked, then T renamed onto P                   |
+| h0      | absent                     | `notApplied`                                                           |
+| h0      | other bytes (half written) | `rolledBack`: T removed                                                |
+| neither | exactly h1                 | `conflict`: P untouched, and **T kept**, since it holds the saved text |
+| neither | absent or other bytes      | `conflict`: P untouched                                                |
+
+**Git** is judged by its lock file. If `.git/index.lock` remains, the result is `interrupted`, reported with the lock's path; otherwise `completed`. A clone's destination is `notApplied` if it is absent, and a `partial` that is never deleted if it exists.
+
+**Startup.** The `setup` hook in `lib.rs` runs before any window can start an operation:
+
+1. It opens this process's intent log.
+2. It runs `recover(root, own instance)`. For every other instance folder whose `owner.lock` can be locked (its process is gone), each record is read and settled. Folders still locked belong to another running Yavin and are skipped.
+3. It sweeps stale temporary files, and prunes backups of the session and trust files.
+
+The cost follows the number of interrupted operations, never the size of a project: recovery hashes only files that records name. `recovery_report` gives the UI what was done and what is unresolved. The UI logs each item to Output › Recovery and raises one banner if anything is unresolved. The command "Dismiss Recovery Items" calls `recovery_dismiss`, which is the only way anything leaves `unresolved/`.
+
+**Durable writes** (`durable::write_durably`, also behind `config::write_atomically` for the session and trust files):
+
+1. Write a unique sibling temporary file (`.<name>.<pid>-<seq>.yavin-tmp`).
+2. Flush it to disk with `sync_all`.
+3. Rename it over the target. On Windows this is `MoveFileEx` with replace, which is atomic on one volume.
+4. On Unix, also flush the folder. The standard library cannot flush a folder on Windows.
+
+On failure the temporary file is removed and the old file is left untouched. The project save (`atomic_write_file_via`) now closes its temporary file before removing it on failure; Windows refuses to delete an open file, so failed writes used to leave it behind.
+
+**Formats and versions.** A file is read with `durable::read_versioned`: the version is read, then validated, then migrated.
+
+- **A missing version** means the legacy format (version 0), which is read as it stands.
+- **A file that does not parse, or has an unreadable version,** is moved aside to `<file>.corrupt-<ms>.bak`. A torn line in the trust file counts: the whole file is set aside, never rewritten without the line.
+- **A newer version** is moved aside to `<file>.v<N>-<ms>.bak`, untouched, and never reinterpreted.
+- In both cases the run starts fresh: an empty session, or nothing trusted.
+
+| File                                  | Version marker                 | Current |
+| ------------------------------------- | ------------------------------ | ------- |
+| `session.json`                        | top-level `"version"`          | 1       |
+| `trusted-folders.txt`                 | first line `# yavin-trust <N>` | 1       |
+| recovery records and unresolved items | top-level `"version"`          | 1       |
+
+**Storage limits.** All cleanup is bounded to one pass over Yavin's own folders, tolerates failure, and never touches project folders. Temporary files in projects are handled only through records.
+
+| Category                             | Limit                                                                  | Cleanup                                    |
+| ------------------------------------ | ---------------------------------------------------------------------- | ------------------------------------------ |
+| Live records                         | 256 per process; a new operation is refused past that                  | removed when their operation ends          |
+| Unresolved items                     | no cap, and never deleted automatically; a warning is logged past 1000 | explicit dismiss only                      |
+| Dead instance folders                | —                                                                      | removed at startup once settled            |
+| Backups (`.corrupt-*`, `.v*`)        | the newest 5 per file, plus any younger than 30 days                   | startup, and on each new backup            |
+| Stale `*.yavin-tmp` in Yavin folders | older than 1 hour                                                      | startup; this process's own at normal exit |
+
+**Invariants**
+
+1. Recovery never overwrites a resource whose current state cannot be proven compatible with the recorded recovery state.
+2. Every operation that changes the disk is durably recorded before it does, or it does not happen.
+3. The existence of a record is never taken as proof that anything should be replayed. Only a save whose target is still exactly its pre-save bytes, and whose temporary file holds exactly the new bytes, is finished.
+4. An operation is settled as a whole, never one path at a time.
+5. Unresolved items and the evidence they name, such as a kept temporary file, are never deleted automatically.
+6. Another running Yavin's records are never recovered: its instance lock is held.
+7. Persisted formats are versioned. Unreadable and newer files are moved aside, never overwritten or reinterpreted.
+8. A failed save of the session or trust file leaves the previous complete file.
+9. Recovery reads only what records name. Its cost follows interrupted operations, not project size.
+
 ## Rules and references
 
 Follow `../GEMINI.md`: small changes, explicit errors, safe Rust, minimal permissive dependencies, and relevant tests. The user's TypeScript requirement supersedes the previous JavaScript wording.

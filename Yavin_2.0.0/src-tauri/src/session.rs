@@ -15,8 +15,8 @@
 
 use crate::config::write_atomically;
 use crate::paths::normalise;
+use ide_workspace::durable::{json_version, read_versioned, Loaded};
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
@@ -154,26 +154,84 @@ pub struct Sessions(pub Mutex<Option<Store>>);
 pub struct Store {
     file: PathBuf,
     session: Session,
+    /// False when the file on disk could be neither read nor set aside: saving would destroy
+    /// it, so this run does not save.
+    writable: bool,
+}
+
+/// The session file's format. Version 0 is the same shape without a `version` field -- every
+/// file written before versions existed -- and is read as it stands.
+pub const SESSION_VERSION: u32 = 1;
+
+/// The session as it is written: the current version, then the session itself.
+#[derive(Serialize)]
+struct VersionedSession<'a> {
+    version: u32,
+    #[serde(flatten)]
+    session: &'a Session,
 }
 
 impl Store {
     fn load(file: PathBuf) -> Store {
         // A session that cannot be read is not worth failing to start over: the worst case
-        // is opening the way a first run does.
-        let mut session = fs::read_to_string(&file)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Session>(&text).ok())
-            .unwrap_or_default();
+        // is opening the way a first run does. But it is never *overwritten*: one that does
+        // not parse, or that a newer Yavin wrote, is moved aside first
+        // (`session.json.corrupt-<ms>.bak`, `session.json.v<N>-<ms>.bak`), so the next save
+        // cannot destroy what might still be recovered from it.
+        let loaded =
+            read_versioned(
+                &file,
+                SESSION_VERSION,
+                json_version,
+                |text, version| match version {
+                    0 | 1 => serde_json::from_str::<Session>(text).ok(),
+                    _ => None,
+                },
+            );
+        match &loaded {
+            Loaded::Corrupt { backup } => eprintln!(
+                "The session file could not be read and was set aside{}",
+                backup
+                    .as_ref()
+                    .map(|b| format!(" as {}", b.display()))
+                    .unwrap_or_default()
+            ),
+            Loaded::Future { version, backup } => eprintln!(
+                "The session file is from a newer Yavin (format {version}) and was set aside{}",
+                backup
+                    .as_ref()
+                    .map(|b| format!(" as {}", b.display()))
+                    .unwrap_or_default()
+            ),
+            _ => {}
+        }
+        let writable = loaded.can_replace();
+        if !writable {
+            eprintln!("The session file could not be read; it is left as it is and not saved over");
+        }
+        let mut session = loaded.value().unwrap_or_default();
         // The caps are applied on the way in as well as on the way out: a file that was
         // hand-edited, or written by a future version, must not be able to make startup slow.
         session.trim();
-        Store { file, session }
+        Store {
+            file,
+            session,
+            writable,
+        }
     }
 
     /// Written whole, atomically: a torn write would lose the folders someone works in.
     fn save(&self) -> Result<(), String> {
-        let text = serde_json::to_string_pretty(&self.session)
-            .map_err(|e| format!("Cannot save the session: {e}"))?;
+        if !self.writable {
+            return Err(
+                "The session file could not be read at startup, so it is not overwritten.".into(),
+            );
+        }
+        let text = serde_json::to_string_pretty(&VersionedSession {
+            version: SESSION_VERSION,
+            session: &self.session,
+        })
+        .map_err(|e| format!("Cannot save the session: {e}"))?;
         write_atomically(&self.file, &text).map_err(|e| format!("Cannot save the session: {e}"))
     }
 }
@@ -234,6 +292,7 @@ pub fn forget_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("yavin-session-{}-{name}", std::process::id()));
@@ -475,6 +534,129 @@ mod tests {
 
         let reloaded = store_at(&dir);
         assert_eq!(reloaded.session.folders, vec!["/work/two", "/work/one"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn backups(dir: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".bak"))
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn a_session_is_written_with_its_version_and_read_back() {
+        let dir = temp("versioned");
+        let mut store = store_at(&dir);
+        store
+            .session
+            .remember(workspace("/work/one", &["/work/one/a.ts"]));
+        store.save().unwrap();
+        let text = fs::read_to_string(dir.join("session.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["version"], SESSION_VERSION);
+        assert_eq!(store_at(&dir).session.folders, vec!["/work/one"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_from_before_versions_is_read_as_it_stands() {
+        let dir = temp("legacy");
+        fs::write(
+            dir.join("session.json"),
+            r#"{"folders":["/work/old"],"workspaces":[{"folder":"/work/old","files":["/work/old/a.ts"]}]}"#,
+        )
+        .unwrap();
+        let store = store_at(&dir);
+        assert_eq!(store.session.folders, vec!["/work/old"]);
+        assert_eq!(store.session.workspaces[0].files, vec!["/work/old/a.ts"]);
+        assert!(backups(&dir).is_empty(), "nothing to set aside");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_session_is_set_aside_and_never_overwritten() {
+        let dir = temp("corrupt-set-aside");
+        let torn = r#"{"version":1,"folders":["/work/a","/wor"#;
+        fs::write(dir.join("session.json"), torn).unwrap();
+        let mut store = store_at(&dir);
+        assert!(
+            store.session.folders.is_empty(),
+            "starts the way a first run does"
+        );
+        // The next save writes a fresh file; the damaged one survives beside it.
+        store.session.remember(workspace("/work/new", &[]));
+        store.save().unwrap();
+        let kept = backups(&dir);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read_to_string(&kept[0]).unwrap(), torn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_from_a_newer_yavin_is_set_aside_intact() {
+        let dir = temp("future");
+        let newer = r#"{"version":9,"folders":["/work/a"],"somethingNew":{"x":1}}"#;
+        fs::write(dir.join("session.json"), newer).unwrap();
+        let store = store_at(&dir);
+        assert!(
+            store.session.folders.is_empty(),
+            "never reinterpreted as this version"
+        );
+        let kept = backups(&dir);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].to_string_lossy().contains(".v9-"));
+        assert_eq!(fs::read_to_string(&kept[0]).unwrap(), newer);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_that_fails_keeps_the_last_good_session() {
+        let dir = temp("save-fails");
+        let mut store = store_at(&dir);
+        store.session.remember(workspace("/work/good", &[]));
+        store.save().unwrap();
+        let good = fs::read_to_string(dir.join("session.json")).unwrap();
+        // Something in the way of the replacement: the old file must survive the failure.
+        let blocked = Store {
+            file: dir.join("session.json").join("impossible"),
+            session: store.session.clone(),
+            writable: true,
+        };
+        assert!(blocked.save().is_err());
+        assert_eq!(fs::read_to_string(dir.join("session.json")).unwrap(), good);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Another program holds the file so that it cannot be read -- as antivirus does for a
+    /// moment -- yet it could still be replaced by a rename. A save then must not replace it:
+    /// the session could not be read, so what Yavin holds is not the session.
+    #[cfg(windows)]
+    #[test]
+    fn a_session_file_that_cannot_be_read_is_never_saved_over() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = temp("unreadable-session");
+        let file = dir.join("session.json");
+        fs::write(&file, r#"{"version":1,"folders":["/work/precious"]}"#).unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x4) // FILE_SHARE_DELETE: no one else may read or write it
+            .open(&file)
+            .unwrap();
+        let mut store = store_at(&dir);
+        store.session.remember(workspace("/work/new", &[]));
+        let saved = store.save();
+        drop(held);
+        assert!(
+            saved.is_err(),
+            "refused rather than replacing what it could not read"
+        );
+        assert!(fs::read_to_string(&file)
+            .unwrap()
+            .contains("/work/precious"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1,6 +1,7 @@
-use crate::{expecting, made_folders, with_workspace, Watch, Workspace};
+use crate::{expecting, made_folders, with_workspace, Planned, Watch, Workspace};
 use ide_workspace::file_tree::{temp_nonce, temp_path_for};
 use ide_workspace::process::{capture, ToolOutput};
+use ide_workspace::recovery::{DiskState, Role};
 use ide_workspace::resource_events::{Expectation, OperationKind};
 use serde::Deserialize;
 use std::{
@@ -160,13 +161,27 @@ pub fn write_file_guarded(
         // holding exactly them), the rename onto the target, and the target's final bytes.
         let target = manager.validate_path(&path)?;
         let nonce = temp_nonce();
-        let mut results = made_folders(&target);
-        results.push((
-            temp_path_for(&target, nonce),
-            Expectation::transient(content.as_bytes()),
-        ));
-        results.push((target, Expectation::content(content.as_bytes())));
-        expecting(&watch, OperationKind::Save, results, || {
+        let new = content.as_bytes();
+        // Recovery's record of the file before the save: its exact bytes on disk (just shown
+        // to be what the editor opened), so an interrupted save can be finished only if the
+        // file is still exactly that.
+        let before = std::fs::read(&target)
+            .map(|bytes| DiskState::file(&bytes))
+            .unwrap_or(DiskState::Absent);
+        let mut plan = made_folders(&target);
+        plan.push(
+            Planned::new(
+                temp_path_for(&target, nonce),
+                Expectation::transient(new),
+                DiskState::file(new),
+            )
+            .pre(DiskState::Absent)
+            .role(Role::Temporary),
+        );
+        plan.push(
+            Planned::new(target, Expectation::content(new), DiskState::file(new)).pre(before),
+        );
+        expecting(&watch, OperationKind::Save, plan, || {
             manager.write_file_with(&path, &content, nonce)
         })
     })

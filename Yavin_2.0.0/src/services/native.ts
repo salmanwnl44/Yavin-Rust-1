@@ -48,6 +48,9 @@ interface Commands {
   set_workspace_trust: { args: { trusted: boolean; parent: boolean }; result: TrustState };
   trusted_folders: { args: undefined; result: string[] };
   forget_trusted_folder: { args: { folder: string }; result: TrustState };
+  // Read through `asRecoveryReport` (services/recovery.ts), never trusted as typed.
+  recovery_report: { args: undefined; result: unknown };
+  recovery_dismiss: { args: { ids: string[] }; result: unknown };
   stop_listening_process: { args: { port: number; pid: number }; result: void };
   git_exec: {
     args: { repoId: string; args: string[]; id: string; input?: string };
