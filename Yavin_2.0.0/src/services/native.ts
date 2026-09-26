@@ -12,6 +12,8 @@ interface Commands {
   list_workspace_files: { args: { path: string; maxDepth: number }; result: FileNode };
   read_file_content: { args: { path: string }; result: string };
   create_file: { args: { path: string }; result: void };
+  /** Exclusive: fails if anything is there. Resolves to the operation's id (Module 03). */
+  create_file_with_content: { args: { path: string; content: string }; result: number };
   create_directory: { args: { path: string }; result: void };
   rename_path: { args: { oldPath: string; newPath: string }; result: void };
   delete_path: { args: { path: string; recursive: boolean }; result: void };
@@ -21,7 +23,12 @@ interface Commands {
   open_folder_dialog: { args: undefined; result: string | null };
   pick_folder_dialog: { args: undefined; result: string | null };
   open_file_dialog: { args: undefined; result: string | null };
-  write_file_guarded: { args: { path: string; expected: string; content: string }; result: void };
+  save_file_dialog: { args: { defaultName?: string }; result: string | null };
+  /** Resolves to the operation's id, which the watcher credits the write to (Module 03). */
+  write_file_guarded: {
+    args: { path: string; expected: string; content: string };
+    result: number;
+  };
   search_project: {
     args: { workspace: string; id: string; options: SearchOptions };
     result: ToolOutput;

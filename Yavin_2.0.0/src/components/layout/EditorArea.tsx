@@ -7,6 +7,24 @@ import { FileIcon } from "../ui/FileIcons";
 import { WelcomePage } from "../welcome/WelcomePage";
 import type { WelcomeHint } from "../welcome/WelcomePage";
 
+/** What a tab's marker means, as its tooltip says it. */
+function statusTitle(tab: EditorTab): string {
+  switch (tab.status) {
+    case "conflicted":
+      return "Changed on disk while it had unsaved changes. Nothing was overwritten.";
+    case "saveFailed":
+      return "The last save failed. Unsaved changes (Ctrl+S to try again)";
+    case "saving":
+      return "Saving…";
+    case "externallyChanged":
+      return "Changed on disk: deleted, or no longer readable";
+    case "neverSaved":
+      return "Not saved yet (Ctrl+S to choose where)";
+    default:
+      return "Unsaved changes (Ctrl+S to save)";
+  }
+}
+
 export function EditorArea({
   tabs,
   activeTabId,
@@ -25,6 +43,7 @@ export function EditorArea({
   onOpenRecentFolder,
   onForgetRecentFolder,
   onCloneRepository,
+  details,
   editorRef,
   histories,
   onEditorState,
@@ -51,6 +70,8 @@ export function EditorArea({
   onOpenRecentFolder: (folder: string) => void;
   onForgetRecentFolder: (folder: string) => void;
   onCloneRepository: () => void;
+  /** The active document's encoding, line endings and language. */
+  details?: string[];
   editorRef: Ref<EditorHandle>;
   histories: Map<string, TextHistory>;
   onEditorState: (state: EditorState) => void;
@@ -127,11 +148,17 @@ export function EditorArea({
 
                 <span className="truncate max-w-[140px] text-[12px]">{tab.name}</span>
 
-                {/* Dirty indicator dot */}
-                {tab.dirty ? (
+                {/* The document's state: unsaved, saving, failed, or changed on disk. */}
+                {tab.dirty || tab.status === "externallyChanged" ? (
                   <span
-                    title="Unsaved changes (Ctrl+S to save)"
-                    className="size-2 rounded-full bg-amber-400 hover:bg-amber-300"
+                    title={statusTitle(tab)}
+                    className={`size-2 rounded-full ${
+                      tab.status === "conflicted" || tab.status === "saveFailed"
+                        ? "bg-red-500"
+                        : tab.status === "externallyChanged"
+                          ? "bg-zinc-500"
+                          : "bg-amber-400 hover:bg-amber-300"
+                    }`}
                   />
                 ) : null}
 
@@ -222,9 +249,7 @@ export function EditorArea({
           <span className="text-zinc-300 truncate">{getBreadcrumbs()}</span>
         </div>
         <div className="flex items-center gap-3 shrink-0 text-zinc-500 font-mono text-[10px]">
-          <span>UTF-8</span>
-          <span>•</span>
-          <span>{activeTab?.name?.split(".").pop()?.toUpperCase() || "TEXT"}</span>
+          {details?.join(" • ")}
         </div>
       </div>
 

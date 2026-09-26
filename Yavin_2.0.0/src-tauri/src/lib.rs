@@ -166,7 +166,20 @@ pub(crate) fn expecting<T>(
     plan: Vec<Planned>,
     run: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
+    expecting_operation(watch, kind, plan, run).map(|(_, value)| value)
+}
+
+/// `expecting`, also returning the operation's id -- the id the watcher credits the changes
+/// it caused to, so that the caller (an open document saving itself) can recognise them as
+/// its own when they arrive.
+pub(crate) fn expecting_operation<T>(
+    watch: &Watch,
+    kind: OperationKind,
+    plan: Vec<Planned>,
+    run: impl FnOnce() -> Result<T, String>,
+) -> Result<(u64, T), String> {
     let operation = watch.expected.begin(kind);
+    let id = operation.id();
     let mut effects = Vec::with_capacity(plan.len());
     for planned in plan {
         let path = file_tree::clean_path_str(&planned.path);
@@ -183,7 +196,7 @@ pub(crate) fn expecting<T>(
     let result = run();
     operation.finish(&result);
     intent.close();
-    result
+    result.map(|value| (id, value))
 }
 
 /// The folders a create of `target` will make on the way, as effects of that create.
@@ -265,6 +278,41 @@ fn create_file(
             manager.create_file(&path)
         })
     })
+}
+
+/// Creates `path` holding `content`, refusing if anything is already there -- Save As to a new
+/// file, and saving a document whose file was deleted. One operation, as `create_file`;
+/// returns its id (see `expecting_operation`).
+#[tauri::command(async)]
+fn create_file_with_content(
+    state: State<'_, Workspace>,
+    watch: State<'_, Watch>,
+    path: String,
+    content: String,
+) -> Result<u64, String> {
+    with_workspace(&state, |manager| {
+        create_with_content(manager, &watch, &path, &content)
+    })
+}
+
+fn create_with_content(
+    manager: &WorkspaceManager,
+    watch: &Watch,
+    path: &str,
+    content: &str,
+) -> Result<u64, String> {
+    let target = manager.validate_path(path)?;
+    let bytes = content.as_bytes();
+    let mut plan = made_folders(&target);
+    plan.push(Planned::new(
+        target,
+        Expectation::content(bytes),
+        DiskState::file(bytes),
+    ));
+    expecting_operation(watch, OperationKind::CreateFile, plan, || {
+        manager.create_file_with(path, content)
+    })
+    .map(|(id, ())| id)
 }
 
 #[tauri::command(async)]
@@ -450,6 +498,29 @@ fn open_file_dialog(state: State<'_, Workspace>) -> Result<Option<String>, Strin
         .transpose()
 }
 
+/// The Save As dialog, opening in the workspace. What is chosen must be inside the workspace,
+/// as every path Yavin writes must.
+#[tauri::command]
+fn save_file_dialog(
+    state: State<'_, Workspace>,
+    default_name: Option<String>,
+) -> Result<Option<String>, String> {
+    let root = state
+        .0
+        .lock()
+        .map_err(|e| e.to_string())?
+        .as_ref()
+        .map(|manager| manager.root().to_path_buf());
+    let selected = file_tree::pick_save_file(default_name, root.as_deref())?;
+    selected
+        .map(|path| {
+            with_workspace(&state, |manager| {
+                manager.validate_path(path).map(file_tree::clean_path_str)
+            })
+        })
+        .transpose()
+}
+
 #[tauri::command(async)]
 fn copy_path(
     state: State<'_, Workspace>,
@@ -558,6 +629,7 @@ pub fn run() {
             list_workspace_files,
             read_file_content,
             create_file,
+            create_file_with_content,
             create_directory,
             rename_path,
             delete_path,
@@ -568,6 +640,7 @@ pub fn run() {
             open_workspace,
             pick_folder_dialog,
             open_file_dialog,
+            save_file_dialog,
             search_project,
             cancel_search,
             write_file_guarded,
@@ -745,6 +818,47 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "after");
         assert!(!temporary.exists());
         assert_eq!(records_in(&root), 0);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn recording_watch(root: &Path) -> Watch {
+        let watch = Watch::default();
+        watch
+            .intents
+            .set(Ok(IntentLog::open(root).unwrap()))
+            .unwrap();
+        watch
+    }
+
+    /// Save As and a deleted document's save: the file is created holding the text, as one
+    /// recorded operation whose id is returned -- and something already there is never
+    /// replaced, the operation ending without leaving a record behind.
+    #[test]
+    fn a_file_created_with_content_is_one_operation_and_never_replaces_anything() {
+        let root = temp_folder("create-content-root");
+        let dir = temp_folder("create-content-files");
+        let manager = WorkspaceManager::new(dir.clone()).unwrap();
+        let watch = recording_watch(&root);
+        let target = file_tree::clean_path_str(dir.join("new").join("a.ts"));
+
+        let first = create_with_content(&manager, &watch, &target, "one\r\ntwo").unwrap();
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"one\r\ntwo",
+            "bytes exactly"
+        );
+        assert_eq!(records_in(&root), 0, "the intent is closed");
+
+        let again = create_with_content(&manager, &watch, &target, "other");
+        assert!(again.unwrap_err().contains("already exists"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"one\r\ntwo", "untouched");
+        assert_eq!(records_in(&root), 0);
+
+        let other = file_tree::clean_path_str(dir.join("b.ts"));
+        let second = create_with_content(&manager, &watch, &other, "").unwrap();
+        assert!(second > first, "each operation has its own id");
+        drop(watch);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&dir);
     }

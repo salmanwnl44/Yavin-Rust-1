@@ -4,7 +4,16 @@ import type { EditorHandle, EditorState, EditorAction } from "./components/layou
 import type { TextHistory } from "./services/editor";
 import { matchesShortcut, shortcutLabel } from "./services/commands";
 import type { AppCommand } from "./services/commands";
-import React, { useState, useEffect, useCallback, useRef, Component, lazy, Suspense } from "react";
+import React, {
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  useSyncExternalStore,
+  Component,
+  lazy,
+  Suspense,
+} from "react";
 import { TitleBar } from "./components/layout/TitleBar";
 import { ActivityBar } from "./components/layout/ActivityBar";
 import { Sidebar } from "./components/layout/Sidebar";
@@ -44,7 +53,10 @@ import type { TrustState } from "./services/trust";
 import { WorkspaceTrustDialog } from "./components/trust/WorkspaceTrustDialog";
 
 import { isTauri } from "@tauri-apps/api/core";
-import type { FileNode, EditorTab, RecentFile } from "./types";
+import type { FileNode, EditorTab, OpenTab, RecentFile } from "./types";
+import { createDocumentService, DocumentError, documentStatus } from "./services/documents";
+import type { DocumentIO, DocumentService, TextDocument } from "./services/documents";
+import { languageLabel } from "./services/language";
 import { native, onResourceChanges, onWatcherStatus } from "./services/native";
 import { createWatchTracker } from "./services/resourceEvents";
 import { asRecoveryReport, describeRecovery } from "./services/recovery";
@@ -71,6 +83,18 @@ import {
 } from "./services/git";
 import type { Decorations } from "./services/git";
 import { listFiles } from "./services/search";
+
+/**
+ * The Document Model's disk: the guarded native commands, each one a Module 03 operation with
+ * its Module 04 recovery intent. The only way an open document reaches a file.
+ */
+const documentIO: DocumentIO = {
+  read: (path) => native("read_file_content", { path }),
+  write: (path, expected, content) => native("write_file_guarded", { path, expected, content }),
+  create: (path, content) => native("create_file_with_content", { path, content }),
+};
+
+const WELCOME_TAB: OpenTab = { id: "welcome", name: "Welcome", path: "welcome" };
 // Error boundary to prevent white/black screen crashes
 class ErrorBoundary extends Component<
   React.PropsWithChildren,
@@ -113,7 +137,6 @@ class ErrorBoundary extends Component<
 export default function App() {
   const editorRef = useRef<EditorHandle>(null);
   const histories = useRef(new Map<string, TextHistory>());
-  const savedContents = useRef<Record<string, string>>({});
   const [editorState, setEditorState] = useState<EditorState>({
     canUndo: false,
     canRedo: false,
@@ -128,16 +151,31 @@ export default function App() {
   const treeRef = useRef<FileNode | null>(null);
   const treeRequests = useRef(new Map<string, number>());
   const [quickOpen, setQuickOpen] = useState<{ files: string[]; note: string } | null>(null);
-  const [fileContents, setFileContents] = useState<Record<string, string>>({});
-  const contentsRef = useRef(fileContents);
+  /**
+   * The Document Model (`services/documents.ts`): the one owner of open files' contents, their
+   * versions, whether they are saved and what happened to them on disk. The editor, search and
+   * Source Control read its text through `buffers()`; nothing here keeps a copy of its own.
+   */
+  const documentsRef = useRef<DocumentService | null>(null);
+  documentsRef.current ??= createDocumentService(documentIO, {
+    base: () => treeRef.current?.path ?? null,
+  });
+  const documents = documentsRef.current;
+  useSyncExternalStore(documents.subscribe, documents.revision);
+  const fileContents = documents.buffers();
   const workspaceRevision = useRef(0);
   const [decorations, setDecorations] = useState<Decorations>({
     files: new Map(),
     folders: new Set(),
   });
-  const [tabs, setTabs] = useState<EditorTab[]>([
-    { id: "welcome", name: "Welcome", path: "welcome", dirty: false },
-  ]);
+  const [openTabs, setTabs] = useState<OpenTab[]>([WELCOME_TAB]);
+  // What each tab shows about its document is read from the document, never stored twice.
+  const tabs: EditorTab[] = openTabs.map((tab) => {
+    const doc = tab.id === "welcome" ? undefined : documents.get(tab.path);
+    return doc
+      ? { ...tab, name: doc.name, dirty: doc.dirty, status: documentStatus(doc) }
+      : { ...tab, dirty: false };
+  });
   const [activeTabId, setActiveTabId] = useState("welcome");
   const [recentFiles, setRecentFiles] = useState<RecentFile[]>([]);
   /** The folders opened before, and what each looked like. See `services/session.ts`. */
@@ -279,10 +317,6 @@ export default function App() {
   }, [hasUnsavedChanges]);
 
   const reportError = useCallback((reason: unknown) => setError(String(reason)), []);
-  const updateContents = (contents: Record<string, string>) => {
-    contentsRef.current = contents;
-    setFileContents(contents);
-  };
   const run = async (operation: () => Promise<void>) => {
     try {
       await operation();
@@ -405,62 +439,61 @@ export default function App() {
    * that reported four errors for four files someone deleted on purpose would be worse than
    * one that quietly opens what is still there.
    */
-  const restoreTabs = useCallback(async (state: WorkspaceSession) => {
-    const revision = workspaceRevision.current;
-    // Read together rather than one after another: this is startup, and fifty files read in
-    // series is fifty round trips the window waits through before it is usable. `Promise.all`
-    // keeps the results in tab order.
-    const read = await Promise.all(
-      state.files.map((path) =>
-        native("read_file_content", { path }).then(
-          (content) => ({ path, content }),
+  const restoreTabs = useCallback(
+    async (state: WorkspaceSession) => {
+      const revision = workspaceRevision.current;
+      // Opened together rather than one after another: this is startup, and fifty files read
+      // in series is fifty round trips the window waits through before it is usable.
+      // `Promise.all` keeps the results in tab order.
+      const read = await Promise.all(
+        state.files.map((path) =>
           // Gone since last time; nothing to reopen and nothing worth saying.
-          () => null,
+          documents.open(path).catch(() => null),
         ),
-      ),
-    );
-    if (revision !== workspaceRevision.current) return;
+      );
+      if (revision !== workspaceRevision.current) return;
 
-    const opened: EditorTab[] = [];
-    const contents: Record<string, string> = {};
-    for (const file of read) {
-      if (!file) continue;
-      contents[file.path] = file.content;
-      savedContents.current[file.path] = file.content;
-      opened.push({
-        id: file.path,
-        path: file.path,
-        name: file.path.split(/[\\/]/).pop() || file.path,
-        dirty: false,
-      });
-    }
-    if (!opened.length) return;
-    updateContents({ ...contentsRef.current, ...contents });
-    setTabs((previous) => [
-      ...previous,
-      ...opened.filter((tab) => !previous.some((existing) => existing.path === tab.path)),
-    ]);
-    setRecentFiles(opened.map((tab) => ({ name: tab.name, path: tab.path })).reverse());
-    if (state.active && contents[state.active] !== undefined) setActiveTabId(state.active);
-  }, []);
+      const opened: OpenTab[] = [];
+      for (const doc of read) {
+        if (!doc || opened.some((tab) => tab.path === doc.key)) continue;
+        opened.push({ id: doc.key, path: doc.key, name: doc.name });
+      }
+      if (!opened.length) return;
+      setTabs((previous) => [
+        ...previous,
+        ...opened.filter((tab) => !previous.some((existing) => existing.path === tab.path)),
+      ]);
+      setRecentFiles(opened.map((tab) => ({ name: tab.name, path: tab.path })).reverse());
+      const active = state.active ? documents.get(state.active) : undefined;
+      if (active) setActiveTabId(active.key);
+    },
+    [documents],
+  );
 
   /**
    * Records what this folder looks like now. Called from the effect below and from the
    * explorer, which reports scrolling and unfolding outside render -- the writer coalesces
    * the bursts, so calling it often is cheap.
    */
-  const sessionState = useRef({ workspacePath, tabs, activeTabId });
-  sessionState.current = { workspacePath, tabs, activeTabId };
+  // The stored tabs, not the drawn ones: those are rebuilt on every render, and the session
+  // would be rewritten on every keystroke.
+  const sessionState = useRef({ workspacePath, tabs: openTabs, activeTabId });
+  sessionState.current = { workspacePath, tabs: openTabs, activeTabId };
   const writeSession = useCallback(() => {
     const { workspacePath: folder, tabs: open, activeTabId: active } = sessionState.current;
     // Nothing is written while a folder is still being restored. The window passes through
     // "this folder has no tabs" on its way to reopening them, and saving that -- which took
     // one debounce interval, less than a slow restore -- erased the folder's tabs on disk.
     if (!isTauri() || !folder || restoring.current) return;
+    // Files only: an untitled document has nothing on disk to reopen, and its content is not
+    // kept across restarts (there is no hot exit yet).
+    const files = open
+      .filter((tab) => tab.id !== "welcome" && documents.get(tab.path)?.source.kind === "disk")
+      .map((tab) => tab.path);
     const state: WorkspaceSession = {
       folder,
-      files: open.filter((tab) => tab.id !== "welcome").map((tab) => tab.path),
-      active: active === "welcome" ? null : active,
+      files,
+      active: active && files.includes(active) ? active : null,
       expanded: explorerRef.current.expanded,
       scroll: explorerRef.current.scroll,
     };
@@ -476,8 +509,8 @@ export default function App() {
       ],
     };
     saveWorkspaceSession(state);
-  }, []);
-  useEffect(writeSession, [workspacePath, tabs, activeTabId, writeSession]);
+  }, [documents]);
+  useEffect(writeSession, [workspacePath, openTabs, activeTabId, writeSession]);
 
   /** The explorer reporting what it has unfolded and where it is scrolled. */
   const rememberExplorer = useCallback(
@@ -569,6 +602,8 @@ export default function App() {
       if (!tree || !watchTracker.current.accept(batch, tree.path)) return;
       for (const scope of batch.rescan)
         log.appendLine(`Changes under ${scope} were not all reported; re-reading it.`, "info");
+      // Open documents check every change to their files, their own saves excepted.
+      void documents.applyResourceChanges(batch.changes, batch.rescan).catch(reportError);
       const external = batch.changes.filter((change) => change.operation === undefined);
       const directories = directoriesToRefresh(tree, external, batch.rescan);
       if (directories.length) void refreshTreeRef.current(directories).catch(reportError);
@@ -589,7 +624,38 @@ export default function App() {
       stopChanges();
       stopStatus();
     };
-  }, [reportError]);
+  }, [documents, reportError]);
+
+  // What the Document Model decides, the editors follow: a document that became another file
+  // (Save As, or a rename) takes its tab and undo history with it; a conflict is said once.
+  useEffect(
+    () =>
+      documents.subscribe((event) => {
+        if (event.type === "sourceChanged") {
+          const { previousKey, key } = event;
+          const doc = documents.get(key);
+          setTabs((previous) =>
+            previous.map((tab) =>
+              tab.path === previousKey ? { id: key, path: key, name: doc?.name ?? tab.name } : tab,
+            ),
+          );
+          setActiveTabId((active) => (active === previousKey ? key : active));
+          const history = histories.current.get(previousKey);
+          if (history) {
+            histories.current.delete(previousKey);
+            histories.current.set(key, history);
+          }
+        } else if (event.type === "conflict") {
+          const doc = documents.all().find((one) => one.id === event.id);
+          reportError(
+            `“${doc?.name ?? "A file"}” changed on disk while it had unsaved changes. Nothing ` +
+              "was overwritten and your changes are kept: use File › Revert File to take the " +
+              "version on disk, or File › Keep My Version to replace it on the next save.",
+          );
+        }
+      }),
+    [documents, reportError],
+  );
 
   // Git decorations refresh on focus when the Source Control panel is not polling.
   useEffect(() => {
@@ -599,87 +665,75 @@ export default function App() {
     return () => window.removeEventListener("focus", refresh);
   }, [isSidebarOpen, activeActivityTab]);
 
-  const handleOpenFile = (path: string, name: string = path.split("/").pop() || path) =>
+  // The name a caller passes is not needed: the document knows its own.
+  const handleOpenFile = (path: string) =>
     run(async () => {
       setDiff(null);
       if (path === "welcome") {
         // Its tab may have been closed -- Help > Welcome is how it comes back -- and
         // selecting a tab that is not there leaves the strip with nothing selected.
         setTabs((previous) =>
-          previous.some((tab) => tab.id === "welcome")
-            ? previous
-            : [{ id: "welcome", name: "Welcome", path: "welcome", dirty: false }, ...previous],
+          previous.some((tab) => tab.id === "welcome") ? previous : [WELCOME_TAB, ...previous],
         );
         setActiveTabId(path);
         return;
       }
-      if (contentsRef.current[path] === undefined) {
-        const revision = workspaceRevision.current;
-        const content = await native("read_file_content", { path });
-        if (revision !== workspaceRevision.current) return;
-        savedContents.current[path] = content;
-        if (contentsRef.current[path] === undefined)
-          updateContents({ ...contentsRef.current, [path]: content });
-      }
+      // However the path is spelled, one resource is one document and one tab: the tab is
+      // keyed by the document's key, not by the spelling that asked for it.
+      const doc = documents.get(path) ?? (await documents.open(path));
+      // Null: the workspace changed while it was loading.
+      if (!doc) return;
+      const key = doc.key;
       setTabs((prev) =>
-        prev.some((tab) => tab.path === path)
+        prev.some((tab) => tab.path === key)
           ? prev
-          : [...prev, { id: path, path, name, dirty: false }],
+          : [...prev, { id: key, path: key, name: doc.name }],
       );
-      setActiveTabId(path);
-      setRecentFiles((prev) =>
-        [{ name, path }, ...prev.filter((file) => file.path !== path)].slice(0, 10),
-      );
+      setActiveTabId(key);
+      if (doc.source.kind === "disk")
+        setRecentFiles((prev) =>
+          [{ name: doc.name, path: key }, ...prev.filter((file) => file.path !== key)].slice(0, 10),
+        );
     });
 
   const handleCloseTab = (id: string) => {
-    if (saving.current.size) {
-      reportError("Wait for saves to finish before closing editors.");
+    const doc = id === "welcome" ? undefined : documents.get(id);
+    if (doc?.save.kind === "saving") {
+      reportError("Wait for the file to finish saving before closing it.");
       return;
     }
-    if (
-      tabs.find((tab) => tab.id === id)?.dirty &&
-      !window.confirm("Discard unsaved changes in this file?")
-    )
-      return;
+    if (doc?.dirty && !window.confirm("Discard unsaved changes in this file?")) return;
+    if (doc) documents.close(id, { discard: true });
     setTabs((prev) => prev.filter((tab) => tab.id !== id));
-    const next = { ...contentsRef.current };
-    delete next[id];
     histories.current.delete(id);
-    delete savedContents.current[id];
-    updateContents(next);
     if (activeTabId === id) setActiveTabId("welcome");
   };
-  const handleContentChange = (path: string, text: string) => {
-    updateContents({ ...contentsRef.current, [path]: text });
-    setTabs((prev) =>
-      prev.map((tab) =>
-        tab.path === path ? { ...tab, dirty: text !== savedContents.current[path] } : tab,
-      ),
-    );
+  // The editor's compatibility path into the Document Model: each change is a new version.
+  const handleContentChange = (key: string, text: string) => void documents.edit(key, text);
+  /** Save As: a new file for any open document, and how an untitled one reaches the disk. */
+  const saveAs = async (key: string) => {
+    const doc = documents.get(key);
+    if (!doc || doc.source.kind === "proposed") return;
+    const target = await native("save_file_dialog", { defaultName: doc.name });
+    if (!target) return;
+    // The tab and its history follow the document (`sourceChanged`, above).
+    await documents.saveAs(key, target);
+    await refreshAround(target);
   };
-  const saving = useRef(new Set<string>());
-  const handleSaveFile = (path: string) =>
+  const handleSaveFile = (key: string) =>
     run(async () => {
-      const content = contentsRef.current[path];
-      if (content === undefined || saving.current.has(path)) return;
-      saving.current.add(path);
+      const doc = documents.get(key);
+      if (!doc) return;
+      if (doc.source.kind === "untitled") return saveAs(key);
       try {
-        await native("write_file_guarded", {
-          path,
-          expected: savedContents.current[path],
-          content,
-        });
-        savedContents.current[path] = content;
-        setTabs((prev) =>
-          prev.map((tab) =>
-            tab.path === path ? { ...tab, dirty: contentsRef.current[path] !== content } : tab,
-          ),
-        );
-        bumpGitRevision();
-      } finally {
-        saving.current.delete(path);
+        await documents.save(key);
+      } catch (error) {
+        // Refused because the file changed on disk: the conflict has been announced, in words
+        // more useful than the write's own.
+        if (!(error instanceof DocumentError) && documentStatus(doc) === "conflicted") return;
+        throw error;
       }
+      bumpGitRevision();
     });
   /**
    * Everything that has to happen when the window changes folder, whichever way the folder
@@ -692,10 +746,9 @@ export default function App() {
     restoring.current = true;
     setDiff(null);
     setPendingHit(null);
-    updateContents({});
-    savedContents.current = {};
+    documents.reset();
     histories.current.clear();
-    setTabs([{ id: "welcome", name: "Welcome", path: "welcome", dirty: false }]);
+    setTabs([WELCOME_TAB]);
     setActiveTabId("welcome");
     setRecentFiles([]);
     setWorkspacePath(selected);
@@ -724,7 +777,7 @@ export default function App() {
 
   /** Refuses to leave a folder while saves are in flight, and asks about unsaved edits. */
   const canLeaveWorkspace = () => {
-    if (saving.current.size)
+    if (documents.anySaving())
       throw new Error("Wait for file saves to finish before changing workspace.");
     return (
       !tabs.some((tab) => tab.dirty) ||
@@ -774,30 +827,13 @@ export default function App() {
     });
   const handleRename = (oldPath: string, newPath: string) =>
     run(async () => {
-      if (saving.current.size)
+      if (documents.anySaving())
         throw new Error("Wait for file saves to finish before renaming files.");
       await native("rename_path", { oldPath, newPath });
       const remap = (path: string) => remapPath(path, oldPath, newPath);
-      setTabs((prev) =>
-        prev.map((tab) => ({
-          ...tab,
-          id: remap(tab.id),
-          path: remap(tab.path),
-          name: remap(tab.path).split("/").pop() || tab.name,
-        })),
-      );
-      setActiveTabId(remap);
-      histories.current = new Map(
-        [...histories.current].map(([path, history]) => [remap(path), history]),
-      );
-      savedContents.current = Object.fromEntries(
-        Object.entries(savedContents.current).map(([path, text]) => [remap(path), text]),
-      );
-      updateContents(
-        Object.fromEntries(
-          Object.entries(contentsRef.current).map(([path, text]) => [remap(path), text]),
-        ),
-      );
+      // Open documents under it move to their new identity; their tabs, histories and the
+      // active editor follow (`sourceChanged`).
+      documents.moved(oldPath, newPath);
       setRecentFiles((prev) =>
         prev.map((file) => ({
           path: remap(file.path),
@@ -809,7 +845,7 @@ export default function App() {
   // Deletes one entry or a whole Explorer selection behind a single confirmation.
   const handleDelete = (entries: { path: string; isDir: boolean }[]) => {
     if (!entries.length) return;
-    if (saving.current.size) {
+    if (documents.anySaving()) {
       reportError("Wait for file saves to finish before deleting files.");
       return;
     }
@@ -827,17 +863,14 @@ export default function App() {
         `Permanently delete ${subject}? This cannot be undone.` +
         (dirty ? "\n\nUnsaved changes in open editors will be discarded." : ""),
       submit: async () => {
-        for (const entry of entries)
+        for (const entry of entries) {
           await native("delete_path", { path: entry.path, recursive: entry.isDir });
+          // The user agreed to lose their edits in the confirmation above.
+          documents.removed(entry.path);
+        }
         setTabs((prev) => prev.filter((tab) => !doomed(tab.path)));
         for (const key of histories.current.keys()) if (doomed(key)) histories.current.delete(key);
-        savedContents.current = Object.fromEntries(
-          Object.entries(savedContents.current).filter(([key]) => !doomed(key)),
-        );
         if (doomed(activeTabId)) setActiveTabId("welcome");
-        updateContents(
-          Object.fromEntries(Object.entries(contentsRef.current).filter(([key]) => !doomed(key))),
-        );
         setRecentFiles((prev) => prev.filter((file) => !doomed(file.path)));
         await refreshAround(...entries.map((entry) => entry.path));
       },
@@ -858,6 +891,16 @@ export default function App() {
   const handleReveal = (path: string) => run(() => native("reveal_in_explorer", { path }));
 
   const activeTab = tabs.find((t) => t.id === activeTabId);
+  const activeDocument: TextDocument | undefined =
+    activeTab && activeTab.id !== "welcome" ? documents.get(activeTab.path) : undefined;
+  /** Encoding, line endings and language of the document in front, for the status bars. */
+  const documentDetails = activeDocument
+    ? [
+        activeDocument.encoding === "utf8bom" ? "UTF-8 with BOM" : "UTF-8",
+        activeDocument.lineEnding === "crlf" ? "CRLF" : "LF",
+        languageLabel(activeDocument.languageId),
+      ]
+    : undefined;
 
   useEffect(() => {
     if (!pendingHit || activeTabId !== pendingHit.path || diff) return;
@@ -883,30 +926,25 @@ export default function App() {
       try {
         if (workspaceRevision.current !== revision)
           throw new Error("Workspace changed; remaining files skipped");
-        if (saving.current.has(change.path)) throw new Error("File is being saved");
-        const open = contentsRef.current[change.path];
-        if (open !== undefined && open !== change.before)
-          throw new Error("Editor changed; preview again");
-        if (open === undefined || saved) {
-          saving.current.add(change.path);
-          try {
-            await native("write_file_guarded", {
-              path: change.path,
-              expected: change.before,
-              content: change.after,
-            });
-          } finally {
-            saving.current.delete(change.path);
-          }
-          if (saved) savedContents.current[change.path] = change.after;
-        }
-        if (open !== undefined) {
-          if (contentsRef.current[change.path] !== change.before)
-            throw new Error("Editor changed during write; saved file updated, editor retained");
-          const history = histories.current.get(change.path) ?? { past: [], future: [] };
-          recordEdit(history, { text: open, start: 0, end: 0 });
-          histories.current.set(change.path, history);
-          handleContentChange(change.path, change.after);
+        const doc = documents.get(change.path);
+        if (doc) {
+          // An open file is changed in its document -- an undoable edit -- and, for `saved`,
+          // saved from there, so the document's base and the disk never disagree.
+          if (doc.save.kind === "saving") throw new Error("File is being saved");
+          if (doc.text !== change.before) throw new Error("Editor changed; preview again");
+          if (saved && doc.dirty)
+            throw new Error("The editor has unsaved changes; save or revert it first");
+          const history = histories.current.get(doc.key) ?? { past: [], future: [] };
+          recordEdit(history, { text: doc.text, start: 0, end: 0 });
+          histories.current.set(doc.key, history);
+          documents.edit(doc.key, change.after);
+          if (saved) await documents.save(doc.key);
+        } else {
+          await native("write_file_guarded", {
+            path: change.path,
+            expected: change.before,
+            content: change.after,
+          });
         }
         applied.push(change);
       } catch (error) {
@@ -917,20 +955,12 @@ export default function App() {
     return { applied, errors };
   };
 
+  /**
+   * After a Git command that may have rewritten open files: each is checked against the disk.
+   * One with no unsaved edits follows it; one with edits is put in conflict, never overwritten.
+   */
   const reconcileWorkspace = async () => {
-    const revision = workspaceRevision.current;
-    for (const [path, before] of Object.entries(contentsRef.current)) {
-      if (before !== savedContents.current[path]) continue;
-      try {
-        const content = await native("read_file_content", { path });
-        if (revision !== workspaceRevision.current) return;
-        if (contentsRef.current[path] !== before) continue;
-        savedContents.current[path] = content;
-        updateContents({ ...contentsRef.current, [path]: content });
-      } catch (error) {
-        reportError(`${path}: ${String(error)}`);
-      }
-    }
+    await documents.revalidate();
     await refreshTree();
   };
 
@@ -998,14 +1028,16 @@ export default function App() {
     setPaletteMode(mode);
     setIsCommandPaletteOpen(true);
   };
+  /** An untitled document in a new tab: edited in memory, saved with Save As. */
+  const newUntitled = (name?: string) => {
+    const doc = documents.createUntitled({ name });
+    setTabs((prev) => [...prev, { id: doc.key, path: doc.key, name: doc.name }]);
+    setActiveTabId(doc.key);
+  };
   const newFile = () => {
     if (!desktop) {
-      const path = "preview:" + crypto.randomUUID();
-      const name = "Untitled.ts";
-      savedContents.current[path] = "";
-      updateContents({ ...contentsRef.current, [path]: "" });
-      setTabs((prev) => [...prev, { id: path, path, name, dirty: false }]);
-      setActiveTabId(path);
+      // The browser preview has no disk, so a new file is an untitled document.
+      newUntitled("Untitled.ts");
       return;
     }
     if (!workspacePath) {
@@ -1032,14 +1064,13 @@ export default function App() {
     });
   };
   const closeAll = () => {
-    if (saving.current.size) throw new Error("Wait for saves to finish before closing editors.");
+    if (documents.anySaving()) throw new Error("Wait for saves to finish before closing editors.");
     if (hasUnsavedChanges && !window.confirm("Discard all unsaved changes and close all editors?"))
       return;
-    setTabs([{ id: "welcome", path: "welcome", name: "Welcome", dirty: false }]);
+    setTabs([WELCOME_TAB]);
     setActiveTabId("welcome");
-    updateContents({});
+    documents.reset();
     histories.current.clear();
-    savedContents.current = {};
   };
   const edit = (action: EditorAction) => editorRef.current?.execute(action);
   const navigateTab = (direction: number) => {
@@ -1109,12 +1140,30 @@ export default function App() {
       run: handleOpenFolderDialog,
     },
     {
+      id: "file.newText",
+      menu: "File",
+      label: "New Text File",
+      shortcut: "Mod+Alt+n",
+      run: () => newUntitled(),
+    },
+    {
       id: "file.save",
       menu: "File",
       label: "Save",
       shortcut: "Mod+s",
-      disabled: !desktop || !hasEditor || !activeTab?.dirty,
+      // A file deleted on disk can be saved without edits: that recreates it.
+      disabled:
+        !desktop ||
+        !activeDocument ||
+        !(activeDocument.dirty || activeDocument.external?.kind === "deleted"),
       run: () => handleSaveFile(activeTabId),
+    },
+    {
+      id: "file.saveAs",
+      menu: "File",
+      label: "Save As…",
+      disabled: !desktop || !activeDocument || activeDocument.source.kind === "proposed",
+      run: () => run(() => saveAs(activeTabId)),
     },
     {
       id: "file.saveAll",
@@ -1123,35 +1172,50 @@ export default function App() {
       shortcut: "Mod+Shift+s",
       disabled: !desktop || !hasUnsavedChanges,
       run: async () => {
-        if (saving.current.size) throw new Error("A save is already in progress.");
+        if (documents.anySaving()) throw new Error("A save is already in progress.");
         const dirtyTabs = tabs.filter((tab) => tab.dirty);
-        for (const tab of dirtyTabs) {
-          const content = contentsRef.current[tab.path];
-          saving.current.add(tab.path);
-          try {
-            await native("write_file_guarded", {
-              path: tab.path,
-              expected: savedContents.current[tab.path],
-              content,
-            });
-            savedContents.current[tab.path] = content;
-            setTabs((prev) =>
-              prev.map((item) =>
-                item.path === tab.path
-                  ? { ...item, dirty: contentsRef.current[tab.path] !== content }
-                  : item,
-              ),
-            );
-          } finally {
-            saving.current.delete(tab.path);
-          }
-        }
+        // Files first, in tab order; then each untitled document asks where it goes.
+        for (const tab of dirtyTabs)
+          if (documents.get(tab.path)?.source.kind === "disk") await documents.save(tab.path);
+        for (const tab of dirtyTabs)
+          if (documents.get(tab.path)?.source.kind === "untitled") await saveAs(tab.path);
         // Every other write path (single save, hunk reconcile, every Explorer
         // op) already bumps this once its own writes settle; Save All omitted
         // it, leaving Git status to fall back entirely on the ~300ms watcher
         // latency instead of the immediate trigger every other path gets.
         if (dirtyTabs.length) bumpGitRevision();
       },
+    },
+    {
+      // Takes the file as it is on disk -- after asking, when that loses unsaved changes.
+      id: "file.revert",
+      menu: "File",
+      label: "Revert File",
+      disabled: !desktop || activeDocument?.source.kind !== "disk",
+      run: () =>
+        run(async () => {
+          const doc = activeDocument;
+          if (!doc) return;
+          if (
+            doc.dirty &&
+            !window.confirm("Discard unsaved changes and reload the file from disk?")
+          )
+            return;
+          await documents.reload(doc.key, { discard: true });
+        }),
+    },
+    {
+      // The other way out of a conflict: keep the editor's version, to replace the disk's on
+      // the next save.
+      id: "file.keepMine",
+      menu: "File",
+      label: "Keep My Version",
+      disabled: !activeDocument || documentStatus(activeDocument) !== "conflicted",
+      reason: "Only for a file that changed on disk while it had unsaved changes",
+      run: () =>
+        run(async () => {
+          if (activeDocument) await documents.keepLocal(activeDocument.key);
+        }),
     },
     {
       id: "file.close",
@@ -1455,7 +1519,7 @@ export default function App() {
       id: "help.welcome",
       menu: "Help",
       label: "Welcome",
-      run: () => void handleOpenFile("welcome", "Welcome"),
+      run: () => void handleOpenFile("welcome"),
     },
     {
       id: "help.about",
@@ -1585,11 +1649,10 @@ export default function App() {
               setPendingHit(hit);
               void handleOpenFile(hit.path);
             }}
-            read={(path) =>
-              contentsRef.current[path] !== undefined
-                ? Promise.resolve(contentsRef.current[path])
-                : native("read_file_content", { path })
-            }
+            read={(path) => {
+              const doc = documents.get(path);
+              return doc ? Promise.resolve(doc.text) : native("read_file_content", { path });
+            }}
             apply={applyReplacements}
           />
           <SourceControlPanel
@@ -1701,7 +1764,7 @@ export default function App() {
               <EditorArea
                 tabs={tabs}
                 activeTabId={activeTabId}
-                onSelectTab={(path, name) => handleOpenFile(path, name || path.split("/").pop())}
+                onSelectTab={(path) => handleOpenFile(path)}
                 onCloseTab={handleCloseTab}
                 onNewFile={newFile}
                 onOpenCommandPalette={() => openPalette("commands")}
@@ -1722,6 +1785,7 @@ export default function App() {
                     if (!workspacePath) void handleOpenRecentFolder(root);
                   })
                 }
+                details={documentDetails}
                 editorRef={editorRef}
                 histories={histories.current}
                 onEditorState={setEditorState}
@@ -1758,6 +1822,7 @@ export default function App() {
         {/* Status Bar */}
         <StatusBar
           activeFile={activeTab?.path || ""}
+          details={documentDetails}
           onToggleTerminal={() => showTerminal((prev) => !prev)}
           restricted={!trust.trusted}
           onManageTrust={() => setTrustDialog("manage")}

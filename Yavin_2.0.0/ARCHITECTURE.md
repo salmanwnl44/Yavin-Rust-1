@@ -189,6 +189,7 @@ One logical action -- a save, a create, a copy, a Git switch -- is one **operati
 | ------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | Save          | `write_file_guarded`                                                  | the temporary file (`Transient`: gone, or holding exactly the bytes), the target (`Content`: exactly the bytes), any folders it must make |
 | Create file   | `create_file`                                                         | every missing ancestor folder (`Directory`), the file (empty `Content`)                                                                   |
+| Create file   | `create_file_with_content` (Save As, recreating a deleted file)       | every missing ancestor folder, the file (`Content`: exactly the bytes); refused if anything is there                                      |
 | Create folder | `create_directory`                                                    | every missing ancestor folder, and the folder itself (`Directory`)                                                                        |
 | Rename        | `rename_path`                                                         | old name `Absent` (`Present` for a case-only rename), new name `Present`                                                                  |
 | Delete        | `delete_path`                                                         | `Absent`                                                                                                                                  |
@@ -381,6 +382,119 @@ On failure the temporary file is removed and the old file is left untouched. The
 7. Persisted formats are versioned. Unreadable and newer files are moved aside, never overwritten or reinterpreted.
 8. A failed save of the session or trust file leaves the previous complete file.
 9. Recovery reads only what records name. Its cost follows interrupted operations, not project size.
+
+## Document model
+
+The Document Model (`src/services/documents.ts`) owns what is open in memory; the filesystem owns what is on disk. It is not a second filesystem: it never lists, watches or writes anything itself, and every write it asks for is a Module 03 operation with a Module 04 intent.
+
+```text
+Filesystem ──read──> ResourceUri (Module 01) ──> Document Service ──> Document
+     ^                                                 │                 │
+     │                    resource-changes (Module 02) │                 v
+     └──── write_file_guarded / create_file_with_content (Modules 03, 04) ── Editor, future LSP, index, AI
+```
+
+| Owner            | Owns                                                                                |
+| ---------------- | ----------------------------------------------------------------------------------- |
+| Filesystem       | disk truth                                                                          |
+| Resource service | resource identity (`resource.ts`)                                                   |
+| Document service | in-memory document truth: content, version, dirty, encoding, line endings, language |
+| Editor           | presentation and edit interaction, including its undo stack (Module 06 migrates it) |
+| Git              | repository status                                                                   |
+| LSP, index, AI   | language state, the searchable project, runs and ChangeSets -- none yet             |
+
+**A document** has an id, a `uri` and `path` (none for an untitled one), a `key` the editor uses (the path for a file, the id otherwise), a `source`, its `text` (always `\n`, no byte order mark), a `version`, derived `dirty`, `encoding` (`utf8` or `utf8bom`), `lineEnding` (`lf` or `crlf`), `languageId` (`language.ts`, from the name, VS Code's ids), its `base` (the exact disk text it was loaded from or last saved as, with a fingerprint), what happened to the file underneath it (`external`), and its save activity.
+
+**Sources.** A union, so contradictory flags cannot exist:
+
+- **Disk:** a workspace file. Its id is the Module 01 `ResourceId`, so every spelling of the path -- slashes, case on Windows, `\\?\`, a `file:` URI, a path relative to the workspace -- is one document, and concurrent opens share one read.
+- **Untitled:** `untitled:N`, no path. Edited in memory; Save As writes it (`create_file_with_content`, or a guarded replace of a file the dialog confirmed replacing) and it becomes a Disk document (`sourceChanged`). Not kept across restarts: there is no hot exit.
+- **Proposed:** `proposed:N`, content Yavin proposes for a file, beside that file's own document. It records the file it was made against (`baseHash`, or none for a new file) and reports its own `proposedHash`. It is never saved: `save` refuses it, and accepting it belongs to ChangeSets (Module 13). It goes **stale** when a check (`isStale`, or a watcher change to its file) finds the file is no longer its base.
+
+**Versions.** Every content change, including a reload, makes a new version; versions are never reused and are never times or hashes. `dirty` is derived: a document is clean when its version is the persisted one or its text is the persisted text.
+
+**Encoding and line endings.** Files are read as UTF-8 (`read_file_content`); a binary file (a NUL in the first 8 KB), a file over 10 MB or invalid UTF-8 fails to open and is not touched. A byte order mark is removed from the text and written back on save. Line endings become `\n` in memory -- what the textarea does anyway -- and the file's own style is written back, so opening and saving a CRLF file never rewrites it. A file mixing both gets the style most of its lines use.
+
+**States.** `documentStatus` derives exactly one from the parts, so "saving" is never "clean" and a conflict is exactly "the disk changed under unsaved edits":
+
+| Status              | When                                                                                                                                                              |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `neverSaved`        | untitled                                                                                                                                                          |
+| `clean`             | a file, in step with the disk, no unsaved edits                                                                                                                   |
+| `dirty`             | unsaved edits                                                                                                                                                     |
+| `saving`            | a save is on its way                                                                                                                                              |
+| `saveFailed`        | the last save failed and the edits are still unsaved                                                                                                              |
+| `externallyChanged` | the file was deleted or cannot be read, or its conflict's edits were undone (Revert File takes the disk version); a changed file with no edits is simply reloaded |
+| `conflicted`        | the file changed on disk while the document had unsaved edits                                                                                                     |
+| `proposed`, `stale` | a proposal; stale once its file is not its base                                                                                                                   |
+
+```text
+open ──> clean ──edit──> dirty ──save──> saving ──ok──> clean (if nothing was typed meanwhile, else dirty)
+                           ^                 └──fail──> saveFailed (disk unchanged) | conflicted (disk changed)
+disk change: clean ──> reloaded (new version)      dirty ──> conflicted ──Revert File──> clean (disk version)
+                                                                         └─Keep My Version──> dirty (next save replaces)
+file deleted ──> externallyChanged, dirty ──save──> recreated (exclusive create)
+                                           └─a different file appears──> conflicted (never reloaded)
+```
+
+**Save pipeline.**
+
+```text
+Document.save()
+  -> capture version v, text, and the base (exact disk text)
+  -> write_file_guarded(path, expected = base, content = encode(text))
+       -> refused unless the file still holds exactly the base
+       -> Module 03 operation: begin, expect temporary file and target
+       -> Module 04 intent recorded durably (refused if it cannot be)
+       -> temporary file, flush, rename
+       -> finish; returns the operation id
+  -> base = what was written; persisted = (v, text); clean only if nothing was typed since v
+```
+
+A failed write leaves the document dirty and the disk untouched. The failure is followed by one check of the disk: if the file is no longer the base, the document is in conflict.
+
+**Save race.** A save captures the version it writes. On completion, only that version is marked persisted, so an edit typed while it was in flight keeps the document dirty. The next save is guarded on what the first one wrote. A second save while one is in flight starts no second write.
+
+**External changes.** Every `resource-changes` batch is handed to `applyResourceChanges`:
+
+- A change credited to one of the document's own saves (by the operation id the save returned) needs nothing. Because the watcher can report a write before the save's reply arrives, a change reported while a save is in flight is held until the save ends, then compared with the operations the save turned out to be.
+- Anything else -- another program, Git, another Yavin operation, a rescan after lost notifications -- is checked by reading the file and comparing it with the base, exactly:
+  - the same text, such as a touch, is nothing;
+  - a document without unsaved edits is reloaded, which is a new version and a `reloaded` event;
+  - a document with unsaved edits enters conflict, keeping both texts and writing nothing.
+- A deleted file keeps its document, marked deleted. Its text is now held nowhere but memory, so it is dirty: closing asks, and a different file appearing there -- reported, or found when the exclusive create of a save fails -- is a conflict, never a reload. Saving recreates it exclusively; the same text coming back puts it in step again. An external rename away is a deletion.
+- Checks are ordered by a counter, so a slow earlier read never overwrites a later one, and one still reading when its document closes changes nothing. Nothing uses timers.
+
+After a Git command, `revalidate` checks every open file the same way.
+
+**Reload.** `reload` reads the file, then replaces the text, the encoding and line-ending metadata and the base; it advances the version and clears both the external change and dirty. It refuses a dirty document unless the user chose to discard its edits (Revert File asks first). If an edit is typed while it reads, and the edits were not given up, the edit is kept.
+
+**Events.** Typed and scoped to the service (`subscribe`): `opened`, `changed`, `saving`, `saved`, `saveFailed`, `externallyChanged`, `conflict`, `reloaded`, `sourceChanged` (Save As, or a rename by Yavin), and `closed`. There is no global bus. The window uses `sourceChanged` to move a tab and its undo history, and `conflict` to say so once.
+
+**Lifecycle.**
+
+- `close` refuses a document that is being saved, and a dirty one unless the user chose to discard it (the existing confirmation).
+- `reset` (changing workspace, Close All) drops everything; opens still loading stay dropped.
+- A rename by Yavin moves the documents under it (`moved`), and a delete by Yavin closes them (`removed`).
+- Reopening reads the file again as a new document.
+
+**Session.** Unchanged: `session.json` keeps the open files' paths. A reopened file's source is Disk and its language comes from its name, so nothing more is stored. Untitled documents are not written to the session.
+
+**Editor compatibility.** The textarea editor still takes `Record<key, text>` and reports whole-text changes. The window keeps no copy: `buffers()` is built from the documents' own strings, and `edit` is the only way in. Tabs store only which document is where; dirty and status are read from the document when drawn. Undo stays in the editor (`TextHistory`); replacing it is Module 06.
+
+**Performance.** An edit is one string comparison with the persisted text and a version increment; nothing is hashed per keystroke. A disk document holds its base text (which the guarded save needs anyway), so an external change is one read and one comparison. Fingerprints are computed only on load, save and reload.
+
+**Invariants**
+
+1. One canonical `ResourceUri` corresponds to at most one live disk-backed document.
+2. The Document Model owns in-memory content; the filesystem owns disk state.
+3. A document is clean only when its current in-memory version is known to be persisted.
+4. Completion of an older save never marks a newer document version clean.
+5. Yavin never silently overwrites an externally modified disk resource when local edits could be lost.
+6. Proposed content never silently overwrites its base resource.
+7. A document's version increases monotonically with content changes.
+8. All disk mutations continue to use the Module 03/04 operation and recovery infrastructure.
+9. A file's encoding and line endings survive opening, editing and saving it.
 
 ## Rules and references
 

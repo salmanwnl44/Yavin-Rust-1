@@ -206,6 +206,39 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// Creates a new file holding `content`, refusing -- without touching it -- if anything
+    /// is already at `path`. Flushed to disk before returning; a file that could not be
+    /// written completely is removed again (it was this call's own, created a moment before).
+    pub fn create_file_with<P: AsRef<Path>>(&self, path: P, content: &str) -> Result<(), String> {
+        if content.len() as u64 > MAX_EDITOR_FILE_SIZE {
+            return Err("Content exceeds the editor's 10 MB file size limit".into());
+        }
+        let validated = self.validate_path(path)?;
+        if let Some(parent) = validated.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&validated)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!("File already exists: {}", validated.display())
+                } else {
+                    error.to_string()
+                }
+            })?;
+        let written = file
+            .write_all(content.as_bytes())
+            .and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(error) = written {
+            let _ = fs::remove_file(&validated);
+            return Err(format!("Failed to write the new file: {error}"));
+        }
+        Ok(())
+    }
+
     /// Creates a new directory inside the workspace.
     pub fn create_directory<P: AsRef<Path>>(&self, path: P) -> Result<(), String> {
         let validated = self.validate_path(path)?;
@@ -704,11 +737,17 @@ pub fn pick_file() -> Result<Option<String>, String> {
     Ok(file.map(clean_path_str))
 }
 
-/// Native save file picker.
-pub fn pick_save_file(default_name: Option<String>) -> Result<Option<String>, String> {
+/// Native save file picker, opening in `directory` when given.
+pub fn pick_save_file(
+    default_name: Option<String>,
+    directory: Option<&Path>,
+) -> Result<Option<String>, String> {
     let mut dialog = rfd::FileDialog::new().set_title("Save File As");
     if let Some(name) = default_name {
         dialog = dialog.set_file_name(&name);
+    }
+    if let Some(directory) = directory {
+        dialog = dialog.set_directory(directory);
     }
     let file = dialog.save_file();
     Ok(file.map(clean_path_str))
@@ -765,6 +804,22 @@ mod tests {
             .rename_path(&tmp_dir, &tmp_dir.join("new_root"))
             .is_err());
 
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn a_file_that_is_not_utf8_is_refused_and_left_untouched() {
+        let tmp_dir = env::temp_dir().join(format!("yavin-latin1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let mgr = WorkspaceManager::new(tmp_dir.clone()).unwrap();
+        // "café" in Latin-1: not binary (no NUL), but not UTF-8 either. Never decoded lossily --
+        // that text, saved back, would destroy the original bytes.
+        let path = tmp_dir.join("latin1.txt");
+        fs::write(&path, [b'c', b'a', b'f', 0xE9]).unwrap();
+        let read = mgr.read_file(&path);
+        assert!(read.unwrap_err().contains("invalid UTF-8"));
+        assert_eq!(fs::read(&path).unwrap(), [b'c', b'a', b'f', 0xE9]);
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 

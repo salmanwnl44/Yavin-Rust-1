@@ -5,6 +5,8 @@ import { problemCounts, problemsVersion, subscribeProblems } from "../../service
 
 interface StatusBarProps {
   activeFile: string;
+  /** The document in front: encoding, line endings, language. */
+  details?: string[];
   onToggleTerminal: () => void;
   /** Opens the Problems view, as clicking the count does in VS Code. */
   onShowProblems?: () => void;
@@ -23,6 +25,7 @@ interface StatusBarProps {
  */
 export function StatusBar({
   activeFile,
+  details,
   onToggleTerminal,
   onShowProblems,
   restricted,
@@ -31,13 +34,6 @@ export function StatusBar({
   useSyncExternalStore(subscribeProblems, problemsVersion, problemsVersion);
   const branch = useRepoSnapshot(useActiveRepo()?.store)?.branch;
   const counts = problemCounts();
-  const language = activeFile.endsWith(".tsx")
-    ? "TypeScript React"
-    : activeFile.endsWith(".ts")
-      ? "TypeScript"
-      : activeFile.endsWith(".rs")
-        ? "Rust"
-        : "Plain text";
   return (
     <footer className="flex h-6 items-center justify-between border-t border-[#151515] bg-black px-3 text-[11px] text-zinc-400">
       <div className="flex min-w-0 items-center gap-3">
@@ -87,8 +83,9 @@ export function StatusBar({
         <span className="truncate">{activeFile || "Yavin IDE"}</span>
       </div>
       <div className="flex shrink-0 items-center gap-4">
-        <span>UTF-8</span>
-        <span>{language}</span>
+        {details?.map((detail) => (
+          <span key={detail}>{detail}</span>
+        ))}
         <button
           onClick={onToggleTerminal}
           title="Show or hide the terminal panel"

@@ -1,4 +1,4 @@
-use crate::{expecting, made_folders, with_workspace, Planned, Watch, Workspace};
+use crate::{expecting_operation, made_folders, with_workspace, Planned, Watch, Workspace};
 use ide_workspace::file_tree::{temp_nonce, temp_path_for};
 use ide_workspace::process::{capture, ToolOutput};
 use ide_workspace::recovery::{DiskState, Role};
@@ -150,7 +150,7 @@ pub fn write_file_guarded(
     path: String,
     expected: String,
     content: String,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     with_workspace(&state, |manager| {
         if manager.read_file(&path)? != expected {
             return Err(
@@ -181,8 +181,11 @@ pub fn write_file_guarded(
         plan.push(
             Planned::new(target, Expectation::content(new), DiskState::file(new)).pre(before),
         );
-        expecting(&watch, OperationKind::Save, plan, || {
+        // The operation's id goes back to the document that saved, which recognises the
+        // watcher's report of this write by it.
+        expecting_operation(&watch, OperationKind::Save, plan, || {
             manager.write_file_with(&path, &content, nonce)
         })
+        .map(|(id, ())| id)
     })
 }

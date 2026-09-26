@@ -1,3 +1,5 @@
+import type { DocumentStatus } from "./services/documents.ts";
+
 export interface FileNode {
   name: string;
   path: string;
@@ -14,7 +16,13 @@ export interface RecentFile {
   path: string;
 }
 
-export interface EditorTab extends RecentFile {
+/** A tab as the editor strip stores it: which document, in which place. */
+export interface OpenTab extends RecentFile {
   id: string;
+}
+
+/** A tab as it is drawn, with what its document says about itself (never stored twice). */
+export interface EditorTab extends OpenTab {
   dirty: boolean;
+  status?: DocumentStatus;
 }
