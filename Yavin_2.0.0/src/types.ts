@@ -9,6 +9,8 @@ export interface FileNode {
   readonly?: boolean;
   /** For a directory, `null`/`undefined` means not loaded yet; `[]` means empty. */
   children?: FileNode[] | null;
+  /** For a directory whose listing failed (and so has no children): why. */
+  loadError?: string;
 }
 
 export interface RecentFile {

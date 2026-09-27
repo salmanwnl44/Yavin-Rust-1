@@ -9,6 +9,7 @@ import React, {
   useState,
   useEffect,
   useCallback,
+  useMemo,
   useRef,
   useSyncExternalStore,
   Component,
@@ -54,7 +55,7 @@ import type { TrustState } from "./services/trust";
 import { WorkspaceTrustDialog } from "./components/trust/WorkspaceTrustDialog";
 
 import { isTauri } from "@tauri-apps/api/core";
-import type { FileNode, EditorTab, OpenTab, RecentFile } from "./types";
+import type { EditorTab, OpenTab, RecentFile } from "./types";
 import { createDocumentService, DocumentError, documentStatus } from "./services/documents";
 import type { DocumentIO, DocumentService, TextDocument } from "./services/documents";
 import { languageLabel } from "./services/language";
@@ -62,16 +63,9 @@ import { native, onResourceChanges, onWatcherStatus } from "./services/native";
 import { createWatchTracker } from "./services/resourceEvents";
 import { asRecoveryReport, describeRecovery } from "./services/recovery";
 import { createOutputChannel } from "./services/panel/output";
-import {
-  directoriesToRefresh,
-  findNode,
-  isWithin,
-  loadedDirectories,
-  nearestLoadedDirectory,
-  remapPath,
-  setChildren,
-  validateEntryName,
-} from "./services/workspace";
+import { isWithin, remapPath, validateEntryName } from "./services/workspace";
+import { createFileSystemExplorerProvider } from "./services/explorerProvider";
+import type { FileSystemExplorerProvider } from "./services/explorerProvider";
 import {
   buildDecorations,
   bumpGitRevision,
@@ -152,9 +146,21 @@ export default function App() {
   const [zoom, setZoom] = useState(1);
   const [paletteMode, setPaletteMode] = useState<"files" | "commands">("files");
   const [workspacePath, setWorkspacePath] = useState("");
-  const [fileTree, setFileTree] = useState<FileNode | null>(null);
-  const treeRef = useRef<FileNode | null>(null);
-  const treeRequests = useRef(new Map<string, number>());
+  /**
+   * The Explorer Provider (`services/explorerProvider.ts`): what the Explorer shows, as a
+   * projection of the filesystem -- listings, per-folder state, watcher changes applied where
+   * they show. The window keeps no tree of its own; it renders the provider's projection.
+   */
+  const explorerProviderRef = useRef<FileSystemExplorerProvider | null>(null);
+  explorerProviderRef.current ??= createFileSystemExplorerProvider({
+    list: (path) => native("list_workspace_files", { path, maxDepth: 1 }),
+  });
+  const explorer = explorerProviderRef.current;
+  const explorerRevision = useSyncExternalStore(explorer.subscribe, explorer.revision);
+  // The same object for as long as nothing in it changed (see `projection`).
+  const fileTree = useMemo(() => explorer.projection(), [explorer, explorerRevision]);
+  /** The open folder as the Explorer's root has it -- the listing's own spelling. */
+  const rootPath = useCallback(() => explorer.getRootNodes()[0]?.path ?? null, [explorer]);
   const [quickOpen, setQuickOpen] = useState<{ files: string[]; note: string } | null>(null);
   /**
    * The Document Model (`services/documents.ts`): the one owner of open files' contents, their
@@ -163,7 +169,7 @@ export default function App() {
    */
   const documentsRef = useRef<DocumentService | null>(null);
   documentsRef.current ??= createDocumentService(documentIO, {
-    base: () => treeRef.current?.path ?? null,
+    base: () => (explorerProviderRef.current?.projection() ? rootPath() : null),
   });
   const documents = documentsRef.current;
   // The window redraws when what it shows about documents changes -- a tab's dirty marker, a
@@ -333,112 +339,47 @@ export default function App() {
       reportError(reason);
     }
   };
-  const applyTree = (tree: FileNode | null) => {
-    treeRef.current = tree;
-    setFileTree(tree);
-  };
-  // Lists one directory and patches it into the tree; stale responses are dropped.
-  const loadDirectory = useCallback(async (path: string) => {
-    const sequence = (treeRequests.current.get(path) ?? 0) + 1;
-    treeRequests.current.set(path, sequence);
-    const revision = workspaceRevision.current;
-    const node = await native("list_workspace_files", { path, maxDepth: 1 });
-    if (revision !== workspaceRevision.current || treeRequests.current.get(path) !== sequence)
-      return;
-    const current = treeRef.current;
-    applyTree(
-      current && isWithin(node.path, current.path)
-        ? setChildren(current, node.path, node.children ?? [])
-        : node,
-    );
-  }, []);
+  /** Lists a folder the Explorer is showing; abandoned (the folder collapsed) with `signal`. */
+  const loadDirectory = useCallback(
+    (path: string, signal?: AbortSignal) => explorer.loadChildren(explorer.idFor(path), signal),
+    [explorer],
+  );
   const loadWorkspace = useCallback(
     async (target: string) => {
       const revision = workspaceRevision.current;
-      await loadDirectory(target);
+      explorer.setRoots([target]);
+      await explorer.loadChildren(explorer.idFor(target));
       // A folder opened while this listing was in flight owns the window now. Setting the
       // path here would aim the explorer, Source Control and the trust check at the folder
       // that has just been left, while the tree and the native side show the new one.
       if (revision !== workspaceRevision.current) return;
-      setWorkspacePath(treeRef.current?.path ?? target);
+      setWorkspacePath(rootPath() ?? target);
       setQuickOpen(null);
       bumpGitRevision();
     },
-    [loadDirectory],
+    [explorer, rootPath],
   );
   /**
-   * Re-lists every loaded folder: manual refresh, and after Git operations.
-   *
-   * The listings are independent, so they are issued together and folded into the tree in
-   * one pass. Done one at a time, a workspace someone had browsed into sixty folders deep
-   * cost sixty round trips end to end and sixty renders of the whole window -- once per
-   * settled burst of filesystem events, which a running build produces continuously.
+   * Re-lists every loaded folder: manual refresh, and after Git operations. The provider lists
+   * them together and reconciles each answer in one pass; a newer listing of a folder always
+   * wins over an older one still in flight, so overlapping refreshes need no queue.
    */
-  const refreshingTree = useRef(false);
-  /** Folders asked for while a refresh was running, or "all"; run as soon as it finishes. */
-  const queuedRefresh = useRef<Set<string> | "all" | null>(null);
-  /**
-   * Re-lists `only` (default: every loaded folder). A request made while another refresh is
-   * running is queued and run after it, rather than dropped: the running one may have read
-   * those folders before the change that prompted the request.
-   */
-  const refreshTree = async (only?: readonly string[]) => {
-    const tree = treeRef.current;
-    if (!tree) return;
-    if (only && !only.length) return;
-    if (refreshingTree.current) {
-      const queued = queuedRefresh.current;
-      if (!only || queued === "all") queuedRefresh.current = "all";
-      else queuedRefresh.current = new Set([...(queued ?? []), ...only]);
-      return;
-    }
-    refreshingTree.current = true;
-    try {
-      const directories = (only ?? loadedDirectories(tree)).filter(
-        (directory) => treeRef.current && findNode(treeRef.current, directory),
-      );
-      const revision = workspaceRevision.current;
-      const listed = await Promise.all(
-        directories.map((directory) =>
-          native("list_workspace_files", { path: directory, maxDepth: 1 }).then(
-            (node) => ({ directory, node }),
-            (error) => {
-              reportError(`${directory}: ${String(error)}`);
-              return null;
-            },
-          ),
-        ),
-      );
-      if (revision !== workspaceRevision.current) return;
-
-      let next = treeRef.current;
-      for (const result of listed) {
-        if (!result || !next) continue;
-        // A directory that has gone since the listing was asked for is skipped rather than
-        // grafted back on; `setChildren` would have nowhere to put it.
-        if (!findNode(next, result.node.path)) continue;
-        next = isWithin(result.node.path, next.path)
-          ? setChildren(next, result.node.path, result.node.children ?? [])
-          : result.node;
-      }
-      if (next !== treeRef.current) applyTree(next);
-    } finally {
-      refreshingTree.current = false;
-    }
+  const refreshTree = async () => {
+    if (!explorer.projection()) return;
+    const revision = workspaceRevision.current;
+    const errors = await explorer.refresh();
+    if (revision !== workspaceRevision.current) return;
+    for (const error of errors) reportError(error);
     setQuickOpen(null);
     bumpGitRevision();
-    const queued = queuedRefresh.current;
-    queuedRefresh.current = null;
-    if (queued) await refreshTree(queued === "all" ? undefined : [...queued]);
   };
   // Re-lists the loaded folders that hold `paths` after a file operation.
   const refreshAround = async (...paths: string[]) => {
-    const tree = treeRef.current;
-    if (!tree) return;
-    for (const directory of new Set(paths.map((path) => nearestLoadedDirectory(tree, path))))
-      await loadDirectory(directory);
+    if (!explorer.projection()) return;
+    const errors = await explorer.refreshAround(paths);
     setQuickOpen(null);
     bumpGitRevision();
+    if (errors.length) throw new Error(errors.join("\n"));
   };
 
   /**
@@ -578,11 +519,9 @@ export default function App() {
     };
   }, [loadWorkspace, restoreTabs, rememberSession, reportError, writeSession]);
 
-  // Changes on disk re-list the loaded folders they touched (`directoriesToRefresh`).
-  // Changes the watcher credits to one of Yavin's own operations are skipped: each operation
-  // already re-lists what it changed as soon as it finishes (`refreshAround`).
-  const refreshTreeRef = useRef(refreshTree);
-  refreshTreeRef.current = refreshTree;
+  // Changes on disk reach the Explorer through its provider, which re-lists only the loaded
+  // folders they touched. Changes the watcher credits to one of Yavin's own operations are
+  // skipped: each operation already re-lists what it changed as it finishes (`refreshAround`).
   // What crash recovery did at startup, and what still needs the user (see recovery.ts). Once:
   // the native side settled everything before this window could exist.
   useEffect(() => {
@@ -607,16 +546,21 @@ export default function App() {
   useEffect(() => {
     const log = createOutputChannel("Workspace");
     const stopChanges = onResourceChanges((batch) => {
-      const tree = treeRef.current;
-      if (!tree || !watchTracker.current.accept(batch, tree.path)) return;
+      const root = explorer.projection() ? rootPath() : null;
+      if (!root || !watchTracker.current.accept(batch, root)) return;
       for (const scope of batch.rescan)
         log.appendLine(`Changes under ${scope} were not all reported; re-reading it.`, "info");
       // Open documents check every change to their files, their own saves excepted.
       void documents.applyResourceChanges(batch.changes, batch.rescan).catch(reportError);
       const external = batch.changes.filter((change) => change.operation === undefined);
-      const directories = directoriesToRefresh(tree, external, batch.rescan);
-      if (directories.length) void refreshTreeRef.current(directories).catch(reportError);
-      else if (external.length) bumpGitRevision();
+      void explorer
+        .applyResourceChanges(external, batch.rescan)
+        .then(({ relisted, errors }) => {
+          for (const error of errors) reportError(error);
+          if (relisted) setQuickOpen(null);
+          if (relisted || external.length) bumpGitRevision();
+        })
+        .catch(reportError);
     });
     const stopStatus = onWatcherStatus((status) => {
       const current = watchTracker.current.status(status);
@@ -633,7 +577,7 @@ export default function App() {
       stopChanges();
       stopStatus();
     };
-  }, [documents, reportError]);
+  }, [documents, explorer, reportError, rootPath]);
 
   // What the Document Model decides, the editors follow: a document that became another file
   // (Save As, or a rename) takes its tab and undo history with it; a conflict is said once.
@@ -773,7 +717,7 @@ export default function App() {
     setActiveTabId("welcome");
     setRecentFiles([]);
     setWorkspacePath(selected);
-    applyTree(null);
+    explorer.setRoots([]);
     setDecorations({ files: new Map(), folders: new Set() });
     // Seeded before the explorer mounts for the new folder, so it unfolds where it was.
     explorerRef.current = { expanded: restore?.expanded ?? [], scroll: restore?.scroll ?? 0 };
@@ -851,6 +795,8 @@ export default function App() {
       if (documents.anySaving())
         throw new Error("Wait for file saves to finish before renaming files.");
       await native("rename_path", { oldPath, newPath });
+      // What the Explorer knows moves with it, and its expansion and selection follow.
+      explorer.moved(oldPath, newPath);
       const remap = (path: string) => remapPath(path, oldPath, newPath);
       // Open documents under it move to their new identity; their tabs, histories and the
       // active editor follow (`sourceChanged`).
@@ -886,6 +832,7 @@ export default function App() {
       submit: async () => {
         for (const entry of entries) {
           await native("delete_path", { path: entry.path, recursive: entry.isDir });
+          explorer.removed(entry.path);
           // The user agreed to lose their edits in the confirmation above.
           documents.removed(entry.path);
         }
@@ -1756,8 +1703,13 @@ export default function App() {
             visible={isSidebarOpen && activeActivityTab !== "search" && activeActivityTab !== "git"}
             activeTab={activeActivityTab}
             workspacePath={workspacePath}
-            fileTree={fileTree}
+            // Only once the window has taken the folder: the provider's tree arrives through a
+            // synchronous store update, a render before the workspace path does, and an
+            // explorer shown it then -- keyed to no folder -- reported its own fresh state over
+            // the session's before the real one mounted.
+            fileTree={workspacePath ? fileTree : null}
             decorations={decorations}
+            provider={explorer}
             onLoadDirectory={loadDirectory}
             onOpenFile={handleOpenFile}
             activeFile={activeTab?.path || ""}

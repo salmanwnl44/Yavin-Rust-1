@@ -558,6 +558,93 @@ Filesystem -> resource-changes (Module 02) -> DocumentService.applyResourceChang
 4. Typing that does not change what the window shows redraws only the editor showing it.
 5. Caret, selection, scroll and undo history are editor state; the Document Model never holds them.
 
+## Explorer provider platform
+
+The Explorer is a projection of the filesystem, never a store of filesystem truth. `src/services/explorerProvider.ts` holds what has been listed; `src/services/explorerStore.ts` holds what the user did to the view; the existing tree view (`Sidebar`, `TreeRow`) renders the one and reads and writes the other.
+
+```text
+Filesystem ── list_workspace_files ──┐          ┌── resource-changes (Module 02)
+                                     v          v
+                        ExplorerProvider  (resource projection)
+          typed nodes · ResourceId identity · per-folder state and generations
+                     │ provider events                  │ projection()
+                     v                                  v
+      ExplorerStore (UI state)  ──── Set/setter ───>  Explorer view (virtualized rows)
+```
+
+| Owner                    | Owns                                                                                    |
+| ------------------------ | --------------------------------------------------------------------------------------- |
+| Filesystem (native side) | what is on disk                                                                         |
+| Resource service         | identity (`ResourceUri`, `ResourceId`)                                                  |
+| Explorer provider        | the hierarchy as listed: nodes, which folders are loaded, failures, capabilities, roots |
+| Explorer store           | expansion, selection, anchor, focus                                                     |
+| Explorer view            | rendering, virtualization, keyboard, menus, drag and drop, inline editing               |
+| Documents, Git           | their own state; the Explorer only reads Git decorations                                |
+
+**Nodes.** A typed union: `workspace` (a root), `directory`, `file`, and `error` (a failed listing, in place of the folder's children). A resource node's id is its Module 01 `ResourceId`, so it survives refreshes, re-renders, expansion and unrelated changes, and every spelling of a path is one node. Nodes carry their `ResourceUri`, the native spelling of the path, their parent's id and their metadata. No path normalization exists here beyond `resource.ts`.
+
+**Provider API.** Snapshots are synchronous: `getRootNodes`, `getNode`, `getChildren`, `childrenState` (`unloaded`, `loading`, `loaded` or `failed`), `capabilities` and `projection`. Only listing is asynchronous: `loadChildren(id, signal)`, `refresh(ids?)` and `refreshAround(paths)`. `ExplorerProvider` is the contract; the filesystem provider is the one implementation. Capabilities (`canOpen`, `canCreateFile`, `canCreateDirectory`, `canRename`, `canDelete`, `canMove`, `canCopy`, `canRefresh`) come per node from the provider, so future virtual, remote or archive providers need no UI guessing.
+
+**Events.** Provider-local and typed, with no global bus: `created`, `changed` (metadata), `deleted` (with its subtree), `renamed` (from and to, with the subtree), `childrenChanged`, `reset` (the roots changed) and `error`. The store and the window subscribe to their own provider.
+
+**Watcher integration.** The window passes every accepted `resource-changes` batch, minus changes credited to Yavin's own operations (which re-list what they changed as they finish), to `applyResourceChanges`:
+
+- A change shows only as an entry of its folder, so only the parent is re-listed, and only if loaded. It is found by id in constant time, with no tree walk.
+- A change inside a folder that is not loaded costs nothing.
+- A burst re-lists each touched folder once.
+- A rename moves the known node, and its loaded subtree, to the new identity at once. Then both folders are re-listed to confirm.
+- A `rescan` re-lists every loaded folder inside the scope, and the scope's parent.
+
+**Reconciliation.** A listing is reconciled into its folder only:
+
+- A child that is still there keeps its node object and its own loaded children.
+- A changed child gets new metadata under the same id.
+- A new child is added.
+- A missing child is removed with its subtree.
+
+Nothing outside the folder is touched. The projection is cached per node by a version that changes only for the node and its ancestors (O(depth)). A change in one folder therefore rebuilds that folder and the path to the root, and every other `FileNode` is the same object, so the view's memoized rows do not re-render. A refresh that finds nothing new returns the identical tree.
+
+**Async loading, cancellation and generations.** Every listing request takes a new generation for its folder. An answer applies only if it is for the newest request, and only if the folder is still the same entry: not forgotten, not moved, not replaced by another workspace's folder of the same id. Otherwise it is dropped, so an older answer never overwrites a newer one. Concurrent loads of a folder share one listing. A caller's `AbortSignal` withdraws only that caller: an answer is dropped as abandoned only if every caller waiting on it aborted. The view aborts a folder's load when the folder is collapsed.
+
+**Errors.** A failed first listing is the folder's typed state (`failed`, an `error` node, `loadError` in the projection); it is never turned into an empty folder. The view shows it with Retry. A failed refresh of a loaded folder keeps what was known and reports the error. The provider stays usable.
+
+**Refresh.** `refresh()` re-lists every loaded folder at once. `refresh(ids)` re-lists those folders and every loaded folder inside them, which covers a workspace, a root or a directory. `refreshAround(paths)` re-lists the nearest loaded folders after one of Yavin's own operations. Each goes through the same reconciliation, so identities and UI state survive. Overlapping refreshes need no queue, because the newest listing of each folder wins.
+
+**Multi-root.** `setRoots(paths)` keeps roots that stay, with everything known under them; forgets roots that go; adds new ones unloaded; and emits `reset`. Roots are separate nodes, never flattened into one hierarchy. The view still shows the first root; showing several is Module 08.
+
+**The store.** It keys state by node id and records the path each entry was recorded under. It follows the provider:
+
+- `renamed` moves the state of the node and its subtree to the new ids, so a renamed folder stays expanded and a moved file stays selected.
+- `deleted` drops the state.
+- `reset` clears selection and focus.
+
+It gives the view the `Set<string>` and setter shapes the view already used.
+
+**Performance.** Measured in the provider tests, in folders of 1,000 files:
+
+| Files   | Loading every folder | One change applied and projected |
+| ------- | -------------------- | -------------------------------- |
+| 10,000  | 90 ms                | about 10 ms                      |
+| 100,000 | 0.7 s                | about 7 ms                       |
+| 500,000 | 3 s                  | about 6 ms                       |
+
+That is one listing and one path rebuilt, not a tree rebuild. In the UI, a folder of 20,000 files expands in about 0.7 s and renders about 34 rows, because virtualization is unchanged.
+
+What is still proportional to the loaded tree:
+
+- `refresh()`, `rescan` and `refresh(ids)` scan the loaded folders to find those in scope. This happens on explicit refreshes and lost-notification rescans, never per change.
+- The view's row flattening walks the expanded part of the tree on each change, as before.
+
+**Invariants**
+
+1. The Explorer is a projection of resource and workspace state and is never the source of filesystem truth.
+2. Filesystem changes enter the Explorer through the provider boundary, never by the view mutating a tree.
+3. Explorer node identity is resource-based (`ResourceId`) and stable across refreshes.
+4. An older listing never overwrites a newer one; an abandoned one changes nothing.
+5. A failed listing is an error state, never an empty folder.
+6. One change re-lists at most the folders it shows in; it never rebuilds the tree.
+7. The Explorer store holds UI state only, and it follows renames and deletions.
+
 ## Rules and references
 
 Follow `../GEMINI.md`: small changes, explicit errors, safe Rust, minimal permissive dependencies, and relevant tests. The user's TypeScript requirement supersedes the previous JavaScript wording.

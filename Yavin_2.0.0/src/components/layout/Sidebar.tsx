@@ -1,8 +1,18 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import type { FileNode } from "../../types";
 import type { Decorations } from "../../services/git";
 import { folderName, parentPath } from "../../services/paths";
 import { isWithin, parentOf, validateEntryName } from "../../services/workspace";
+import type { FileSystemExplorerProvider } from "../../services/explorerProvider";
+import { createExplorerStore } from "../../services/explorerStore";
 import { requestTerminal } from "../../services/terminal";
 import { ContextMenu } from "../ui/ContextMenu";
 import { FolderClosedIcon, ChevronIcon } from "../ui/FileIcons";
@@ -38,9 +48,13 @@ interface SidebarProps {
   visible: boolean;
   activeTab: string;
   workspacePath: string;
+  /** The provider's projection of the workspace (see `services/explorerProvider.ts`). */
   fileTree: FileNode | null;
   decorations: Decorations;
-  onLoadDirectory: (path: string) => Promise<void>;
+  /** Where the tree comes from; the Explorer's UI state follows its renames and deletions. */
+  provider: FileSystemExplorerProvider;
+  /** Lists a folder; the listing is abandoned when `signal` aborts (the folder collapsed). */
+  onLoadDirectory: (path: string, signal?: AbortSignal) => Promise<void>;
   onOpenFile: (path: string, name: string) => void;
   activeFile: string;
   onRefresh: () => void;
@@ -66,12 +80,23 @@ interface SidebarProps {
 export function Sidebar(props: SidebarProps) {
   const { visible, activeTab, workspacePath, fileTree, decorations, onLoadDirectory } = props;
 
-  // Seeded from the session, so a reopened folder is unfolded the way it was left. Folders
-  // whose children are not loaded yet are listed on demand, exactly as an unfold does.
-  const [expandedPaths, setExpandedPaths] = useState(() => new Set<string>(props.initialExpanded));
-  const [selection, setSelection] = useState(() => new Set<string>());
-  const [anchor, setAnchor] = useState<string | null>(null);
-  const [focused, setFocused] = useState<string | null>(null);
+  // The Explorer's UI state -- expansion, selection, anchor, focus -- lives in its store, keyed
+  // by node identity and following the provider's renames and deletions; this reads it as the
+  // same sets and setters it always used. Seeded from the session, so a reopened folder is
+  // unfolded the way it was left; folders not loaded yet are listed on demand, as an unfold.
+  const [store] = useState(() =>
+    createExplorerStore(props.provider, { expanded: props.initialExpanded }),
+  );
+  useEffect(() => store.attach(), [store]);
+  useSyncExternalStore(store.subscribe, store.revision);
+  const expandedPaths = store.paths("expanded");
+  const setExpandedPaths = store.setter("expanded");
+  const selection = store.paths("selection");
+  const setSelection = store.setter("selection");
+  const anchor = store.value("anchor");
+  const setAnchor = store.valueSetter("anchor");
+  const focused = store.value("focused");
+  const setFocused = store.valueSetter("focused");
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -86,13 +111,12 @@ export function Sidebar(props: SidebarProps) {
   );
   const [newName, setNewName] = useState("");
   const [inlineError, setInlineError] = useState("");
-  const [loadErrors, setLoadErrors] = useState<Record<string, string>>({});
   const [clipboard, setClipboard] = useState<Clipboard>(null);
   const [dragged, setDragged] = useState<FileNode[]>([]);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
 
-  const inFlight = useRef(new Set<string>());
-  const loadAttempts = useRef(new Map<string, number>());
+  /** Listings in flight, by folder; aborted when the folder is collapsed before they answer. */
+  const loads = useRef(new Map<string, AbortController>());
   const createInputRef = useRef<HTMLInputElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   /** Set when the tree itself moves focus, so revealing a file never steals it from the editor. */
@@ -134,7 +158,8 @@ export function Sidebar(props: SidebarProps) {
           walk(node.children, depth + 1);
         } else {
           rows.push({ kind: "status", key: path + "@status", depth: depth + 1, path });
-          pending.push(path);
+          // A failed listing is the folder's state until retried, not something to re-ask.
+          if (!node.loadError) pending.push(path);
         }
       }
     };
@@ -144,26 +169,36 @@ export function Sidebar(props: SidebarProps) {
     return { rows, nodeRows, rowIndex, navIndex, nodes, pending };
   }, [fileTree, expandedPaths, creating, rootPath, rootExpanded]);
 
-  // An expanded folder whose children are not loaded yet is listed on demand.
+  // An expanded folder whose children are not loaded yet is listed on demand. One that is
+  // collapsed again before its listing answers has the listing abandoned: the provider drops
+  // the answer rather than applying it to a folder nobody is looking at.
   useEffect(() => {
-    // A folder that left `pending` has its children, so its attempt count is spent.
-    for (const path of loadAttempts.current.keys())
-      if (!pending.includes(path)) loadAttempts.current.delete(path);
-
-    for (const path of pending) {
-      if (inFlight.current.has(path) || loadErrors[path]) continue;
-      const attempts = (loadAttempts.current.get(path) ?? 0) + 1;
-      loadAttempts.current.set(path, attempts);
-      if (attempts > 2) {
-        setLoadErrors((previous) => ({ ...previous, [path]: "This folder could not be loaded." }));
-        continue;
+    for (const [path, controller] of loads.current)
+      if (!pending.includes(path)) {
+        controller.abort();
+        loads.current.delete(path);
       }
-      inFlight.current.add(path);
-      onLoadDirectory(path)
-        .catch((error) => setLoadErrors((previous) => ({ ...previous, [path]: String(error) })))
-        .finally(() => inFlight.current.delete(path));
+    for (const path of pending) {
+      // An abandoned listing is no listing: expanding again before it has settled lists anew,
+      // rather than waiting on an answer that will be dropped.
+      if (loads.current.get(path)?.signal.aborted === false) continue;
+      const controller = new AbortController();
+      loads.current.set(path, controller);
+      onLoadDirectory(path, controller.signal)
+        // A failure is kept as the folder's state by the provider and shown in its row.
+        .catch(() => undefined)
+        .finally(() => {
+          if (loads.current.get(path) === controller) loads.current.delete(path);
+        });
     }
-  }, [pending, loadErrors, onLoadDirectory]);
+  }, [pending, onLoadDirectory]);
+  useEffect(() => {
+    const current = loads.current;
+    return () => {
+      for (const controller of current.values()) controller.abort();
+      current.clear();
+    };
+  }, []);
 
   useEffect(() => {
     if (rootPath) setExpandedPaths((previous) => new Set([...previous, rootPath]));
@@ -760,11 +795,8 @@ export function Sidebar(props: SidebarProps) {
                   <StatusRow
                     key={row.key}
                     depth={row.depth}
-                    error={loadErrors[row.path]}
-                    onRetry={() => {
-                      loadAttempts.current.delete(row.path);
-                      setLoadErrors(({ [row.path]: _removed, ...rest }) => rest);
-                    }}
+                    error={nodes.get(row.path)?.loadError}
+                    onRetry={() => void onLoadDirectory(row.path).catch(() => undefined)}
                   />
                 ) : (
                   <TreeRow
