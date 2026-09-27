@@ -283,6 +283,8 @@ interface Doc {
   recheck: (number | undefined)[] | null;
   /** Bumped by every disk check, so a slower earlier one cannot overwrite a later one. */
   checking: number;
+  /** The service revision of this document's last event: what its editor subscribes to. */
+  revision: number;
 }
 
 const IDLE: SaveActivity = { kind: "idle" };
@@ -316,12 +318,22 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
   /** Bumped by `reset`: work started before it must not bring its documents back. */
   let epoch = 0;
   let revision = 0;
+  /** Like `revision`, but not moved by an edit that leaves everything but the text as it was. */
+  let stateRevision = 0;
   let untitled = 0;
   let proposals = 0;
   let buffers: Record<string, string> | null = null;
 
-  const emit = (event: DocumentEvent) => {
+  /**
+   * Tells listeners. `state` is false for an edit that changed only the text -- not dirty, not
+   * the status -- which moves `revision` and the document's own revision but not
+   * `stateRevision`, so the window's chrome is not redrawn for every keystroke.
+   */
+  const emit = (event: DocumentEvent, state = true) => {
     revision++;
+    if (state) stateRevision++;
+    const doc = docs.get(event.id);
+    if (doc) doc.revision = revision;
     buffers = null;
     for (const listener of [...listeners]) {
       try {
@@ -388,6 +400,7 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
       own: [],
       recheck: null,
       checking: 0,
+      revision: 0,
     };
   };
 
@@ -507,6 +520,18 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
     },
     /** Changes whenever any document does. */
     revision: (): number => revision,
+    /**
+     * Changes whenever anything but a document's text does -- what tabs, status bars and menus
+     * show. Typing that leaves a document as dirty as it was does not move it.
+     */
+    stateRevision: (): number => stateRevision,
+    /**
+     * Changes whenever the document at `key` does, text included; -1 when none is open there.
+     * What one editor subscribes to, so typing redraws that editor and nothing else.
+     */
+    documentRevision(key: string): number {
+      return lookup(key)?.revision ?? -1;
+    },
 
     get(key: string): TextDocument | undefined {
       return lookup(key);
@@ -587,6 +612,7 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
         own: [],
         recheck: null,
         checking: 0,
+        revision: 0,
       };
       doc.dirty = isDirty(doc);
       docs.set(id, doc);
@@ -632,6 +658,7 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
         own: [],
         recheck: null,
         checking: 0,
+        revision: 0,
       };
       docs.set(id, doc);
       emit({ type: "opened", id });
@@ -663,10 +690,11 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
       const doc = required(key);
       const next = normalize(text);
       if (next === doc.text) return doc;
+      const wasDirty = doc.dirty;
       doc.text = next;
       doc.version++;
       doc.dirty = isDirty(doc);
-      emit({ type: "changed", id: doc.id, version: doc.version });
+      emit({ type: "changed", id: doc.id, version: doc.version }, wasDirty !== doc.dirty);
       return doc;
     },
 

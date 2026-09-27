@@ -480,7 +480,7 @@ After a Git command, `revalidate` checks every open file the same way.
 
 **Session.** Unchanged: `session.json` keeps the open files' paths. A reopened file's source is Disk and its language comes from its name, so nothing more is stored. Untitled documents are not written to the session.
 
-**Editor compatibility.** The textarea editor still takes `Record<key, text>` and reports whole-text changes. The window keeps no copy: `buffers()` is built from the documents' own strings, and `edit` is the only way in. Tabs store only which document is where; dirty and status are read from the document when drawn. Undo stays in the editor (`TextHistory`); replacing it is Module 06.
+**The editor.** The editor is a view of documents; see [Editor](#editor).
 
 **Performance.** An edit is one string comparison with the persisted text and a version increment; nothing is hashed per keystroke. A disk document holds its base text (which the guarded save needs anyway), so an external change is one read and one comparison. Fingerprints are computed only on load, save and reload.
 
@@ -495,6 +495,68 @@ After a Git command, `revalidate` checks every open file the same way.
 7. A document's version increases monotonically with content changes.
 8. All disk mutations continue to use the Module 03/04 operation and recovery infrastructure.
 9. A file's encoding and line endings survive opening, editing and saving it.
+
+## Editor
+
+The editor is a view and controller over the Document Model, never a second document store.
+
+```text
+DocumentService ── Document (text, version, persistence state)
+      │  documentRevision(key)          ^
+      v                                 │ documents.edit(key, text)
+Editor binding (editorBinding.ts) ── showDocumentText(surface, doc.text)
+      │                                 ^
+      v                                 │ input
+TextEditor (textarea) ── EditorViews (history, selection, scroll)
+```
+
+| Owner    | Owns                                                                                                  |
+| -------- | ----------------------------------------------------------------------------------------------------- |
+| Document | content, version, dirty, save state, disk identity, external change, encoding, line endings, language |
+| Editor   | caret, selection, scroll position, focus, IME composition, undo/redo history, find bar, layout        |
+| Tab      | which document (its key), its place in the strip; title and markers are read from the document        |
+
+**The editor is never the authoritative owner of persisted document content.**
+
+**Binding.** `TextEditor` shows the document whose key it is given. It subscribes to that document's revision alone (`documents.documentRevision`), so typing redraws the editor and nothing else. The window subscribes to `stateRevision`, which an edit moves only when it changes dirtiness. The textarea is not controlled by React. Its text is set when the editor mounts, and afterwards changes only in two ways:
+
+- **User input:** the textarea already holds the text. `documents.edit` makes a new version, which the editor records as shown, so the document's report of it writes nothing back.
+- **Anything else** (a reload, Revert, replace-in-files, Keep My Version): the document's version is not the one shown. `showDocumentText` writes the text, moving the caret and selection with the text around them (`mapOffset`: unchanged before the edited span, shifted after it) and keeping the scroll position.
+
+The two paths cannot feed each other, and neither uses a timer. A document-originated write is not an input event, so it is never mistaken for an edit.
+
+**Undo and redo** stay in the editor, per document, in `EditorViews` (`services/editorViews.ts`): whole-text snapshots, bounded by count and size. Undoing to the saved text makes the document clean again, because dirty compares text as well as versions. The history follows the document through Save As and renames (`sourceChanged` renames its entry) and is dropped when the document closes. A change the document makes itself is not an undo step. A replace-in-files edit is recorded as one.
+
+**View state.** Selection is recorded on input, select, keyup and mouseup; scroll is recorded on scroll events; both are recorded once more as the editor leaves a document. Coming back to a tab restores both. Selection is only ever read, never the scroll position after an edit: reading that would force the browser to lay out the whole text at once.
+
+**Saving** goes through the window's commands. Ctrl+S calls `DocumentService.save`, which is one Module 03 operation with its Module 04 intent. Save As goes through `save_file_dialog` and then `DocumentService.saveAs`. The editor never writes a file. It follows the result through document state: the tab marker, and a note above the text for:
+
+- a conflict, with **Revert File** and **Keep My Version**
+- a deletion ("your text is kept; saving recreates the file")
+- an unreadable file
+- a failed save
+- a proposal, and a stale proposal
+
+Watcher events never reach the editor directly:
+
+```text
+Filesystem -> resource-changes (Module 02) -> DocumentService.applyResourceChanges -> Document -> editor
+```
+
+**Untitled and proposed documents** use the same editor. Their source only changes what the window says and what saving does: Save opens Save As for an untitled document, and is never available for a proposal.
+
+**Large files.** The limit is the native 10 MB (`MAX_EDITOR_FILE_SIZE`); a save past it is refused. The UI tests type into 1 MB, 5 MB and 9.5 MB files and compare each keystroke with the same keystroke in a plain textarea holding the same text. The editor matches the browser: about 12 ms at 1 MB, 60 ms at 5 MB and 115 ms at 9.5 MB on the development machine. That remaining cost is the browser re-laying out a textarea of that size; only an editor that renders a viewport (a future Monaco or CodeMirror migration) avoids it. Two things were removed from the keystroke path to get there:
+
+- React's per-render comparison of the textarea's whole text with a `value` or `defaultValue` prop: the text is now set imperatively.
+- The gutter's line count, a scan of the whole text: it is now computed from a deferred copy.
+
+**Invariants**
+
+1. The editor is never the authoritative owner of persisted document content.
+2. An editor changes content only through `DocumentService.edit`, and never writes a file.
+3. A change the document makes is shown only when the editor does not already show that version, so edits and displays cannot loop.
+4. Typing that does not change what the window shows redraws only the editor showing it.
+5. Caret, selection, scroll and undo history are editor state; the Document Model never holds them.
 
 ## Rules and references
 

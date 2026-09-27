@@ -35,7 +35,8 @@ export function SearchPanel({
   apply,
 }: {
   workspace: string;
-  buffers: Record<string, string>;
+  /** The open documents' text, read when a search starts. */
+  buffers: () => Record<string, string>;
   visible: boolean;
   focusRequest: number;
   onOpen: (hit: SearchHit) => void;
@@ -137,7 +138,7 @@ export function SearchPanel({
       void searchWorkspace(
         workspace,
         options,
-        latestBuffers.current,
+        latestBuffers.current(),
         scope === "open",
         abort.signal,
       )

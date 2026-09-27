@@ -1,11 +1,19 @@
 import type { Ref } from "react";
 import { TextEditor } from "./TextEditor";
 import type { EditorHandle, EditorState } from "./TextEditor";
-import type { TextHistory } from "../../services/editor";
+import type { DocumentService } from "../../services/documents";
+import type { EditorViews } from "../../services/editorViews";
 import type { EditorTab, RecentFile } from "../../types";
 import { FileIcon } from "../ui/FileIcons";
 import { WelcomePage } from "../welcome/WelcomePage";
 import type { WelcomeHint } from "../welcome/WelcomePage";
+
+/** A line above the editor about the document's state, with what can be done about it. */
+export interface DocumentNotice {
+  tone: "warning" | "error" | "info";
+  text: string;
+  actions?: { label: string; run: () => void }[];
+}
 
 /** What a tab's marker means, as its tooltip says it. */
 function statusTitle(tab: EditorTab): string {
@@ -20,6 +28,10 @@ function statusTitle(tab: EditorTab): string {
       return "Changed on disk: deleted, or no longer readable";
     case "neverSaved":
       return "Not saved yet (Ctrl+S to choose where)";
+    case "proposed":
+      return "Proposed content, not on disk";
+    case "stale":
+      return "Proposed content; the file changed since it was proposed";
     default:
       return "Unsaved changes (Ctrl+S to save)";
   }
@@ -33,8 +45,9 @@ export function EditorArea({
   onNewFile,
   onOpenCommandPalette,
   onOpenFolderDialog,
-  fileContents,
-  onContentChange,
+  documents,
+  views,
+  notice,
   onSaveFile,
   recentFiles,
   workspacePath,
@@ -45,7 +58,6 @@ export function EditorArea({
   onCloneRepository,
   details,
   editorRef,
-  histories,
   onEditorState,
   wordWrap,
   zoom,
@@ -57,8 +69,12 @@ export function EditorArea({
   onNewFile: () => void;
   onOpenCommandPalette: () => void;
   onOpenFolderDialog: () => void;
-  fileContents: Record<string, string>;
-  onContentChange: (path: string, text: string) => void;
+  /** The Document Model: the editor shows and edits its documents, and keeps no copy. */
+  documents: DocumentService;
+  /** The editor's own per-document state: undo history, selection, scroll. */
+  views: EditorViews;
+  /** What to say about the active document's state, if anything. */
+  notice?: DocumentNotice;
   onSaveFile: (path: string) => void;
   recentFiles: RecentFile[];
   /** The open folder, or null in a window with none -- the welcome page says so. */
@@ -73,13 +89,11 @@ export function EditorArea({
   /** The active document's encoding, line endings and language. */
   details?: string[];
   editorRef: Ref<EditorHandle>;
-  histories: Map<string, TextHistory>;
   onEditorState: (state: EditorState) => void;
   wordWrap: boolean;
   zoom: number;
 }) {
   const activeTab = tabs.find((t) => t.id === activeTabId);
-  const currentContent = activeTab ? (fileContents[activeTab.path] ?? "") : "";
 
   const getBreadcrumbs = () => {
     if (!activeTab || activeTab.id === "welcome") return "Yavin IDE › Welcome";
@@ -275,18 +289,42 @@ export function EditorArea({
             onOpenFile={(path, name) => onSelectTab(path, name)}
           />
         ) : (
-          <TextEditor
-            key={activeTab.path}
-            path={activeTab.path}
-            name={activeTab.name}
-            content={currentContent}
-            onChange={(text) => onContentChange(activeTab.path, text)}
-            editorRef={editorRef}
-            histories={histories}
-            onState={onEditorState}
-            wordWrap={wordWrap}
-            zoom={zoom}
-          />
+          <>
+            {notice && (
+              <div
+                role="note"
+                aria-label="Document state"
+                className={`flex flex-wrap items-center gap-3 border-b border-zinc-800 bg-zinc-950 px-3 py-1.5 text-xs ${
+                  notice.tone === "error"
+                    ? "text-red-300"
+                    : notice.tone === "warning"
+                      ? "text-amber-300"
+                      : "text-zinc-300"
+                }`}
+              >
+                <span className="min-w-0 flex-1">{notice.text}</span>
+                {notice.actions?.map((action) => (
+                  <button
+                    key={action.label}
+                    onClick={action.run}
+                    className="rounded border border-zinc-700 px-2 py-0.5 text-zinc-200 hover:bg-zinc-800"
+                  >
+                    {action.label}
+                  </button>
+                ))}
+              </div>
+            )}
+            <TextEditor
+              key={activeTab.path}
+              documentKey={activeTab.path}
+              documents={documents}
+              views={views}
+              editorRef={editorRef}
+              onState={onEditorState}
+              wordWrap={wordWrap}
+              zoom={zoom}
+            />
+          </>
         )}
       </div>
     </div>

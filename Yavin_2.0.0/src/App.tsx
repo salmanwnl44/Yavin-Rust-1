@@ -1,7 +1,8 @@
 import { AppDialog } from "./components/ui/AppDialog";
+import type { DocumentNotice } from "./components/layout/EditorArea";
 import type { DialogRequest } from "./components/ui/AppDialog";
 import type { EditorHandle, EditorState, EditorAction } from "./components/layout/TextEditor";
-import type { TextHistory } from "./services/editor";
+import { createEditorViews } from "./services/editorViews";
 import { matchesShortcut, shortcutLabel } from "./services/commands";
 import type { AppCommand } from "./services/commands";
 import React, {
@@ -136,7 +137,11 @@ class ErrorBoundary extends Component<
 
 export default function App() {
   const editorRef = useRef<EditorHandle>(null);
-  const histories = useRef(new Map<string, TextHistory>());
+  /**
+   * The editor's own state per document -- undo history, selection, scroll -- which is not the
+   * document's (see `services/editorViews.ts`).
+   */
+  const views = useRef(createEditorViews()).current;
   const [editorState, setEditorState] = useState<EditorState>({
     canUndo: false,
     canRedo: false,
@@ -161,8 +166,12 @@ export default function App() {
     base: () => treeRef.current?.path ?? null,
   });
   const documents = documentsRef.current;
-  useSyncExternalStore(documents.subscribe, documents.revision);
-  const fileContents = documents.buffers();
+  // The window redraws when what it shows about documents changes -- a tab's dirty marker, a
+  // status, a document opened or closed -- not for every keystroke: the editor showing the
+  // document subscribes to its text on its own (`TextEditor`).
+  const documentState = useSyncExternalStore(documents.subscribe, documents.stateRevision);
+  /** The open documents' text, read when it is needed rather than passed down as it changes. */
+  const readBuffers = useCallback(() => documents.buffers(), [documents]);
   const workspaceRevision = useRef(0);
   const [decorations, setDecorations] = useState<Decorations>({
     files: new Map(),
@@ -640,11 +649,7 @@ export default function App() {
             ),
           );
           setActiveTabId((active) => (active === previousKey ? key : active));
-          const history = histories.current.get(previousKey);
-          if (history) {
-            histories.current.delete(previousKey);
-            histories.current.set(key, history);
-          }
+          views.rename(previousKey, key);
         } else if (event.type === "conflict") {
           const doc = documents.all().find((one) => one.id === event.id);
           reportError(
@@ -654,8 +659,26 @@ export default function App() {
           );
         }
       }),
-    [documents, reportError],
+    [documents, reportError, views],
   );
+
+  // Development builds only, and only for the UI tests: opens a proposal in the editor. Nothing
+  // in the product creates one yet -- that arrives with ChangeSets -- and production builds drop
+  // this entirely.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const hook = window as unknown as {
+      __yavinPropose?: (path: string, text: string) => Promise<void>;
+    };
+    hook.__yavinPropose = async (path, text) => {
+      const doc = await documents.propose(path, text);
+      setTabs((previous) => [...previous, { id: doc.key, path: doc.key, name: doc.name }]);
+      setActiveTabId(doc.key);
+    };
+    return () => {
+      delete hook.__yavinPropose;
+    };
+  }, [documents]);
 
   // Git decorations refresh on focus when the Source Control panel is not polling.
   useEffect(() => {
@@ -705,11 +728,9 @@ export default function App() {
     if (doc?.dirty && !window.confirm("Discard unsaved changes in this file?")) return;
     if (doc) documents.close(id, { discard: true });
     setTabs((prev) => prev.filter((tab) => tab.id !== id));
-    histories.current.delete(id);
+    views.forget(id);
     if (activeTabId === id) setActiveTabId("welcome");
   };
-  // The editor's compatibility path into the Document Model: each change is a new version.
-  const handleContentChange = (key: string, text: string) => void documents.edit(key, text);
   /** Save As: a new file for any open document, and how an untitled one reaches the disk. */
   const saveAs = async (key: string) => {
     const doc = documents.get(key);
@@ -747,7 +768,7 @@ export default function App() {
     setDiff(null);
     setPendingHit(null);
     documents.reset();
-    histories.current.clear();
+    views.clear();
     setTabs([WELCOME_TAB]);
     setActiveTabId("welcome");
     setRecentFiles([]);
@@ -869,7 +890,7 @@ export default function App() {
           documents.removed(entry.path);
         }
         setTabs((prev) => prev.filter((tab) => !doomed(tab.path)));
-        for (const key of histories.current.keys()) if (doomed(key)) histories.current.delete(key);
+        for (const tab of openTabs) if (doomed(tab.path)) views.forget(tab.path);
         if (doomed(activeTabId)) setActiveTabId("welcome");
         setRecentFiles((prev) => prev.filter((file) => !doomed(file.path)));
         await refreshAround(...entries.map((entry) => entry.path));
@@ -893,6 +914,67 @@ export default function App() {
   const activeTab = tabs.find((t) => t.id === activeTabId);
   const activeDocument: TextDocument | undefined =
     activeTab && activeTab.id !== "welcome" ? documents.get(activeTab.path) : undefined;
+  /** Revert File: the file as it is on disk, after asking when that loses unsaved changes. */
+  const revertActive = () =>
+    run(async () => {
+      const doc = activeDocument;
+      if (!doc) return;
+      if (doc.dirty && !window.confirm("Discard unsaved changes and reload the file from disk?"))
+        return;
+      await documents.reload(doc.key, { discard: true });
+    });
+  /** Keep My Version: the other way out of a conflict; the next save replaces the disk's. */
+  const keepMine = () =>
+    run(async () => {
+      if (activeDocument) await documents.keepLocal(activeDocument.key);
+    });
+  /** What the editor says about the document in front, from the document's own state. */
+  const notice = ((): DocumentNotice | undefined => {
+    const doc = activeDocument;
+    if (!doc) return undefined;
+    const status = documentStatus(doc);
+    if (status === "conflicted")
+      return {
+        tone: "error",
+        text: "This file changed on disk while it had unsaved changes. Nothing was overwritten; both versions are kept.",
+        actions: [
+          { label: "Revert File", run: () => void revertActive() },
+          { label: "Keep My Version", run: () => void keepMine() },
+        ],
+      };
+    if (status === "externallyChanged")
+      return doc.external?.kind === "deleted"
+        ? {
+            tone: "warning",
+            text: "This file was deleted on disk. Your text is kept here; saving recreates the file.",
+          }
+        : doc.external?.kind === "unreadable"
+          ? {
+              tone: "warning",
+              text: `This file can no longer be read from disk (${doc.external.message}). Your text is kept here.`,
+            }
+          : {
+              tone: "warning",
+              text: "This file changed on disk.",
+              actions: [{ label: "Revert File", run: () => void revertActive() }],
+            };
+    if (status === "saveFailed" && doc.save.kind === "failed")
+      return {
+        tone: "error",
+        text: `The last save failed: ${doc.save.message} Your changes are kept.`,
+      };
+    if (status === "proposed")
+      return {
+        tone: "info",
+        text: "Proposed content, not on disk. It is never saved over the file; accepting proposals is not available yet.",
+      };
+    if (status === "stale")
+      return {
+        tone: "warning",
+        text: "Proposed content, and the file has changed since it was proposed.",
+      };
+    return undefined;
+  })();
   /** Encoding, line endings and language of the document in front, for the status bars. */
   const documentDetails = activeDocument
     ? [
@@ -904,7 +986,7 @@ export default function App() {
 
   useEffect(() => {
     if (!pendingHit || activeTabId !== pendingHit.path || diff) return;
-    const content = fileContents[pendingHit.path];
+    const content = documents.get(pendingHit.path)?.text;
     if (content === undefined) return;
     const lines = content.split("\n");
     if (lines[pendingHit.line - 1] !== pendingHit.text.replace(/\n$/, "")) {
@@ -916,7 +998,7 @@ export default function App() {
       editorRef.current?.revealRange(start, start + pendingHit.end - pendingHit.start);
     }
     setPendingHit(null);
-  }, [activeTabId, fileContents, pendingHit, diff, reportError]);
+  }, [activeTabId, documentState, documents, pendingHit, diff, reportError]);
 
   const applyReplacements = async (changes: Replacement[], saved = false) => {
     const applied: Replacement[] = [];
@@ -934,9 +1016,8 @@ export default function App() {
           if (doc.text !== change.before) throw new Error("Editor changed; preview again");
           if (saved && doc.dirty)
             throw new Error("The editor has unsaved changes; save or revert it first");
-          const history = histories.current.get(doc.key) ?? { past: [], future: [] };
-          recordEdit(history, { text: doc.text, start: 0, end: 0 });
-          histories.current.set(doc.key, history);
+          // Undoable in its editor like any other edit.
+          recordEdit(views.history(doc.key), { text: doc.text, start: 0, end: 0 });
           documents.edit(doc.key, change.after);
           if (saved) await documents.save(doc.key);
         } else {
@@ -1070,7 +1151,7 @@ export default function App() {
     setTabs([WELCOME_TAB]);
     setActiveTabId("welcome");
     documents.reset();
-    histories.current.clear();
+    views.clear();
   };
   const edit = (action: EditorAction) => editorRef.current?.execute(action);
   const navigateTab = (direction: number) => {
@@ -1192,17 +1273,7 @@ export default function App() {
       menu: "File",
       label: "Revert File",
       disabled: !desktop || activeDocument?.source.kind !== "disk",
-      run: () =>
-        run(async () => {
-          const doc = activeDocument;
-          if (!doc) return;
-          if (
-            doc.dirty &&
-            !window.confirm("Discard unsaved changes and reload the file from disk?")
-          )
-            return;
-          await documents.reload(doc.key, { discard: true });
-        }),
+      run: revertActive,
     },
     {
       // The other way out of a conflict: keep the editor's version, to replace the disk's on
@@ -1212,10 +1283,7 @@ export default function App() {
       label: "Keep My Version",
       disabled: !activeDocument || documentStatus(activeDocument) !== "conflicted",
       reason: "Only for a file that changed on disk while it had unsaved changes",
-      run: () =>
-        run(async () => {
-          if (activeDocument) await documents.keepLocal(activeDocument.key);
-        }),
+      run: keepMine,
     },
     {
       id: "file.close",
@@ -1642,7 +1710,7 @@ export default function App() {
           <SearchPanel
             key={`search:${workspacePath}`}
             workspace={workspacePath}
-            buffers={fileContents}
+            buffers={readBuffers}
             visible={isSidebarOpen && activeActivityTab === "search"}
             focusRequest={searchFocus}
             onOpen={(hit) => {
@@ -1658,7 +1726,7 @@ export default function App() {
           <SourceControlPanel
             key={`git:${workspacePath}`}
             workspace={workspacePath}
-            buffers={fileContents}
+            buffers={readBuffers}
             visible={isSidebarOpen && activeActivityTab === "git"}
             dirty={hasUnsavedChanges}
             onDiff={setDiff}
@@ -1769,8 +1837,9 @@ export default function App() {
                 onNewFile={newFile}
                 onOpenCommandPalette={() => openPalette("commands")}
                 onOpenFolderDialog={handleOpenFolderDialog}
-                fileContents={fileContents}
-                onContentChange={handleContentChange}
+                documents={documents}
+                views={views}
+                notice={notice}
                 onSaveFile={handleSaveFile}
                 recentFiles={recentFiles}
                 workspacePath={workspacePath || null}
@@ -1787,7 +1856,6 @@ export default function App() {
                 }
                 details={documentDetails}
                 editorRef={editorRef}
-                histories={histories.current}
                 onEditorState={setEditorState}
                 wordWrap={wordWrap}
                 zoom={zoom}

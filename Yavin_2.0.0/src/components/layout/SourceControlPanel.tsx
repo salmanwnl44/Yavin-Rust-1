@@ -140,7 +140,8 @@ export function SourceControlPanel({
 }: {
   workspace: string;
   visible: boolean;
-  buffers: Record<string, string>;
+  /** The open documents' text, read when it is needed. */
+  buffers: () => Record<string, string>;
   dirty: boolean;
   onDiff: (diff: DiffDocument | null) => void;
   onChanged: () => Promise<void>;
@@ -427,7 +428,7 @@ export function SourceControlPanel({
         ? await native("read_file_content", { path: entry.path })
         : await activeRepo.store.repository.diff(entry.path, staged, entry.originalPath);
       if (!alive.current || current !== diffGeneration.current) return;
-      const hasUnsavedEdits = buffers[entry.path] !== undefined;
+      const hasUnsavedEdits = buffers()[entry.path] !== undefined;
       // Hunk-level staging needs the raw diff text untouched by the warning banner
       // below, and makes no sense for an untracked file or an unresolved conflict.
       const hunkStagingSafe = !entry.untracked && !entry.conflict && !hasUnsavedEdits;

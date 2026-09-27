@@ -1,4 +1,13 @@
-import { useImperativeHandle, useMemo, useRef, useState, useEffect } from "react";
+import {
+  useDeferredValue,
+  useImperativeHandle,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useEffect,
+  useSyncExternalStore,
+} from "react";
 import type { Ref } from "react";
 import {
   duplicateSelection,
@@ -7,7 +16,10 @@ import {
   recordEdit,
   stepHistory,
 } from "../../services/editor";
-import type { TextHistory, TextSelection } from "../../services/editor";
+import type { TextSelection } from "../../services/editor";
+import { showDocumentText } from "../../services/editorBinding";
+import type { DocumentService } from "../../services/documents";
+import type { EditorViews } from "../../services/editorViews";
 
 export type EditorAction =
   | "undo"
@@ -32,27 +44,42 @@ export interface EditorHandle {
   focus: () => void;
 }
 
+/**
+ * A view of one document and a way to change it -- never a store of its own.
+ *
+ * The text is the Document Model's (`documents.ts`). This subscribes to that one document's
+ * revision, so typing redraws this editor and not the window around it. The textarea is not
+ * controlled by React: the document's text reaches it only through `showDocumentText`, which
+ * writes only when the textarea does not already show it (a reload, Revert, a replace), and
+ * the user's input reaches the document only through `documents.edit`. The two paths cannot
+ * feed each other (see `editorBinding.ts`).
+ *
+ * What is the editor's own: the caret, selection, scroll position and undo history, kept per
+ * document in `views` so they survive switching tabs.
+ */
 export function TextEditor({
-  path,
-  name,
-  content,
-  onChange,
+  documentKey,
+  documents,
+  views,
   editorRef,
-  histories,
   onState,
   wordWrap,
   zoom,
 }: {
-  path: string;
-  name: string;
-  content: string;
-  onChange: (text: string) => void;
+  /** The document shown: its key in the Document Model. */
+  documentKey: string;
+  documents: DocumentService;
+  views: EditorViews;
   editorRef: Ref<EditorHandle>;
-  histories: Map<string, TextHistory>;
   onState: (state: EditorState) => void;
   wordWrap: boolean;
   zoom: number;
 }) {
+  useSyncExternalStore(documents.subscribe, () => documents.documentRevision(documentKey));
+  const doc = documents.get(documentKey);
+  const content = doc?.text ?? "";
+  const name = doc?.name ?? documentKey;
+  const path = documentKey;
   const textarea = useRef<HTMLTextAreaElement>(null);
   const gutter = useRef<HTMLDivElement>(null);
 
@@ -64,12 +91,15 @@ export function TextEditor({
    * time, for a column of text that changes only when a line is added or removed. Counting
    * without `split` avoids allocating the lines themselves just to count them.
    */
+  // Counted from a deferred copy of the text: the count is a scan of the whole document, and a
+  // keystroke must not wait for it -- React renders the edit first and the gutter after it.
+  const counted = useDeferredValue(content);
   const lineCount = useMemo(() => {
     let lines = 1;
-    for (let index = 0; index < content.length; index++)
-      if (content.charCodeAt(index) === 10) lines++;
+    for (let index = 0; index < counted.length; index++)
+      if (counted.charCodeAt(index) === 10) lines++;
     return lines;
-  }, [content]);
+  }, [counted]);
   const gutterText = useMemo(
     () => Array.from({ length: lineCount }, (_, index) => index + 1).join("\n"),
     [lineCount],
@@ -80,35 +110,119 @@ export function TextEditor({
   const [replacement, setReplacement] = useState("");
   const [searchMessage, setSearchMessage] = useState("");
   const searchInput = useRef<HTMLInputElement>(null);
-  const history = histories.get(path) ?? { past: [], future: [] };
-  histories.set(path, history);
+  const history = views.history(path);
   const snapshot = (): TextSelection => ({
     text: textarea.current?.value ?? content,
     start: textarea.current?.selectionStart ?? 0,
     end: textarea.current?.selectionEnd ?? 0,
   });
-  const publish = () =>
-    onState({
+  /**
+   * The document version the textarea is known to show. An edit made here is on the textarea
+   * before the document has it, so the version it produces is marked shown at once, and the
+   * document's report of it costs nothing -- not even reading back the textarea's text, which
+   * for a large file is the whole file.
+   */
+  const shown = useRef(doc?.version ?? 0);
+  /** The user's change, into the document: the one way this editor changes content. */
+  const edit = (text: string) => {
+    shown.current = documents.edit(path, text).version;
+  };
+  // Told only when something it shows changes: a new object per keystroke re-rendered the
+  // whole window above this editor for every character typed.
+  const published = useRef<EditorState | null>(null);
+  const publish = () => {
+    const next: EditorState = {
       canUndo: history.past.length > 0,
       canRedo: history.future.length > 0,
       selected: (textarea.current?.selectionStart ?? 0) !== (textarea.current?.selectionEnd ?? 0),
+    };
+    const last = published.current;
+    if (
+      last &&
+      last.canUndo === next.canUndo &&
+      last.canRedo === next.canRedo &&
+      last.selected === next.selected
+    )
+      return;
+    published.current = next;
+    onState(next);
+  };
+  /**
+   * Remembers where the caret is in this document, for the next time it is shown. Only the
+   * selection: reading it costs nothing, where reading the scroll position after an edit would
+   * make the browser lay out the whole text there and then. Scrolling is remembered from
+   * scroll events (`rememberScroll`).
+   */
+  const rememberView = () => {
+    const element = textarea.current;
+    if (!element) return;
+    views.setViewState(path, {
+      selectionStart: element.selectionStart,
+      selectionEnd: element.selectionEnd,
     });
+  };
+  const rememberScroll = () => {
+    const element = textarea.current;
+    if (element)
+      views.setViewState(path, { scrollTop: element.scrollTop, scrollLeft: element.scrollLeft });
+  };
   const apply = (next: TextSelection, remember = true) => {
     const element = textarea.current;
     if (!element) return;
     const previous = snapshot();
     if (next.text !== previous.text) {
       if (remember) recordEdit(history, previous);
-      // Set the controlled element immediately so rapid commands see the latest edit.
+      // On the surface first, so the document's report of it finds nothing to write back.
       element.value = next.text;
-      onChange(next.text);
+      edit(next.text);
     }
     element.focus();
     element.setSelectionRange(next.start, next.end);
     publish();
+    rememberView();
   };
+  // The document changed by something other than this editor -- a reload, Revert, a replace:
+  // shown with the caret and scroll carried across. An edit typed here is already shown, so
+  // this writes nothing for it.
+  useLayoutEffect(() => {
+    const element = textarea.current;
+    if (!element || !doc || doc.version === shown.current) return;
+    shown.current = doc.version;
+    if (showDocumentText(element, content)) {
+      publish();
+      rememberView();
+    }
+  });
+  // Mounted: the document's text, and back where the view was when it was last shown.
+  //
+  // The text is set here rather than through React. Given a `value` or `defaultValue`, React
+  // compares it with the textarea's text on every render -- reading the whole text out of the
+  // page and comparing it, for every keystroke, which in a large file was most of its cost.
+  useLayoutEffect(() => {
+    const element = textarea.current;
+    if (!element) return;
+    element.value = content;
+    const view = views.getViewState(path);
+    if (!view) return;
+    const end = element.value.length;
+    element.setSelectionRange(Math.min(view.selectionStart, end), Math.min(view.selectionEnd, end));
+    element.scrollTop = view.scrollTop;
+    element.scrollLeft = view.scrollLeft;
+    if (gutter.current) gutter.current.scrollTop = element.scrollTop;
+  }, [path]);
+  // And on the way out -- to another tab, or closed -- while the textarea is still in the page.
+  // Not for a document that has since become another (Save As): its state went with it.
+  useLayoutEffect(
+    () => () => {
+      if (!views.has(path)) return;
+      rememberView();
+      rememberScroll();
+    },
+    [path],
+  );
   useEffect(() => {
-    textarea.current?.focus();
+    // `preventScroll`: focusing must not undo the scroll position just restored.
+    textarea.current?.focus({ preventScroll: true });
     publish();
   }, [path]); // History survives tab switches.
   useEffect(() => {
@@ -269,29 +383,37 @@ export function TextEditor({
           ref={textarea}
           key={path}
           aria-label={name}
-          value={content}
           wrap={wordWrap ? "soft" : "off"}
           onBeforeInput={() => {
             beforeInput.current = snapshot();
           }}
           onChange={(event) => {
+            // The document's text as it was before this input: what undo returns to.
+            const before = documents.get(path)?.text ?? content;
             const previous =
-              beforeInput.current?.text === content
+              beforeInput.current?.text === before
                 ? beforeInput.current
                 : {
-                    text: content,
+                    text: before,
                     start: event.target.selectionStart,
                     end: event.target.selectionEnd,
                   };
-            if (event.target.value !== content) recordEdit(history, previous);
+            if (event.target.value !== before) recordEdit(history, previous);
             beforeInput.current = null;
-            onChange(event.target.value);
+            edit(event.target.value);
             publish();
+            rememberView();
           }}
-          onSelect={publish}
+          onSelect={() => {
+            publish();
+            rememberView();
+          }}
+          onKeyUp={rememberView}
+          onMouseUp={rememberView}
           onScroll={() => {
             if (gutter.current && textarea.current)
               gutter.current.scrollTop = textarea.current.scrollTop;
+            rememberScroll();
           }}
           onKeyDown={(event) => {
             if (event.nativeEvent.isComposing) return;
