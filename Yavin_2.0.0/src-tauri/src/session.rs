@@ -28,6 +28,8 @@ const MAX_FOLDERS: usize = 15;
 const MAX_FILES: usize = 50;
 /// Unfolded directories remembered per folder, so one enormous tree cannot bloat the file.
 const MAX_EXPANDED: usize = 500;
+/// Explorer entries remembered as selected per folder.
+const MAX_SELECTED: usize = 100;
 
 /// What one folder looked like when it was last open.
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
@@ -48,6 +50,10 @@ pub struct WorkspaceSession {
     /// fire-and-forget, the session would simply have stopped being written, silently, for
     /// everyone not at 100% zoom.
     pub scroll: f64,
+    /// What the explorer had selected. Absent in files written before it was remembered.
+    pub selected: Vec<String>,
+    /// The explorer entry that had keyboard focus, if any.
+    pub focused: Option<String>,
 }
 
 /// The whole session. `folders` is the recent list, most recent first; its head is the
@@ -86,6 +92,7 @@ impl Session {
     fn remember(&mut self, mut state: WorkspaceSession) -> bool {
         state.files.truncate(MAX_FILES);
         state.expanded.truncate(MAX_EXPANDED);
+        state.selected.truncate(MAX_SELECTED);
         // An active tab that is not open is not a tab; dropping it here means the UI never
         // has to defend against restoring a selection it cannot show.
         if let Some(active) = &state.active {
@@ -116,6 +123,7 @@ impl Session {
         for state in &mut self.workspaces {
             state.files.truncate(MAX_FILES);
             state.expanded.truncate(MAX_EXPANDED);
+            state.selected.truncate(MAX_SELECTED);
         }
         self.prune();
     }
@@ -312,6 +320,7 @@ mod tests {
             active: files.first().map(|file| file.to_string()),
             expanded: Vec::new(),
             scroll: 0.0,
+            ..Default::default()
         }
     }
 
@@ -391,10 +400,33 @@ mod tests {
                 .map(|n| format!("/work/{n}"))
                 .collect(),
             scroll: 0.0,
+            selected: (0..MAX_SELECTED + 50)
+                .map(|n| format!("/work/{n}"))
+                .collect(),
+            ..Default::default()
         });
         let state = session.workspace("/work").unwrap();
         assert_eq!(state.files.len(), MAX_FILES);
         assert_eq!(state.expanded.len(), MAX_EXPANDED);
+        assert_eq!(state.selected.len(), MAX_SELECTED);
+    }
+
+    /// A session written before the explorer's selection was remembered still loads, with
+    /// nothing selected.
+    #[test]
+    fn a_session_without_selection_still_loads() {
+        let dir = temp("no-selection");
+        fs::write(
+            dir.join("session.json"),
+            r#"{"version":1,"folders":["/work"],"workspaces":[{"folder":"/work","files":[],"expanded":["/work/src"],"scroll":3}]}"#,
+        )
+        .unwrap();
+        let store = store_at(&dir);
+        let state = store.session.workspace("/work").unwrap();
+        assert_eq!(state.expanded, vec!["/work/src".to_string()]);
+        assert!(state.selected.is_empty());
+        assert_eq!(state.focused, None);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

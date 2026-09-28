@@ -144,7 +144,7 @@ test("a first run offers the ways to start, and says the explorer has nothing ye
   await expect(welcome(page).getByRole("button", { name: "Open Folder" })).toBeVisible();
   await expect(welcome(page).getByRole("button", { name: "Clone Repository" })).toBeVisible();
   await expect(welcome(page)).toContainText("Folders you open are listed here");
-  await expect(page.getByText("No workspace opened")).toBeVisible();
+  await expect(page.getByText("You have not yet opened a folder.")).toBeVisible();
 });
 
 test("the folder from last time is reopened, with the tabs it had", async ({ page }) => {
@@ -188,7 +188,7 @@ test("a folder that has been moved since leaves a usable window", async ({ page 
 
   // Not a crash and not an error wall: the window a first run would have.
   await expect(welcome(page).getByRole("button", { name: "Open Folder" })).toBeVisible();
-  await expect(page.getByText("No workspace opened")).toBeVisible();
+  await expect(page.getByText("You have not yet opened a folder.")).toBeVisible();
 });
 
 test("the explorer is unfolded where it was left", async ({ page }) => {

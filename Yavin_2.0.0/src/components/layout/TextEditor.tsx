@@ -220,9 +220,14 @@ export function TextEditor({
     },
     [path],
   );
+  // Decided once per editor: React runs mount effects twice in development, and the second
+  // run would find the "moved" mark already taken and focus anyway.
+  const takesFocus = useRef<boolean | null>(null);
   useEffect(() => {
-    // `preventScroll`: focusing must not undo the scroll position just restored.
-    textarea.current?.focus({ preventScroll: true });
+    takesFocus.current ??= views.takeFocus(path);
+    // `preventScroll`: focusing must not undo the scroll position just restored. Not taken
+    // from somewhere else when the document only changed key (see `takeFocus`).
+    if (takesFocus.current) textarea.current?.focus({ preventScroll: true });
     publish();
   }, [path]); // History survives tab switches.
   useEffect(() => {
@@ -404,6 +409,8 @@ export function TextEditor({
             publish();
             rememberView();
           }}
+          onFocus={() => views.setFocused(path, true)}
+          onBlur={() => views.setFocused(path, false)}
           onSelect={() => {
             publish();
             rememberView();

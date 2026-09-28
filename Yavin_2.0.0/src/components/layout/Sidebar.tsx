@@ -7,16 +7,20 @@ import React, {
   useState,
   useSyncExternalStore,
 } from "react";
-import type { FileNode } from "../../types";
 import type { Decorations } from "../../services/git";
-import { folderName, parentPath } from "../../services/paths";
-import { isWithin, parentOf, validateEntryName } from "../../services/workspace";
-import type { FileSystemExplorerProvider } from "../../services/explorerProvider";
-import { createExplorerStore } from "../../services/explorerStore";
+import { relativePath, samePathString } from "../../services/resource";
+import { parentOf, validateEntryName } from "../../services/workspace";
+import type {
+  ExplorerNodeId,
+  FileSystemExplorerProvider,
+  ProjectedNode,
+} from "../../services/explorerProvider";
+import type { ExplorerStore } from "../../services/explorerStore";
 import { requestTerminal } from "../../services/terminal";
 import { ContextMenu } from "../ui/ContextMenu";
-import { FolderClosedIcon, ChevronIcon } from "../ui/FileIcons";
+import { ChevronIcon } from "../ui/FileIcons";
 import { CollapseIcon, MoreIcon, PlusIcon, FolderPlusIcon, RefreshIcon } from "../ui/Icons";
+import { allowed, INTO_FOLDER, type ExplorerAction } from "../explorer/actions";
 import { buildExplorerMenu, pathsToCopy, type Clipboard, type MenuActions } from "../explorer/menu";
 import { cleanPath, containingDir } from "../explorer/paths";
 import { CreateRow, ROW_HEIGHT, StatusRow, TreeRow, type RowApi } from "../explorer/TreeRow";
@@ -26,18 +30,29 @@ export { cleanPath, getRelativePath } from "../explorer/paths";
 /** Extra rows rendered above and below the viewport so scrolling never shows a gap. */
 const OVERSCAN = 10;
 
+type Id = ExplorerNodeId;
+
+/**
+ * One visible row. Identity is the node's: `id` for state (selection, expansion), `key` --
+ * the provider's view key, kept through renames and moves -- for React, so a renamed row is
+ * the same element.
+ */
 type NodeRow = {
   kind: "node";
   key: string;
+  id: Id;
   path: string;
   depth: number;
-  node: FileNode;
+  node: ProjectedNode;
   expanded: boolean;
+  /** A workspace root shown as a row (several roots). */
+  isRoot: boolean;
 };
 type Row =
   | NodeRow
   | { kind: "create"; key: string; depth: number }
-  | { kind: "status"; key: string; depth: number; path: string };
+  /** Under a folder: its listing is loading, or failed (with its error). */
+  | { kind: "status"; key: string; depth: number; id: Id; error?: string };
 
 export interface DeleteTarget {
   path: string;
@@ -48,11 +63,13 @@ interface SidebarProps {
   visible: boolean;
   activeTab: string;
   workspacePath: string;
-  /** The provider's projection of the workspace (see `services/explorerProvider.ts`). */
-  fileTree: FileNode | null;
+  /** Every workspace root, as the provider projects it (see `services/explorerProvider.ts`). */
+  roots: ProjectedNode[];
   decorations: Decorations;
-  /** Where the tree comes from; the Explorer's UI state follows its renames and deletions. */
+  /** Where the tree comes from: capabilities, retries, parents. */
   provider: FileSystemExplorerProvider;
+  /** The Explorer's UI state: expansion, selection, anchor, focus, reveal. */
+  store: ExplorerStore;
   /** Lists a folder; the listing is abandoned when `signal` aborts (the folder collapsed). */
   onLoadDirectory: (path: string, signal?: AbortSignal) => Promise<void>;
   onOpenFile: (path: string, name: string) => void;
@@ -67,128 +84,186 @@ interface SidebarProps {
   onMoveFile: (src: string, dest: string) => void;
   onReveal: (path: string) => void;
   onOpenFolderDialog: () => void;
-  /** Folders opened before, offered when there is no folder open. */
-  recentFolders?: string[];
-  onOpenRecentFolder?: (folder: string) => void;
-  /** What this folder had unfolded last time, and where it was scrolled. */
-  initialExpanded?: string[];
+  /** Where the explorer was scrolled last time. */
   initialScroll?: number;
-  /** Reports unfolding and scrolling, so the session can be written. */
-  onExplorerState?: (state: { expanded: string[]; scroll: number }) => void;
+  /** Reports the explorer's state as it changes, so the session can be written. */
+  onExplorerState?: (state: {
+    expanded: string[];
+    selected: string[];
+    focused: string | null;
+    scroll: number;
+  }) => void;
 }
 
 export function Sidebar(props: SidebarProps) {
-  const { visible, activeTab, workspacePath, fileTree, decorations, onLoadDirectory } = props;
+  const {
+    visible,
+    activeTab,
+    workspacePath,
+    roots,
+    decorations,
+    onLoadDirectory,
+    provider,
+    store,
+  } = props;
 
-  // The Explorer's UI state -- expansion, selection, anchor, focus -- lives in its store, keyed
-  // by node identity and following the provider's renames and deletions; this reads it as the
-  // same sets and setters it always used. Seeded from the session, so a reopened folder is
-  // unfolded the way it was left; folders not loaded yet are listed on demand, as an unfold.
-  const [store] = useState(() =>
-    createExplorerStore(props.provider, { expanded: props.initialExpanded }),
-  );
-  useEffect(() => store.attach(), [store]);
-  useSyncExternalStore(store.subscribe, store.revision);
-  const expandedPaths = store.paths("expanded");
-  const setExpandedPaths = store.setter("expanded");
-  const selection = store.paths("selection");
-  const setSelection = store.setter("selection");
-  const anchor = store.value("anchor");
-  const setAnchor = store.valueSetter("anchor");
-  const focused = store.value("focused");
-  const setFocused = store.valueSetter("focused");
+  // The Explorer's UI state lives in its store (App owns it, one per workspace), keyed by node
+  // identity and following the provider's renames and deletions.
+  const storeRevision = useSyncExternalStore(store.subscribe, store.revision);
+  const expanded = store.ids("expanded");
+  const selection = store.ids("selection");
+  const anchor = store.anchor();
+  const focused = store.focused();
+  const { setExpanded, setSelection, setAnchor, setFocused } = store;
+
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
-    node: FileNode | null;
+    node: ProjectedNode | null;
+    /** The menu for a root: a root row, or the background of the root it belongs to. */
     isRoot: boolean;
   } | null>(null);
-  const [renaming, setRenaming] = useState<{ path: string; name: string; value: string } | null>(
-    null,
-  );
+  const [renaming, setRenaming] = useState<{
+    id: Id;
+    path: string;
+    name: string;
+    value: string;
+  } | null>(null);
   const [creating, setCreating] = useState<{ parent: string; type: "file" | "folder" } | null>(
     null,
   );
   const [newName, setNewName] = useState("");
   const [inlineError, setInlineError] = useState("");
   const [clipboard, setClipboard] = useState<Clipboard>(null);
-  const [dragged, setDragged] = useState<FileNode[]>([]);
-  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const [dragged, setDragged] = useState<ProjectedNode[]>([]);
+  const [dropTarget, setDropTarget] = useState<Id | null>(null);
+  /** The "No Folder Opened" section's own disclosure. */
+  const [noFolderOpen, setNoFolderOpen] = useState(true);
 
   /** Listings in flight, by folder; aborted when the folder is collapsed before they answer. */
-  const loads = useRef(new Map<string, AbortController>());
+  const loads = useRef(new Map<Id, AbortController>());
   const createInputRef = useRef<HTMLInputElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   /** Set when the tree itself moves focus, so revealing a file never steals it from the editor. */
-  const pendingFocus = useRef<string | null>(null);
+  const pendingFocus = useRef<Id | null>(null);
 
-  const rootPath = cleanPath(fileTree?.path || workspacePath);
-  const rootExpanded = expandedPaths.has(rootPath);
+  const multiRoot = roots.length > 1;
+  const firstRoot = roots[0] ?? null;
+  const rootPath = cleanPath(firstRoot?.path || workspacePath);
+  const rootExpanded = !!firstRoot && expanded.has(firstRoot.id);
+  const capabilities = useCallback((id: Id) => provider.capabilities(id), [provider]);
+  /** The folder things are created in when acting on `node`: itself, or the one holding it. */
+  const containerOf = (node: ProjectedNode): Id | null =>
+    node.is_dir ? node.id : (provider.getNode(node.id)?.parentId ?? null);
+  /** The root a node belongs to (or the first one). */
+  const rootOf = (id: Id | null): ProjectedNode | null => {
+    const path = id ? store.pathOf(id) : undefined;
+    return (path && roots.find((root) => relativePath(root.path, path) !== undefined)) || firstRoot;
+  };
 
   // --- Tree flattening -----------------------------------------------------
-  // One pass turns the tree into the exact list of visible rows plus the lookup
-  // tables navigation needs, and collects the folders still awaiting a listing.
+  // One pass turns the projection into the exact list of visible rows plus the lookup tables
+  // navigation needs, and collects the folders still awaiting a listing.
   const { rows, nodeRows, rowIndex, navIndex, nodes, pending } = useMemo(() => {
     const rows: Row[] = [];
     const nodeRows: NodeRow[] = [];
-    const rowIndex = new Map<string, number>();
-    const navIndex = new Map<string, number>();
-    const nodes = new Map<string, FileNode>();
-    const pending: string[] = [];
-    if (!fileTree) return { rows, nodeRows, rowIndex, navIndex, nodes, pending };
+    const rowIndex = new Map<Id, number>();
+    const navIndex = new Map<Id, number>();
+    const nodes = new Map<Id, ProjectedNode>();
+    const pending: { id: Id; path: string }[] = [];
 
     const emitCreate = (parent: string, depth: number) => {
-      if (creating && creating.parent === parent)
+      if (creating && samePathString(creating.parent, parent))
         rows.push({ kind: "create", key: "@create", depth });
     };
-
-    const walk = (children: FileNode[], depth: number) => {
+    const push = (node: ProjectedNode, depth: number, isRoot: boolean) => {
+      const isExpanded = node.is_dir && expanded.has(node.id);
+      const row: NodeRow = {
+        kind: "node",
+        key: node.key,
+        id: node.id,
+        path: cleanPath(node.path),
+        depth,
+        node,
+        expanded: isExpanded,
+        isRoot,
+      };
+      rowIndex.set(node.id, rows.length);
+      navIndex.set(node.id, nodeRows.length);
+      nodes.set(node.id, node);
+      rows.push(row);
+      nodeRows.push(row);
+      return isExpanded;
+    };
+    /** A folder's contents: its children, or where they would be -- loading, or failed. */
+    const contents = (folder: ProjectedNode, depth: number) => {
+      if (!folder.children) {
+        rows.push({
+          kind: "status",
+          key: folder.key + "@status",
+          depth,
+          id: folder.id,
+          error: folder.loadError,
+        });
+        // A failed listing is the folder's state until retried, not something to re-ask.
+        if (!folder.loadError) pending.push({ id: folder.id, path: cleanPath(folder.path) });
+        return;
+      }
+      // Listed before, but its last refresh failed: said above what is still known of it.
+      if (folder.loadError)
+        rows.push({
+          kind: "status",
+          key: folder.key + "@error",
+          depth,
+          id: folder.id,
+          error: folder.loadError,
+        });
+      walk(folder.children, depth);
+    };
+    const walk = (children: ProjectedNode[], depth: number) => {
       for (const node of children) {
-        const path = cleanPath(node.path);
-        const expanded = node.is_dir && expandedPaths.has(path);
-        const row: NodeRow = { kind: "node", key: path, path, depth, node, expanded };
-        rowIndex.set(path, rows.length);
-        navIndex.set(path, nodeRows.length);
-        nodes.set(path, node);
-        rows.push(row);
-        nodeRows.push(row);
-        if (node.is_dir) emitCreate(path, depth + 1);
-        if (!expanded) continue;
-        if (node.children) {
-          walk(node.children, depth + 1);
-        } else {
-          rows.push({ kind: "status", key: path + "@status", depth: depth + 1, path });
-          // A failed listing is the folder's state until retried, not something to re-ask.
-          if (!node.loadError) pending.push(path);
-        }
+        const isExpanded = push(node, depth, false);
+        if (node.is_dir) emitCreate(node.path, depth + 1);
+        if (isExpanded) contents(node, depth + 1);
       }
     };
 
-    emitCreate(rootPath, 0);
-    if (rootExpanded) walk(fileTree.children ?? [], 0);
+    if (multiRoot) {
+      // Each root is a row of its own, never folded into one tree with the others.
+      for (const root of roots) {
+        const isExpanded = push(root, 0, true);
+        emitCreate(root.path, 1);
+        if (isExpanded) contents(root, 1);
+      }
+    } else if (firstRoot) {
+      // One root: its header above the tree is the root, and its entries start at the left.
+      emitCreate(firstRoot.path, 0);
+      if (expanded.has(firstRoot.id)) contents(firstRoot, 0);
+    }
     return { rows, nodeRows, rowIndex, navIndex, nodes, pending };
-  }, [fileTree, expandedPaths, creating, rootPath, rootExpanded]);
+  }, [roots, multiRoot, firstRoot, expanded, creating]);
 
   // An expanded folder whose children are not loaded yet is listed on demand. One that is
   // collapsed again before its listing answers has the listing abandoned: the provider drops
   // the answer rather than applying it to a folder nobody is looking at.
   useEffect(() => {
-    for (const [path, controller] of loads.current)
-      if (!pending.includes(path)) {
+    const wanted = new Set(pending.map((folder) => folder.id));
+    for (const [id, controller] of loads.current)
+      if (!wanted.has(id)) {
         controller.abort();
-        loads.current.delete(path);
+        loads.current.delete(id);
       }
-    for (const path of pending) {
+    for (const { id, path } of pending) {
       // An abandoned listing is no listing: expanding again before it has settled lists anew,
       // rather than waiting on an answer that will be dropped.
-      if (loads.current.get(path)?.signal.aborted === false) continue;
+      if (loads.current.get(id)?.signal.aborted === false) continue;
       const controller = new AbortController();
-      loads.current.set(path, controller);
+      loads.current.set(id, controller);
       onLoadDirectory(path, controller.signal)
         // A failure is kept as the folder's state by the provider and shown in its row.
         .catch(() => undefined)
         .finally(() => {
-          if (loads.current.get(path) === controller) loads.current.delete(path);
+          if (loads.current.get(id) === controller) loads.current.delete(id);
         });
     }
   }, [pending, onLoadDirectory]);
@@ -200,9 +275,14 @@ export function Sidebar(props: SidebarProps) {
     };
   }, []);
 
+  // A root appearing for the first time is shown open, as a folder opened in the window is.
+  const seenRoots = useRef(new Set<Id>());
   useEffect(() => {
-    if (rootPath) setExpandedPaths((previous) => new Set([...previous, rootPath]));
-  }, [rootPath]);
+    const fresh = roots.filter((root) => !seenRoots.current.has(root.id));
+    if (!fresh.length) return;
+    for (const root of fresh) seenRoots.current.add(root.id);
+    setExpanded((previous) => new Set([...previous, ...fresh.map((root) => root.id)]));
+  }, [roots, setExpanded]);
 
   useEffect(() => {
     if (creating) createInputRef.current?.focus();
@@ -237,7 +317,7 @@ export function Sidebar(props: SidebarProps) {
    * Two things make this harder than one assignment. The tree arrives a directory at a time,
    * so a viewport that is still short silently clamps the offset to what little it can
    * scroll; and this component remounts on every folder change, when the tree is momentarily
-   * null. So the target is captured once at mount -- never re-read from the prop, which the
+   * empty. So the target is captured once at mount -- never re-read from the prop, which the
    * reporting below would otherwise have overwritten with the current zero -- and reapplied
    * as rows arrive until the offset actually sticks.
    */
@@ -255,8 +335,6 @@ export function Sidebar(props: SidebarProps) {
       restored.current = true;
   }, [rows.length]);
 
-  const expandedRef = useRef(expandedPaths);
-  expandedRef.current = expandedPaths;
   const reportState = props.onExplorerState;
   const report = useCallback(() => {
     // Nothing is reported until the restore has settled: a report before then says the
@@ -264,15 +342,17 @@ export function Sidebar(props: SidebarProps) {
     // restored -- and it is written back to the session, losing it for good.
     if (!reportState || !restored.current) return;
     reportState({
-      expanded: [...expandedRef.current],
+      expanded: [...store.paths("expanded")],
+      selected: [...store.paths("selection")],
+      focused: store.focusedPath(),
       // Rounded because sub-pixel scroll is meaningless to restore, and a whole number is
       // what someone reading the session file by hand expects to find.
       scroll: Math.round(viewportRef.current?.scrollTop ?? 0),
     });
-  }, [reportState]);
+  }, [reportState, store]);
 
-  // Unfolding is reported as it happens; it is a deliberate act and there is one of them.
-  useEffect(report, [expandedPaths, report]);
+  // Unfolding, selecting and focusing are reported as they happen; each is a deliberate act.
+  useEffect(report, [storeRevision, report]);
   // Scrolling is reported once it settles. Reporting every frame wrote the session file
   // every 400ms for as long as a drag lasted, for a value that was about to change again.
   useEffect(() => {
@@ -299,7 +379,7 @@ export function Sidebar(props: SidebarProps) {
     const wanted = pendingFocus.current;
     if (!wanted) return;
     const row = viewportRef.current?.querySelector<HTMLElement>(
-      `[data-path="${CSS.escape(wanted)}"]`,
+      `[data-id="${CSS.escape(wanted)}"]`,
     );
     if (!row) return;
     pendingFocus.current = null;
@@ -307,67 +387,69 @@ export function Sidebar(props: SidebarProps) {
   });
 
   // --- Reveal the active editor file ---------------------------------------
+  // The store does the work -- ancestors expanded and listed, the file selected and focused --
+  // and the focused row is scrolled to above, without taking focus from the editor.
   const revealed = useRef("");
   useEffect(() => {
     const path = cleanPath(props.activeFile);
     if (!path || path === revealed.current) return;
     revealed.current = path;
-    if (!rootPath || !isWithin(path, rootPath) || path === rootPath) return;
-    const ancestors = [rootPath];
-    for (let dir = parentOf(path); dir !== rootPath && isWithin(dir, rootPath);) {
-      ancestors.push(dir);
-      const next = parentOf(dir);
-      if (next === dir) break;
-      dir = next;
-    }
-    setExpandedPaths((previous) => new Set([...previous, ...ancestors]));
-    setSelection(new Set([path]));
-    setAnchor(path);
-    // Scrolls into view without taking focus away from the editor.
-    setFocused(path);
-  }, [props.activeFile, rootPath]);
+    void store.reveal(path);
+  }, [props.activeFile, store]);
 
-  // --- Selection -----------------------------------------------------------
+  // --- Capabilities --------------------------------------------------------
   /** The entries an action applies to: the whole selection when the target is part of it. */
-  const targetsFor = (node: FileNode): FileNode[] => {
-    const path = cleanPath(node.path);
-    if (selection.size > 1 && selection.has(path))
-      return nodeRows.filter((row) => selection.has(row.path)).map((row) => row.node);
+  const targetsFor = (node: ProjectedNode): ProjectedNode[] => {
+    if (selection.size > 1 && selection.has(node.id))
+      return nodeRows.filter((row) => selection.has(row.id)).map((row) => row.node);
     return [node];
   };
+  /** Whether `action` is supported for `node` (its targets, or its folder for creating). */
+  const can = (action: ExplorerAction, node: ProjectedNode | null): boolean => {
+    if (!node) return allowed(capabilities, [firstRoot?.id], action);
+    if (INTO_FOLDER.has(action)) return allowed(capabilities, [containerOf(node)], action);
+    return allowed(
+      capabilities,
+      targetsFor(node).map((target) => target.id),
+      action,
+    );
+  };
 
-  const selectRange = (from: string, to: string) => {
+  // --- Selection -----------------------------------------------------------
+  const selectRange = (from: Id, to: Id) => {
     const a = navIndex.get(from);
     const b = navIndex.get(to);
     if (a === undefined || b === undefined) return false;
     const [low, high] = a < b ? [a, b] : [b, a];
-    setSelection(new Set(nodeRows.slice(low, high + 1).map((row) => row.path)));
+    setSelection(new Set(nodeRows.slice(low, high + 1).map((row) => row.id)));
     return true;
   };
 
   /** Moves the roving focus, optionally extending the selection from the anchor. */
-  const moveFocus = (path: string, extend = false) => {
-    pendingFocus.current = path;
-    setFocused(path);
-    if (extend && anchor && selectRange(anchor, path)) return;
-    setSelection(new Set([path]));
-    setAnchor(path);
+  const moveFocus = (id: Id, extend = false) => {
+    pendingFocus.current = id;
+    setFocused(id);
+    if (extend && anchor && selectRange(anchor, id)) return;
+    setSelection(new Set([id]));
+    setAnchor(id);
   };
 
   // --- Expansion -----------------------------------------------------------
-  const expand = (path: string) =>
-    setExpandedPaths((previous) => new Set([...previous, cleanPath(path)]));
+  const expand = (id: Id | null) => {
+    if (id) setExpanded((previous) => new Set([...previous, id]));
+  };
+  const expandPath = (path: string) => expand(provider.idFor(path));
 
-  const toggleExpand = (path: string) =>
-    setExpandedPaths((previous) => {
+  const toggleExpand = (id: Id) =>
+    setExpanded((previous) => {
       const next = new Set(previous);
-      if (!next.delete(path)) next.add(path);
+      if (!next.delete(id)) next.add(id);
       return next;
     });
 
-  const openNode = (node: FileNode) => {
-    if (node.is_dir) toggleExpand(cleanPath(node.path));
-    else props.onOpenFile(node.path, node.name);
+  const openNode = (node: ProjectedNode) => {
+    if (node.is_dir) toggleExpand(node.id);
+    else if (can("open", node)) props.onOpenFile(node.path, node.name);
   };
 
   // --- Editing -------------------------------------------------------------
@@ -379,11 +461,14 @@ export function Sidebar(props: SidebarProps) {
   };
 
   const startCreate = (parent: string, type: "file" | "folder") => {
+    const folder = cleanPath(parent || rootPath);
+    if (!allowed(capabilities, [provider.idFor(folder)], type === "file" ? "newFile" : "newFolder"))
+      return;
     setRenaming(null);
     setNewName("");
     setInlineError("");
-    setCreating({ parent: cleanPath(parent || workspacePath), type });
-    expand(parent || workspacePath);
+    setCreating({ parent: folder, type });
+    expandPath(folder);
   };
 
   const submitCreate = () => {
@@ -394,7 +479,7 @@ export function Sidebar(props: SidebarProps) {
       const path = `${creating.parent}/${name}`;
       if (creating.type === "file") props.onCreateFile(path);
       else props.onCreateFolder(path);
-      expand(creating.parent);
+      expandPath(creating.parent);
     }
     cancelEdit();
   };
@@ -404,50 +489,62 @@ export function Sidebar(props: SidebarProps) {
     if (renaming && name && name !== renaming.name) {
       const problem = validateEntryName(name);
       if (problem) return setInlineError(problem);
-      props.onRename(renaming.path, `${parentOf(renaming.path)}/${name}`);
+      const target = `${parentOf(renaming.path)}/${name}`;
+      props.onRename(renaming.path, target);
+      // Keyboard focus comes back to the renamed row -- the same element, under its new id.
+      pendingFocus.current = provider.idFor(target);
+    } else if (renaming) {
+      pendingFocus.current = renaming.id;
     }
     cancelEdit();
   };
 
   const paste = (targetDir: string) => {
     if (!clipboard) return;
-    const dir = cleanPath(targetDir || workspacePath);
+    const dir = cleanPath(targetDir || rootPath);
+    if (!allowed(capabilities, [provider.idFor(dir)], "paste")) return;
     for (const node of clipboard.nodes) {
       const source = cleanPath(node.path);
       const dest = `${dir}/${node.name}`;
       if (clipboard.op === "cut") {
-        if (source !== dest) props.onRename(node.path, dest);
-      } else if (source === dest) {
+        if (!samePathString(source, dest)) props.onRename(node.path, dest);
+      } else if (samePathString(source, dest)) {
         props.onDuplicate(node.path);
       } else {
         props.onCopyFile(node.path, dest);
       }
     }
     if (clipboard.op === "cut") setClipboard(null);
-    expand(dir);
+    expandPath(dir);
   };
 
   // --- Drag and drop -------------------------------------------------------
-  // A move is refused into the dragged item itself, its own subtree, or its current parent.
-  const dropDirFor = (node: FileNode | null) =>
+  // A move is refused into the dragged item itself, its own subtree, or its current parent,
+  // and into a folder that cannot take entries. Roots are compared as resources, so a drop
+  // across roots is a move like any other.
+  const dropDirFor = (node: ProjectedNode | null): string =>
     node ? containingDir(node.path, node.is_dir) : rootPath;
 
-  const moveAllowed = (source: FileNode, dir: string) => {
+  const moveAllowed = (source: ProjectedNode, dir: string) => {
     const path = cleanPath(source.path);
-    return path !== dir && !dir.startsWith(path + "/") && parentOf(path) !== dir;
+    return (
+      relativePath(path, dir) === undefined &&
+      !samePathString(parentOf(path), dir) &&
+      allowed(capabilities, [provider.idFor(dir)], "paste")
+    );
   };
 
-  const dragOver = (event: React.DragEvent, node: FileNode | null) => {
+  const dragOver = (event: React.DragEvent, node: ProjectedNode | null) => {
     event.preventDefault();
     event.stopPropagation();
     if (!dragged.length) return;
     const dir = dropDirFor(node);
     if (!dragged.some((source) => moveAllowed(source, dir))) return;
     event.dataTransfer.dropEffect = "move";
-    setDropTarget(dir);
+    setDropTarget(provider.idFor(dir));
   };
 
-  const drop = (event: React.DragEvent, node: FileNode | null) => {
+  const drop = (event: React.DragEvent, node: ProjectedNode | null) => {
     event.preventDefault();
     event.stopPropagation();
     const dir = dropDirFor(node);
@@ -457,50 +554,73 @@ export function Sidebar(props: SidebarProps) {
         props.onMoveFile(source.path, dir);
         moved = true;
       }
-    if (moved) expand(dir);
+    if (moved) expandPath(dir);
     setDragged([]);
     setDropTarget(null);
   };
 
   // --- Actions shared by the menus and the keyboard ------------------------
+  // Each checks the provider's capabilities, whichever way it was asked for.
   const menuActions: MenuActions = {
     newFile: (parent) => startCreate(parent, "file"),
     newFolder: (parent) => startCreate(parent, "folder"),
     paste,
-    cut: (node) => setClipboard({ nodes: targetsFor(node), op: "cut" }),
-    copy: (node) => setClipboard({ nodes: targetsFor(node), op: "copy" }),
-    copyPath: (node, relative) =>
-      void navigator.clipboard.writeText(pathsToCopy(targetsFor(node), rootPath, relative)),
-    rename: (node) => {
+    cut: (file) => {
+      const node = file as ProjectedNode;
+      if (can("cut", node)) setClipboard({ nodes: targetsFor(node), op: "cut" });
+    },
+    copy: (file) => {
+      const node = file as ProjectedNode;
+      if (can("copy", node)) setClipboard({ nodes: targetsFor(node), op: "copy" });
+    },
+    copyPath: (file, relative) => {
+      const node = file as ProjectedNode;
+      void navigator.clipboard.writeText(
+        pathsToCopy(targetsFor(node), rootOf(node.id)?.path ?? rootPath, relative),
+      );
+    },
+    rename: (file) => {
+      const node = file as ProjectedNode;
+      if (!can("rename", node) || targetsFor(node).length > 1) return;
       setCreating(null);
       setInlineError("");
-      setRenaming({ path: cleanPath(node.path), name: node.name, value: node.name });
+      setRenaming({ id: node.id, path: cleanPath(node.path), name: node.name, value: node.name });
     },
-    duplicate: (node) => targetsFor(node).forEach((target) => props.onDuplicate(target.path)),
-    remove: (node) =>
-      props.onDelete(
-        targetsFor(node).map((target) => ({ path: target.path, isDir: target.is_dir })),
-      ),
+    duplicate: (file) => {
+      const node = file as ProjectedNode;
+      if (can("duplicate", node))
+        targetsFor(node).forEach((target) => props.onDuplicate(target.path));
+    },
+    remove: (file) => {
+      const node = file as ProjectedNode;
+      if (can("delete", node))
+        props.onDelete(
+          targetsFor(node).map((target) => ({ path: target.path, isDir: target.is_dir })),
+        );
+    },
     reveal: props.onReveal,
-    openFile: (node) => props.onOpenFile(node.path, node.name),
+    openFile: (file) => {
+      if (can("open", file as ProjectedNode)) props.onOpenFile(file.path, file.name);
+    },
     openFolderDialog: props.onOpenFolderDialog,
     refresh: props.onRefresh,
-    collapseAll: () => setExpandedPaths(new Set(rootPath ? [rootPath] : [])),
+    collapseAll: () => setExpanded(new Set(multiRoot ? [] : firstRoot ? [firstRoot.id] : [])),
     // Goes through the panel's own request channel, so the explorer stays unaware of how
     // terminals are tracked.
     openTerminal: (directory) => requestTerminal({ name: "new", cwd: directory }),
   };
 
   // --- Keyboard ------------------------------------------------------------
-  // One handler for the whole tree; the focused row is identified by `data-path`.
+  // One handler for the whole tree; the focused row is identified by `data-id`.
   // Every handled key stops propagation so the window-level shortcuts (which bind
   // Ctrl+X/C/V/N to editor commands) do not also fire.
   const onTreeKeyDown = (event: React.KeyboardEvent) => {
-    const path = (event.target as HTMLElement).dataset?.path;
-    const node = path ? nodes.get(path) : undefined;
-    if (!path || !node) return;
+    const id = (event.target as HTMLElement).dataset?.id as Id | undefined;
+    const node = id ? nodes.get(id) : undefined;
+    if (!id || !node) return;
+    const row = nodeRows[navIndex.get(id) ?? 0];
 
-    const index = navIndex.get(path) ?? 0;
+    const index = navIndex.get(id) ?? 0;
     const modifier = event.ctrlKey || event.metaKey;
     const letter = event.key.length === 1 ? event.key.toLowerCase() : "";
     const stop = () => {
@@ -508,14 +628,14 @@ export function Sidebar(props: SidebarProps) {
       event.stopPropagation();
     };
     const focusAt = (target: number, extend = false) => {
-      const row = nodeRows[Math.max(0, Math.min(nodeRows.length - 1, target))];
-      if (row) moveFocus(row.path, extend);
+      const next = nodeRows[Math.max(0, Math.min(nodeRows.length - 1, target))];
+      if (next) moveFocus(next.id, extend);
     };
 
     if ((event.shiftKey && event.key === "F10") || event.key === "ContextMenu") {
       stop();
       const bounds = (event.target as HTMLElement).getBoundingClientRect();
-      setContextMenu({ x: bounds.left + 16, y: bounds.bottom, node, isRoot: false });
+      setContextMenu({ x: bounds.left + 16, y: bounds.bottom, node, isRoot: !!row?.isRoot });
       return;
     }
     if (event.shiftKey && event.altKey && letter === "c") {
@@ -539,14 +659,14 @@ export function Sidebar(props: SidebarProps) {
         return focusAt(nodeRows.length - 1, event.shiftKey);
       case "ArrowRight":
         stop();
-        if (node.is_dir && !expandedPaths.has(path)) expand(path);
+        if (node.is_dir && !expanded.has(id)) expand(id);
         else if (node.is_dir) focusAt(index + 1);
         return;
       case "ArrowLeft": {
         stop();
-        if (node.is_dir && expandedPaths.has(path)) return toggleExpand(path);
-        const parent = parentOf(path);
-        if (navIndex.has(parent)) moveFocus(parent);
+        if (node.is_dir && expanded.has(id)) return toggleExpand(id);
+        const parent = provider.getNode(id)?.parentId;
+        if (parent && navIndex.has(parent)) moveFocus(parent);
         return;
       }
       case "Enter":
@@ -556,7 +676,7 @@ export function Sidebar(props: SidebarProps) {
         stop();
         return setSelection((previous) => {
           const next = new Set(previous);
-          if (!next.delete(path)) next.add(path);
+          if (!next.delete(id)) next.add(id);
           return next;
         });
       case "F2":
@@ -582,13 +702,13 @@ export function Sidebar(props: SidebarProps) {
       return;
     }
 
-    // Type-to-find, wrapping around from the focused row.
+    // Type-to-find, wrapping around from the focused row, over the rows that are shown.
     if (letter && !event.altKey) {
       const order = [...nodeRows.slice(index + 1), ...nodeRows.slice(0, index + 1)];
-      const hit = order.find((row) => row.node.name.toLowerCase().startsWith(letter));
+      const hit = order.find((candidate) => candidate.node.name.toLowerCase().startsWith(letter));
       if (hit) {
         stop();
-        moveFocus(hit.path);
+        moveFocus(hit.id);
       }
     }
   };
@@ -598,47 +718,54 @@ export function Sidebar(props: SidebarProps) {
   // bodies current without invalidating it.
   const latest = useRef<RowApi>(null!);
   latest.current = {
-    click: (event, node) => {
-      const path = cleanPath(node.path);
-      pendingFocus.current = path;
-      setFocused(path);
-      if (event.shiftKey && anchor && selectRange(anchor, path)) return;
+    click: (event, file) => {
+      const node = file as ProjectedNode;
+      pendingFocus.current = node.id;
+      setFocused(node.id);
+      if (event.shiftKey && anchor && selectRange(anchor, node.id)) return;
       if (event.ctrlKey || event.metaKey) {
         setSelection((previous) => {
           const next = new Set(previous);
-          if (!next.delete(path)) next.add(path);
+          if (!next.delete(node.id)) next.add(node.id);
           return next;
         });
-        setAnchor(path);
+        setAnchor(node.id);
         return;
       }
-      setSelection(new Set([path]));
-      setAnchor(path);
+      setSelection(new Set([node.id]));
+      setAnchor(node.id);
       openNode(node);
     },
-    toggle: (node) => toggleExpand(cleanPath(node.path)),
-    menu: (x, y, node) => {
-      const path = cleanPath(node.path);
-      if (!selection.has(path)) {
-        setSelection(new Set([path]));
-        setAnchor(path);
-        setFocused(path);
+    toggle: (file) => toggleExpand((file as ProjectedNode).id),
+    menu: (x, y, file) => {
+      const node = file as ProjectedNode;
+      if (!selection.has(node.id)) {
+        setSelection(new Set([node.id]));
+        setAnchor(node.id);
+        setFocused(node.id);
       }
-      setContextMenu({ x, y, node, isRoot: false });
+      const row = nodeRows[navIndex.get(node.id) ?? -1];
+      setContextMenu({ x, y, node, isRoot: !!row?.isRoot });
     },
-    dragStart: (event, node) => {
+    dragStart: (event, file) => {
       event.stopPropagation();
+      const node = file as ProjectedNode;
+      // Only what can be moved is dragged at all.
+      if (!can("move", node)) {
+        event.preventDefault();
+        return;
+      }
       const sources = targetsFor(node);
       setDragged(sources);
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", sources.map((source) => source.path).join("\n"));
     },
-    dragOver,
+    dragOver: (event, file) => dragOver(event, file as ProjectedNode),
     dragLeave: (event) => {
       event.stopPropagation();
       setDropTarget(null);
     },
-    drop,
+    drop: (event, file) => drop(event, file as ProjectedNode),
     dragEnd: () => {
       setDragged([]);
       setDropTarget(null);
@@ -648,7 +775,10 @@ export function Sidebar(props: SidebarProps) {
       setInlineError(validateEntryName(value.trim()) ?? "");
     },
     renameSubmit: () => (inlineError ? cancelEdit() : submitRename()),
-    renameCancel: cancelEdit,
+    renameCancel: () => {
+      if (renaming) pendingFocus.current = renaming.id;
+      cancelEdit();
+    },
   };
   const api = useMemo<RowApi>(
     () => ({
@@ -670,8 +800,27 @@ export function Sidebar(props: SidebarProps) {
   const openRootMenu = (event: React.MouseEvent) => {
     event.preventDefault();
     event.stopPropagation();
-    setContextMenu({ x: event.clientX, y: event.clientY, node: fileTree, isRoot: true });
+    setContextMenu({ x: event.clientX, y: event.clientY, node: firstRoot, isRoot: true });
   };
+
+  // Ids computed once per render, not once per row.
+  const activeId = useMemo(() => {
+    const path = cleanPath(props.activeFile);
+    try {
+      return path ? provider.idFor(path) : null;
+    } catch {
+      // Not a path (an untitled document): nothing in the tree is active.
+      return null;
+    }
+  }, [props.activeFile, provider]);
+  const cutIds = useMemo(
+    () =>
+      new Set(
+        clipboard?.op === "cut" ? clipboard.nodes.map((node) => (node as ProjectedNode).id) : [],
+      ),
+    [clipboard],
+  );
+  const draggedIds = useMemo(() => new Set(dragged.map((node) => node.id)), [dragged]);
 
   if (activeTab !== "explorer") {
     return (
@@ -685,12 +834,13 @@ export function Sidebar(props: SidebarProps) {
     );
   }
 
-  const rootName = fileTree?.name || rootPath.split("/").pop() || "WORKSPACE";
-  const activePath = cleanPath(props.activeFile);
-  const cutPaths = clipboard?.op === "cut" ? clipboard.nodes.map((n) => cleanPath(n.path)) : [];
-  const draggedPaths = dragged.map((node) => cleanPath(node.path));
+  const headerRoot = multiRoot ? rootOf(focused) : firstRoot;
+  const rootName = multiRoot
+    ? "Workspace"
+    : firstRoot?.name || rootPath.split("/").pop() || "WORKSPACE";
   // Exactly one row is tabbable, so Tab enters and leaves the tree in one step.
-  const tabbable = focused !== null && navIndex.has(focused) ? focused : nodeRows[0]?.path;
+  const tabbable = focused !== null && navIndex.has(focused) ? focused : nodeRows[0]?.id;
+  const rootDropId = firstRoot && !multiRoot ? firstRoot.id : null;
 
   const headerButton = (title: string, onClick: () => void, icon: React.ReactNode) => (
     <button
@@ -722,30 +872,38 @@ export function Sidebar(props: SidebarProps) {
         </button>
       </div>
 
-      {fileTree && (
+      {firstRoot && (
         <div
           onContextMenu={openRootMenu}
-          onClick={() => toggleExpand(rootPath)}
+          onClick={() => !multiRoot && toggleExpand(firstRoot.id)}
           onDragOver={(event) => dragOver(event, null)}
           onDragLeave={api.dragLeave}
           onDrop={(event) => drop(event, null)}
           className={`flex h-7 items-center justify-between px-2 border-b transition-colors cursor-pointer text-[11.5px] font-semibold ${
-            dropTarget === rootPath
+            rootDropId && dropTarget === rootDropId
               ? "bg-indigo-900/40 border-indigo-500 text-white"
               : "bg-[#050505] border-[#121212] text-zinc-200 hover:bg-[#0a0a0a]"
           }`}
         >
           <div className="flex items-center gap-1.5 min-w-0">
-            <ChevronIcon isExpanded={rootExpanded} />
+            {!multiRoot && <ChevronIcon isExpanded={rootExpanded} />}
             <span className="truncate text-white">{rootName}</span>
           </div>
           <div className="flex items-center gap-1">
-            {headerButton("New File", () => startCreate(rootPath, "file"), <PlusIcon size={13} />)}
-            {headerButton(
-              "New Folder",
-              () => startCreate(rootPath, "folder"),
-              <FolderPlusIcon size={13} />,
-            )}
+            {headerRoot &&
+              allowed(capabilities, [headerRoot.id], "newFile") &&
+              headerButton(
+                "New File",
+                () => startCreate(headerRoot.path, "file"),
+                <PlusIcon size={13} />,
+              )}
+            {headerRoot &&
+              allowed(capabilities, [headerRoot.id], "newFolder") &&
+              headerButton(
+                "New Folder",
+                () => startCreate(headerRoot.path, "folder"),
+                <FolderPlusIcon size={13} />,
+              )}
             {headerButton("Refresh Explorer", props.onRefresh, <RefreshIcon size={13} />)}
             {headerButton(
               "Collapse Folders in Explorer",
@@ -756,9 +914,38 @@ export function Sidebar(props: SidebarProps) {
         </div>
       )}
 
+      {!firstRoot && (
+        // No folder: what VS Code shows -- a collapsible section saying so, and the way to
+        // open one. Outside the tree, which only ever holds the tree's own rows.
+        <section aria-label="No Folder Opened" className="shrink-0 border-b border-[#101010]">
+          <button
+            onClick={() => setNoFolderOpen((open) => !open)}
+            aria-expanded={noFolderOpen}
+            className="flex h-6 w-full items-center gap-1 px-1.5 text-left text-[11px] font-semibold text-zinc-200 hover:bg-[#0a0a0a]"
+          >
+            <ChevronIcon isExpanded={noFolderOpen} />
+            No Folder Opened
+          </button>
+          {noFolderOpen && (
+            <div className="flex flex-col gap-3 px-4 pt-1.5 pb-4">
+              <p className="text-[12.5px] text-zinc-300">You have not yet opened a folder.</p>
+              <button
+                onClick={props.onOpenFolderDialog}
+                className="w-full rounded-sm bg-[#0e639c] py-1.5 text-[12.5px] text-white hover:bg-[#1177bb] focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-2 focus-visible:outline-[#1177bb]"
+              >
+                Open Folder
+              </button>
+            </div>
+          )}
+        </section>
+      )}
+
       <div
         ref={viewportRef}
         role="tree"
+        // Kept mounted with no folder open -- the windowing measures it from its first render
+        // -- but not shown: there is no tree.
+        hidden={!firstRoot}
         aria-label="Files"
         aria-multiselectable="true"
         onKeyDown={onTreeKeyDown}
@@ -767,10 +954,12 @@ export function Sidebar(props: SidebarProps) {
         onDragLeave={api.dragLeave}
         onDrop={(event) => drop(event, null)}
         className={`flex-1 overflow-y-auto py-1 min-h-0 transition-colors ${
-          dropTarget === rootPath ? "ring-2 ring-indigo-500/50 bg-indigo-950/20" : ""
+          rootDropId && dropTarget === rootDropId
+            ? "ring-2 ring-indigo-500/50 bg-indigo-950/20"
+            : ""
         }`}
       >
-        {fileTree ? (
+        {firstRoot ? (
           <div style={{ height: rows.length * ROW_HEIGHT }}>
             <div style={{ transform: `translateY(${first * ROW_HEIGHT}px)` }}>
               {rows.slice(first, last).map((row) =>
@@ -795,67 +984,39 @@ export function Sidebar(props: SidebarProps) {
                   <StatusRow
                     key={row.key}
                     depth={row.depth}
-                    error={nodes.get(row.path)?.loadError}
-                    onRetry={() => void onLoadDirectory(row.path).catch(() => undefined)}
+                    error={row.error}
+                    // Retried by the provider: listed if never listed, re-listed if a refresh
+                    // failed. The row changes when the provider's state does.
+                    onRetry={() => void provider.retry(row.id)}
                   />
                 ) : (
                   <TreeRow
                     key={row.key}
+                    id={row.id}
                     node={row.node}
                     path={row.path}
                     depth={row.depth}
+                    isRoot={row.isRoot}
                     expanded={row.expanded}
-                    selected={selection.has(row.path)}
-                    active={activePath === row.path}
-                    cut={cutPaths.includes(row.path)}
-                    dragging={draggedPaths.includes(row.path)}
-                    dropTarget={dropTarget === row.path}
-                    status={decorations.files.get(row.path)}
+                    selected={selection.has(row.id)}
+                    active={activeId === row.id}
+                    cut={cutIds.has(row.id)}
+                    dragging={draggedIds.has(row.id)}
+                    dropTarget={dropTarget === row.id}
+                    // Git's own state, looked up by the resource's path: the Git store owns it.
+                    status={row.isRoot ? undefined : decorations.files.get(row.path)}
                     folderDirty={
                       row.node.is_dir && !row.expanded && decorations.folders.has(row.path)
                     }
-                    renameValue={renaming?.path === row.path ? renaming.value : undefined}
-                    tabIndex={tabbable === row.path ? 0 : -1}
+                    renameValue={renaming?.id === row.id ? renaming.value : undefined}
+                    tabIndex={tabbable === row.id ? 0 : -1}
                     api={api}
                   />
                 ),
               )}
             </div>
           </div>
-        ) : (
-          <div className="flex flex-col items-center p-6 text-center text-zinc-500 gap-3">
-            <FolderClosedIcon className="size-10" />
-            <p className="text-xs">No workspace opened</p>
-            <button
-              onClick={props.onOpenFolderDialog}
-              className="rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-indigo-500 transition-colors"
-            >
-              Open Folder
-            </button>
-            {/* The folders opened before, here as well as on the welcome page: this is where
-                someone looks when the explorer is the empty thing in front of them. */}
-            {!!props.recentFolders?.length && props.onOpenRecentFolder && (
-              <nav aria-label="Recent folders" className="w-full text-left">
-                <h3 className="mb-1 px-1 text-[10px] font-semibold tracking-wider text-zinc-600 uppercase">
-                  Recent
-                </h3>
-                {props.recentFolders.slice(0, 5).map((folder) => (
-                  <button
-                    key={folder}
-                    onClick={() => props.onOpenRecentFolder?.(folder)}
-                    title={folder}
-                    className="block w-full truncate rounded px-1.5 py-1 text-left text-[11.5px] text-zinc-400 hover:bg-[#121212] hover:text-zinc-100"
-                  >
-                    {folderName(folder)}
-                    <span className="ml-1.5 font-mono text-[9.5px] text-zinc-600">
-                      {parentPath(folder)}
-                    </span>
-                  </button>
-                ))}
-              </nav>
-            )}
-          </div>
-        )}
+        ) : null}
       </div>
 
       {inlineError && (
@@ -876,9 +1037,10 @@ export function Sidebar(props: SidebarProps) {
           items={buildExplorerMenu({
             node: contextMenu.node,
             isRoot: contextMenu.isRoot,
-            workspacePath: rootPath || workspacePath,
+            workspacePath: contextMenu.node?.path ?? rootPath,
             clipboard,
             count: contextMenu.node ? targetsFor(contextMenu.node).length : 1,
+            can: (action) => can(action, contextMenu.node),
             actions: menuActions,
           })}
         />

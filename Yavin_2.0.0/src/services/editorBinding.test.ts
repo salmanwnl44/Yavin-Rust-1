@@ -243,3 +243,15 @@ test("a proposal is shown and edited through the same binding, and never saved",
   assert.equal(store.get("/w/a.ts"), "base");
   binding.stop();
 });
+
+test("an editor following its document to a new key takes focus only if it had it", () => {
+  const views = createEditorViews();
+  assert.equal(views.takeFocus("/w/a.ts"), true, "opening a document focuses its editor");
+  views.setFocused("/w/a.ts", false); // the Explorer took focus, then renamed the file
+  views.rename("/w/a.ts", "/w/b.ts");
+  assert.equal(views.takeFocus("/w/b.ts"), false, "the rename leaves focus where it was");
+  assert.equal(views.takeFocus("/w/b.ts"), true, "switching to it later focuses it again");
+  views.setFocused("/w/b.ts", true); // typing in it, then Save As
+  views.rename("/w/b.ts", "/w/c.ts");
+  assert.equal(views.takeFocus("/w/c.ts"), true, "Save As from the editor keeps the editor");
+});

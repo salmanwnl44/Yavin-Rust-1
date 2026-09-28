@@ -130,9 +130,15 @@ export interface ExplorerIO {
 
 /** The FileNode the existing tree view renders, plus what the provider knows of a folder. */
 export type ProjectedNode = FileNode & {
-  /** The node's identity (its ResourceId). */
-  id?: string;
-  /** Set on a folder whose listing failed and which has no children to show. */
+  /** The node's identity: its resource's `ResourceId`. Changes when the resource does. */
+  id: ExplorerNodeId;
+  /**
+   * The node's identity as a view element: given when the provider first learns of the node
+   * and kept through renames and moves, which change `id`. What a view keys its rows by, so a
+   * renamed row is the same element -- focus and all.
+   */
+  key: string;
+  /** The folder's last listing failed: why. With no children, it was never listed. */
   loadError?: string;
   children?: ProjectedNode[] | null;
 };
@@ -141,6 +147,8 @@ export type ProjectedNode = FileNode & {
 
 interface Entry {
   node: ExplorerResourceNode;
+  /** The view key (`ProjectedNode.key`): kept when a move re-keys the node's id. */
+  key: string;
   /** Child ids in listing order; null until the folder has been listed. */
   children: ExplorerNodeId[] | null;
   /** The last listing's error: the whole state if never listed, beside the children if it was. */
@@ -187,7 +195,10 @@ export function createFileSystemExplorerProvider(io: ExplorerIO) {
   let revision = 0;
   let counter = 0;
   let generation = 0;
+  /** Hands out view keys. */
+  let keys = 0;
   const projections = new Map<ExplorerNodeId, { version: number; node: ProjectedNode }>();
+  let lastRoots: ProjectedNode[] = [];
 
   const emit = (event: ExplorerProviderEvent) => {
     revision++;
@@ -280,6 +291,7 @@ export function createFileSystemExplorerProvider(io: ExplorerIO) {
           loading: 0,
           interest: [],
           version: ++counter,
+          key: `n${++keys}`,
         });
         membership = true;
         emit({ type: "created", node: fresh });
@@ -296,6 +308,7 @@ export function createFileSystemExplorerProvider(io: ExplorerIO) {
           loading: 0,
           interest: [],
           version: ++counter,
+          key: `n${++keys}`,
         });
         membership = true;
         emit({ type: "created", node: fresh });
@@ -487,9 +500,12 @@ export function createFileSystemExplorerProvider(io: ExplorerIO) {
       )
         children = previous;
     }
-    const loadError = entry.children === null && entry.error ? entry.error : undefined;
+    // Shown whether the folder was never listed (in place of its children) or a refresh of
+    // it failed (above the children it had): an error is never an empty folder, nor hidden.
+    const loadError = entry.error ?? undefined;
     const projected: ProjectedNode = {
       id: node.id,
+      key: entry.key,
       name: node.name,
       path: node.path,
       is_dir: node.kind !== "file",
@@ -501,6 +517,8 @@ export function createFileSystemExplorerProvider(io: ExplorerIO) {
     };
     const same =
       cached &&
+      cached.node.key === projected.key &&
+      cached.node.id === projected.id &&
       cached.node.children === projected.children &&
       cached.node.name === projected.name &&
       cached.node.path === projected.path &&
@@ -605,6 +623,7 @@ export function createFileSystemExplorerProvider(io: ExplorerIO) {
             loading: 0,
             interest: [],
             version: ++counter,
+            key: `n${++keys}`,
           });
         }
       }
@@ -642,6 +661,24 @@ export function createFileSystemExplorerProvider(io: ExplorerIO) {
      * Re-lists loaded folders and reconciles them: everything loaded (no argument), or the
      * given folders and every loaded folder inside them. Resolves to the listing errors.
      */
+    /**
+     * Tries a failed folder again: lists it if it was never listed, re-lists it if a refresh
+     * of it failed. What a view's Retry does. Resolves to the error, if it failed again.
+     */
+    async retry(id: ExplorerNodeId): Promise<string | null> {
+      const entry = entries.get(id);
+      if (!entry || !isContainer(entry)) return null;
+      if (entry.children === null) {
+        try {
+          await provider.loadChildren(id);
+          return null;
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error);
+        }
+      }
+      const errors = await relist([id]);
+      return errors[0] ?? null;
+    },
     refresh(ids?: readonly ExplorerNodeId[]): Promise<string[]> {
       if (!ids) return relist(loadedContainers().map((entry) => entry.node.id));
       const scopes = ids.map((id) => entries.get(id)?.node.path).filter((path) => !!path);
@@ -730,6 +767,53 @@ export function createFileSystemExplorerProvider(io: ExplorerIO) {
       const entry = id ? entries.get(id) : undefined;
       if (!entry || entry.children === null) return null;
       return project(id);
+    },
+    /**
+     * Every root as the view renders it -- listed or not yet, a failed one with its error --
+     * from the same cache as `projection`. The array is the same object while nothing in any
+     * root changed.
+     */
+    projections(): ProjectedNode[] {
+      const next: ProjectedNode[] = [];
+      for (const id of roots) {
+        const projected = project(id);
+        if (projected) next.push(projected);
+      }
+      if (
+        lastRoots.length === next.length &&
+        lastRoots.every((root, index) => root === next[index])
+      )
+        return lastRoots;
+      lastRoots = next;
+      return next;
+    },
+    /**
+     * Where `path` sits: the root it is under and the folders between that root and it,
+     * outermost first -- what has to be expanded (and listed) to show it. Null when it is under
+     * no root. Worked out from the path, so it needs nothing to be loaded.
+     */
+    ancestorsOf(path: string): { root: ExplorerNodeId; folders: string[] } | null {
+      const target = unprefixed(path);
+      let best: { id: ExplorerNodeId; path: string; rel: string } | null = null;
+      for (const id of roots) {
+        const root = entries.get(id)?.node.path;
+        if (!root) continue;
+        const rel = relativePath(root, target);
+        // The innermost root wins, for roots nested inside one another.
+        if (rel !== undefined && (!best || root.length > best.path.length))
+          best = { id, path: root, rel };
+      }
+      if (!best) return null;
+      const folders: string[] = [];
+      if (best.rel !== ".") {
+        const parts = best.rel.split("/");
+        let at = best.path.replace(/\/+$/, "");
+        for (const part of parts.slice(0, -1)) {
+          at = `${at}/${part}`;
+          folders.push(at);
+        }
+      }
+      return { root: best.id, folders };
     },
   };
 

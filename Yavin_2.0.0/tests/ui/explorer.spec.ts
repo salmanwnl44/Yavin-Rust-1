@@ -196,7 +196,7 @@ test("Git badges cover modified, renamed and conflicted files", async ({ page })
 
 test("without a workspace the Explorer offers to open a folder", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByText("No workspace opened")).toBeVisible();
+  await expect(page.getByText("You have not yet opened a folder.")).toBeVisible();
   await expect(page.getByTitle("New Folder", { exact: true })).toHaveCount(0);
 });
 

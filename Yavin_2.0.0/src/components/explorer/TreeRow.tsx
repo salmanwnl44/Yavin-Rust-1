@@ -84,9 +84,11 @@ const INPUT_CLASS =
   "h-5 flex-1 rounded bg-[#161616] border border-indigo-500 px-1 text-[11.5px] text-white outline-none";
 
 export const TreeRow = React.memo(function TreeRow({
+  id,
   node,
   path,
   depth,
+  isRoot = false,
   expanded,
   selected,
   active,
@@ -99,10 +101,14 @@ export const TreeRow = React.memo(function TreeRow({
   tabIndex,
   api,
 }: {
+  /** The node's identity; the `data-id` the tree's keyboard handler and focus read. */
+  id: string;
   node: FileNode;
-  /** Cleaned path; also the `data-path` the container's keyboard handler reads. */
+  /** Cleaned path, for display concerns only -- never the row's identity. */
   path: string;
   depth: number;
+  /** A workspace root, shown as a row when there are several. */
+  isRoot?: boolean;
   expanded: boolean;
   /** Part of the current Explorer selection. */
   selected: boolean;
@@ -126,12 +132,14 @@ export const TreeRow = React.memo(function TreeRow({
   return (
     <div
       role="treeitem"
+      data-id={id}
       data-path={path}
       tabIndex={tabIndex}
       aria-label={node.name}
+      aria-level={depth + 1}
       aria-selected={selected}
       aria-expanded={node.is_dir ? expanded : undefined}
-      draggable={renameValue === undefined}
+      draggable={renameValue === undefined && !isRoot}
       onDragStart={(event) => api.dragStart(event, node)}
       onDragOver={(event) => api.dragOver(event, node)}
       onDragLeave={api.dragLeave}
@@ -170,7 +178,11 @@ export const TreeRow = React.memo(function TreeRow({
       <FileIcon name={node.name} isDir={node.is_dir} isExpanded={expanded} />
 
       {renameValue === undefined ? (
-        <span className={`truncate text-[12px] leading-tight ${style?.text ?? "text-zinc-300"}`}>
+        <span
+          className={`truncate text-[12px] leading-tight ${style?.text ?? "text-zinc-300"} ${
+            isRoot ? "font-semibold uppercase tracking-wide text-[11px]" : ""
+          }`}
+        >
           {node.name}
         </span>
       ) : (
@@ -253,7 +265,10 @@ export function CreateRow({
   );
 }
 
-/** Placeholder under an expanded folder whose children have not arrived yet. */
+/**
+ * Under an expanded folder: its listing is on its way, or failed -- with why, and Retry.
+ * Never shown as an empty folder.
+ */
 export function StatusRow({
   depth,
   error,
@@ -271,7 +286,7 @@ export function StatusRow({
       {error ? (
         <>
           <span role="alert" className="truncate text-red-400" title={error}>
-            {error}
+            ⚠ {error}
           </span>
           <button className="shrink-0 underline" onClick={onRetry}>
             Retry

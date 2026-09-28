@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createFileSystemExplorerProvider } from "./explorerProvider.ts";
-import type { ExplorerProviderEvent } from "./explorerProvider.ts";
+import type { ExplorerProviderEvent, ProjectedNode } from "./explorerProvider.ts";
 import { createExplorerStore } from "./explorerStore.ts";
 import type { FileNode } from "../types.ts";
 
@@ -276,9 +276,9 @@ test("a rename keeps the node's loaded subtree and hands its state to the new id
   await provider.loadChildren(id("/w"));
   await provider.loadChildren(id("/w/src"));
   await provider.loadChildren(id("/w/src/deep"));
-  store.setter("expanded")(new Set(["/w", "/w/src", "/w/src/deep"]));
-  store.setter("selection")(new Set(["/w/src/deep/x.ts"]));
-  store.valueSetter("focused")("/w/src/deep/x.ts");
+  store.setExpanded(new Set(["/w", "/w/src", "/w/src/deep"].map((path) => provider.idFor(path))));
+  store.setSelection(new Set(["/w/src/deep/x.ts"].map((path) => provider.idFor(path))));
+  store.setFocused(provider.idFor("/w/src/deep/x.ts"));
   events.length = 0;
   fs.listed.length = 0;
 
@@ -290,7 +290,8 @@ test("a rename keeps the node's loaded subtree and hands its state to the new id
   assert.equal(provider.getNode(id("/w/src")), undefined);
   assert.deepEqual([...store.paths("expanded")].sort(), ["/w", "/w/lib", "/w/lib/deep"]);
   assert.deepEqual([...store.paths("selection")], ["/w/lib/deep/x.ts"]);
-  assert.equal(store.value("focused"), "/w/lib/deep/x.ts");
+  assert.equal(store.focusedPath(), "/w/lib/deep/x.ts");
+  assert.equal(store.focused(), provider.idFor("/w/lib/deep/x.ts"));
   assert.ok(store.has("selection", provider.idFor("/w/lib/deep/x.ts")));
   assert.deepEqual(fs.listed, ["/w"], "confirmed by one listing of the parent");
   assert.ok(
@@ -304,7 +305,7 @@ test("a move to another loaded folder, and a move to one that is not loaded", as
   const store = createExplorerStore(provider);
   store.attach();
   for (const path of ["/w", "/w/a", "/w/b"]) await provider.loadChildren(id(path));
-  store.setter("selection")(new Set(["/w/a/f.ts"]));
+  store.setSelection(new Set(["/w/a/f.ts"].map((path) => provider.idFor(path))));
   fs.rename("/w/a/f.ts", "/w/b/f.ts");
   await provider.applyResourceChanges([{ kind: "renamed", from: "/w/a/f.ts", path: "/w/b/f.ts" }]);
   assert.deepEqual(names("/w/a"), []);
@@ -324,8 +325,8 @@ test("a deleted folder takes its UI state with it", async () => {
   store.attach();
   await provider.loadChildren(id("/w"));
   await provider.loadChildren(id("/w/src"));
-  store.setter("expanded")(new Set(["/w", "/w/src"]));
-  store.setter("selection")(new Set(["/w/src/a.ts", "/w/b.ts"]));
+  store.setExpanded(new Set(["/w", "/w/src"].map((path) => provider.idFor(path))));
+  store.setSelection(new Set(["/w/src/a.ts", "/w/b.ts"].map((path) => provider.idFor(path))));
   fs.remove("/w/src");
   await provider.applyResourceChanges([{ kind: "deleted", path: "/w/src" }]);
   assert.equal(provider.getNode(id("/w/src/a.ts")), undefined);
@@ -554,3 +555,159 @@ for (const total of [10_000, 100_000, 500_000]) {
     assert.ok(change < 250, `${change} ms`);
   });
 }
+
+// ---------------------------------------------------------------------------------------
+// Module 08: view keys, several roots, reveal, retry
+// ---------------------------------------------------------------------------------------
+
+test("a node's view key survives renames, moves and refreshes; its id follows the resource", async () => {
+  const { fs, provider, id } = setup(["/w/src/a.ts", "/w/lib/"]);
+  for (const path of ["/w", "/w/src", "/w/lib"]) await provider.loadChildren(id(path));
+  const key = (path: string) => {
+    const top = provider.projections()[0].children as ProjectedNode[];
+    const all = top.flatMap((child) => [child, ...((child.children ?? []) as ProjectedNode[])]);
+    return all.find((node) => node.path === path)?.key;
+  };
+  const before = key("/w/src/a.ts");
+  assert.ok(before);
+  await provider.refresh();
+  assert.equal(key("/w/src/a.ts"), before, "a refresh does not re-key");
+  fs.rename("/w/src/a.ts", "/w/lib/b.ts");
+  await provider.applyResourceChanges([
+    { kind: "renamed", from: "/w/src/a.ts", path: "/w/lib/b.ts" },
+  ]);
+  assert.equal(key("/w/lib/b.ts"), before, "the same view element, moved and renamed");
+  assert.equal(provider.getNode(id("/w/lib/b.ts"))?.id, id("/w/lib/b.ts"), "a new resource id");
+});
+
+test("every root is projected, loaded or not, and the array is kept while nothing changes", async () => {
+  const { fs, provider, id } = setup(["/a/x.ts", "/b/y.ts"], ["/a", "/b"]);
+  await provider.loadChildren(id("/a"));
+  const first = provider.projections();
+  assert.deepEqual(
+    first.map((root) => [root.path, root.children === null]),
+    [
+      ["/a", false],
+      ["/b", true],
+    ],
+  );
+  assert.equal(provider.projections(), first, "the same array");
+  fs.failures.set("/b", "offline");
+  await assert.rejects(provider.loadChildren(id("/b")));
+  assert.equal(provider.projections()[1].loadError, "offline", "a root can fail on its own");
+  assert.equal(provider.projections()[0], first[0], "and the other root is untouched");
+});
+
+test("ancestors are worked out from the path, under the innermost root", () => {
+  const { provider, id } = setup([], ["/w", "/w/nested", "/v"]);
+  assert.deepEqual(provider.ancestorsOf("/w/src/deep/a.ts"), {
+    root: id("/w"),
+    folders: ["/w/src", "/w/src/deep"],
+  });
+  assert.deepEqual(provider.ancestorsOf("/w/nested/x/y.ts"), {
+    root: id("/w/nested"),
+    folders: ["/w/nested/x"],
+  });
+  assert.deepEqual(provider.ancestorsOf("/w/top.ts"), { root: id("/w"), folders: [] });
+  assert.equal(provider.ancestorsOf("/elsewhere/a.ts"), null);
+});
+
+test("retry lists a never-listed folder, or re-lists one whose refresh failed", async () => {
+  const { fs, provider, id, names } = setup(["/w/src/a.ts"]);
+  await provider.loadChildren(id("/w"));
+  fs.failures.set("/w/src", "denied");
+  await assert.rejects(provider.loadChildren(id("/w/src")));
+  assert.equal(await provider.retry(id("/w/src")), "denied", "still failing, and says why");
+  fs.failures.delete("/w/src");
+  assert.equal(await provider.retry(id("/w/src")), null);
+  assert.deepEqual(names("/w/src"), ["a.ts"]);
+  fs.failures.set("/w/src", "gone quiet");
+  await provider.refresh([id("/w/src")]);
+  assert.equal(
+    provider.projections()[0].children![0].loadError,
+    "gone quiet",
+    "shown on a loaded folder",
+  );
+  fs.failures.delete("/w/src");
+  assert.equal(await provider.retry(id("/w/src")), null);
+  assert.equal(provider.projections()[0].children![0].loadError, undefined);
+});
+
+test("reveal expands and lists the folders above a file, then selects and focuses it", async () => {
+  const { fs, provider, id } = setup(["/w/src/deep/x.ts", "/w/other.ts"]);
+  const store = createExplorerStore(provider);
+  store.attach();
+  await provider.loadChildren(id("/w"));
+  fs.listed.length = 0;
+  assert.equal(await store.reveal("/w/src/deep/x.ts"), true);
+  assert.deepEqual(fs.listed, ["/w/src", "/w/src/deep"], "the unloaded folders, outermost first");
+  for (const path of ["/w", "/w/src", "/w/src/deep"])
+    assert.ok(store.has("expanded", id(path)), path);
+  assert.deepEqual([...store.ids("selection")], [id("/w/src/deep/x.ts")]);
+  assert.equal(store.focused(), id("/w/src/deep/x.ts"));
+  assert.equal(store.anchor(), id("/w/src/deep/x.ts"));
+  assert.equal(await store.reveal("/elsewhere/a.ts"), false, "outside every root");
+  assert.equal(await store.reveal("/w/src/missing.ts"), false, "not there");
+});
+
+test("reveal works across roots, and after a rename", async () => {
+  const { fs, provider, id } = setup(["/a/x.ts", "/b/lib/y.ts"], ["/a", "/b"]);
+  const store = createExplorerStore(provider);
+  store.attach();
+  assert.equal(await store.reveal("/b/lib/y.ts"), true);
+  assert.equal(store.focused(), id("/b/lib/y.ts"));
+  fs.rename("/b/lib/y.ts", "/b/lib/z.ts");
+  await provider.applyResourceChanges([
+    { kind: "renamed", from: "/b/lib/y.ts", path: "/b/lib/z.ts" },
+  ]);
+  assert.equal(store.focused(), id("/b/lib/z.ts"), "focus followed the rename");
+  assert.equal(await store.reveal("/b/lib/z.ts"), true);
+  assert.deepEqual([...store.ids("selection")], [id("/b/lib/z.ts")]);
+});
+
+test("a newer reveal supersedes one still listing", async () => {
+  const { fs, provider, id } = setup(["/w/slow/a.ts", "/w/fast/b.ts"]);
+  const store = createExplorerStore(provider);
+  store.attach();
+  await provider.loadChildren(id("/w"));
+  const release = fs.hold("/w/slow");
+  const older = store.reveal("/w/slow/a.ts");
+  await flush();
+  assert.equal(await store.reveal("/w/fast/b.ts"), true);
+  release();
+  assert.equal(await older, false);
+  assert.deepEqual(
+    [...store.ids("selection")],
+    [id("/w/fast/b.ts")],
+    "the older one changed nothing",
+  );
+});
+
+test("the store is seeded from the session and keeps entries it cannot resolve yet", () => {
+  const { provider, id } = setup(["/w/src/a.ts"]);
+  const store = createExplorerStore(provider, {
+    expanded: ["/w", "/w/src"],
+    selection: ["/w/src/a.ts"],
+    focused: "/w/src/a.ts",
+  });
+  assert.ok(store.has("expanded", id("/w/src")), "known before /w is even listed");
+  assert.deepEqual([...store.paths("selection")], ["/w/src/a.ts"]);
+  assert.equal(store.focused(), id("/w/src/a.ts"));
+  store.setExpanded((previous) => new Set([...previous].filter((one) => one !== id("/w/src"))));
+  assert.deepEqual([...store.paths("expanded")], ["/w"]);
+});
+
+test("moving the selection does not hand out a new expanded set -- the tree is not re-flattened", async () => {
+  const { provider, id } = setup(["/w/a.ts", "/w/b.ts"]);
+  const store = createExplorerStore(provider, { expanded: ["/w"] });
+  store.attach();
+  await provider.loadChildren(id("/w"));
+  const expanded = store.ids("expanded");
+  store.setSelection(new Set([id("/w/a.ts")]));
+  store.setFocused(id("/w/a.ts"));
+  store.setAnchor(id("/w/a.ts"));
+  store.setSelection(new Set([id("/w/b.ts")]));
+  assert.equal(store.ids("expanded"), expanded, "the same object");
+  store.setExpanded((previous) => new Set([...previous, id("/w/a.ts")]));
+  assert.notEqual(store.ids("expanded"), expanded, "until it really changes");
+});

@@ -21,6 +21,10 @@ export interface WorkspaceSession {
   expanded: string[];
   /** Where the explorer was scrolled, in pixels. */
   scroll: number;
+  /** What the explorer had selected. Missing from sessions written before it was kept. */
+  selected?: string[];
+  /** The explorer entry that had keyboard focus. */
+  focused?: string | null;
 }
 
 export interface Session {
@@ -58,14 +62,17 @@ export function asSession(value: unknown): Session {
       if (typeof state.folder !== "string" || !state.folder) return null;
       const files = strings(state.files);
       const active = typeof state.active === "string" ? state.active : null;
-      return {
+      const result: WorkspaceSession = {
         folder: state.folder,
         files,
         // A tab that is not open cannot be the one in front.
         active: active && files.includes(active) ? active : null,
         expanded: strings(state.expanded),
         scroll: typeof state.scroll === "number" && state.scroll >= 0 ? state.scroll : 0,
-      } satisfies WorkspaceSession;
+        selected: strings(state.selected),
+        focused: typeof state.focused === "string" ? state.focused : null,
+      };
+      return result;
     })
     .filter((state): state is WorkspaceSession => state !== null);
   return { folders, workspaces };

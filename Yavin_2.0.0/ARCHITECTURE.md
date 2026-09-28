@@ -543,6 +543,8 @@ Watcher events never reach the editor directly:
 Filesystem -> resource-changes (Module 02) -> DocumentService.applyResourceChanges -> Document -> editor
 ```
 
+**Focus.** Showing a document (a tab opened or switched to) focuses its editor. A document that only changed key (renamed in the Explorer, or saved under a new name) keeps focus where it was: its editor takes focus back only if it had it (`EditorViews.takeFocus`). The decision is made once per editor, because React runs mount effects twice in development.
+
 **Untitled and proposed documents** use the same editor. Their source only changes what the window says and what saving does: Save opens Save As for an untitled document, and is never available for a proposal.
 
 **Large files.** The limit is the native 10 MB (`MAX_EDITOR_FILE_SIZE`); a save past it is refused. The UI tests type into 1 MB, 5 MB and 9.5 MB files and compare each keystroke with the same keystroke in a plain textarea holding the same text. The editor matches the browser: about 12 ms at 1 MB, 60 ms at 5 MB and 115 ms at 9.5 MB on the development machine. That remaining cost is the browser re-laying out a textarea of that size; only an editor that renders a viewport (a future Monaco or CodeMirror migration) avoids it. Two things were removed from the keystroke path to get there:
@@ -610,7 +612,7 @@ Nothing outside the folder is touched. The projection is cached per node by a ve
 
 **Refresh.** `refresh()` re-lists every loaded folder at once. `refresh(ids)` re-lists those folders and every loaded folder inside them, which covers a workspace, a root or a directory. `refreshAround(paths)` re-lists the nearest loaded folders after one of Yavin's own operations. Each goes through the same reconciliation, so identities and UI state survive. Overlapping refreshes need no queue, because the newest listing of each folder wins.
 
-**Multi-root.** `setRoots(paths)` keeps roots that stay, with everything known under them; forgets roots that go; adds new ones unloaded; and emits `reset`. Roots are separate nodes, never flattened into one hierarchy. The view still shows the first root; showing several is Module 08.
+**Multi-root.** `setRoots(paths)` keeps roots that stay, with everything known under them; forgets roots that go; adds new ones unloaded; and emits `reset`. Roots are separate nodes, never flattened into one hierarchy. With one root, the view shows it as the header above the tree; with several, each is a row of its own (see [Explorer view](#explorer-view)). The native side still opens one folder per window, so nothing in the product adds a second root yet; the view and store are ready for it.
 
 **The store.** It keys state by node id and records the path each entry was recorded under. It follows the provider:
 
@@ -618,7 +620,7 @@ Nothing outside the folder is touched. The projection is cached per node by a ve
 - `deleted` drops the state.
 - `reset` clears selection and focus.
 
-It gives the view the `Set<string>` and setter shapes the view already used.
+Its API is by node id: `ids(set)`, `setExpanded`, `setSelection`, `anchor`/`focused` and their setters, `reveal(path)`. `paths(set)` gives the recorded paths for the session. Each set's `ids` is the same object until that set changes, so moving the selection never re-flattens the tree.
 
 **Performance.** Measured in the provider tests, in folders of 1,000 files:
 
@@ -644,6 +646,97 @@ What is still proportional to the loaded tree:
 5. A failed listing is an error state, never an empty folder.
 6. One change re-lists at most the folders it shows in; it never rebuilds the tree.
 7. The Explorer store holds UI state only, and it follows renames and deletions.
+
+### Explorer view
+
+The Explorer view (`Sidebar`, `TreeRow`, `explorer/menu.tsx`, `explorer/actions.ts`) renders the provider's projection with the store's state. It keeps no filesystem facts and makes no filesystem decisions of its own.
+
+```text
+WorkspaceManager (native: one folder per window)
+      ↓ list_workspace_files, resource-changes
+ExplorerProvider      nodes · ids · view keys · per-folder state · capabilities · roots
+      ↓ projections()             ↓ events
+ExplorerStore         expansion · selection · anchor · focus · reveal   (one per workspace, in App)
+      ↓
+flattening            projection + expanded ids → visible rows, lookup tables, folders to list
+      ↓
+virtualized Sidebar   rows keyed by view key; state by node id; Git decorations by path
+```
+
+**Identity.** A row's state is keyed by the node id (the resource's `ResourceId`). Its React key is the provider's view key, which is given when the provider first learns of the node and kept through renames and moves. A renamed row is therefore the same element: its selection, its expansion and its keyboard focus survive. Rows carry `data-id`; the keyboard handler and focus management read it, never a path.
+
+**Roots.**
+
+- **One root:** the header above the tree is the root and its entries start at depth 0, as before.
+- **Several roots:** each root is a top-level tree row (`aria-level` 1) with its entries below it. Each root expands and collapses on its own. Selection, Shift/Ctrl ranges, arrow keys, Home/End and type-to-find all run across roots.
+- **Header buttons** (New File, New Folder) act on the root holding the focused row.
+- **Drops across roots** are moves like any other.
+- **New roots** are shown expanded the first time they appear.
+
+**Capabilities.** `explorer/actions.ts` maps each action to the provider capability it needs: open, new file, new folder, rename, delete, cut and move, copy and duplicate, paste, refresh. It is the one place those checks live.
+
+- **Context menus** hide what is not supported. For example, a root has no Rename, Delete or Cut.
+- **Keyboard shortcuts** (F2, Delete, Ctrl+X/C/V/D/N), **header buttons** and **drag and drop** check the same mapping: a node that cannot be moved cannot be dragged, and a folder that cannot take entries is no drop target.
+- **Create and paste** check the folder they would put things in.
+
+**Loading and errors.** Under an expanded folder, the view shows the provider's state:
+
+- **Loading…** while its listing is on its way.
+- **⚠ and the error, with Retry**, if it failed. A folder whose first listing failed shows no children. A loaded folder whose refresh failed shows the error above what is still known of it.
+- Retry is `provider.retry(id)`: the folder is listed if it was never listed, and re-listed otherwise.
+- The view starts listings for expanded, unloaded folders and aborts them when the folder is collapsed; the provider's per-caller cancellation and generations decide what is applied. There is no second loading mechanism.
+
+**Reveal.** `explorerStore.reveal(path)`:
+
+1. finds the path's root and the folders above it (`provider.ancestorsOf`, from the path alone)
+2. expands them
+3. has the provider list them, outermost first
+4. selects the target and makes it the focused row, which the view scrolls into view without taking keyboard focus
+
+A newer reveal supersedes one still listing. Revealing the active editor, a search result opened, a Git change opened, a Quick Open pick and View › Reveal Active File in Explorer all go through this one implementation. The view does no traversal.
+
+**Selection and expansion.** Both are store state.
+
+- **Rename or move:** state follows the node's new identity.
+- **Refresh:** nothing collapses, because reconciliation keeps identities.
+- **Deletion:** the deleted entries leave the selection, and nothing else is selected in their place, as before.
+- **Collapse All:** collapses every folder; with one root the root itself stays open, with several every root collapses.
+
+**Mutations.** Every create, rename, move, copy, paste, duplicate and delete goes from the view to App's handlers, then through the native command, which is a Module 03 operation with its Module 04 intent. The tree is updated by the provider:
+
+- `refreshAround` re-lists the affected folders as each of Yavin's own operations finishes.
+- A successful rename or delete is announced to the provider (`moved`, `removed`), so identities and UI state follow at once.
+- The watcher's report of the same change is then reconciled like any other.
+
+The view never inserts a result into a tree itself. A collision (a copy or a move onto an existing name) is refused by the native side and reported.
+
+**No folder.** With no folder open, the Explorer shows a collapsible **No Folder Opened** section ("You have not yet opened a folder." and an Open Folder button), outside the tree, which only ever holds the tree's rows. The recent folders are on the Welcome page.
+
+**Git decorations** stay the Git store's. Rows look them up by the resource's path when they render; the provider and store know nothing of Git.
+
+**Session.** `session.json` keeps, per folder: the expanded folders, the selection (up to 100 entries) and the focused entry, all as paths, plus the scroll offset. The two new fields are optional, so older files still load. The store for a workspace is made when the window has taken the folder, which is also when the provider knows its root, so the saved paths resolve to nodes. The tree is only handed to the view once the workspace path is set, which avoids the Module 07 startup race.
+
+**Accessibility.**
+
+- Rows are `treeitem`s with `aria-level`, `aria-selected`, and `aria-expanded` on folders and roots.
+- There is exactly one tab stop (roving tabindex), and the tree is `aria-multiselectable`.
+- Error rows are `alert`s.
+- After a rename, keyboard focus returns to the renamed row, which is the same element.
+
+**Performance.**
+
+- Flattening runs when the projection, the expanded set or an inline edit changes, never for selection or focus.
+- Rows are memoized on their node object, so a change in one folder re-renders the rows whose nodes changed. In the UI test, adding one file to a folder of 20,000 re-renders fewer than 60 rows.
+- A folder of 100,000 files expands in about 2.3 s (mostly the listing itself) and renders fewer than 200 rows. An arrow key in it takes about 90 ms, which was 255 ms before the set-identity fix.
+- Cut and dragged states are sets, looked up in O(1) per row.
+
+**Invariants**
+
+1. Explorer UI state never becomes the source of filesystem truth.
+2. Filesystem mutations go through the existing operation pipeline; the view never edits the tree.
+3. Explorer identity is based on stable resource and node identity, not display paths: state by node id, React identity by view key.
+4. Every Explorer action is checked against provider capabilities, whichever way it is invoked.
+5. A folder's loading and failure are shown as such, never as an empty folder.
 
 ## Rules and references
 

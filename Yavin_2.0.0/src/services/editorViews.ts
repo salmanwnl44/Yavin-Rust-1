@@ -20,6 +20,10 @@ export interface EditorViewState {
 interface EditorView {
   history: TextHistory;
   view: EditorViewState | null;
+  /** Whether the editor showing this document has keyboard focus. */
+  focused: boolean;
+  /** Set by `rename`, taken by the editor that shows the document under its new key. */
+  moved: boolean;
 }
 
 export type EditorViews = ReturnType<typeof createEditorViews>;
@@ -29,7 +33,7 @@ export function createEditorViews() {
   const entry = (key: string): EditorView => {
     let view = views.get(key);
     if (!view) {
-      view = { history: { past: [], future: [] }, view: null };
+      view = { history: { past: [], future: [] }, view: null, focused: false, moved: false };
       views.set(key, view);
     }
     return view;
@@ -56,7 +60,23 @@ export function createEditorViews() {
       const view = views.get(previousKey);
       if (!view || previousKey === key) return;
       views.delete(previousKey);
+      view.moved = true;
       views.set(key, view);
+    },
+    /** The editor showing the document gained or lost keyboard focus. */
+    setFocused(key: string, focused: boolean): void {
+      entry(key).focused = focused;
+    },
+    /**
+     * Whether an editor mounting for `key` should take keyboard focus: yes when the document
+     * is being shown (a tab opened or switched to); after it only changed key (a rename, Save
+     * As), only if its editor had focus -- a rename in the Explorer leaves focus there.
+     */
+    takeFocus(key: string): boolean {
+      const view = views.get(key);
+      if (!view?.moved) return true;
+      view.moved = false;
+      return view.focused;
     },
     /** The document was closed: its history and view state go too. */
     forget(key: string): void {

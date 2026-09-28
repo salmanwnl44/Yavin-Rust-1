@@ -66,6 +66,7 @@ import { createOutputChannel } from "./services/panel/output";
 import { isWithin, remapPath, validateEntryName } from "./services/workspace";
 import { createFileSystemExplorerProvider } from "./services/explorerProvider";
 import type { FileSystemExplorerProvider } from "./services/explorerProvider";
+import { createExplorerStore } from "./services/explorerStore";
 import {
   buildDecorations,
   bumpGitRevision,
@@ -90,6 +91,27 @@ const documentIO: DocumentIO = {
 };
 
 const WELCOME_TAB: OpenTab = { id: "welcome", name: "Welcome", path: "welcome" };
+
+/** What the session keeps of the Explorer. */
+interface ExplorerSessionState {
+  expanded: string[];
+  scroll: number;
+  selected: string[];
+  focused: string | null;
+}
+const NO_EXPLORER_STATE: ExplorerSessionState = {
+  expanded: [],
+  scroll: 0,
+  selected: [],
+  focused: null,
+};
+const explorerStateOf = (state: WorkspaceSession): ExplorerSessionState => ({
+  expanded: state.expanded,
+  scroll: state.scroll,
+  selected: state.selected ?? [],
+  focused: state.focused ?? null,
+});
+const NO_ROOTS: never[] = [];
 // Error boundary to prevent white/black screen crashes
 class ErrorBoundary extends Component<
   React.PropsWithChildren,
@@ -157,8 +179,8 @@ export default function App() {
   });
   const explorer = explorerProviderRef.current;
   const explorerRevision = useSyncExternalStore(explorer.subscribe, explorer.revision);
-  // The same object for as long as nothing in it changed (see `projection`).
-  const fileTree = useMemo(() => explorer.projection(), [explorer, explorerRevision]);
+  // Every root, the same array for as long as nothing in any of them changed.
+  const explorerRoots = useMemo(() => explorer.projections(), [explorer, explorerRevision]);
   /** The open folder as the Explorer's root has it -- the listing's own spelling. */
   const rootPath = useCallback(() => explorer.getRootNodes()[0]?.path ?? null, [explorer]);
   const [quickOpen, setQuickOpen] = useState<{ files: string[]; note: string } | null>(null);
@@ -196,7 +218,7 @@ export default function App() {
   /** The folders opened before, and what each looked like. See `services/session.ts`. */
   const [session, setSession] = useState<Session>(EMPTY_SESSION);
   /** What the explorer looks like now, kept out of render: it changes on every scroll. */
-  const explorerRef = useRef<{ expanded: string[]; scroll: number }>({ expanded: [], scroll: 0 });
+  const explorerRef = useRef<ExplorerSessionState>(NO_EXPLORER_STATE);
   /**
    * The session as it stands now, which is not the same as `session`: that is React state for
    * the recent list, updated only when the list itself changes, while this tracks every save
@@ -446,6 +468,8 @@ export default function App() {
       active: active && files.includes(active) ? active : null,
       expanded: explorerRef.current.expanded,
       scroll: explorerRef.current.scroll,
+      selected: explorerRef.current.selected,
+      focused: explorerRef.current.focused,
     };
     // Kept here as well as sent, because reopening a folder later in the same run restores
     // from this -- reading the startup snapshot would bring back the tabs it had then.
@@ -462,14 +486,31 @@ export default function App() {
   }, [documents]);
   useEffect(writeSession, [workspacePath, openTabs, activeTabId, writeSession]);
 
-  /** The explorer reporting what it has unfolded and where it is scrolled. */
+  /** The explorer reporting what it has unfolded and selected, and where it is scrolled. */
   const rememberExplorer = useCallback(
-    (next: { expanded: string[]; scroll: number }) => {
+    (next: ExplorerSessionState) => {
       explorerRef.current = next;
       writeSession();
     },
     [writeSession],
   );
+  /**
+   * The Explorer's UI state (`services/explorerStore.ts`), one per workspace: expansion,
+   * selection, focus and reveal, following the provider's renames and deletions. Made when the
+   * window takes a folder, from what the session says it looked like -- by then the provider
+   * knows the folder's root, so the saved paths resolve to nodes.
+   */
+  const explorerStore = useMemo(
+    () =>
+      createExplorerStore(explorer, {
+        expanded: explorerRef.current.expanded,
+        selection: explorerRef.current.selected,
+        focused: explorerRef.current.focused,
+      }),
+    // A new workspace, a new store: `explorerRef` has been seeded for it by then.
+    [explorer, workspacePath],
+  );
+  useEffect(() => explorerStore.attach(), [explorerStore]);
 
   // Startup: reopen the folder from last time, with what was open in it. A folder that has
   // since been moved or deleted falls back to opening no folder rather than failing to start.
@@ -490,7 +531,7 @@ export default function App() {
           const root = await native("open_workspace", { path: target });
           if (superseded()) return;
           const state = workspaceIn(saved, target);
-          if (state) explorerRef.current = { expanded: state.expanded, scroll: state.scroll };
+          if (state) explorerRef.current = explorerStateOf(state);
           restoring.current = true;
           try {
             // The tree listing and the files' contents are independent once the folder is
@@ -623,6 +664,19 @@ export default function App() {
       delete hook.__yavinPropose;
     };
   }, [documents]);
+  // Development builds only, and only for the UI tests: shows several roots. The native side
+  // opens one folder per window, so nothing in the product adds a second root yet.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const hook = window as unknown as { __yavinSetRoots?: (paths: string[]) => Promise<void> };
+    hook.__yavinSetRoots = async (paths) => {
+      explorer.setRoots(paths);
+      await Promise.all(paths.map((path) => explorer.loadChildren(explorer.idFor(path))));
+    };
+    return () => {
+      delete hook.__yavinSetRoots;
+    };
+  }, [explorer]);
 
   // Git decorations refresh on focus when the Source Control panel is not polling.
   useEffect(() => {
@@ -720,7 +774,7 @@ export default function App() {
     explorer.setRoots([]);
     setDecorations({ files: new Map(), folders: new Set() });
     // Seeded before the explorer mounts for the new folder, so it unfolds where it was.
-    explorerRef.current = { expanded: restore?.expanded ?? [], scroll: restore?.scroll ?? 0 };
+    explorerRef.current = restore ? explorerStateOf(restore) : NO_EXPLORER_STATE;
     // Optimistic, so the recent list is in the right order before the file is written.
     rememberSession({
       ...sessionRef.current,
@@ -1248,6 +1302,20 @@ export default function App() {
       run: closeAll,
     },
     {
+      // Shown in Yavin's own Explorer, by its store: ancestors expanded and listed, selected.
+      id: "view.revealInExplorer",
+      menu: "View",
+      label: "Reveal Active File in Explorer",
+      disabled: !activeDocument?.path,
+      reason: "Open a file first",
+      run: () => {
+        if (!activeDocument?.path) return;
+        setActiveActivityTab("explorer");
+        setIsSidebarOpen(true);
+        void explorerStore.reveal(activeDocument.path);
+      },
+    },
+    {
       id: "file.reveal",
       menu: "File",
       label: "Reveal in File Explorer",
@@ -1707,9 +1775,10 @@ export default function App() {
             // synchronous store update, a render before the workspace path does, and an
             // explorer shown it then -- keyed to no folder -- reported its own fresh state over
             // the session's before the real one mounted.
-            fileTree={workspacePath ? fileTree : null}
+            roots={workspacePath ? explorerRoots : NO_ROOTS}
             decorations={decorations}
             provider={explorer}
+            store={explorerStore}
             onLoadDirectory={loadDirectory}
             onOpenFile={handleOpenFile}
             activeFile={activeTab?.path || ""}
@@ -1723,9 +1792,6 @@ export default function App() {
             onMoveFile={handleMovePath}
             onReveal={handleReveal}
             onOpenFolderDialog={handleOpenFolderDialog}
-            recentFolders={session.folders}
-            onOpenRecentFolder={handleOpenRecentFolder}
-            initialExpanded={explorerRef.current.expanded}
             initialScroll={explorerRef.current.scroll}
             onExplorerState={rememberExplorer}
           />
