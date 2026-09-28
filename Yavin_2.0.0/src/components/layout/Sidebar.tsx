@@ -295,12 +295,16 @@ export function Sidebar(props: SidebarProps) {
   useEffect(() => {
     const element = viewportRef.current;
     if (!element) return;
-    const measure = () =>
+    const measure = () => {
+      // Hidden (another view is showing): it measures nothing, and the last real view stands
+      // -- otherwise a hidden tree would draw only a few rows and report scrolling to the top.
+      if (!element.clientHeight) return;
       setView((previous) =>
         previous.top === element.scrollTop && previous.height === element.clientHeight
           ? previous
           : { top: element.scrollTop, height: element.clientHeight },
       );
+    };
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(element);
@@ -822,17 +826,19 @@ export function Sidebar(props: SidebarProps) {
   );
   const draggedIds = useMemo(() => new Set(dragged.map((node) => node.id)), [dragged]);
 
-  if (activeTab !== "explorer") {
-    return (
-      <aside
-        hidden={!visible}
-        className="w-64 shrink-0 border-r border-[#181818] bg-[#050505] p-4 text-xs text-zinc-400"
-      >
-        <p>{activeTab === "git" ? "Source control actions" : activeTab} are not connected yet.</p>
-        <p className="mt-2">Use Explorer to browse files and view Git status badges.</p>
-      </aside>
-    );
-  }
+  // Another view's placeholder is shown beside the tree, which stays mounted and hidden: the
+  // windowing observes the tree's scroll container, and a remount would leave it observing a
+  // detached one -- the tree then drew only a few rows -- and would lose the scroll position.
+  const explorerShown = activeTab === "explorer";
+  const placeholder = !explorerShown && (
+    <aside
+      hidden={!visible}
+      className="w-64 shrink-0 border-r border-[#181818] bg-[#050505] p-4 text-xs text-zinc-400"
+    >
+      <p>{activeTab === "git" ? "Source control actions" : activeTab} are not connected yet.</p>
+      <p className="mt-2">Use Explorer to browse files and view Git status badges.</p>
+    </aside>
+  );
 
   const headerRoot = multiRoot ? rootOf(focused) : firstRoot;
   const rootName = multiRoot
@@ -856,195 +862,198 @@ export function Sidebar(props: SidebarProps) {
   );
 
   return (
-    <aside
-      hidden={!visible}
-      onContextMenu={openRootMenu}
-      className="flex w-[260px] flex-col border-r border-[#141414] bg-black select-none text-[12px] shrink-0 font-sans"
-    >
-      <div className="flex h-9 items-center justify-between px-3 border-b border-[#101010] text-zinc-300">
-        <span className="text-[11px] font-semibold uppercase tracking-wider">Explorer</span>
-        <button
-          onClick={props.onOpenFolderDialog}
-          title="Open Folder"
-          className="text-zinc-500 hover:text-zinc-200 p-1 rounded hover:bg-[#121212] transition-colors"
-        >
-          <MoreIcon />
-        </button>
-      </div>
+    <>
+      {placeholder}
+      <aside
+        hidden={!visible || !explorerShown}
+        onContextMenu={openRootMenu}
+        className="flex w-[260px] flex-col border-r border-[#141414] bg-black select-none text-[12px] shrink-0 font-sans"
+      >
+        <div className="flex h-9 items-center justify-between px-3 border-b border-[#101010] text-zinc-300">
+          <span className="text-[11px] font-semibold uppercase tracking-wider">Explorer</span>
+          <button
+            onClick={props.onOpenFolderDialog}
+            title="Open Folder"
+            className="text-zinc-500 hover:text-zinc-200 p-1 rounded hover:bg-[#121212] transition-colors"
+          >
+            <MoreIcon />
+          </button>
+        </div>
 
-      {firstRoot && (
+        {firstRoot && (
+          <div
+            onContextMenu={openRootMenu}
+            onClick={() => !multiRoot && toggleExpand(firstRoot.id)}
+            onDragOver={(event) => dragOver(event, null)}
+            onDragLeave={api.dragLeave}
+            onDrop={(event) => drop(event, null)}
+            className={`flex h-7 items-center justify-between px-2 border-b transition-colors cursor-pointer text-[11.5px] font-semibold ${
+              rootDropId && dropTarget === rootDropId
+                ? "bg-indigo-900/40 border-indigo-500 text-white"
+                : "bg-[#050505] border-[#121212] text-zinc-200 hover:bg-[#0a0a0a]"
+            }`}
+          >
+            <div className="flex items-center gap-1.5 min-w-0">
+              {!multiRoot && <ChevronIcon isExpanded={rootExpanded} />}
+              <span className="truncate text-white">{rootName}</span>
+            </div>
+            <div className="flex items-center gap-1">
+              {headerRoot &&
+                allowed(capabilities, [headerRoot.id], "newFile") &&
+                headerButton(
+                  "New File",
+                  () => startCreate(headerRoot.path, "file"),
+                  <PlusIcon size={13} />,
+                )}
+              {headerRoot &&
+                allowed(capabilities, [headerRoot.id], "newFolder") &&
+                headerButton(
+                  "New Folder",
+                  () => startCreate(headerRoot.path, "folder"),
+                  <FolderPlusIcon size={13} />,
+                )}
+              {headerButton("Refresh Explorer", props.onRefresh, <RefreshIcon size={13} />)}
+              {headerButton(
+                "Collapse Folders in Explorer",
+                menuActions.collapseAll,
+                <CollapseIcon size={13} />,
+              )}
+            </div>
+          </div>
+        )}
+
+        {!firstRoot && (
+          // No folder: what VS Code shows -- a collapsible section saying so, and the way to
+          // open one. Outside the tree, which only ever holds the tree's own rows.
+          <section aria-label="No Folder Opened" className="shrink-0 border-b border-[#101010]">
+            <button
+              onClick={() => setNoFolderOpen((open) => !open)}
+              aria-expanded={noFolderOpen}
+              className="flex h-6 w-full items-center gap-1 px-1.5 text-left text-[11px] font-semibold text-zinc-200 hover:bg-[#0a0a0a]"
+            >
+              <ChevronIcon isExpanded={noFolderOpen} />
+              No Folder Opened
+            </button>
+            {noFolderOpen && (
+              <div className="flex flex-col gap-3 px-4 pt-1.5 pb-4">
+                <p className="text-[12.5px] text-zinc-300">You have not yet opened a folder.</p>
+                <button
+                  onClick={props.onOpenFolderDialog}
+                  className="w-full rounded-sm bg-[#0e639c] py-1.5 text-[12.5px] text-white hover:bg-[#1177bb] focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-2 focus-visible:outline-[#1177bb]"
+                >
+                  Open Folder
+                </button>
+              </div>
+            )}
+          </section>
+        )}
+
         <div
+          ref={viewportRef}
+          role="tree"
+          // Kept mounted with no folder open -- the windowing measures it from its first render
+          // -- but not shown: there is no tree.
+          hidden={!firstRoot}
+          aria-label="Files"
+          aria-multiselectable="true"
+          onKeyDown={onTreeKeyDown}
           onContextMenu={openRootMenu}
-          onClick={() => !multiRoot && toggleExpand(firstRoot.id)}
           onDragOver={(event) => dragOver(event, null)}
           onDragLeave={api.dragLeave}
           onDrop={(event) => drop(event, null)}
-          className={`flex h-7 items-center justify-between px-2 border-b transition-colors cursor-pointer text-[11.5px] font-semibold ${
+          className={`flex-1 overflow-y-auto py-1 min-h-0 transition-colors ${
             rootDropId && dropTarget === rootDropId
-              ? "bg-indigo-900/40 border-indigo-500 text-white"
-              : "bg-[#050505] border-[#121212] text-zinc-200 hover:bg-[#0a0a0a]"
+              ? "ring-2 ring-indigo-500/50 bg-indigo-950/20"
+              : ""
           }`}
         >
-          <div className="flex items-center gap-1.5 min-w-0">
-            {!multiRoot && <ChevronIcon isExpanded={rootExpanded} />}
-            <span className="truncate text-white">{rootName}</span>
-          </div>
-          <div className="flex items-center gap-1">
-            {headerRoot &&
-              allowed(capabilities, [headerRoot.id], "newFile") &&
-              headerButton(
-                "New File",
-                () => startCreate(headerRoot.path, "file"),
-                <PlusIcon size={13} />,
-              )}
-            {headerRoot &&
-              allowed(capabilities, [headerRoot.id], "newFolder") &&
-              headerButton(
-                "New Folder",
-                () => startCreate(headerRoot.path, "folder"),
-                <FolderPlusIcon size={13} />,
-              )}
-            {headerButton("Refresh Explorer", props.onRefresh, <RefreshIcon size={13} />)}
-            {headerButton(
-              "Collapse Folders in Explorer",
-              menuActions.collapseAll,
-              <CollapseIcon size={13} />,
-            )}
-          </div>
+          {firstRoot ? (
+            <div style={{ height: rows.length * ROW_HEIGHT }}>
+              <div style={{ transform: `translateY(${first * ROW_HEIGHT}px)` }}>
+                {rows.slice(first, last).map((row) =>
+                  row.kind === "create" ? (
+                    <CreateRow
+                      key={row.key}
+                      depth={row.depth}
+                      type={creating!.type}
+                      value={newName}
+                      invalid={Boolean(inlineError)}
+                      inputRef={createInputRef}
+                      onChange={(value) => {
+                        setNewName(value);
+                        setInlineError(
+                          value.trim() ? (validateEntryName(value.trim(), true) ?? "") : "",
+                        );
+                      }}
+                      onSubmit={submitCreate}
+                      onCancel={cancelEdit}
+                    />
+                  ) : row.kind === "status" ? (
+                    <StatusRow
+                      key={row.key}
+                      depth={row.depth}
+                      error={row.error}
+                      // Retried by the provider: listed if never listed, re-listed if a refresh
+                      // failed. The row changes when the provider's state does.
+                      onRetry={() => void provider.retry(row.id)}
+                    />
+                  ) : (
+                    <TreeRow
+                      key={row.key}
+                      id={row.id}
+                      node={row.node}
+                      path={row.path}
+                      depth={row.depth}
+                      isRoot={row.isRoot}
+                      expanded={row.expanded}
+                      selected={selection.has(row.id)}
+                      active={activeId === row.id}
+                      cut={cutIds.has(row.id)}
+                      dragging={draggedIds.has(row.id)}
+                      dropTarget={dropTarget === row.id}
+                      // Git's own state, looked up by the resource's path: the Git store owns it.
+                      status={row.isRoot ? undefined : decorations.files.get(row.path)}
+                      folderDirty={
+                        row.node.is_dir && !row.expanded && decorations.folders.has(row.path)
+                      }
+                      renameValue={renaming?.id === row.id ? renaming.value : undefined}
+                      tabIndex={tabbable === row.id ? 0 : -1}
+                      api={api}
+                    />
+                  ),
+                )}
+              </div>
+            </div>
+          ) : null}
         </div>
-      )}
 
-      {!firstRoot && (
-        // No folder: what VS Code shows -- a collapsible section saying so, and the way to
-        // open one. Outside the tree, which only ever holds the tree's own rows.
-        <section aria-label="No Folder Opened" className="shrink-0 border-b border-[#101010]">
-          <button
-            onClick={() => setNoFolderOpen((open) => !open)}
-            aria-expanded={noFolderOpen}
-            className="flex h-6 w-full items-center gap-1 px-1.5 text-left text-[11px] font-semibold text-zinc-200 hover:bg-[#0a0a0a]"
+        {inlineError && (
+          <p
+            role="alert"
+            className="shrink-0 truncate border-t border-[#121212] bg-[#160c0c] px-3 py-1 text-[11px] text-red-400"
+            title={inlineError}
           >
-            <ChevronIcon isExpanded={noFolderOpen} />
-            No Folder Opened
-          </button>
-          {noFolderOpen && (
-            <div className="flex flex-col gap-3 px-4 pt-1.5 pb-4">
-              <p className="text-[12.5px] text-zinc-300">You have not yet opened a folder.</p>
-              <button
-                onClick={props.onOpenFolderDialog}
-                className="w-full rounded-sm bg-[#0e639c] py-1.5 text-[12.5px] text-white hover:bg-[#1177bb] focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-2 focus-visible:outline-[#1177bb]"
-              >
-                Open Folder
-              </button>
-            </div>
-          )}
-        </section>
-      )}
+            {inlineError}
+          </p>
+        )}
 
-      <div
-        ref={viewportRef}
-        role="tree"
-        // Kept mounted with no folder open -- the windowing measures it from its first render
-        // -- but not shown: there is no tree.
-        hidden={!firstRoot}
-        aria-label="Files"
-        aria-multiselectable="true"
-        onKeyDown={onTreeKeyDown}
-        onContextMenu={openRootMenu}
-        onDragOver={(event) => dragOver(event, null)}
-        onDragLeave={api.dragLeave}
-        onDrop={(event) => drop(event, null)}
-        className={`flex-1 overflow-y-auto py-1 min-h-0 transition-colors ${
-          rootDropId && dropTarget === rootDropId
-            ? "ring-2 ring-indigo-500/50 bg-indigo-950/20"
-            : ""
-        }`}
-      >
-        {firstRoot ? (
-          <div style={{ height: rows.length * ROW_HEIGHT }}>
-            <div style={{ transform: `translateY(${first * ROW_HEIGHT}px)` }}>
-              {rows.slice(first, last).map((row) =>
-                row.kind === "create" ? (
-                  <CreateRow
-                    key={row.key}
-                    depth={row.depth}
-                    type={creating!.type}
-                    value={newName}
-                    invalid={Boolean(inlineError)}
-                    inputRef={createInputRef}
-                    onChange={(value) => {
-                      setNewName(value);
-                      setInlineError(
-                        value.trim() ? (validateEntryName(value.trim(), true) ?? "") : "",
-                      );
-                    }}
-                    onSubmit={submitCreate}
-                    onCancel={cancelEdit}
-                  />
-                ) : row.kind === "status" ? (
-                  <StatusRow
-                    key={row.key}
-                    depth={row.depth}
-                    error={row.error}
-                    // Retried by the provider: listed if never listed, re-listed if a refresh
-                    // failed. The row changes when the provider's state does.
-                    onRetry={() => void provider.retry(row.id)}
-                  />
-                ) : (
-                  <TreeRow
-                    key={row.key}
-                    id={row.id}
-                    node={row.node}
-                    path={row.path}
-                    depth={row.depth}
-                    isRoot={row.isRoot}
-                    expanded={row.expanded}
-                    selected={selection.has(row.id)}
-                    active={activeId === row.id}
-                    cut={cutIds.has(row.id)}
-                    dragging={draggedIds.has(row.id)}
-                    dropTarget={dropTarget === row.id}
-                    // Git's own state, looked up by the resource's path: the Git store owns it.
-                    status={row.isRoot ? undefined : decorations.files.get(row.path)}
-                    folderDirty={
-                      row.node.is_dir && !row.expanded && decorations.folders.has(row.path)
-                    }
-                    renameValue={renaming?.id === row.id ? renaming.value : undefined}
-                    tabIndex={tabbable === row.id ? 0 : -1}
-                    api={api}
-                  />
-                ),
-              )}
-            </div>
-          </div>
-        ) : null}
-      </div>
-
-      {inlineError && (
-        <p
-          role="alert"
-          className="shrink-0 truncate border-t border-[#121212] bg-[#160c0c] px-3 py-1 text-[11px] text-red-400"
-          title={inlineError}
-        >
-          {inlineError}
-        </p>
-      )}
-
-      {contextMenu && (
-        <ContextMenu
-          x={contextMenu.x}
-          y={contextMenu.y}
-          onClose={() => setContextMenu(null)}
-          items={buildExplorerMenu({
-            node: contextMenu.node,
-            isRoot: contextMenu.isRoot,
-            workspacePath: contextMenu.node?.path ?? rootPath,
-            clipboard,
-            count: contextMenu.node ? targetsFor(contextMenu.node).length : 1,
-            can: (action) => can(action, contextMenu.node),
-            actions: menuActions,
-          })}
-        />
-      )}
-    </aside>
+        {contextMenu && (
+          <ContextMenu
+            x={contextMenu.x}
+            y={contextMenu.y}
+            onClose={() => setContextMenu(null)}
+            items={buildExplorerMenu({
+              node: contextMenu.node,
+              isRoot: contextMenu.isRoot,
+              workspacePath: contextMenu.node?.path ?? rootPath,
+              clipboard,
+              count: contextMenu.node ? targetsFor(contextMenu.node).length : 1,
+              can: (action) => can(action, contextMenu.node),
+              actions: menuActions,
+            })}
+          />
+        )}
+      </aside>
+    </>
   );
 }

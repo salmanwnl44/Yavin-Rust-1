@@ -62,6 +62,7 @@ import "monaco-editor/editor/contrib/wordPartOperations/browser/wordPartOperatio
 import "monaco-editor/editor/common/standaloneStrings";
 
 // Syntax colouring: Monarch tokenizers only, each loaded when a document first needs it.
+import "monaco-editor/languages/definitions/bat/register";
 import "monaco-editor/languages/definitions/cpp/register";
 import "monaco-editor/languages/definitions/csharp/register";
 import "monaco-editor/languages/definitions/css/register";
@@ -73,6 +74,7 @@ import "monaco-editor/languages/definitions/java/register";
 import "monaco-editor/languages/definitions/javascript/register";
 import "monaco-editor/languages/definitions/less/register";
 import "monaco-editor/languages/definitions/markdown/register";
+import "monaco-editor/languages/definitions/mdx/register";
 import "monaco-editor/languages/definitions/powershell/register";
 import "monaco-editor/languages/definitions/python/register";
 import "monaco-editor/languages/definitions/rust/register";

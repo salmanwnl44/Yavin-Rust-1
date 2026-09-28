@@ -108,6 +108,11 @@ export interface TextDocument {
   readonly base: DiskBase | null;
   readonly external: ExternalChange | null;
   readonly save: SaveActivity;
+  /**
+   * Whether the file is marked read-only on disk, as of the last open or reload. A fact about
+   * the file, shown to the user; saving is still what finds out whether a write is refused.
+   */
+  readonly readOnly: boolean;
 }
 
 export type DocumentStatus =
@@ -191,6 +196,8 @@ export interface DocumentIO {
   write(path: string, expected: string, content: string): Promise<unknown>;
   /** Creates the file with `content`, failing if anything is already there. Same guarantees. */
   create(path: string, content: string): Promise<unknown>;
+  /** Whether the file is marked read-only on disk. Optional: without it nothing is. */
+  readOnly?(path: string): Promise<boolean>;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -275,6 +282,7 @@ interface Doc {
   base: DiskBase | null;
   external: ExternalChange | null;
   save: SaveActivity;
+  readOnly: boolean;
   /** The text known to be on disk, and the version it was. */
   persisted: { version: number; text: string } | null;
   /** The ids of this document's own recent save operations, which the watcher credits. */
@@ -377,7 +385,17 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
   };
   const live = (doc: Doc) => docs.get(doc.id) === doc;
 
-  const fromDisk = (id: DocumentId, uri: ResourceUri, path: string, raw: string): Doc => {
+  /** Whether a file is read-only; a failure to find out is not a reason to refuse to open it. */
+  const readOnlyOf = (path: string): Promise<boolean> =>
+    io.readOnly ? io.readOnly(path).then(Boolean, () => false) : Promise.resolve(false);
+
+  const fromDisk = (
+    id: DocumentId,
+    uri: ResourceUri,
+    path: string,
+    raw: string,
+    readOnly = false,
+  ): Doc => {
     const decoded = decode(raw);
     const name = basename(uri) || path;
     return {
@@ -396,6 +414,7 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
       base: baseOf(raw),
       external: null,
       save: IDLE,
+      readOnly,
       persisted: { version: 1, text: decoded.text },
       own: [],
       recheck: null,
@@ -570,11 +589,11 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
       const pending = opening.get(id);
       if (pending) return pending;
       const started = epoch;
-      const loading = io.read(path).then((raw) => {
+      const loading = Promise.all([io.read(path), readOnlyOf(path)]).then(([raw, readOnly]) => {
         if (started !== epoch) return null;
         const again = docs.get(id);
         if (again) return again;
-        const doc = fromDisk(id, uri, path, raw);
+        const doc = fromDisk(id, uri, path, raw, readOnly);
         docs.set(id, doc);
         emit({ type: "opened", id });
         return doc;
@@ -608,6 +627,7 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
         base: null,
         external: null,
         save: IDLE,
+        readOnly: false,
         persisted: { version: 0, text: "" },
         own: [],
         recheck: null,
@@ -654,6 +674,7 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
         base,
         external: null,
         save: IDLE,
+        readOnly: false,
         persisted: { version: 1, text },
         own: [],
         recheck: null,
@@ -831,8 +852,9 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
         throw new DocumentError("dirty", `${doc.name} has unsaved changes.`);
       const version = doc.version;
       const check = ++doc.checking;
-      const raw = await io.read(doc.path);
+      const [raw, readOnly] = await Promise.all([io.read(doc.path), readOnlyOf(doc.path)]);
       if (!live(doc) || check !== doc.checking) return doc;
+      doc.readOnly = readOnly;
       // Edited while reading, and the edits were not given up: they are not lost now either.
       if (doc.version !== version && !discard) {
         if (!doc.base || raw !== doc.base.raw)

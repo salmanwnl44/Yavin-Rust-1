@@ -1,18 +1,30 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import type { Ref } from "react";
 import type { EditorHandle, EditorState } from "../../editor/editorTypes";
 import type { DocumentService } from "../../services/documents";
 import type { EditorViews } from "../../services/editorViews";
+import type { CursorStatusStore } from "../../services/cursorStatus";
+import type { MinimapPreferences } from "../../services/minimapPreferences";
+import type { MarkdownLink } from "../../services/markdownLinks";
+import type { MarkdownPreviewHandle } from "./MarkdownPreview";
 import type { EditorTab, RecentFile } from "../../types";
 import { FileIcon } from "../ui/FileIcons";
 import { WelcomePage } from "../welcome/WelcomePage";
+import { EditorBoundary } from "./EditorBoundary";
+import { ContextMenu } from "../ui/ContextMenu";
+import type { MenuItem } from "../ui/ContextMenu";
 import type { WelcomeHint } from "../welcome/WelcomePage";
 
 /**
  * The code editor (Monaco), loaded when an editor is first shown rather than with the window:
  * the engine is most of the application's code, and the welcome page does not need it.
  */
-const CodeEditor = lazy(() => import("./CodeEditor"));
+const loadCodeEditor = () => import("./CodeEditor");
+/** The Markdown preview, with the editor's chunk: it colours code with the editor's theme. */
+const MarkdownPreview = lazy(() => import("./MarkdownPreview"));
+
+/** How a Markdown document is shown: its editor, its preview, or both side by side. */
+export type MarkdownMode = "edit" | "preview" | "split";
 
 /** A line above the editor about the document's state, with what can be done about it. */
 export interface DocumentNotice {
@@ -67,6 +79,18 @@ export function EditorArea({
   onEditorState,
   wordWrap,
   zoom,
+  cursorStatus,
+  readOnly = false,
+  minimap,
+  onMinimapChange,
+  markdownMode,
+  onMarkdownMode,
+  onOpenLink,
+  loadImage,
+  onOpenCode,
+  previewRef,
+  tabMenu,
+  onMenuError,
 }: {
   tabs: EditorTab[];
   activeTabId: string;
@@ -98,8 +122,38 @@ export function EditorArea({
   onEditorState: (state: EditorState) => void;
   wordWrap: boolean;
   zoom: number;
+  /** Where the editor tells the status bar about its cursor. */
+  cursorStatus?: CursorStatusStore;
+  /** The document in front cannot be typed into (a file read-only on disk). */
+  readOnly?: boolean;
+  minimap?: MinimapPreferences;
+  onMinimapChange?: (change: Partial<MinimapPreferences>) => void;
+  /** Set for a Markdown document: how it is shown, and the buttons that change it. */
+  markdownMode?: MarkdownMode;
+  onMarkdownMode?: (mode: MarkdownMode) => void;
+  /** A link followed in the preview. */
+  onOpenLink?: (link: MarkdownLink) => void;
+  /** An image in the workspace, for the preview, as a `data:` URL. */
+  loadImage?: (path: string) => Promise<string>;
+  /** "Open in Editor" on a code block in the preview. */
+  onOpenCode?: (code: string, languageId: string | undefined) => void;
+  previewRef?: Ref<MarkdownPreviewHandle>;
+  /** What a tab's context menu offers (close others, copy its path, ...). */
+  tabMenu?: (id: string) => MenuItem[];
+  onMenuError?: (error: unknown) => void;
 }) {
   const activeTab = tabs.find((t) => t.id === activeTabId);
+  const [menu, setMenu] = useState<{ x: number; y: number; id: string } | null>(null);
+  const strip = useRef<HTMLDivElement>(null);
+  // The strip shows no scrollbar, so the tab in front is scrolled into view.
+  useEffect(() => {
+    document
+      .getElementById(`tab-${activeTabId}`)
+      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [activeTabId, tabs.length]);
+  // A lazy component keeps a failed load for good, so each retry is a new one.
+  const [attempt, setAttempt] = useState(0);
+  const CodeEditor = useMemo(() => lazy(loadCodeEditor), [attempt]);
 
   const getBreadcrumbs = () => {
     if (!activeTab || activeTab.id === "welcome") return "Yavin IDE › Welcome";
@@ -109,7 +163,14 @@ export function EditorArea({
   return (
     <div className="flex flex-1 flex-col min-w-0 bg-[#000000] select-none text-[12px] overflow-hidden font-sans">
       {/* Tab Bar */}
-      <div className="flex h-9 items-center border-b border-[#151515] bg-[#050505] px-1 overflow-x-auto no-scrollbar gap-0.5 shrink-0">
+      <div
+        ref={strip}
+        // A mouse wheel scrolls the tabs sideways, as the missing scrollbar would.
+        onWheel={(event) => {
+          if (strip.current && !event.deltaX) strip.current.scrollLeft += event.deltaY;
+        }}
+        className="flex h-9 items-center border-b border-[#151515] bg-[#050505] px-1 overflow-x-auto no-scrollbar gap-0.5 shrink-0"
+      >
         <div role="tablist" aria-label="Open editors" className="flex h-full items-center gap-0.5">
           {tabs.map((tab) => {
             const isActive = tab.id === activeTabId;
@@ -126,6 +187,17 @@ export function EditorArea({
                 // not separately tabbable.
                 tabIndex={isActive ? 0 : -1}
                 onClick={() => onSelectTab(tab.id)}
+                // The middle button closes a tab, as in a browser.
+                onAuxClick={(event) => {
+                  if (event.button !== 1) return;
+                  event.preventDefault();
+                  onCloseTab(tab.id);
+                }}
+                onContextMenu={(event) => {
+                  if (!tabMenu) return;
+                  event.preventDefault();
+                  setMenu({ x: event.clientX, y: event.clientY, id: tab.id });
+                }}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" || event.key === " ") {
                     event.preventDefault();
@@ -182,28 +254,27 @@ export function EditorArea({
                   />
                 ) : null}
 
-                {tabs.length > 1 && (
-                  <button
-                    aria-label={`Close ${tab.name}`}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onCloseTab(tab.id);
-                    }}
-                    className="rounded p-0.5 text-zinc-500 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-[#1a1a1a] hover:text-white transition-all ml-0.5"
+                {/* Every tab closes, the last one too: the window then shows Welcome. */}
+                <button
+                  aria-label={`Close ${tab.name}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onCloseTab(tab.id);
+                  }}
+                  className={`rounded p-0.5 text-zinc-500 ${isActive ? "opacity-100" : "opacity-0"} group-hover:opacity-100 focus-visible:opacity-100 hover:bg-[#1a1a1a] hover:text-white transition-all ml-0.5`}
+                >
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.5"
                   >
-                    <svg
-                      width="10"
-                      height="10"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2.5"
-                    >
-                      <line x1="18" y1="6" x2="6" y2="18" />
-                      <line x1="6" y1="6" x2="18" y2="18" />
-                    </svg>
-                  </button>
-                )}
+                    <line x1="18" y1="6" x2="6" y2="18" />
+                    <line x1="6" y1="6" x2="18" y2="18" />
+                  </svg>
+                </button>
               </div>
             );
           })}
@@ -222,6 +293,36 @@ export function EditorArea({
             </button>
           )}
 
+          {markdownMode && onMarkdownMode && (
+            // How a Markdown document is shown: its source, its preview, or both.
+            <div
+              role="group"
+              aria-label="Markdown view"
+              className="mr-1 flex items-center rounded border border-[#1f1f1f] p-px"
+            >
+              {(
+                [
+                  ["edit", "Edit", "Show the Markdown source"],
+                  ["preview", "Preview", "Show the preview (Ctrl+Shift+V)"],
+                  ["split", "Split", "Source and preview side by side"],
+                ] as const
+              ).map(([mode, label, title]) => (
+                <button
+                  key={mode}
+                  onClick={() => onMarkdownMode(mode)}
+                  aria-pressed={markdownMode === mode}
+                  title={title}
+                  className={`rounded-sm px-2 py-0.5 text-[11px] transition-colors ${
+                    markdownMode === mode
+                      ? "bg-[#1c1c36] text-indigo-200"
+                      : "text-zinc-500 hover:text-zinc-200"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
           <button
             onClick={onNewFile}
             className="p-1 rounded hover:bg-[#151515] hover:text-zinc-200 transition-colors"
@@ -320,23 +421,72 @@ export function EditorArea({
                 ))}
               </div>
             )}
-            <Suspense
-              fallback={<div className="flex-1 p-3 text-xs text-zinc-500">Loading editor…</div>}
-            >
-              {/* One editor for every tab: it swaps documents rather than remounting. */}
-              <CodeEditor
-                documentKey={activeTab.path}
-                documents={documents}
-                views={views}
-                editorRef={editorRef}
-                onState={onEditorState}
-                wordWrap={wordWrap}
-                zoom={zoom}
-              />
-            </Suspense>
+            <EditorBoundary onRetry={() => setAttempt((n) => n + 1)}>
+              <Suspense
+                fallback={<div className="flex-1 p-3 text-xs text-zinc-500">Loading editor…</div>}
+              >
+                {/* One editor for every tab: it swaps documents rather than remounting. A
+                    Markdown preview replaces it (kept, hidden: its view state and undo stay)
+                    or sits beside it. */}
+                <div
+                  className={`flex min-h-0 flex-1 ${markdownMode === "split" ? "flex-row" : "flex-col"}`}
+                >
+                  <div
+                    className={
+                      markdownMode === "preview"
+                        ? "hidden"
+                        : `flex min-h-0 min-w-0 flex-1 flex-col ${markdownMode === "split" ? "border-r border-[#1f1f1f]" : ""}`
+                    }
+                  >
+                    <CodeEditor
+                      documentKey={activeTab.path}
+                      documents={documents}
+                      views={views}
+                      editorRef={editorRef}
+                      onState={onEditorState}
+                      wordWrap={wordWrap}
+                      zoom={zoom}
+                      cursorStatus={cursorStatus}
+                      readOnly={readOnly}
+                      onCommandPalette={onOpenCommandPalette}
+                      minimap={minimap}
+                      onMinimapChange={onMinimapChange}
+                    />
+                  </div>
+                  {markdownMode && markdownMode !== "edit" && (
+                    <Suspense
+                      fallback={
+                        <div className="flex-1 p-3 text-xs text-zinc-500">Loading preview…</div>
+                      }
+                    >
+                      <MarkdownPreview
+                        documents={documents}
+                        documentKey={activeTab.path}
+                        onOpenLink={(link) => onOpenLink?.(link)}
+                        loadImage={(path) =>
+                          loadImage ? loadImage(path) : Promise.reject(new Error("No images here."))
+                        }
+                        onOpenCode={(code, languageId) => onOpenCode?.(code, languageId)}
+                        previewRef={previewRef}
+                      />
+                    </Suspense>
+                  )}
+                </div>
+              </Suspense>
+            </EditorBoundary>
           </>
         )}
       </div>
+      {menu && tabMenu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          label="Tab actions"
+          items={tabMenu(menu.id)}
+          onClose={() => setMenu(null)}
+          onError={onMenuError}
+        />
+      )}
     </div>
   );
 }

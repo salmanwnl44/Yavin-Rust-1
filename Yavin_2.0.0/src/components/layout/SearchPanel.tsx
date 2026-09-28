@@ -30,6 +30,7 @@ export function SearchPanel({
   buffers,
   visible,
   focusRequest,
+  replaceRequest = 0,
   onOpen,
   read,
   apply,
@@ -39,6 +40,8 @@ export function SearchPanel({
   buffers: () => Record<string, string>;
   visible: boolean;
   focusRequest: number;
+  /** Raised by Replace in Files: the panel opens with its replace field showing. */
+  replaceRequest?: number;
   onOpen: (hit: SearchHit) => void;
   read: (path: string) => Promise<string>;
   apply: (changes: Replacement[]) => Promise<{ applied: Replacement[]; errors: string[] }>;
@@ -98,6 +101,9 @@ export function SearchPanel({
   useEffect(() => {
     if (visible) input.current?.focus();
   }, [visible, focusRequest]);
+  useEffect(() => {
+    if (replaceRequest) setReplace(true);
+  }, [replaceRequest]);
 
   useEffect(() => {
     if (!workspace || !query) {

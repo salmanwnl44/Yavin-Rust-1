@@ -20,6 +20,7 @@ const BY_EXTENSION: Record<string, string> = {
   jsonc: "jsonc",
   md: "markdown",
   markdown: "markdown",
+  mdx: "mdx",
   css: "css",
   scss: "scss",
   less: "less",
@@ -33,16 +34,28 @@ const BY_EXTENSION: Record<string, string> = {
   yml: "yaml",
   sh: "shellscript",
   bash: "shellscript",
+  zsh: "shellscript",
   ps1: "powershell",
+  bat: "bat",
+  cmd: "bat",
   go: "go",
   java: "java",
   c: "c",
   h: "c",
   cpp: "cpp",
   cc: "cpp",
+  cxx: "cpp",
+  "c++": "cpp",
   hpp: "cpp",
+  hh: "cpp",
+  hxx: "cpp",
+  "h++": "cpp",
   cs: "csharp",
   sql: "sql",
+  ini: "ini",
+  cfg: "ini",
+  conf: "ini",
+  dockerfile: "dockerfile",
   txt: "plaintext",
 };
 
@@ -54,6 +67,11 @@ const BY_NAME: Record<string, string> = {
   ".gitignore": "ignore",
   ".gitattributes": "properties",
   ".editorconfig": "properties",
+  ".env": "dotenv",
+  ".bashrc": "shellscript",
+  ".bash_profile": "shellscript",
+  ".zshrc": "shellscript",
+  ".profile": "shellscript",
 };
 
 const LABELS: Record<string, string> = {
@@ -65,6 +83,7 @@ const LABELS: Record<string, string> = {
   json: "JSON",
   jsonc: "JSON with Comments",
   markdown: "Markdown",
+  mdx: "MDX",
   css: "CSS",
   scss: "SCSS",
   less: "Less",
@@ -75,6 +94,7 @@ const LABELS: Record<string, string> = {
   yaml: "YAML",
   shellscript: "Shell Script",
   powershell: "PowerShell",
+  bat: "Batch",
   go: "Go",
   java: "Java",
   c: "C",
@@ -85,6 +105,8 @@ const LABELS: Record<string, string> = {
   makefile: "Makefile",
   ignore: "Ignore",
   properties: "Properties",
+  ini: "Ini",
+  dotenv: "Environment Variables",
   plaintext: "Plain Text",
 };
 
@@ -94,6 +116,9 @@ export function languageFor(name: string): string {
   const lower = base.toLowerCase();
   const named = BY_NAME[lower];
   if (named) return named;
+  // `.env.local`, `.env.production`: variants of `.env`; `Dockerfile.dev`: of a Dockerfile.
+  if (lower.startsWith(".env.")) return "dotenv";
+  if (lower.startsWith("dockerfile.")) return "dockerfile";
   const dot = lower.lastIndexOf(".");
   // A leading dot is a hidden file's name, not an extension.
   if (dot <= 0) return "plaintext";

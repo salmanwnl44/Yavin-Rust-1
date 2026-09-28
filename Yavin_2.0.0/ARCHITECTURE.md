@@ -403,7 +403,7 @@ Filesystem ──read──> ResourceUri (Module 01) ──> Document Service �
 | Git              | repository status                                                                   |
 | LSP, index, AI   | language state, the searchable project, runs and ChangeSets -- none yet             |
 
-**A document** has an id, a `uri` and `path` (none for an untitled one), a `key` the editor uses (the path for a file, the id otherwise), a `source`, its `text` (always `\n`, no byte order mark), a `version`, derived `dirty`, `encoding` (`utf8` or `utf8bom`), `lineEnding` (`lf` or `crlf`), `languageId` (`language.ts`, from the name, VS Code's ids), its `base` (the exact disk text it was loaded from or last saved as, with a fingerprint), what happened to the file underneath it (`external`), and its save activity.
+**A document** has an id, a `uri` and `path` (none for an untitled one), a `key` the editor uses (the path for a file, the id otherwise), a `source`, its `text` (always `\n`, no byte order mark), a `version`, derived `dirty`, `encoding` (`utf8` or `utf8bom`), `lineEnding` (`lf` or `crlf`), `languageId` (`language.ts`, from the name, VS Code's ids), its `base` (the exact disk text it was loaded from or last saved as, with a fingerprint), what happened to the file underneath it (`external`), its save activity, and whether the file is marked read-only on disk (`readOnly`, read on open and reload through the optional `DocumentIO.readOnly`, the native `is_read_only`; a failure to find out counts as writable, never as a reason not to open).
 
 **Sources.** A union, so contradictory flags cannot exist:
 
@@ -544,17 +544,43 @@ Filesystem -> resource-changes (Module 02) -> DocumentService.applyResourceChang
 
 **Languages** are mapped from the Document Model's language id (`monacoLanguage` in `editor/monacoHost.ts`): TypeScript and TSX to `typescript`, JavaScript and JSX to `javascript`, TOML, ignore files and properties to `ini`, shell scripts to `shell`, C and C++ to `cpp`, the rest by name, otherwise `plaintext`. A rename that changes the extension changes the model's language. JSON is registered as its own id and coloured with the JavaScript tokenizer: Monaco's JSON language feature starts a language service and needs contributions this build leaves out. No language service runs; completion, hover and parameter hints are off until language tooling arrives.
 
-**Settings and themes.** `editor/editorSettings.ts` is the one place editor options are made (`editorOptions(settings, view)`), from `DEFAULT_EDITOR_SETTINGS` plus the window's word wrap, zoom and read-only state. The themes `yavin-dark` and `yavin-light` are defined in `editor/monaco.ts`.
+**Settings and themes.** `editor/editorSettings.ts` is the one place editor options are made (`editorOptions(settings, view)`), from `DEFAULT_EDITOR_SETTINGS` plus the window's word wrap, zoom and read-only state, and the minimap's look. That one is changed from the minimap's right-click menu or View › Minimap and remembered on this computer (`services/minimapPreferences.ts`: browser storage, validated field by field, failures ignored). The editor's own right-click menu is Monaco's editing menu with Command Palette added last. The themes `yavin-dark` and `yavin-light` are defined in `editor/monaco.ts`.
 
 **Decorations.** `bridge.setDecorations(key, owner, decorations)` replaces one owner's decorations on one document (offset ranges, a class name, whole-line, a plain-text hover); other owners' are untouched. They live on the model, so they follow renames. Hover text is never treated as HTML or as a trusted link.
 
-**Read-only and proposals.** `readOnly` is an editor option. A proposed document is a model like any other; saving it is refused by the Document Model, not by the editor.
+**Read-only and proposals.** `readOnly` is an editor option. A file read-only on disk opens read-only, with a notice saying so and **Edit Anyway**, which lasts while the document is open (the window's choice, not the document's: the disk fact stays `readOnly`). Saving is still what decides whether a write is refused. A proposed document is a model like any other; saving it is refused by the Document Model, not by the editor.
+
+**Failure.** `EditorBoundary` contains a failure of the editor to its area: the tabs, menus and Save keep working, and unsaved documents stay open. Monaco failing to start is retried by starting it again (a fresh lazy component per attempt). Code that failed to load cannot be retried in the same page -- the browser keeps the failed module -- so it offers to reload the window, after saving.
+
+**Status bar.** The cursor position, the selection and the document's indentation reach the status bar through `services/cursorStatus.ts`, a store of their own: only the few items that show them redraw on a keystroke, never the window. Clicking the position opens Go to Line.
+
+**Tabs.** A tab's context menu closes it, the others, those to its right, the saved ones or all, copies its path and reveals it. Closing several asks once, naming the file when there is one. Closing the tab in front brings its neighbour forward. Reopen Closed Editor (Ctrl+Shift+T) brings back the files closed in this folder, latest first.
 
 **Diff editor.** `createDiffView(container, {original, modified})` shows an original text (an in-memory `yavin-original:` model, not editable) beside a document's model. Disposing the view disposes only the original; the document's model stays. It is the foundation for Git and ChangeSet diffs; nothing in the UI opens one yet.
 
 **Workers.** Only `editor.worker` is used (link and diff computation). It is imported with Vite's `?worker`, so it is emitted as a same-origin script under `assets/` and allowed by the CSP (`script-src 'self'`) in the development server, the production build and the packaged app. No worker is loaded from a CDN, a blob or a data URL.
 
-**Security.** Document text is only ever given to Monaco as model text, so it is rendered as text: markup in a file is never parsed or run. Decoration hovers are plain text.
+**Security.** Document text is only ever given to Monaco as model text, so it is rendered as text: markup in a file is never run. Decoration hovers are plain text.
+
+**Markdown preview.** A Markdown document can be shown as its editor, its preview (`MarkdownPreview.tsx`) or both side by side: **Edit | Preview | Split** in the tab bar, View › Toggle Markdown Preview (Ctrl+Shift+V) and Open Markdown Preview to the Side. The mode is the window's, per document; in preview the editor stays mounted, hidden, so its view state and undo are kept.
+
+```text
+DocumentService -> Document -> marked (GFM + footnotes) -> DOMPurify -> preview
+                                                                          | links, images, "Open in Editor"
+                                                                          v
+                                                          the window -> the same services as the editor
+```
+
+The preview reads the Document Model like the editor and subscribes to its one document, so it follows typing, reloads and Save As; a document over 200 KB is re-rendered after a pause in typing. It never reads or writes a file itself. It is the one place a file's markup is parsed, and it is parsed as data:
+
+- `marked` (GitHub-flavoured, with footnotes from `services/markdownFootnotes.ts`) makes HTML, which DOMPurify sanitizes -- no scripts, event handlers, frames, forms, style elements or attributes, or `javascript:` links -- and the CSP refuses inline and remote scripts besides.
+- **Images.** A path resolves against the document's own folder (`resolveMarkdownLink`) and is read through `read_image_file`: workspace files only, image extensions only, at most 20 MB, returned as raw bytes and shown as a `data:` URL (which is all the CSP allows; SVG in an `<img>` runs no script). An image that cannot be read says why; one from the web is not loaded (privacy, and the CSP), with a button that opens it in the browser. A shown image enlarges on click.
+- **Links.** The preview never navigates. `#heading` scrolls it (headings get GitHub's ids, and a hover anchor), a relative or absolute path opens that file in an editor (the workspace boundary applies as always), `https` opens the system browser through `open_external_url`, and any other scheme is ignored.
+- **Code blocks** have a language label, Copy (with "Copied"), Open in Editor (a new untitled document in that language) and numbered lines, and are coloured by Monaco's own tokenizers and theme (`monaco.editor.colorize`, which escapes what it is given).
+- **Outline**: every heading, the one being read marked, a click scrolls to it, a level collapses. **Find** (Ctrl+F in the preview, or Edit › Find while the preview replaces the editor): matches highlighted with the CSS Custom Highlight API, a count, next/previous, match case.
+- Not yet (later milestones): Mermaid, math, scroll sync, clickable task boxes, Git views, AI actions.
+
+**Keyboard.** Monaco handles its own keys first, clipboard keys included (so copying with nothing selected copies the line). The window's editing shortcuts act on the editor only while it has the keyboard; elsewhere the key is the focused control's, so Ctrl+A in the Explorer never selects the editor's text. A dialog dismissed with Escape returns focus to what had it.
 
 **Focus.** Showing a document (a tab opened or switched to) focuses its editor. A document that only changed key (renamed in the Explorer, or saved under a new name) keeps focus where it was: its editor takes focus back only if it had it (`EditorViews.takeFocus`). The decision is made once per key, because React StrictMode runs effects twice in development.
 
@@ -750,6 +776,7 @@ The view never inserts a result into a tree itself. A collision (a copy or a mov
 - Rows are memoized on their node object, so a change in one folder re-renders the rows whose nodes changed. In the UI test, adding one file to a folder of 20,000 re-renders fewer than 60 rows.
 - A folder of 100,000 files expands in about 2.3 s (mostly the listing itself) and renders fewer than 200 rows. An arrow key in it takes about 90 ms, which was 255 ms before the set-identity fix.
 - Cut and dragged states are sets, looked up in O(1) per row.
+- Only the rows in view are drawn, from the tree's measured height. The tree stays mounted, hidden, while another view (Search, Source Control, ...) is showing: remounting it left the measurement watching a detached element, so a tree came back with only a handful of rows drawn and its scroll position lost. A measurement taken while hidden is ignored.
 
 **Invariants**
 

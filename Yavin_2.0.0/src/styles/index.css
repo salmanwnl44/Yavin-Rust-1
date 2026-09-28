@@ -66,3 +66,262 @@ body,
 ::-webkit-scrollbar-thumb:hover {
   background: var(--color-border-strong);
 }
+
+/* A strip that scrolls without showing a scrollbar (the editor tabs): the wheel and the
+   active tab scroll it instead. */
+@utility no-scrollbar {
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* The Markdown preview: the editor's colours (Yavin Dark) in a reading face, code in the
+   editor's font. */
+.markdown-body {
+  --md-text: #d4d4d4;
+  --md-heading: #ffffff;
+  --md-link: #569cd6;
+  --md-inline-code: #ce9178;
+  --md-code-background: #111111;
+  --md-quote: #6a9955;
+  --md-border: #303030;
+  color: var(--md-text);
+  background: #000000;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.7;
+}
+.markdown-body > * {
+  max-width: 900px;
+}
+.markdown-body > * + * {
+  margin-top: 0.9em;
+}
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  position: relative;
+  color: var(--md-heading);
+  font-weight: 600;
+  line-height: 1.3;
+  margin-top: 1.5em;
+  scroll-margin-top: 12px;
+}
+.markdown-body > :first-child {
+  margin-top: 0;
+}
+.markdown-body h1 {
+  font-size: 1.9em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--md-border);
+}
+.markdown-body h2 {
+  font-size: 1.45em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--md-border);
+}
+.markdown-body h3 {
+  font-size: 1.2em;
+}
+.markdown-body h5,
+.markdown-body h6 {
+  color: #a1a1aa;
+}
+.markdown-body .heading-anchor {
+  position: absolute;
+  left: -1.1em;
+  width: 1em;
+  text-align: center;
+  color: #52525b;
+  opacity: 0;
+  text-decoration: none;
+}
+.markdown-body .heading-anchor::before {
+  content: "#";
+}
+.markdown-body :is(h1, h2, h3, h4, h5, h6):hover .heading-anchor {
+  opacity: 1;
+}
+.markdown-body a {
+  color: var(--md-link);
+  text-decoration: none;
+  cursor: pointer;
+}
+.markdown-body a:hover {
+  text-decoration: underline;
+}
+.markdown-body ul,
+.markdown-body ol {
+  padding-left: 1.8em;
+}
+.markdown-body ul {
+  list-style: disc;
+}
+.markdown-body ul ul {
+  list-style: circle;
+}
+.markdown-body ol {
+  list-style: decimal;
+}
+.markdown-body li + li,
+.markdown-body li > ul,
+.markdown-body li > ol {
+  margin-top: 0.25em;
+}
+.markdown-body li:has(> input[type="checkbox"]) {
+  list-style: none;
+  margin-left: -1.4em;
+}
+.markdown-body input[type="checkbox"] {
+  margin-right: 0.45em;
+  vertical-align: middle;
+  accent-color: #6366f1;
+}
+.markdown-body code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  color: var(--md-inline-code);
+  background: var(--md-code-background);
+  border-radius: 4px;
+  padding: 0.15em 0.35em;
+}
+.markdown-body del {
+  color: #71717a;
+}
+.markdown-body blockquote {
+  color: var(--md-quote);
+  border-left: 3px solid var(--md-quote);
+  padding-left: 1em;
+}
+.markdown-body table {
+  border-collapse: collapse;
+  display: block;
+  max-width: 100%;
+  overflow: auto;
+}
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid var(--md-border);
+  padding: 6px 12px;
+  vertical-align: top;
+}
+.markdown-body th {
+  background: var(--md-code-background);
+  color: var(--md-heading);
+  font-weight: 600;
+}
+.markdown-body tr:nth-child(even) td {
+  background: #070707;
+}
+.markdown-body hr {
+  border: 0;
+  border-top: 1px solid var(--md-border);
+}
+.markdown-body img {
+  max-width: 100%;
+  cursor: zoom-in;
+  border-radius: 4px;
+}
+.markdown-body .markdown-image[data-state="loading"],
+.markdown-body .markdown-image[data-state="remote"],
+.markdown-body .markdown-image[data-state="broken"] {
+  display: inline-block;
+  color: #71717a;
+  font-size: 12px;
+  font-style: italic;
+  border: 1px dashed var(--md-border);
+  border-radius: 4px;
+  padding: 4px 8px;
+}
+.markdown-body .markdown-image[data-state="broken"] {
+  color: #f87171;
+}
+.markdown-body .markdown-image-open {
+  font-style: normal;
+  color: var(--md-link);
+}
+
+/* Code blocks: a header with the language and actions, numbered lines. */
+.markdown-body .code-block {
+  border: 1px solid var(--md-border);
+  border-radius: 6px;
+  background: var(--md-code-background);
+  overflow: hidden;
+}
+.markdown-body .code-block-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 8px 3px 12px;
+  border-bottom: 1px solid var(--md-border);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  color: #71717a;
+}
+.markdown-body .code-block-action {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  color: #a1a1aa;
+}
+.markdown-body .code-block-action:hover {
+  background: #1f1f1f;
+  color: #f4f4f5;
+}
+.markdown-body pre {
+  margin: 0;
+  padding: 10px 0;
+  overflow: auto;
+  line-height: 1.55;
+  counter-reset: code-line;
+}
+.markdown-body pre code {
+  display: block;
+  min-width: max-content;
+  background: none;
+  color: var(--md-text);
+  padding: 0;
+  font-size: 12.5px;
+  border-radius: 0;
+}
+.markdown-body .code-line {
+  display: block;
+  white-space: pre;
+  padding-right: 14px;
+}
+.markdown-body .code-line::before {
+  counter-increment: code-line;
+  content: counter(code-line);
+  display: inline-block;
+  width: 3em;
+  margin-right: 1em;
+  padding-right: 0.6em;
+  text-align: right;
+  color: #4a4a4a;
+  user-select: none;
+}
+
+/* Footnotes. */
+.markdown-body .footnote-ref a {
+  font-size: 0.8em;
+}
+.markdown-body .footnotes {
+  font-size: 0.9em;
+  color: #a1a1aa;
+}
+.markdown-body .footnote-back {
+  margin-left: 0.3em;
+}
+
+/* Find in the preview. */
+::highlight(markdown-find) {
+  background-color: rgba(234, 179, 8, 0.35);
+}
+::highlight(markdown-find-current) {
+  background-color: rgba(249, 115, 22, 0.85);
+  color: #000000;
+}

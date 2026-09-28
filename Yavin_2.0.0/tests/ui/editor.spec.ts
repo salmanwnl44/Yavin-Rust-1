@@ -365,9 +365,13 @@ test("typing renders nothing in React: not the window, not the editor component"
   page,
 }) => {
   // React reports every commit to the DevTools hook; a component function that ran in a
-  // render carries the PerformedWork flag (1) on its fiber in that commit.
+  // render carries the PerformedWork flag (1) on its fiber in that commit. A subtree a commit
+  // did not touch keeps its fibers as they were, flags included -- so a component counts as
+  // rendered only when its fiber is also a new one. (Typing does commit: the status bar's
+  // cursor position redraws.)
   await page.addInitScript(() => {
     const renders: Record<string, number> = {};
+    const seen: Record<string, unknown> = {};
     const find = (fiber: unknown, name: string): { flags: number } | null => {
       type Fiber = { type?: { name?: string }; child?: Fiber; sibling?: Fiber; flags: number };
       const stack: Fiber[] = [fiber as Fiber];
@@ -390,9 +394,12 @@ test("typing renders nothing in React: not the window, not the editor component"
         onCommitFiberUnmount: () => {},
         onPostCommitFiberRoot: () => {},
         onCommitFiberRoot: (_id: number, root: { current: unknown }) => {
-          for (const name of ["App", "CodeEditor"])
-            if (((find(root.current, name)?.flags ?? 0) & 1) === 1)
+          for (const name of ["App", "CodeEditor"]) {
+            const fiber = find(root.current, name);
+            if (fiber && fiber !== seen[name] && (fiber.flags & 1) === 1)
               renders[name] = (renders[name] ?? 0) + 1;
+            seen[name] = fiber;
+          }
         },
       },
     });
@@ -400,11 +407,16 @@ test("typing renders nothing in React: not the window, not the editor component"
   await fixture(page, { "/work/a.ts": "a" });
   const editor = await open(page, "a.ts");
   await editor.press("End");
+  const renders = () =>
+    page.evaluate(() => ({
+      ...(window as unknown as { __renders: Record<string, number> }).__renders,
+    }));
+  const clean = await renders();
   await editor.pressSequentially("b"); // clean -> dirty: the tab's marker changes, so it redraws
   await expect(unsaved(page)).toBeVisible();
-  const before = await page.evaluate(() => ({
-    ...(window as unknown as { __renders: Record<string, number> }).__renders,
-  }));
+  const before = await renders();
+  // The count does see a real render: this keystroke changed what the window shows.
+  expect(before.App ?? 0).toBeGreaterThan(clean.App ?? 0);
   await editor.pressSequentially("cdefghij");
   await expectText(page, "abcdefghij");
   const after = await page.evaluate(() => ({

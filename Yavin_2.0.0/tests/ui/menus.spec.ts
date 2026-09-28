@@ -50,7 +50,9 @@ test("keyboard navigation crosses menus and disabled commands cannot run", async
   await page.keyboard.press("ArrowRight");
   await expect(page.getByRole("menu", { name: "Edit", exact: true })).toBeVisible();
   await page.keyboard.press("End");
-  await expect(page.getByRole("menuitem", { name: "Replace…", exact: true })).toBeFocused();
+  await expect(
+    page.getByRole("menu", { name: "Edit", exact: true }).getByRole("menuitem").last(),
+  ).toBeFocused();
 });
 
 test("selection, duplication, undo and redo change the document", async ({ page }) => {

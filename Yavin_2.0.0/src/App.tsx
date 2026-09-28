@@ -1,5 +1,8 @@
 import { AppDialog } from "./components/ui/AppDialog";
-import type { DocumentNotice } from "./components/layout/EditorArea";
+import type { MenuItem } from "./components/ui/ContextMenu";
+import type { DocumentNotice, MarkdownMode } from "./components/layout/EditorArea";
+import type { MarkdownLink } from "./services/markdownLinks";
+import type { MarkdownPreviewHandle } from "./components/layout/MarkdownPreview";
 import type { DialogRequest } from "./components/ui/AppDialog";
 import type { EditorHandle, EditorState, EditorAction } from "./editor/editorTypes";
 import { createEditorViews } from "./services/editorViews";
@@ -78,6 +81,9 @@ import {
 } from "./services/git";
 import type { Decorations } from "./services/git";
 import { hitOffset, listFiles } from "./services/search";
+import { createCursorStatus } from "./services/cursorStatus";
+import { loadMinimapPreferences, saveMinimapPreferences } from "./services/minimapPreferences";
+import type { MinimapPreferences } from "./services/minimapPreferences";
 
 /**
  * The Document Model's disk: the guarded native commands, each one a Module 03 operation with
@@ -87,6 +93,7 @@ const documentIO: DocumentIO = {
   read: (path) => native("read_file_content", { path }),
   write: (path, expected, content) => native("write_file_guarded", { path, expected, content }),
   create: (path, content) => native("create_file_with_content", { path, content }),
+  readOnly: (path) => native("is_read_only", { path }),
 };
 
 const WELCOME_TAB: OpenTab = { id: "welcome", name: "Welcome", path: "welcome" };
@@ -111,6 +118,34 @@ const explorerStateOf = (state: WorkspaceSession): ExplorerSessionState => ({
   focused: state.focused ?? null,
 });
 const NO_ROOTS: never[] = [];
+/** What a Markdown preview's images are, by extension (`read_image_file` allows only these). */
+const IMAGE_TYPES: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  svg: "image/svg+xml",
+  bmp: "image/bmp",
+  ico: "image/x-icon",
+  avif: "image/avif",
+};
+/**
+ * Commands that act on the editor's text. From the keyboard they run only while the editor
+ * has it; elsewhere the key is the focused control's (see the window's key handler).
+ */
+const EDITOR_KEY_COMMANDS = [
+  "selection.line",
+  "selection.duplicate",
+  "selection.copyLineUp",
+  "selection.copyLineDown",
+  "selection.moveLineUp",
+  "selection.moveLineDown",
+  "edit.deleteLine",
+  "edit.toggleComment",
+  "edit.indent",
+  "edit.outdent",
+];
 // Error boundary to prevent white/black screen crashes
 class ErrorBoundary extends Component<
   React.PropsWithChildren,
@@ -152,6 +187,9 @@ class ErrorBoundary extends Component<
 
 export default function App() {
   const editorRef = useRef<EditorHandle>(null);
+  const previewRef = useRef<MarkdownPreviewHandle>(null);
+  /** The editor's cursor for the status bar, outside React state (see `cursorStatus.ts`). */
+  const cursorStatus = useRef(createCursorStatus()).current;
   /**
    * The editor's own state per document -- undo history, selection, scroll -- which is not the
    * document's (see `services/editorViews.ts`).
@@ -306,6 +344,20 @@ export default function App() {
     setPanelRequest((previous) => ({ nonce: previous.nonce + 1, view, channel }));
   }, []);
   const [searchFocus, setSearchFocus] = useState(0);
+  const [replaceRequest, setReplaceRequest] = useState(0);
+  /** How the editor's minimap looks: its right-click menu and View › Minimap change it. */
+  const [minimap, setMinimap] = useState<MinimapPreferences>(loadMinimapPreferences);
+  const changeMinimap = useCallback((change: Partial<MinimapPreferences>) => {
+    setMinimap((previous) => {
+      const next = { ...previous, ...change };
+      saveMinimapPreferences(next);
+      return next;
+    });
+  }, []);
+  /** How each Markdown document is shown (editor, preview, both), by document id. */
+  const [markdownModes, setMarkdownModes] = useState<ReadonlyMap<string, MarkdownMode>>(new Map());
+  /** Read-only files the user chose to edit anyway, by document id: the choice lasts while open. */
+  const [editAnyway, setEditAnyway] = useState<ReadonlySet<string>>(new Set());
   const [pendingHit, setPendingHit] = useState<SearchHit | null>(null);
   const hasUnsavedChanges = tabs.some((tab) => tab.dirty);
   const totalGitChanges = useTotalChanges();
@@ -721,22 +773,71 @@ export default function App() {
         );
     });
 
-  const handleCloseTab = (id: string) => {
-    const doc = id === "welcome" ? undefined : documents.get(id);
-    if (doc?.save.kind === "saving") {
-      reportError("Wait for the file to finish saving before closing it.");
+  /** Files closed in this folder, the latest last: what Reopen Closed Editor brings back. */
+  const closedFiles = useRef<string[]>([]);
+  const rememberClosed = (paths: string[]) => {
+    const kept = closedFiles.current.filter((path) => !paths.includes(path));
+    closedFiles.current = [...kept, ...paths].slice(-20);
+  };
+
+  /**
+   * Closes several tabs at once (Close Others, Close to the Right, Close Saved), asking once
+   * for all the unsaved changes that would be lost. Nothing closes while one of them saves.
+   */
+  const closeTabs = (ids: string[]) => {
+    const closing = new Set(ids);
+    const docs = ids.flatMap((id) => (id === "welcome" ? [] : (documents.get(id) ?? [])));
+    if (docs.some((doc) => doc.save.kind === "saving")) {
+      reportError(
+        ids.length === 1
+          ? "Wait for the file to finish saving before closing it."
+          : "Wait for saves to finish before closing these editors.",
+      );
       return;
     }
-    if (doc?.dirty && !window.confirm("Discard unsaved changes in this file?")) return;
-    if (doc) documents.close(id, { discard: true });
-    setTabs((prev) => prev.filter((tab) => tab.id !== id));
-    views.forget(id);
-    if (activeTabId === id) {
-      // The tab beside it comes forward, as in a browser: the right one, else the left one.
-      const index = tabs.findIndex((tab) => tab.id === id);
-      const next = tabs[index + 1] ?? tabs[index - 1];
+    const unsaved = docs.filter((doc) => doc.dirty);
+    // "This file" only for the one in front; any other is named.
+    const question =
+      ids.length === 1 && ids[0] === activeTabId
+        ? "Discard unsaved changes in this file?"
+        : unsaved.length === 1
+          ? `Discard unsaved changes in ${unsaved[0].name}?`
+          : `Discard unsaved changes in ${unsaved.length} files?`;
+    if (unsaved.length && !window.confirm(question)) return;
+    rememberClosed(docs.flatMap((doc) => (doc.path ? [doc.path] : [])));
+    for (const doc of docs) {
+      documents.close(doc.key, { discard: true });
+      views.forget(doc.key);
+    }
+    setTabs((prev) => prev.filter((tab) => !closing.has(tab.id)));
+    if (closing.has(activeTabId)) {
+      // The tab beside it comes forward, as in a browser: the nearest one to the right that
+      // stays open, else to the left.
+      const index = tabs.findIndex((tab) => tab.id === activeTabId);
+      const next =
+        tabs.slice(index + 1).find((tab) => !closing.has(tab.id)) ??
+        tabs
+          .slice(0, index)
+          .reverse()
+          .find((tab) => !closing.has(tab.id));
       setActiveTabId(next?.id ?? "welcome");
     }
+  };
+  const handleCloseTab = (id: string) => closeTabs([id]);
+  /** The tab's neighbours for Close Others and Close to the Right. */
+  const otherTabs = (id: string) => tabs.filter((tab) => tab.id !== id).map((tab) => tab.id);
+  const tabsRightOf = (id: string) =>
+    tabs.slice(tabs.findIndex((tab) => tab.id === id) + 1).map((tab) => tab.id);
+  const savedTabs = () =>
+    tabs
+      .filter((tab) => {
+        const doc = tab.id === "welcome" ? undefined : documents.get(tab.id);
+        return !doc || (!doc.dirty && doc.save.kind !== "saving");
+      })
+      .map((tab) => tab.id);
+  const reopenClosed = () => {
+    const path = closedFiles.current.pop();
+    if (path) void handleOpenFile(path);
   };
   /** Save As: a new file for any open document, and how an untitled one reaches the disk. */
   const saveAs = async (key: string) => {
@@ -779,6 +880,7 @@ export default function App() {
     setTabs([WELCOME_TAB]);
     setActiveTabId("welcome");
     setRecentFiles([]);
+    closedFiles.current = [];
     setWorkspacePath(selected);
     explorer.setRoots([]);
     setDecorations({ files: new Map(), folders: new Set() });
@@ -921,6 +1023,55 @@ export default function App() {
     handleRename(src, dest.replace(/\/$/, "") + "/" + src.split("/").pop());
   const handleReveal = (path: string) => run(() => native("reveal_in_explorer", { path }));
 
+  /** A tab's context menu. Read when it opens, so it reflects the tabs as they are then. */
+  const tabMenu = (id: string): MenuItem[] => {
+    const path = id === "welcome" ? undefined : documents.get(id)?.path;
+    return [
+      { label: "Close", shortcut: shortcutLabel("Mod+w"), onClick: () => closeTabs([id]) },
+      {
+        label: "Close Others",
+        disabled: tabs.length <= 1,
+        onClick: () => closeTabs(otherTabs(id)),
+      },
+      {
+        label: "Close to the Right",
+        disabled: !tabsRightOf(id).length,
+        onClick: () => closeTabs(tabsRightOf(id)),
+      },
+      {
+        label: "Close Saved",
+        disabled: !savedTabs().length,
+        onClick: () => closeTabs(savedTabs()),
+      },
+      { label: "Close All", onClick: closeAll },
+      { divider: true },
+      {
+        label: "Copy Path",
+        disabled: !path,
+        onClick: () => path && navigator.clipboard.writeText(path),
+      },
+      {
+        label: "Reveal in Explorer View",
+        disabled: !path,
+        onClick: () => {
+          if (!path) return;
+          setActiveActivityTab("explorer");
+          setIsSidebarOpen(true);
+          void explorerStore.reveal(path);
+        },
+      },
+      ...(isTauri()
+        ? [
+            {
+              label: "Reveal in File Explorer",
+              disabled: !path,
+              onClick: () => path && handleReveal(path),
+            },
+          ]
+        : []),
+    ];
+  };
+
   const activeTab = tabs.find((t) => t.id === activeTabId);
   const activeDocument: TextDocument | undefined =
     activeTab && activeTab.id !== "welcome" ? documents.get(activeTab.path) : undefined;
@@ -983,8 +1134,57 @@ export default function App() {
         tone: "warning",
         text: "Proposed content, and the file has changed since it was proposed.",
       };
+    if (doc.readOnly && !editAnyway.has(doc.id))
+      return {
+        tone: "info",
+        text: "This file is read-only on disk. Saving it here would fail; Save As keeps a copy.",
+        actions: [
+          {
+            label: "Edit Anyway",
+            run: () => setEditAnyway((previous) => new Set(previous).add(doc.id)),
+          },
+        ],
+      };
     return undefined;
   })();
+  /** Set for a Markdown document in front: how it is shown. */
+  const markdownMode: MarkdownMode | undefined =
+    activeDocument?.languageId === "markdown"
+      ? (markdownModes.get(activeDocument.id) ?? "edit")
+      : undefined;
+  const showMarkdown = (mode: MarkdownMode) => {
+    if (!activeDocument) return;
+    const id = activeDocument.id;
+    setMarkdownModes((previous) => new Map(previous).set(id, mode));
+    // Back to the editor, the keyboard goes with it.
+    if (mode !== "preview") requestAnimationFrame(() => editorRef.current?.focus());
+  };
+  /** An image in the workspace for a Markdown preview: its bytes, from the native side. */
+  const loadImage = async (path: string): Promise<string> => {
+    const bytes: unknown = await native("read_image_file", { path });
+    // Raw bytes, or nothing is shown.
+    if (!(bytes instanceof ArrayBuffer)) throw new Error("The image could not be read.");
+    const type = IMAGE_TYPES[path.slice(path.lastIndexOf(".") + 1).toLowerCase()] ?? "image/png";
+    return await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(new Blob([bytes], { type }));
+    });
+  };
+  /** "Open in Editor" on a code block: a new, untitled document holding the code. */
+  const openCode = (code: string, languageId: string | undefined) => {
+    const doc = documents.createUntitled({ text: code, languageId });
+    setTabs((prev) => [...prev, { id: doc.key, path: doc.key, name: doc.name }]);
+    setActiveTabId(doc.key);
+  };
+  /** A link followed in a Markdown preview: a workspace file opens, a web page goes to the browser. */
+  const openMarkdownLink = (link: MarkdownLink) => {
+    if (link.kind === "file") void handleOpenFile(link.path);
+    else if (link.kind === "web") void run(() => native("open_external_url", { url: link.url }));
+  };
+  /** The editor refuses typing into a read-only file until the user chooses to edit it. */
+  const editorReadOnly = !!activeDocument?.readOnly && !editAnyway.has(activeDocument.id);
   /** Encoding, line endings and language of the document in front, for the status bars. */
   const documentDetails = activeDocument
     ? [
@@ -998,11 +1198,14 @@ export default function App() {
     if (!pendingHit || activeTabId !== pendingHit.path || diff) return;
     const content = documents.get(pendingHit.path)?.text;
     if (content === undefined) return;
+    // The first document opened loads the editor itself: until it is there, the hit waits.
+    // Showing the document reports the editor's state, which runs this again.
+    if (!editorRef.current) return;
     const start = hitOffset(content, pendingHit);
     if (start === null) reportError("This search result changed. Search again to locate it.");
-    else editorRef.current?.revealRange(start, start + pendingHit.end - pendingHit.start);
+    else editorRef.current.revealRange(start, start + pendingHit.end - pendingHit.start);
     setPendingHit(null);
-  }, [activeTabId, documentState, documents, pendingHit, diff, reportError]);
+  }, [activeTabId, documentState, documents, pendingHit, diff, reportError, editorState]);
 
   const applyReplacements = async (changes: Replacement[], saved = false) => {
     const applied: Replacement[] = [];
@@ -1151,6 +1354,7 @@ export default function App() {
     if (documents.anySaving()) throw new Error("Wait for saves to finish before closing editors.");
     if (hasUnsavedChanges && !window.confirm("Discard all unsaved changes and close all editors?"))
       return;
+    rememberClosed(tabs.flatMap((tab) => documents.get(tab.id)?.path ?? []));
     setTabs([WELCOME_TAB]);
     setActiveTabId("welcome");
     documents.reset();
@@ -1183,6 +1387,7 @@ export default function App() {
         setActiveActivityTab("search");
         setIsSidebarOpen(true);
         setSearchFocus((v) => v + 1);
+        setReplaceRequest((v) => v + 1);
       },
     },
     {
@@ -1297,11 +1502,34 @@ export default function App() {
       run: () => handleCloseTab(activeTabId),
     },
     {
+      id: "file.closeOthers",
+      menu: "File",
+      label: "Close Other Editors",
+      disabled: tabs.length <= 1,
+      run: () => closeTabs(otherTabs(activeTabId)),
+    },
+    {
+      id: "file.closeSaved",
+      menu: "File",
+      label: "Close Saved Editors",
+      disabled: !savedTabs().length,
+      run: () => closeTabs(savedTabs()),
+    },
+    {
       id: "file.closeAll",
       menu: "File",
       label: "Close All Editors",
       disabled: !hasEditor && tabs.length <= 1,
       run: closeAll,
+    },
+    {
+      id: "file.reopenClosed",
+      menu: "File",
+      label: "Reopen Closed Editor",
+      shortcut: "Mod+Shift+t",
+      disabled: !closedFiles.current.length,
+      reason: "No editor has been closed",
+      run: reopenClosed,
     },
     {
       // Shown in Yavin's own Explorer, by its store: ancestors expanded and listed, selected.
@@ -1389,7 +1617,8 @@ export default function App() {
       label: "Find…",
       shortcut: "Mod+f",
       disabled: !hasEditor,
-      run: () => edit("find"),
+      // With a Markdown preview in place of its editor, Find searches the preview.
+      run: () => (markdownMode === "preview" ? previewRef.current?.find() : edit("find")),
     },
     {
       id: "edit.replace",
@@ -1423,6 +1652,27 @@ export default function App() {
       disabled: !hasEditor,
       run: () => edit("duplicate"),
     },
+    // Monaco's own line commands, which its keybindings already run in the editor; listed
+    // here so the menus and the shortcut help show them.
+    ...(
+      [
+        ["selection.copyLineUp", "Copy Line Up", "Shift+Alt+ArrowUp", "copyLineUp"],
+        ["selection.copyLineDown", "Copy Line Down", "Shift+Alt+ArrowDown", "copyLineDown"],
+        ["selection.moveLineUp", "Move Line Up", "Alt+ArrowUp", "moveLineUp"],
+        ["selection.moveLineDown", "Move Line Down", "Alt+ArrowDown", "moveLineDown"],
+        ["edit.deleteLine", "Delete Line", "Mod+Shift+k", "deleteLine"],
+        ["edit.toggleComment", "Toggle Line Comment", "Mod+/", "toggleComment"],
+        ["edit.indent", "Indent Line", "Mod+]", "indent"],
+        ["edit.outdent", "Outdent Line", "Mod+[", "outdent"],
+      ] as const
+    ).map(([id, label, shortcut, action]) => ({
+      id,
+      menu: id.startsWith("edit.") ? "Edit" : "Selection",
+      label,
+      shortcut,
+      disabled: !hasEditor,
+      run: () => edit(action),
+    })),
     {
       id: "view.commands",
       menu: "View",
@@ -1462,9 +1712,35 @@ export default function App() {
       run: () => setWordWrap((prev) => !prev),
     },
     {
+      id: "view.markdownPreview",
+      menu: "View",
+      label: "Toggle Markdown Preview",
+      shortcut: "Mod+Shift+v",
+      disabled: !markdownMode,
+      reason: "Open a Markdown file first",
+      run: () => showMarkdown(markdownMode === "preview" ? "edit" : "preview"),
+    },
+    {
+      id: "view.markdownPreviewSide",
+      menu: "View",
+      label: "Open Markdown Preview to the Side",
+      disabled: !markdownMode,
+      reason: "Open a Markdown file first",
+      run: () => showMarkdown(markdownMode === "split" ? "edit" : "split"),
+    },
+    {
+      // The way back to a minimap turned off from its own menu, as in VS Code.
+      id: "view.minimap",
+      menu: "View",
+      label: "Minimap",
+      checked: minimap.enabled,
+      run: () => changeMinimap({ enabled: !minimap.enabled }),
+    },
+    {
       id: "view.zoomIn",
       menu: "View",
       label: "Zoom In",
+      shortcut: "Mod+=",
       disabled: zoom >= 2,
       run: () => setZoom((prev) => Math.min(2, prev + 0.1)),
     },
@@ -1472,10 +1748,17 @@ export default function App() {
       id: "view.zoomOut",
       menu: "View",
       label: "Zoom Out",
+      shortcut: "Mod+-",
       disabled: zoom <= 0.7,
       run: () => setZoom((prev) => Math.max(0.7, prev - 0.1)),
     },
-    { id: "view.zoomReset", menu: "View", label: "Reset Zoom", run: () => setZoom(1) },
+    {
+      id: "view.zoomReset",
+      menu: "View",
+      label: "Reset Zoom",
+      shortcut: "Mod+0",
+      run: () => setZoom(1),
+    },
     {
       id: "go.file",
       menu: "Go",
@@ -1677,8 +1960,7 @@ export default function App() {
       // Editing keys belong to whatever has the keyboard. Outside the editor they never reach
       // into it: Ctrl+A in the Explorer does not select the editor's text, nor Ctrl+Z undo it.
       // (The menus still run these commands on the editor.)
-      const editorCommand =
-        nativeTextCommand || ["selection.line", "selection.duplicate"].includes(command.id);
+      const editorCommand = nativeTextCommand || EDITOR_KEY_COMMANDS.includes(command.id);
       if (editorCommand && !inEditor) {
         // Without this, Ctrl+A would select the whole window's text.
         if (command.id === "selection.all" && !textControl) event.preventDefault();
@@ -1745,6 +2027,7 @@ export default function App() {
             buffers={readBuffers}
             visible={isSidebarOpen && activeActivityTab === "search"}
             focusRequest={searchFocus}
+            replaceRequest={replaceRequest}
             onOpen={(hit) => {
               setPendingHit(hit);
               void handleOpenFile(hit.path);
@@ -1874,6 +2157,18 @@ export default function App() {
                 onOpenFolderDialog={handleOpenFolderDialog}
                 documents={documents}
                 views={views}
+                cursorStatus={cursorStatus}
+                readOnly={editorReadOnly}
+                minimap={minimap}
+                onMinimapChange={changeMinimap}
+                markdownMode={markdownMode}
+                onMarkdownMode={showMarkdown}
+                onOpenLink={openMarkdownLink}
+                loadImage={loadImage}
+                onOpenCode={openCode}
+                previewRef={previewRef}
+                tabMenu={tabMenu}
+                onMenuError={reportError}
                 notice={notice}
                 onSaveFile={handleSaveFile}
                 recentFiles={recentFiles}
@@ -1929,6 +2224,11 @@ export default function App() {
           onToggleTerminal={() => showTerminal((prev) => !prev)}
           restricted={!trust.trusted}
           onManageTrust={() => setTrustDialog("manage")}
+          cursorStatus={cursorStatus}
+          onGoToLine={() => {
+            const goToLine = commands.find((command) => command.id === "go.line");
+            if (goToLine && !goToLine.disabled) void run(async () => goToLine.run());
+          }}
           onShowProblems={() => {
             showTerminal(true);
             showPanelView("problems");

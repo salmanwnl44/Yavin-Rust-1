@@ -190,7 +190,15 @@ test("the language comes from the name", () => {
   assert.equal(languageFor("C:\\w\\lib.RS"), "rust");
   assert.equal(languageFor("Dockerfile"), "dockerfile");
   assert.equal(languageFor(".gitignore"), "ignore");
-  assert.equal(languageFor(".env"), "plaintext");
+  assert.equal(languageFor(".env"), "dotenv");
+  assert.equal(languageFor("/w/.env.local"), "dotenv");
+  assert.equal(languageFor("Dockerfile.dev"), "dockerfile");
+  assert.equal(languageFor("setup.cfg"), "ini");
+  assert.equal(languageFor("lib.CXX"), "cpp");
+  assert.equal(languageFor("run.cmd"), "bat");
+  assert.equal(languageFor(".zshrc"), "shellscript");
+  assert.equal(languageFor("page.mdx"), "mdx");
+  assert.equal(languageFor(".vimrc"), "plaintext");
   assert.equal(languageFor("notes"), "plaintext");
   assert.equal(languageLabel("typescript"), "TypeScript");
   assert.equal(languageLabel("unknown-id"), "unknown-id");
@@ -865,4 +873,27 @@ test("listeners are told what changed and one failing listener does not stop the
   }
   assert.deepEqual(seen, ["opened", "changed"]);
   assert.ok(docs.revision() > before);
+});
+
+test("a file marked read-only on disk opens as read-only, and a reload sees it change", async () => {
+  const fake = fakeDisk({ "/w/a.ts": "a", "/w/b.ts": "b" });
+  const locked = new Set(["/w/a.ts"]);
+  const docs = createDocumentService({ ...fake.io, readOnly: async (path) => locked.has(path) });
+  assert.equal((await docs.open("/w/a.ts"))?.readOnly, true);
+  assert.equal((await docs.open("/w/b.ts"))?.readOnly, false);
+  locked.delete("/w/a.ts");
+  assert.equal((await docs.reload("/w/a.ts")).readOnly, false);
+
+  // Not knowing is never a reason to refuse a file: without the check, or when it fails,
+  // nothing is read-only.
+  const plain = createDocumentService(fakeDisk({ "/w/c.ts": "c" }).io);
+  assert.equal((await plain.open("/w/c.ts"))?.readOnly, false);
+  const failing = createDocumentService({
+    ...fakeDisk({ "/w/d.ts": "d" }).io,
+    readOnly: async () => {
+      throw new Error("Access is denied.");
+    },
+  });
+  assert.equal((await failing.open("/w/d.ts"))?.readOnly, false);
+  assert.equal(failing.createUntitled().readOnly, false);
 });

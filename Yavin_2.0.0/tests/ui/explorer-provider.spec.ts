@@ -212,3 +212,26 @@ test("a folder of 20,000 files expands, renders a window of rows, and scrolls", 
   console.log(`20,000 files: expanded and shown in ${expanded} ms, ${rendered} rows rendered`);
   expect(expanded).toBeLessThan(5000);
 });
+
+test("a long tree is drawn in full, where it was, after another view was shown", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await fixture(page, [], { "/work/big": 300 });
+  await row(page, "big").click();
+  await expect(row(page, "file00000.ts")).toBeVisible();
+  await tree(page).evaluate((element) => (element.scrollTop = 3000));
+  await expect(row(page, "file00150.ts")).toBeVisible();
+  const drawn = await tree(page).getByRole("treeitem").count();
+
+  // The Search view, and one of the views that are not built yet, each hide the Explorer.
+  for (const view of ["Search (Ctrl+Shift+F)", "Run & Debug (Ctrl+Shift+D)"]) {
+    await page.getByTitle(view).click();
+    await expect(tree(page)).toBeHidden();
+    await page.getByTitle("Explorer (Ctrl+Shift+E)").click();
+    // Every row of the window is drawn again, not the few drawn before it was measured...
+    await expect(tree(page).getByRole("treeitem")).toHaveCount(drawn);
+    // ...at the same place in the tree.
+    await expect(row(page, "file00150.ts")).toBeVisible();
+  }
+});

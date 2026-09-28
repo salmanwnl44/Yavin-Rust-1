@@ -11,6 +11,14 @@ export type EditorAction =
   | "selectAll"
   | "selectLine"
   | "duplicate"
+  | "moveLineUp"
+  | "moveLineDown"
+  | "copyLineUp"
+  | "copyLineDown"
+  | "deleteLine"
+  | "toggleComment"
+  | "indent"
+  | "outdent"
   | "find"
   | "replace";
 

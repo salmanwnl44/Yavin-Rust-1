@@ -2,6 +2,8 @@
 import { useActiveRepo, useRepoSnapshot } from "../../services/git";
 import { GitBranchIcon } from "../ui/Icons";
 import { problemCounts, problemsVersion, subscribeProblems } from "../../services/panel/problems";
+import { describeCursor } from "../../services/cursorStatus";
+import type { CursorStatusStore } from "../../services/cursorStatus";
 
 interface StatusBarProps {
   activeFile: string;
@@ -13,6 +15,29 @@ interface StatusBarProps {
   /** Whether the open folder is in Restricted Mode. */
   restricted?: boolean;
   onManageTrust?: () => void;
+  /** The editor's cursor, read by the items that show it (see `CursorItems`). */
+  cursorStatus?: CursorStatusStore;
+  /** Opens Go to Line, as clicking the position does in VS Code. */
+  onGoToLine?: () => void;
+}
+
+/**
+ * The cursor's position, the selection and the indentation. Subscribed here, in a component of
+ * their own, so that a keystroke redraws these few items and not the status bar or the window.
+ */
+function CursorItems({ store, onGoToLine }: { store: CursorStatusStore; onGoToLine?: () => void }) {
+  const status = useSyncExternalStore(store.subscribe, store.get, store.get);
+  if (!status) return null;
+  const { position, selection, indentation } = describeCursor(status);
+  return (
+    <>
+      <button onClick={onGoToLine} title="Go to Line (Ctrl+G)" className="hover:text-zinc-200">
+        {position}
+        {selection && <span className="ml-1">{selection}</span>}
+      </button>
+      <span title="The indentation this file uses">{indentation}</span>
+    </>
+  );
 }
 
 /**
@@ -30,6 +55,8 @@ export function StatusBar({
   onShowProblems,
   restricted,
   onManageTrust,
+  cursorStatus,
+  onGoToLine,
 }: StatusBarProps) {
   useSyncExternalStore(subscribeProblems, problemsVersion, problemsVersion);
   const branch = useRepoSnapshot(useActiveRepo()?.store)?.branch;
@@ -83,6 +110,7 @@ export function StatusBar({
         <span className="truncate">{activeFile || "Yavin IDE"}</span>
       </div>
       <div className="flex shrink-0 items-center gap-4">
+        {cursorStatus && <CursorItems store={cursorStatus} onGoToLine={onGoToLine} />}
         {details?.map((detail) => (
           <span key={detail}>{detail}</span>
         ))}

@@ -5,6 +5,14 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 pub const MAX_EDITOR_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB limit
+
+/// The largest image a Markdown preview shows.
+pub const MAX_IMAGE_SIZE: u64 = 20 * 1024 * 1024;
+
+/// The image types a Markdown preview shows, by extension (compared case-insensitively).
+pub const IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif",
+];
 pub const BINARY_CHECK_BYTES: usize = 8192; // Inspect first 8 KB
 
 /// Normalizes path to forward slashes `/` and strips Windows extended-length prefixes (`\\?\`, `//?/`, `\??\`).
@@ -167,6 +175,40 @@ impl WorkspaceManager {
     pub fn read_file<P: AsRef<Path>>(&self, path: P) -> Result<String, String> {
         let validated = self.validate_path(path)?;
         read_file_content_guarded(&validated)
+    }
+
+    /// The bytes of an image in the workspace, for a Markdown preview. Only image files, by
+    /// extension, and none over `MAX_IMAGE_SIZE`: this is not a general way to read any file.
+    pub fn read_image<P: AsRef<Path>>(&self, path: P) -> Result<Vec<u8>, String> {
+        let validated = self.validate_path(path)?;
+        let extension = validated
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if !IMAGE_EXTENSIONS.contains(&extension.as_str()) {
+            return Err(format!("Not an image: {}", validated.display()));
+        }
+        let metadata = fs::metadata(&validated).map_err(|e| e.to_string())?;
+        if !metadata.is_file() {
+            return Err(format!("Not a file: {}", validated.display()));
+        }
+        if metadata.len() > MAX_IMAGE_SIZE {
+            return Err(format!(
+                "The image is too large to show ({} MB; the limit is {} MB).",
+                metadata.len() / (1024 * 1024),
+                MAX_IMAGE_SIZE / (1024 * 1024)
+            ));
+        }
+        fs::read(&validated).map_err(|e| e.to_string())
+    }
+
+    /// Whether a file is marked read-only on disk: the read-only attribute on Windows, no write
+    /// permission on Unix. What an editor shows it as; the write itself is still what decides.
+    pub fn is_read_only<P: AsRef<Path>>(&self, path: P) -> Result<bool, String> {
+        let validated = self.validate_path(path)?;
+        let metadata = fs::metadata(&validated).map_err(|e| e.to_string())?;
+        Ok(metadata.permissions().readonly())
     }
 
     /// Safely and atomically writes content to a file.
@@ -804,6 +846,59 @@ mod tests {
             .rename_path(&tmp_dir, &tmp_dir.join("new_root"))
             .is_err());
 
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn only_images_in_the_workspace_are_read_as_images() {
+        let tmp_dir = env::temp_dir().join(format!("yavin-image-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let mgr = WorkspaceManager::new(tmp_dir.clone()).unwrap();
+        let png = tmp_dir.join("Logo.PNG");
+        fs::write(&png, [0x89, b'P', b'N', b'G', 0, 1, 2]).unwrap();
+        assert_eq!(
+            mgr.read_image(&png).unwrap(),
+            vec![0x89, b'P', b'N', b'G', 0, 1, 2]
+        );
+
+        // Not an image by its name: refused, whatever it holds.
+        let secret = tmp_dir.join("secret.txt");
+        fs::write(&secret, "token").unwrap();
+        assert!(mgr
+            .read_image(&secret)
+            .unwrap_err()
+            .contains("Not an image"));
+        // Outside the workspace, or a folder: refused.
+        assert!(mgr.read_image(env::temp_dir().join("x.png")).is_err());
+        fs::create_dir_all(tmp_dir.join("dir.png")).unwrap();
+        assert!(mgr.read_image(tmp_dir.join("dir.png")).is_err());
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn a_read_only_file_is_reported_as_such() {
+        let tmp_dir = env::temp_dir().join(format!("yavin-readonly-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let mgr = WorkspaceManager::new(tmp_dir.clone()).unwrap();
+        let path = tmp_dir.join("locked.txt");
+        fs::write(&path, "text").unwrap();
+        assert!(!mgr.is_read_only(&path).unwrap());
+
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions.clone()).unwrap();
+        assert!(mgr.is_read_only(&path).unwrap());
+
+        // Outside the workspace is refused, as for every other operation.
+        assert!(mgr
+            .is_read_only(env::temp_dir().join("elsewhere.txt"))
+            .is_err());
+
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&path, permissions).unwrap();
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 

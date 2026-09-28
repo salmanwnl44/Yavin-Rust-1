@@ -1,4 +1,6 @@
 import type { monaco } from "./monaco";
+import { DEFAULT_MINIMAP } from "../services/minimapPreferences";
+import type { MinimapPreferences } from "../services/minimapPreferences";
 
 /**
  * The editor's settings, in one place: sensible defaults now, what a Settings module will
@@ -10,7 +12,8 @@ export interface EditorSettings {
   lineHeight: number;
   tabSize: number;
   insertSpaces: boolean;
-  minimap: boolean;
+  /** Changed from the minimap's own right-click menu, and remembered. */
+  minimap: MinimapPreferences;
   lineNumbers: "on" | "off" | "relative";
   bracketPairColorization: boolean;
   renderWhitespace: "none" | "boundary" | "selection" | "all";
@@ -28,7 +31,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   lineHeight: 22,
   tabSize: 2,
   insertSpaces: true,
-  minimap: true,
+  minimap: DEFAULT_MINIMAP,
   lineNumbers: "on",
   bracketPairColorization: true,
   renderWhitespace: "selection",
@@ -55,7 +58,12 @@ export function editorOptions(
     tabSize: settings.tabSize,
     insertSpaces: settings.insertSpaces,
     wordWrap: view.wordWrap ? "on" : "off",
-    minimap: { enabled: settings.minimap },
+    minimap: {
+      enabled: settings.minimap.enabled,
+      renderCharacters: settings.minimap.renderCharacters,
+      size: settings.minimap.size,
+      showSlider: settings.minimap.showSlider,
+    },
     lineNumbers: settings.lineNumbers,
     bracketPairColorization: { enabled: settings.bracketPairColorization },
     matchBrackets: "always",
@@ -75,7 +83,7 @@ export function editorOptions(
     suggestOnTriggerCharacters: false,
     parameterHints: { enabled: false },
     hover: { enabled: "off" },
-    // Yavin's own context menu comes later; Monaco's is the editing one for now.
+    // Monaco's editing menu, with the Command Palette added (see `CodeEditor`).
     contextmenu: true,
     scrollBeyondLastLine: false,
     fixedOverflowWidgets: true,

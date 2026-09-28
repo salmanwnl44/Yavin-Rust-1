@@ -11,6 +11,8 @@ interface Commands {
   get_default_workspace: { args: undefined; result: string | null };
   list_workspace_files: { args: { path: string; maxDepth: number }; result: FileNode };
   read_file_content: { args: { path: string }; result: string };
+  is_read_only: { args: { path: string }; result: boolean };
+  read_image_file: { args: { path: string }; result: ArrayBuffer };
   create_file: { args: { path: string }; result: void };
   /** Exclusive: fails if anything is there. Resolves to the operation's id (Module 03). */
   create_file_with_content: { args: { path: string; content: string }; result: number };

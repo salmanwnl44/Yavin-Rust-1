@@ -260,6 +260,20 @@ fn read_file_content(state: State<'_, Workspace>, path: String) -> Result<String
     with_workspace(&state, |manager| manager.read_file(&path))
 }
 
+/// An image for a Markdown preview, as raw bytes (not JSON numbers): see `read_image`.
+#[tauri::command(async)]
+fn read_image_file(
+    state: State<'_, Workspace>,
+    path: String,
+) -> Result<tauri::ipc::Response, String> {
+    with_workspace(&state, |manager| manager.read_image(&path)).map(tauri::ipc::Response::new)
+}
+
+#[tauri::command(async)]
+fn is_read_only(state: State<'_, Workspace>, path: String) -> Result<bool, String> {
+    with_workspace(&state, |manager| manager.is_read_only(&path))
+}
+
 #[tauri::command(async)]
 fn create_file(
     state: State<'_, Workspace>,
@@ -628,6 +642,8 @@ pub fn run() {
             get_default_workspace,
             list_workspace_files,
             read_file_content,
+            is_read_only,
+            read_image_file,
             create_file,
             create_file_with_content,
             create_directory,

@@ -1,4 +1,4 @@
-import { useEffect, useImperativeHandle, useRef } from "react";
+import { useEffect, useImperativeHandle, useRef, useState } from "react";
 import type { Ref } from "react";
 import { monaco } from "../../editor/monaco";
 import { TEST_HOOKS } from "../../editor/testHooks";
@@ -11,6 +11,10 @@ import type { EditorViews } from "../../services/editorViews";
 import type { EditorHandle, EditorState } from "../../editor/editorTypes";
 import { createDiffView } from "../../editor/diff";
 import type { EditorDecoration } from "../../services/editorModelBridge";
+import type { CursorStatusStore } from "../../services/cursorStatus";
+import type { MinimapPreferences } from "../../services/minimapPreferences";
+import { ContextMenu } from "../ui/ContextMenu";
+import type { MenuItem } from "../ui/ContextMenu";
 
 /**
  * The code editor: Monaco, showing the Document Model's documents.
@@ -30,6 +34,18 @@ import type { EditorDecoration } from "../../services/editorModelBridge";
  */
 
 const bridges = new WeakMap<DocumentService, EditorModelBridge>();
+
+/** The window's line commands, by the Monaco action each one runs. */
+const LINE_ACTIONS = {
+  moveLineUp: "editor.action.moveLinesUpAction",
+  moveLineDown: "editor.action.moveLinesDownAction",
+  copyLineUp: "editor.action.copyLinesUpAction",
+  copyLineDown: "editor.action.copyLinesDownAction",
+  deleteLine: "editor.action.deleteLines",
+  toggleComment: "editor.action.commentLine",
+  indent: "editor.action.indentLines",
+  outdent: "editor.action.outdentLines",
+} as const;
 
 /** The window's one bridge for its Document Model, made when an editor is first shown. */
 export function bridgeFor(documents: DocumentService): EditorModelBridge {
@@ -55,6 +71,10 @@ export default function CodeEditor({
   wordWrap,
   zoom,
   readOnly = false,
+  cursorStatus,
+  onCommandPalette,
+  minimap = DEFAULT_EDITOR_SETTINGS.minimap,
+  onMinimapChange,
 }: {
   documentKey: string;
   documents: DocumentService;
@@ -64,6 +84,13 @@ export default function CodeEditor({
   wordWrap: boolean;
   zoom: number;
   readOnly?: boolean;
+  /** Where the status bar reads the cursor from; told on every move, apart from React. */
+  cursorStatus?: CursorStatusStore;
+  /** Opens the window's command palette: the last item of the editor's right-click menu. */
+  onCommandPalette?: () => void;
+  /** How the minimap looks: the window's, which remembers it and offers View › Minimap. */
+  minimap?: MinimapPreferences;
+  onMinimapChange?: (change: Partial<MinimapPreferences>) => void;
 }) {
   const container = useRef<HTMLDivElement>(null);
   const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -75,8 +102,46 @@ export default function CodeEditor({
    */
   const focusDecision = useRef<{ key: string; take: boolean } | null>(null);
   const bridge = bridgeFor(documents);
-  const latest = useRef({ onState, readOnly, wordWrap, zoom });
-  latest.current = { onState, readOnly, wordWrap, zoom };
+  const [minimapMenu, setMinimapMenu] = useState<{ x: number; y: number } | null>(null);
+  const settings = { ...DEFAULT_EDITOR_SETTINGS, minimap };
+  const latest = useRef({
+    onState,
+    readOnly,
+    wordWrap,
+    zoom,
+    cursorStatus,
+    onCommandPalette,
+    settings,
+  });
+  latest.current = { onState, readOnly, wordWrap, zoom, cursorStatus, onCommandPalette, settings };
+
+  /** The cursor and indentation for the status bar; none while no document is shown. */
+  const publishCursor = () => {
+    const instance = editor.current;
+    const model = instance?.getModel();
+    const selections = instance?.getSelections();
+    const primary = instance?.getSelection();
+    if (!model || !selections?.length || !primary) {
+      latest.current.cursorStatus?.set(null);
+      return;
+    }
+    const options = model.getOptions();
+    latest.current.cursorStatus?.set({
+      line: primary.positionLineNumber,
+      column: primary.positionColumn,
+      // Offsets, not the selected text: selecting all of a large file stays cheap.
+      selected: selections.reduce(
+        (sum, range) =>
+          sum +
+          model.getOffsetAt(range.getEndPosition()) -
+          model.getOffsetAt(range.getStartPosition()),
+        0,
+      ),
+      cursors: selections.length,
+      insertSpaces: options.insertSpaces,
+      tabSize: options.tabSize,
+    });
+  };
 
   const published = useRef<EditorState | null>(null);
   const publish = () => {
@@ -115,14 +180,34 @@ export default function CodeEditor({
   useEffect(() => {
     const element = container.current;
     if (!element) return;
-    const { readOnly, wordWrap, zoom } = latest.current;
+    const { readOnly, wordWrap, zoom, settings } = latest.current;
     const instance = monaco.editor.create(element, {
-      ...editorOptions(DEFAULT_EDITOR_SETTINGS, { wordWrap, zoom, readOnly, ariaLabel: "" }),
+      ...editorOptions(settings, { wordWrap, zoom, readOnly, ariaLabel: "" }),
       model: null,
     });
     editor.current = instance;
+    // The window's command palette, last in the right-click menu as in VS Code. Its key is
+    // Monaco's too while the editor has the keyboard, so the palette opens once.
+    const palette = instance.addAction({
+      id: "yavin.commandPalette",
+      label: "Command Palette…",
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyP],
+      contextMenuGroupId: "z_commands",
+      run: () => latest.current.onCommandPalette?.(),
+    });
+    // Right-clicking the minimap opens its own menu instead of the editing one. Caught on the
+    // way down, before Monaco sees the event.
+    const minimapClick = (event: MouseEvent) => {
+      if (!(event.target instanceof Element) || !event.target.closest(".minimap")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setMinimapMenu({ x: event.clientX, y: event.clientY });
+    };
+    element.addEventListener("contextmenu", minimapClick, true);
     const subscriptions = [
       instance.onDidChangeCursorSelection(publish),
+      instance.onDidChangeCursorSelection(publishCursor),
+      instance.onDidChangeModelOptions(publishCursor),
       instance.onDidChangeModelContent(publish),
       instance.onDidFocusEditorText(() => {
         if (shown.current) views.setFocused(shown.current.key, true);
@@ -135,7 +220,10 @@ export default function CodeEditor({
     // Monaco's input element does not hold the document's text.
     if (TEST_HOOKS) installTestHook(instance, bridge, () => shown.current?.key ?? null);
     return () => {
+      element.removeEventListener("contextmenu", minimapClick, true);
+      palette.dispose();
       leave();
+      latest.current.cursorStatus?.set(null);
       for (const subscription of subscriptions) subscription.dispose();
       instance.dispose();
       editor.current = null;
@@ -171,19 +259,53 @@ export default function CodeEditor({
     if (focusDecision.current.take) instance.focus();
     published.current = null;
     publish();
+    publishCursor();
   }, [documentKey]);
 
   // The window's word wrap and zoom, and read-only documents.
   useEffect(() => {
     editor.current?.updateOptions(
-      editorOptions(DEFAULT_EDITOR_SETTINGS, {
+      editorOptions(settings, {
         wordWrap,
         zoom,
         readOnly,
         ariaLabel: documents.get(documentKey)?.name ?? "",
       }),
     );
-  }, [wordWrap, zoom, readOnly]);
+  }, [wordWrap, zoom, readOnly, minimap]);
+
+  const chooseMinimap = (change: Partial<MinimapPreferences>) => onMinimapChange?.(change);
+  // VS Code's minimap menu; its two submenus are shown inline, each choice checked.
+  const minimapItems = (): MenuItem[] => [
+    {
+      label: "Minimap",
+      checked: minimap.enabled,
+      onClick: () => chooseMinimap({ enabled: !minimap.enabled }),
+    },
+    { divider: true },
+    {
+      label: "Render Characters",
+      checked: minimap.renderCharacters,
+      onClick: () => chooseMinimap({ renderCharacters: !minimap.renderCharacters }),
+    },
+    { divider: true },
+    ...(["proportional", "fill", "fit"] as const).map((size) => ({
+      label: `Vertical Size: ${size[0].toUpperCase()}${size.slice(1)}`,
+      checked: minimap.size === size,
+      onClick: () => chooseMinimap({ size }),
+    })),
+    { divider: true },
+    ...(
+      [
+        ["mouseover", "Slider: Mouse Over"],
+        ["always", "Slider: Always"],
+      ] as const
+    ).map(([showSlider, label]) => ({
+      label,
+      checked: minimap.showSlider === showSlider,
+      onClick: () => chooseMinimap({ showSlider }),
+    })),
+  ];
 
   useImperativeHandle(editorRef, () => ({
     focus: () => editor.current?.focus(),
@@ -228,6 +350,18 @@ export default function CodeEditor({
         case "duplicate":
           instance.trigger("menu", "editor.action.duplicateSelection", null);
           break;
+        case "moveLineUp":
+        case "moveLineDown":
+        case "copyLineUp":
+        case "copyLineDown":
+        case "deleteLine":
+        case "toggleComment":
+        case "indent":
+        case "outdent":
+          // Monaco's own line commands, run as its keybindings would run them.
+          instance.trigger("menu", LINE_ACTIONS[action], null);
+          instance.focus();
+          break;
         case "find":
           await instance.getAction("actions.find")?.run();
           return;
@@ -266,7 +400,20 @@ export default function CodeEditor({
     },
   }));
 
-  return <div ref={container} className="min-h-0 flex-1" data-editor="monaco" />;
+  return (
+    <>
+      <div ref={container} className="min-h-0 flex-1" data-editor="monaco" />
+      {minimapMenu && (
+        <ContextMenu
+          x={minimapMenu.x}
+          y={minimapMenu.y}
+          label="Minimap"
+          items={minimapItems()}
+          onClose={() => setMinimapMenu(null)}
+        />
+      )}
+    </>
+  );
 }
 
 // ---------------------------------------------------------------------------------------
