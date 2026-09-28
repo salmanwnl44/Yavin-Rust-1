@@ -31,6 +31,20 @@ export function AppDialog({ request, onClose }: { request: DialogRequest; onClos
   const [activeIndex, setActiveIndex] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  /** What had the keyboard before the dialog opened (read on the first render only). */
+  const opener = useRef(document.activeElement);
+
+  // Escape, Cancel and the backdrop remove the dialog without `close()`, and the browser then
+  // returns focus to nothing. Give it back to what had it -- the editor, after Go to Line --
+  // unless something else took it meanwhile.
+  useEffect(
+    () => () => {
+      const previous = opener.current;
+      const lost = document.activeElement === null || document.activeElement === document.body;
+      if (lost && previous instanceof HTMLElement && previous.isConnected) previous.focus();
+    },
+    [],
+  );
 
   const filtered = useMemo(() => {
     if (!request.options) return [];

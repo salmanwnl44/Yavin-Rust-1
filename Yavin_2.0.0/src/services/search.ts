@@ -168,6 +168,16 @@ export async function searchWorkspace(
   return result;
 }
 
+/**
+ * Where a hit is in a document's text (always `\n` line endings), or null when that line no
+ * longer reads as it did. A hit found on disk in a CRLF file carries its `\r\n`.
+ */
+export function hitOffset(content: string, hit: SearchHit): number | null {
+  const lines = content.split("\n");
+  if (lines[hit.line - 1] !== hit.text.replace(/\r?\n$/, "")) return null;
+  return lines.slice(0, hit.line - 1).reduce((n, line) => n + line.length + 1, 0) + hit.start;
+}
+
 export function replaceHits(content: string, hits: SearchHit[], replacement: string): string {
   const lines = content.split("\n");
   const offsets = [0];

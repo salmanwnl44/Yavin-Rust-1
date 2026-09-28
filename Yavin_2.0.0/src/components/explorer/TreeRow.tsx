@@ -154,13 +154,13 @@ export const TreeRow = React.memo(function TreeRow({
       style={indentStyle(depth)}
       className={`flex items-center gap-1.5 pr-2 cursor-pointer transition-colors outline-none ${
         cut ? "opacity-40" : ""
-      } ${active ? "border-l-2 border-indigo-500" : ""} ${
+      } border-l-2 ${active ? "border-l-indigo-500" : "border-l-transparent"} ${
         dragging
           ? "opacity-30 bg-zinc-900 border-dashed border border-zinc-700"
           : dropTarget
             ? "bg-indigo-600/30 ring-1 ring-indigo-400 text-white font-medium rounded-sm"
             : selected
-              ? "bg-[#16162a] text-white font-medium focus:ring-1 focus:ring-indigo-500"
+              ? "bg-[#16162a] text-white font-medium focus:bg-[#1c1c36]"
               : "text-zinc-300 hover:bg-[#080808] hover:text-white focus:bg-[#101018]"
       }`}
     >

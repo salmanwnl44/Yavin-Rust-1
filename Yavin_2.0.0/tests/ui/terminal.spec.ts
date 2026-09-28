@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
-import { appAlert } from "./editor-harness";
+import { appAlert, editorSelections, withEditor } from "./editor-harness";
 
 interface Call {
   command: string;
@@ -88,6 +88,9 @@ async function desktop(
               is_dir: true,
               children: [{ path: "/work/file.ts", name: "file.ts", is_dir: false, children: null }],
             };
+          // Any file reads as 30 numbered lines, so a jump to a line can be checked.
+          if (command === "read_file_content")
+            return Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n");
           if (command === "list_listening_ports") return setup.ports ?? [];
           if (command === "workspace_trust") return trust;
           if (command === "set_workspace_trust") {
@@ -938,6 +941,24 @@ test("running a checker lists its diagnostics grouped by file", async ({ page })
   await expect(problems.getByRole("button", { name: /src\/other\.ts/ })).toBeVisible();
   await expect(problems.getByText(/not assignable/)).toBeVisible();
   await expect(problems.getByText(/Ln 12, Col 7/)).toBeVisible();
+});
+
+test("a problem opens its file at its line, even while another file is shown", async ({ page }) => {
+  await desktop(page, {
+    checkers: [{ id: "tsc", label: "TypeScript" }],
+    checkerOutput: TSC_OUTPUT,
+  });
+  await page.getByRole("treeitem", { name: "file.ts" }).click();
+  await expect(page.getByRole("textbox", { name: "file.ts", exact: true })).toBeFocused();
+  await showView(page, "PROBLEMS");
+  const problems = page.getByRole("region", { name: "Problems" });
+  await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
+  await problems.getByText(/not assignable/).click();
+
+  // The jump lands in the problem's file, not in the one that was shown before it opened.
+  await expect.poll(() => withEditor<string>(page, "(editor) => editor.label()")).toBe("app.ts");
+  const lineStart = Array.from({ length: 11 }, (_, i) => `line ${i + 1}\n`).join("").length;
+  await expect.poll(async () => (await editorSelections(page))?.[0]?.start).toBe(lineStart);
 });
 
 test("a checker that could not run says so instead of reporting a clean project", async ({

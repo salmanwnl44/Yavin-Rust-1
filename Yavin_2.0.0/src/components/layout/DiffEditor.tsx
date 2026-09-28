@@ -19,6 +19,8 @@ export interface DiffDocument {
   kind?: "unstaged" | "staged";
   /** For a renamed file, its previous absolute path -- needed again whenever this diff is reloaded. */
   originalPath?: string;
+  /** Shown above the diff: why it may not describe what the editor holds. */
+  notice?: string;
 }
 
 interface ParsedDiffLine {
@@ -477,6 +479,15 @@ export function DiffEditor({
           </button>
         </div>
       </header>
+
+      {document.notice && (
+        <div
+          role="note"
+          className="border-b border-amber-900/40 bg-amber-950/20 px-3 py-1.5 text-xs text-amber-200"
+        >
+          {document.notice}
+        </div>
+      )}
 
       {/* Main Diff Content with Line Numbers Gutter */}
       <div

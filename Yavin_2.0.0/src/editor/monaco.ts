@@ -117,15 +117,32 @@ self.MonacoEnvironment = {
 monaco.editor.defineTheme("yavin-dark", {
   base: "vs-dark",
   inherit: true,
-  rules: [],
+  // A pure-black take on Visual Studio's dark palette. Monarch tokenizers do not tell function
+  // names from other identifiers, so functions share the identifier colour until a language
+  // service supplies semantic tokens.
+  rules: [
+    { token: "", foreground: "D4D4D4" },
+    { token: "keyword", foreground: "569CD6" },
+    { token: "string", foreground: "CE9178" },
+    { token: "comment", foreground: "6A9955" },
+    { token: "number", foreground: "B5CEA8" },
+    { token: "type", foreground: "4EC9B0" },
+    { token: "identifier", foreground: "9CDCFE" },
+    { token: "constant", foreground: "4FC1FF" },
+    { token: "predefined", foreground: "4FC1FF" },
+    { token: "annotation", foreground: "C586C0" },
+    { token: "tag.python", foreground: "C586C0" },
+    { token: "delimiter", foreground: "D4D4D4" },
+    { token: "operator", foreground: "D4D4D4" },
+  ],
   colors: {
     "editor.background": "#000000",
-    "editor.foreground": "#e4e4e7",
+    "editor.foreground": "#D4D4D4",
     "editorGutter.background": "#000000",
-    "editorLineNumber.foreground": "#52525b",
-    "editorLineNumber.activeForeground": "#a1a1aa",
+    "editorLineNumber.foreground": "#4A4A4A",
+    "editorLineNumber.activeForeground": "#D4D4D4",
     "editor.lineHighlightBackground": "#0c0c10",
-    "editor.selectionBackground": "#3730a3",
+    "editor.selectionBackground": "#264F78",
     "editorCursor.foreground": "#a5b4fc",
     "editorWidget.background": "#0a0a0a",
     "editorWidget.border": "#27272a",

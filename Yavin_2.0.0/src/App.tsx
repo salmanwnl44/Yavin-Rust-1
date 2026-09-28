@@ -77,7 +77,7 @@ import {
   useTotalChanges,
 } from "./services/git";
 import type { Decorations } from "./services/git";
-import { listFiles } from "./services/search";
+import { hitOffset, listFiles } from "./services/search";
 
 /**
  * The Document Model's disk: the guarded native commands, each one a Module 03 operation with
@@ -195,10 +195,15 @@ export default function App() {
   const documents = documentsRef.current;
   // The window redraws when what it shows about documents changes -- a tab's dirty marker, a
   // status, a document opened or closed -- not for every keystroke: the editor showing the
-  // document subscribes to its text on its own (`TextEditor`).
+  // document subscribes to its text on its own (`CodeEditor`).
   const documentState = useSyncExternalStore(documents.subscribe, documents.stateRevision);
   /** The open documents' text, read when it is needed rather than passed down as it changes. */
   const readBuffers = useCallback(() => documents.buffers(), [documents]);
+  /** Whether the file's open document has edits its file does not hold; false when not open. */
+  const hasUnsavedEdits = useCallback(
+    (path: string) => documents.get(path)?.dirty ?? false,
+    [documents],
+  );
   const workspaceRevision = useRef(0);
   const [decorations, setDecorations] = useState<Decorations>({
     files: new Map(),
@@ -726,7 +731,12 @@ export default function App() {
     if (doc) documents.close(id, { discard: true });
     setTabs((prev) => prev.filter((tab) => tab.id !== id));
     views.forget(id);
-    if (activeTabId === id) setActiveTabId("welcome");
+    if (activeTabId === id) {
+      // The tab beside it comes forward, as in a browser: the right one, else the left one.
+      const index = tabs.findIndex((tab) => tab.id === id);
+      const next = tabs[index + 1] ?? tabs[index - 1];
+      setActiveTabId(next?.id ?? "welcome");
+    }
   };
   /** Save As: a new file for any open document, and how an untitled one reaches the disk. */
   const saveAs = async (key: string) => {
@@ -988,15 +998,9 @@ export default function App() {
     if (!pendingHit || activeTabId !== pendingHit.path || diff) return;
     const content = documents.get(pendingHit.path)?.text;
     if (content === undefined) return;
-    const lines = content.split("\n");
-    if (lines[pendingHit.line - 1] !== pendingHit.text.replace(/\n$/, "")) {
-      reportError("This search result changed. Search again to locate it.");
-    } else {
-      const start =
-        lines.slice(0, pendingHit.line - 1).reduce((n, line) => n + line.length + 1, 0) +
-        pendingHit.start;
-      editorRef.current?.revealRange(start, start + pendingHit.end - pendingHit.start);
-    }
+    const start = hitOffset(content, pendingHit);
+    if (start === null) reportError("This search result changed. Search again to locate it.");
+    else editorRef.current?.revealRange(start, start + pendingHit.end - pendingHit.start);
     setPendingHit(null);
   }, [activeTabId, documentState, documents, pendingHit, diff, reportError]);
 
@@ -1652,7 +1656,12 @@ export default function App() {
       );
       if (!command) return;
       const target = event.target;
+      // Monaco's input is neither a textarea nor contentEditable (it uses EditContext), but it
+      // is a text control: its own clipboard handling copies a whole line when nothing is
+      // selected, which the menu's commands do not.
+      const inEditor = target instanceof Element && !!target.closest("[data-editor=monaco]");
       const textControl =
+        inEditor ||
         target instanceof HTMLInputElement ||
         target instanceof HTMLTextAreaElement ||
         (target instanceof HTMLElement && target.isContentEditable);
@@ -1665,6 +1674,16 @@ export default function App() {
         "selection.all",
       ].includes(command.id);
       if (textControl && nativeTextCommand) return;
+      // Editing keys belong to whatever has the keyboard. Outside the editor they never reach
+      // into it: Ctrl+A in the Explorer does not select the editor's text, nor Ctrl+Z undo it.
+      // (The menus still run these commands on the editor.)
+      const editorCommand =
+        nativeTextCommand || ["selection.line", "selection.duplicate"].includes(command.id);
+      if (editorCommand && !inEditor) {
+        // Without this, Ctrl+A would select the whole window's text.
+        if (command.id === "selection.all" && !textControl) event.preventDefault();
+        return;
+      }
       event.preventDefault();
       if (!command.disabled)
         void run(async () => {
@@ -1739,7 +1758,7 @@ export default function App() {
           <SourceControlPanel
             key={`git:${workspacePath}`}
             workspace={workspacePath}
-            buffers={readBuffers}
+            hasUnsavedEdits={hasUnsavedEdits}
             visible={isSidebarOpen && activeActivityTab === "git"}
             dirty={hasUnsavedChanges}
             onDiff={setDiff}

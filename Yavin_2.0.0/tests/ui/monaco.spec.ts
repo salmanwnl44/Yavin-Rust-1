@@ -4,6 +4,7 @@ import {
   editorInput,
   editorLanguage,
   editorOptions,
+  editorSelections,
   editorText,
   editorTokenTypes,
   expectText,
@@ -318,4 +319,64 @@ test("a document's text is shown as text, never run as markup", async ({ page })
     0,
   );
   expect(await editorText(page)).toBe(text);
+});
+
+test("copy and cut with nothing selected take the whole line, as Monaco does", async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await fixture(page, { "/work/a.ts": "one\ntwo\n" });
+  await open(page, "a.ts");
+  await page.keyboard.press("Control+Home");
+  await page.keyboard.press("Control+c");
+  // The system clipboard may turn the line's ending into CRLF.
+  const clipboard = () => page.evaluate(() => navigator.clipboard.readText());
+  await expect.poll(async () => (await clipboard()).replace(/\r\n/g, "\n")).toBe("one\n");
+  await page.keyboard.press("Control+x");
+  await expectText(page, "two\n");
+  await page.keyboard.press("Control+v");
+  await expectText(page, "one\ntwo\n");
+});
+
+test("editing keys in the Explorer never reach into the editor", async ({ page }) => {
+  await fixture(page, { "/work/a.ts": "one", "/work/b.ts": "two" });
+  await open(page, "a.ts");
+  await page.keyboard.press("End");
+  await page.keyboard.type("!");
+  await expectText(page, "one!");
+  const row = page.getByRole("treeitem", { name: "b.ts" });
+  await row.focus();
+  await page.keyboard.press("Control+a");
+  await page.keyboard.press("Control+z");
+  await expect(row).toBeFocused();
+  await expectText(page, "one!");
+  expect(await editorSelections(page)).toEqual([{ start: 4, end: 4 }]);
+});
+
+test("Escape from Go to Line gives the keyboard back to the editor", async ({ page }) => {
+  await fixture(page, { "/work/a.ts": "one\ntwo" });
+  const input = await open(page, "a.ts");
+  await page.keyboard.press("Control+g");
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(input).toBeFocused();
+  await page.keyboard.type("x");
+  await expectText(page, "xone\ntwo");
+});
+
+test("closing the tab in front brings the tab beside it forward, not Welcome", async ({ page }) => {
+  await fixture(page, { "/work/a.ts": "a", "/work/b.ts": "b", "/work/c.ts": "c" });
+  await open(page, "a.ts");
+  await open(page, "b.ts");
+  await open(page, "c.ts");
+  const selected = page.getByRole("tab", { selected: true });
+  await page.getByRole("tab", { name: /b\.ts/ }).click();
+  await page.keyboard.press("Control+w");
+  // The one to the right comes forward...
+  await expect(selected).toContainText("c.ts");
+  await page.keyboard.press("Control+w");
+  // ...and with none to the right, the one to the left.
+  await expect(selected).toContainText("a.ts");
 });

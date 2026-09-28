@@ -123,6 +123,32 @@ test("staging one hunk sends only that hunk's patch and leaves the other unstage
   await expect(diffView.getByText("TWO", { exact: true })).toHaveCount(0);
 });
 
+test("a file open in an editor keeps its hunk actions until it has unsaved edits", async ({
+  page,
+}) => {
+  const region = await panel(page);
+  await page.getByTitle("Explorer (Ctrl+Shift+E)").click();
+  await page.getByRole("treeitem", { name: "a.ts" }).click();
+  await expect(page.getByRole("textbox", { name: "a.ts", exact: true })).toBeFocused();
+
+  // Open but clean: the diff describes exactly what the editor holds.
+  await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
+  await region.getByText("a.ts").click();
+  const diffView = page.locator("section[aria-label='Git diff editor']");
+  await expect(diffView.getByRole("button", { name: "Stage Hunk" }).first()).toBeVisible();
+  await expect(diffView.getByRole("note")).toHaveCount(0);
+
+  // Edited and unsaved: the diff no longer describes the editor, so hunks cannot be staged.
+  await page.getByTitle("Explorer (Ctrl+Shift+E)").click();
+  await page.getByRole("treeitem", { name: "a.ts" }).click();
+  await expect(page.getByRole("textbox", { name: "a.ts", exact: true })).toBeFocused();
+  await page.keyboard.type("x");
+  await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
+  await region.getByText("a.ts").click();
+  await expect(diffView.getByRole("note")).toContainText("unsaved edits");
+  await expect(diffView.getByRole("button", { name: "Stage Hunk" })).toHaveCount(0);
+});
+
 test("split view shows the old and new lines side by side and still stages hunks", async ({
   page,
 }) => {

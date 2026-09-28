@@ -127,7 +127,7 @@ function readSectionVisibility(): SectionVisibility {
 export function SourceControlPanel({
   workspace,
   visible,
-  buffers,
+  hasUnsavedEdits,
   dirty,
   onDiff,
   onChanged,
@@ -140,8 +140,11 @@ export function SourceControlPanel({
 }: {
   workspace: string;
   visible: boolean;
-  /** The open documents' text, read when it is needed. */
-  buffers: () => Record<string, string>;
+  /**
+   * Whether a file's open document has unsaved edits. Only those block hunk actions: a file
+   * that is merely open shows its saved text, which is what the diff describes.
+   */
+  hasUnsavedEdits: (path: string) => boolean;
   dirty: boolean;
   onDiff: (diff: DiffDocument | null) => void;
   onChanged: () => Promise<void>;
@@ -428,17 +431,20 @@ export function SourceControlPanel({
         ? await native("read_file_content", { path: entry.path })
         : await activeRepo.store.repository.diff(entry.path, staged, entry.originalPath);
       if (!alive.current || current !== diffGeneration.current) return;
-      const hasUnsavedEdits = buffers()[entry.path] !== undefined;
-      // Hunk-level staging needs the raw diff text untouched by the warning banner
-      // below, and makes no sense for an untracked file or an unresolved conflict.
-      const hunkStagingSafe = !entry.untracked && !entry.conflict && !hasUnsavedEdits;
+      const unsaved = hasUnsavedEdits(entry.path);
+      // Hunk-level staging makes no sense for an untracked file, an unresolved conflict, or a
+      // file whose editor holds text this diff does not describe.
+      const hunkStagingSafe = !entry.untracked && !entry.conflict && !unsaved;
       onDiff({
         path: entry.path,
         title: entry.untracked ? "Untracked file" : staged ? "HEAD → Index" : "Index → Saved file",
-        text:
-          (hasUnsavedEdits
-            ? "Open editor may have unsaved edits. This view shows saved Git content.\n\n"
-            : "") + (text || "No textual differences. The change may be metadata-only."),
+        text: text || "No textual differences. The change may be metadata-only.",
+        ...(unsaved
+          ? {
+              notice:
+                "The open editor has unsaved edits. This diff shows the saved file; save to stage its hunks.",
+            }
+          : {}),
         ...(hunkStagingSafe
           ? { repoId: activeRepo.repoId, kind: staged ? "staged" : "unstaged" }
           : {}),
