@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
+import { appAlert } from "./editor-harness";
 
 interface Call {
   command: string;
@@ -956,7 +957,7 @@ test("a checker that could not run says so instead of reporting a clean project"
     .getByRole("button", { name: "TypeScript", exact: true })
     .click();
 
-  await expect(page.getByRole("alert")).toContainText("could not determine executable");
+  await expect(appAlert(page)).toContainText("could not determine executable");
   await expect(page.getByRole("region", { name: "Problems" })).not.toContainText(
     "No problems found",
   );
@@ -978,7 +979,7 @@ test("a checker that exits nonzero because it found problems still lists them", 
     .click();
 
   await expect(page.getByRole("region", { name: "Problems" })).toContainText("Cannot find name");
-  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(appAlert(page)).toHaveCount(0);
 });
 
 test("the Problems tab is badged with the error and warning count", async ({ page }) => {

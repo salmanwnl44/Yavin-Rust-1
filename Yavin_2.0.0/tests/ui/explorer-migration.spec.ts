@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
+import { appAlert } from "./editor-harness";
 
 /**
  * The Explorer migrated onto the provider and store: node identity instead of paths, several
@@ -417,7 +418,7 @@ test("copy and paste goes through the copy operation; a name collision is refuse
   await row(page, "taken").click();
   await row(page, "taken").focus();
   await page.keyboard.press("Control+v");
-  await expect(page.getByRole("alert").first()).toContainText("already exists");
+  await expect(appAlert(page).first()).toContainText("already exists");
 });
 
 test("cut and paste moves several entries through the rename operation", async ({ page }) => {

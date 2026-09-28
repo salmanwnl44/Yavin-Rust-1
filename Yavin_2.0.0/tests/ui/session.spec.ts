@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
+import { appAlert, expectText } from "./editor-harness";
 
 interface Call {
   command: string;
@@ -161,9 +162,8 @@ test("the folder from last time is reopened, with the tabs it had", async ({ pag
 
   await expect(page.getByRole("tab", { name: /a\.ts/ })).toBeVisible();
   await expect(page.getByRole("tab", { name: /b\.ts/ })).toBeVisible();
-  // The tab that was in front is in front again, with its contents. (The value: the editor's
-  // textarea shows the document's text as its value, not as a text node.)
-  await expect(page.getByRole("textbox")).toHaveValue("the contents of b");
+  // The tab that was in front is in front again, with its contents.
+  await expectText(page, "the contents of b");
 });
 
 test("a file that has been deleted since is skipped, not reported", async ({ page }) => {
@@ -177,7 +177,7 @@ test("a file that has been deleted since is skipped, not reported", async ({ pag
 
   await expect(page.getByRole("tab", { name: /a\.ts/ })).toBeVisible();
   await expect(page.getByRole("tab", { name: /gone\.ts/ })).toHaveCount(0);
-  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(appAlert(page)).toHaveCount(0);
 });
 
 test("a folder that has been moved since leaves a usable window", async ({ page }) => {
@@ -316,7 +316,7 @@ test("a folder that cannot be opened stays in the recent list", async ({ page })
   await page.getByRole("tab", { name: "Welcome" }).click();
   await welcome(page).getByRole("button", { name: /^gone/ }).click();
 
-  await expect(page.getByRole("alert")).toContainText("Cannot open /gone");
+  await expect(appAlert(page)).toContainText("Cannot open /gone");
   await expect(welcome(page).getByRole("button", { name: /^gone/ })).toBeVisible();
   expect(await calls(page, "forget_workspace")).toEqual([]);
 });
@@ -352,7 +352,7 @@ test("the tab strip is one tab stop, with the arrows moving between tabs", async
   // The arrows move focus along the strip, and Enter opens what they land on: selecting as
   // focus moved would hand focus straight to the opened editor, ending the walk at one press.
   // (The editor takes focus when a tab opens, so wait for the restore to settle first.)
-  await expect(page.getByRole("textbox")).toHaveValue("the contents of a");
+  await expectText(page, "the contents of a");
   await strip.getByRole("tab", { name: /a\.ts/ }).focus();
   await expect(strip.getByRole("tab", { name: /a\.ts/ })).toBeFocused();
   await page.keyboard.press("ArrowRight");
@@ -360,7 +360,7 @@ test("the tab strip is one tab stop, with the arrows moving between tabs", async
   await page.keyboard.press("Enter");
   await expect(strip.getByRole("tab", { name: /b\.ts/ })).toHaveAttribute("aria-selected", "true");
 
-  await expect(page.getByRole("textbox")).toHaveValue("the contents of b");
+  await expectText(page, "the contents of b");
   await strip.getByRole("tab", { name: /b\.ts/ }).focus();
   await page.keyboard.press("Home");
   await expect(strip.getByRole("tab", { name: "Welcome" })).toBeFocused();

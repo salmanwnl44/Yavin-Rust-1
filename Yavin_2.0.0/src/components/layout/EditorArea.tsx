@@ -1,12 +1,18 @@
+import { lazy, Suspense } from "react";
 import type { Ref } from "react";
-import { TextEditor } from "./TextEditor";
-import type { EditorHandle, EditorState } from "./TextEditor";
+import type { EditorHandle, EditorState } from "../../editor/editorTypes";
 import type { DocumentService } from "../../services/documents";
 import type { EditorViews } from "../../services/editorViews";
 import type { EditorTab, RecentFile } from "../../types";
 import { FileIcon } from "../ui/FileIcons";
 import { WelcomePage } from "../welcome/WelcomePage";
 import type { WelcomeHint } from "../welcome/WelcomePage";
+
+/**
+ * The code editor (Monaco), loaded when an editor is first shown rather than with the window:
+ * the engine is most of the application's code, and the welcome page does not need it.
+ */
+const CodeEditor = lazy(() => import("./CodeEditor"));
 
 /** A line above the editor about the document's state, with what can be done about it. */
 export interface DocumentNotice {
@@ -314,16 +320,20 @@ export function EditorArea({
                 ))}
               </div>
             )}
-            <TextEditor
-              key={activeTab.path}
-              documentKey={activeTab.path}
-              documents={documents}
-              views={views}
-              editorRef={editorRef}
-              onState={onEditorState}
-              wordWrap={wordWrap}
-              zoom={zoom}
-            />
+            <Suspense
+              fallback={<div className="flex-1 p-3 text-xs text-zinc-500">Loading editor…</div>}
+            >
+              {/* One editor for every tab: it swaps documents rather than remounting. */}
+              <CodeEditor
+                documentKey={activeTab.path}
+                documents={documents}
+                views={views}
+                editorRef={editorRef}
+                onState={onEditorState}
+                wordWrap={wordWrap}
+                zoom={zoom}
+              />
+            </Suspense>
           </>
         )}
       </div>

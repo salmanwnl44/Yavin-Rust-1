@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
+import { appAlert, expectText, fillEditor } from "./editor-harness";
 
 /**
  * The Document Model as the window uses it: formats kept through a save, external changes
@@ -117,13 +118,13 @@ test("a file keeps its byte order mark and CRLF line endings through an edit and
   page,
 }) => {
   await fixture(page, { "/work/crlf.ts": "﻿one\r\ntwo\r\n" });
-  const editor = await open(page, "crlf.ts");
-  await expect(editor).toHaveValue("one\ntwo\n");
+  await open(page, "crlf.ts");
+  await expectText(page, "one\ntwo\n");
   const status = page.getByRole("contentinfo");
   await expect(status).toContainText("UTF-8 with BOM");
   await expect(status).toContainText("CRLF");
   await expect(status).toContainText("TypeScript");
-  await editor.fill("one\ntwo\nthree\n");
+  await fillEditor(page, "one\ntwo\nthree\n");
   await menu(page, "File", "Save");
   await expect.poll(() => disk(page, "/work/crlf.ts")).toBe("﻿one\r\ntwo\r\nthree\r\n");
 });
@@ -132,31 +133,31 @@ test("an editor without unsaved changes follows the file when it changes on disk
   page,
 }) => {
   await fixture(page, { "/work/a.ts": "before" });
-  const editor = await open(page, "a.ts");
-  await expect(editor).toHaveValue("before");
+  await open(page, "a.ts");
+  await expectText(page, "before");
   await setDisk(page, "/work/a.ts", "after");
   await changed(page, "/work/a.ts");
-  await expect(editor).toHaveValue("after");
-  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expectText(page, "after");
+  await expect(appAlert(page)).toHaveCount(0);
 });
 
 test("unsaved edits are never overwritten by a change on disk; keeping them is a choice", async ({
   page,
 }) => {
   await fixture(page, { "/work/a.ts": "base" });
-  const editor = await open(page, "a.ts");
-  await editor.fill("mine");
+  await open(page, "a.ts");
+  await fillEditor(page, "mine");
   await setDisk(page, "/work/a.ts", "theirs");
   await changed(page, "/work/a.ts");
-  await expect(page.getByRole("alert")).toContainText("changed on disk");
-  await expect(editor).toHaveValue("mine");
+  await expect(appAlert(page)).toContainText("changed on disk");
+  await expectText(page, "mine");
   expect(await disk(page, "/work/a.ts")).toBe("theirs");
   await expect(page.getByTitle(/Changed on disk while it had unsaved changes/)).toBeVisible();
 
   // Saving is refused until the conflict is resolved.
   await page.getByRole("button", { name: "Dismiss" }).click();
   await menu(page, "File", "Save");
-  await expect(page.getByRole("alert")).toContainText("Revert it, or keep your version");
+  await expect(appAlert(page)).toContainText("Revert it, or keep your version");
   expect(await disk(page, "/work/a.ts")).toBe("theirs");
 
   await page.getByRole("button", { name: "Dismiss" }).click();
@@ -167,14 +168,14 @@ test("unsaved edits are never overwritten by a change on disk; keeping them is a
 
 test("Revert File takes the disk's version, after asking", async ({ page }) => {
   await fixture(page, { "/work/a.ts": "base" });
-  const editor = await open(page, "a.ts");
-  await editor.fill("mine");
+  await open(page, "a.ts");
+  await fillEditor(page, "mine");
   await setDisk(page, "/work/a.ts", "theirs");
   await changed(page, "/work/a.ts");
-  await expect(page.getByRole("alert")).toContainText("changed on disk");
+  await expect(appAlert(page)).toContainText("changed on disk");
   page.once("dialog", (dialog) => void dialog.accept());
   await menu(page, "File", "Revert File");
-  await expect(editor).toHaveValue("theirs");
+  await expectText(page, "theirs");
   await page.getByRole("menubar").getByRole("menuitem", { name: "File", exact: true }).click();
   await expect(page.getByRole("menuitem", { name: "Save", exact: true })).toHaveAttribute(
     "aria-disabled",
@@ -187,23 +188,23 @@ test("an untitled file becomes a file on disk with Save As", async ({ page }) =>
   await menu(page, "File", "New Text File");
   const untitled = page.getByRole("textbox", { name: "Untitled-1", exact: true });
   await expect(untitled).toBeFocused();
-  await untitled.fill("# Notes\n");
+  await fillEditor(page, "# Notes\n");
   await page.evaluate(() => {
     (window as unknown as { __saveTarget: string }).__saveTarget = "/work/notes.md";
   });
   // Save on a document that has never been saved asks where it goes.
   await menu(page, "File", "Save");
-  const saved = page.getByRole("textbox", { name: "notes.md", exact: true });
-  await expect(saved).toHaveValue("# Notes\n");
+  await expect(page.getByRole("textbox", { name: "notes.md", exact: true })).toBeAttached();
+  await expectText(page, "# Notes\n");
   expect(await disk(page, "/work/notes.md")).toBe("# Notes\n");
   await expect(page.getByRole("tab", { name: /Untitled-1/ })).toHaveCount(0);
   await expect(page.getByRole("contentinfo")).toContainText("Markdown");
   // The undo history came with it: undoing the typing is an edit of the saved file.
   await menu(page, "Edit", "Undo");
-  await expect(saved).toHaveValue("");
+  await expectText(page, "");
   await expect(page.getByTitle("Unsaved changes (Ctrl+S to save)")).toBeVisible();
   await menu(page, "Edit", "Redo");
-  await expect(saved).toHaveValue("# Notes\n");
+  await expectText(page, "# Notes\n");
   await expect(page.getByTitle("Unsaved changes (Ctrl+S to save)")).toHaveCount(0);
 });
 

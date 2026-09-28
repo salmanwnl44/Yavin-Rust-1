@@ -1,7 +1,7 @@
 import { AppDialog } from "./components/ui/AppDialog";
 import type { DocumentNotice } from "./components/layout/EditorArea";
 import type { DialogRequest } from "./components/ui/AppDialog";
-import type { EditorHandle, EditorState, EditorAction } from "./components/layout/TextEditor";
+import type { EditorHandle, EditorState, EditorAction } from "./editor/editorTypes";
 import { createEditorViews } from "./services/editorViews";
 import { matchesShortcut, shortcutLabel } from "./services/commands";
 import type { AppCommand } from "./services/commands";
@@ -35,7 +35,6 @@ import { DiffEditor } from "./components/layout/DiffEditor";
 import type { DiffDocument } from "./components/layout/DiffEditor";
 import { CommitGraphPanel } from "./components/git/CommitGraphPanel";
 import type { SearchHit } from "./services/search";
-import { recordEdit } from "./services/editor";
 import { requestTerminal, onTerminalRequestObserved } from "./services/terminal";
 import type { PanelViewId } from "./services/panel/views";
 import { folderKey } from "./services/paths";
@@ -1017,8 +1016,7 @@ export default function App() {
           if (doc.text !== change.before) throw new Error("Editor changed; preview again");
           if (saved && doc.dirty)
             throw new Error("The editor has unsaved changes; save or revert it first");
-          // Undoable in its editor like any other edit.
-          recordEdit(views.history(doc.key), { text: doc.text, start: 0, end: 0 });
+          // The document's edit reaches its editor as one undoable step (the model bridge).
           documents.edit(doc.key, change.after);
           if (saved) await documents.save(doc.key);
         } else {

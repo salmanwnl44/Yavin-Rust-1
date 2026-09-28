@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import type { Locator, Page } from "@playwright/test";
+import { appAlert, fillEditor } from "./editor-harness";
 
 /** What the fake Git reports; tests mutate it and refresh to move the repository on. */
 interface Scenario {
@@ -542,9 +543,8 @@ test("unsaved editors block every action that rewrites the working tree", async 
   // Make the workspace dirty through a real editor buffer.
   await page.getByTitle("Explorer (Ctrl+Shift+E)").click();
   await page.getByLabel("file.ts", { exact: true }).click();
-  const editor = page.getByRole("textbox", { name: "file.ts", exact: true });
-  await editor.click();
-  await editor.fill("unsaved work");
+  await expect(page.getByRole("textbox", { name: "file.ts", exact: true })).toBeFocused();
+  await fillEditor(page, "unsaved work");
 
   await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
   const banner = region.getByRole("alert").filter({ hasText: "in progress" });
@@ -679,13 +679,13 @@ test("an interrupted operation recovery could not settle is announced at startup
       ],
     },
   });
-  await expect(page.getByRole("alert")).toContainText("1 interrupted operation needs attention");
+  await expect(appAlert(page)).toContainText("1 interrupted operation needs attention");
 });
 
 test("a clean start announces nothing", async ({ page }) => {
   const region = await panel(page);
   await expect(region.getByLabel("Commit message")).toBeVisible();
-  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(appAlert(page)).toHaveCount(0);
 });
 
 test("Save All bumps the active repository's revision, not just individual saves", async ({
@@ -697,9 +697,8 @@ test("Save All bumps the active repository's revision, not just individual saves
   // "unsaved editors block..." test's own convention for editing file.ts.
   await page.getByTitle("Explorer (Ctrl+Shift+E)").click();
   await page.getByLabel("file.ts", { exact: true }).click();
-  const editor = page.getByRole("textbox", { name: "file.ts", exact: true });
-  await editor.click();
-  await editor.fill("edited content");
+  await expect(page.getByRole("textbox", { name: "file.ts", exact: true })).toBeFocused();
+  await fillEditor(page, "edited content");
 
   await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
   await expect(region.getByLabel("Commit message")).toBeVisible();

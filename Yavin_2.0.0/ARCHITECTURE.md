@@ -32,7 +32,7 @@ The seven excluded crates (`ide-core`, `ide-config`, `ide-syntax`, `ide-lsp`, `i
 
 ## Remaining product and release work
 
-1. Replace the textarea with a TypeScript editor integration when syntax, structured undo, large-file virtualization, and language tooling are implemented. Existing inactive Rust buffers were never connected to the UI.
+1. Add language tooling (language servers, completion, diagnostics) to the Monaco editor; see [Editor](#editor). Existing inactive Rust buffers were never connected to the UI.
 2. Implement actual language-server, debugging, AI, and extension services in TypeScript. Keep any Rust process transport small and restrict process spawning to explicit user actions and validated arguments. The terminal follows this shape: `src-tauri/src/terminal.rs` only opens a PTY, starts the user's own shell with no arguments, and streams bytes; xterm.js does the emulation in TypeScript. One session exists per window, started by an explicit user action and ended when the panel closes.
 3. Add desktop end-to-end coverage for folder selection, CRUD, unsaved-close prompts, window controls, and failure recovery. Exercise nested Git repositories, UNC paths, read-only files, symlinks/junctions, and non-ASCII names on supported platforms.
 4. Add conflict detection for open documents before enabling autosave. The watcher reports external changes (see [Filesystem events](#filesystem-events)) and the explorer follows them, but an open, dirty document is not yet told that its file changed on disk; the guarded save still refuses to overwrite it.
@@ -399,7 +399,7 @@ Filesystem ──read──> ResourceUri (Module 01) ──> Document Service �
 | Filesystem       | disk truth                                                                          |
 | Resource service | resource identity (`resource.ts`)                                                   |
 | Document service | in-memory document truth: content, version, dirty, encoding, line endings, language |
-| Editor           | presentation and edit interaction, including its undo stack (Module 06 migrates it) |
+| Editor           | presentation and edit interaction, including its undo stack (Monaco)                |
 | Git              | repository status                                                                   |
 | LSP, index, AI   | language state, the searchable project, runs and ChangeSets -- none yet             |
 
@@ -413,7 +413,7 @@ Filesystem ──read──> ResourceUri (Module 01) ──> Document Service �
 
 **Versions.** Every content change, including a reload, makes a new version; versions are never reused and are never times or hashes. `dirty` is derived: a document is clean when its version is the persisted one or its text is the persisted text.
 
-**Encoding and line endings.** Files are read as UTF-8 (`read_file_content`); a binary file (a NUL in the first 8 KB), a file over 10 MB or invalid UTF-8 fails to open and is not touched. A byte order mark is removed from the text and written back on save. Line endings become `\n` in memory -- what the textarea does anyway -- and the file's own style is written back, so opening and saving a CRLF file never rewrites it. A file mixing both gets the style most of its lines use.
+**Encoding and line endings.** Files are read as UTF-8 (`read_file_content`); a binary file (a NUL in the first 8 KB), a file over 10 MB or invalid UTF-8 fails to open and is not touched. A byte order mark is removed from the text and written back on save. Line endings become `\n` in memory -- what the editor's models use -- and the file's own style is written back, so opening and saving a CRLF file never rewrites it. A file mixing both gets the style most of its lines use.
 
 **States.** `documentStatus` derives exactly one from the parts, so "saving" is never "clean" and a conflict is exactly "the disk changed under unsaved edits":
 
@@ -498,67 +498,88 @@ After a Git command, `revalidate` checks every open file the same way.
 
 ## Editor
 
-The editor is a view and controller over the Document Model, never a second document store.
+The editor is Monaco (`monaco-editor` 0.57.0, pinned), a view and controller over the Document Model, never a second document store. **Monaco is an editor implementation, not the source of truth for Yavin documents.**
 
 ```text
 DocumentService ── Document (text, version, persistence state)
-      │  documentRevision(key)          ^
-      v                                 │ documents.edit(key, text)
-Editor binding (editorBinding.ts) ── showDocumentText(surface, doc.text)
-      │                                 ^
-      v                                 │ input
-TextEditor (textarea) ── EditorViews (history, selection, scroll)
+      │  changed / reloaded / saving / sourceChanged / closed
+      v                                            ^
+EditorModelBridge (services/editorModelBridge.ts)  │ documents.edit(key, model.getValue())
+      │  one EditorModel per open document         │
+      v                                            │
+Monaco TextModel (editor/monacoHost.ts) ── content change listener
+      │  setModel / saveViewState / restoreViewState
+      v
+Monaco editor (components/layout/CodeEditor.tsx) ── EditorViews (view state, focus)
 ```
 
-| Owner    | Owns                                                                                                  |
-| -------- | ----------------------------------------------------------------------------------------------------- |
-| Document | content, version, dirty, save state, disk identity, external change, encoding, line endings, language |
-| Editor   | caret, selection, scroll position, focus, IME composition, undo/redo history, find bar, layout        |
-| Tab      | which document (its key), its place in the strip; title and markers are read from the document        |
+| Owner            | Owns                                                                                                  |
+| ---------------- | ----------------------------------------------------------------------------------------------------- |
+| Document         | content, version, dirty, save state, disk identity, external change, encoding, line endings, language |
+| Monaco TextModel | the editing buffer, undo/redo stack, tokenization, decorations                                        |
+| Monaco editor    | cursor, selections, scroll, folding, find widget, IME, layout, focus                                  |
+| EditorViews      | each document's saved Monaco view state while it is not shown, and whether its editor had focus       |
+| Tab              | which document (its key), its place in the strip; title and markers are read from the document        |
 
-**The editor is never the authoritative owner of persisted document content.**
+**Loading.** `EditorArea` loads `CodeEditor` lazily, so Monaco is a separate chunk fetched when the first document is shown. `editor/monaco.ts` imports Monaco's editor API with an explicit list of contributions and Monarch tokenizers rather than `editor.main`, which would also bring the TypeScript, CSS, HTML and JSON language services and an LSP client. There is one Monaco editor instance for the editor area; switching tabs swaps its model.
 
-**Binding.** `TextEditor` shows the document whose key it is given. It subscribes to that document's revision alone (`documents.documentRevision`), so typing redraws the editor and nothing else. The window subscribes to `stateRevision`, which an edit moves only when it changes dirtiness. The textarea is not controlled by React. Its text is set when the editor mounts, and afterwards changes only in two ways:
+**Model identity.** `createEditorModelBridge(documents, host, naming)` keeps one `EditorModel` per open document, keyed by the `Document` object, not by path: a rename or Save As changes the key and the path but keeps the same model, so its undo stack and decorations survive. **Every open document has at most one canonical Monaco TextModel.** Its URI is built from the document's `ResourceUri` (`monacoUri`: the scheme, authority and path of the canonical URI); an untitled or proposed document gets `untitled:` or `proposed:` from its id. The URI is chosen when the model is created and kept after a rename. If a later document asks for a URI a live model still holds (a renamed model and a newly opened file with its old name), the new model gets the same URI with `?instance=n`. Models use LF line endings: the Document Model keeps text in `\n`, and the file's own style is restored on save.
 
-- **User input:** the textarea already holds the text. `documents.edit` makes a new version, which the editor records as shown, so the document's report of it writes nothing back.
-- **Anything else** (a reload, Revert, replace-in-files, Keep My Version): the document's version is not the one shown. `showDocumentText` writes the text, moving the caret and selection with the text around them (`mapOffset`: unchanged before the edited span, shifted after it) and keeping the scroll position.
+**Synchronization.** Two paths, neither using a timer:
 
-The two paths cannot feed each other, and neither uses a timer. A document-originated write is not an input event, so it is never mistaken for an edit.
+- **User input:** Monaco's content listener calls `documents.edit(key, model.getValue())` and records the returned version as `synced`. The bridge sets `pushing` while it does, so the document's `changed` event for that version writes nothing back.
+- **Anything else** (a reload, Revert File, Keep My Version, replace in files): the bridge sees a version that is not `synced` and calls `applyExternal(doc.text)`. That replaces only the changed span (`changedSpan`: the common prefix and suffix are kept) with `pushEditOperations`, as one undoable step, under the `applying` flag so the content listener does not send it back. Cursors outside the span stay where they are.
 
-**Undo and redo** stay in the editor, per document, in `EditorViews` (`services/editorViews.ts`): whole-text snapshots, bounded by count and size. Undoing to the saved text makes the document clean again, because dirty compares text as well as versions. The history follows the document through Save As and renames (`sourceChanged` renames its entry) and is dropped when the document closes. A change the document makes itself is not an undo step. A replace-in-files edit is recorded as one.
-
-**View state.** Selection is recorded on input, select, keyup and mouseup; scroll is recorded on scroll events; both are recorded once more as the editor leaves a document. Coming back to a tab restores both. Selection is only ever read, never the scroll position after an edit: reading that would force the browser to lay out the whole text at once.
-
-**Saving** goes through the window's commands. Ctrl+S calls `DocumentService.save`, which is one Module 03 operation with its Module 04 intent. Save As goes through `save_file_dialog` and then `DocumentService.saveAs`. The editor never writes a file. It follows the result through document state: the tab marker, and a note above the text for:
-
-- a conflict, with **Revert File** and **Keep My Version**
-- a deletion ("your text is kept; saving recreates the file")
-- an unreadable file
-- a failed save
-- a proposal, and a stale proposal
-
-Watcher events never reach the editor directly:
+External changes therefore follow the Document Model's rules unchanged: a clean document is reloaded and its model updated; a dirty one enters conflict and its model keeps the user's text until **Revert File** or **Keep My Version**. Watcher events never reach the editor directly:
 
 ```text
-Filesystem -> resource-changes (Module 02) -> DocumentService.applyResourceChanges -> Document -> editor
+Filesystem -> resource-changes (Module 02) -> DocumentService.applyResourceChanges -> Document -> bridge -> TextModel
 ```
 
-**Focus.** Showing a document (a tab opened or switched to) focuses its editor. A document that only changed key (renamed in the Explorer, or saved under a new name) keeps focus where it was: its editor takes focus back only if it had it (`EditorViews.takeFocus`). The decision is made once per editor, because React runs mount effects twice in development.
+**Undo and redo** are Monaco's own, per model. Dirty state is never decided by the undo stack: it is `DocumentService`'s comparison of the current text with the persisted text, so undoing back to the saved text makes the document clean again. On the `saving` event the bridge pushes an undo stop, so one undo never merges what was typed before a save with what was typed after it. An external change is one undo step.
 
-**Untitled and proposed documents** use the same editor. Their source only changes what the window says and what saving does: Save opens Save As for an untitled document, and is never available for a proposal.
+**View state.** When the editor leaves a document, `CodeEditor` stores `saveViewState()` (cursor, selections, scroll, folding) in `EditorViews` under the document's key; showing it again restores it. `EditorViews.rename` moves the entry with a rename or Save As, and `forget` drops it when the document closes.
 
-**Large files.** The limit is the native 10 MB (`MAX_EDITOR_FILE_SIZE`); a save past it is refused. The UI tests type into 1 MB, 5 MB and 9.5 MB files and compare each keystroke with the same keystroke in a plain textarea holding the same text. The editor matches the browser: about 12 ms at 1 MB, 60 ms at 5 MB and 115 ms at 9.5 MB on the development machine. That remaining cost is the browser re-laying out a textarea of that size; only an editor that renders a viewport (a future Monaco or CodeMirror migration) avoids it. Two things were removed from the keystroke path to get there:
+**Saving** goes through the window's commands. Ctrl+S calls `DocumentService.save`, which is one Module 03 operation with its Module 04 intent. Save As goes through `save_file_dialog` and then `DocumentService.saveAs`, and keeps the model. Monaco never writes a file.
 
-- React's per-render comparison of the textarea's whole text with a `value` or `defaultValue` prop: the text is now set imperatively.
-- The gutter's line count, a scan of the whole text: it is now computed from a deferred copy.
+**Languages** are mapped from the Document Model's language id (`monacoLanguage` in `editor/monacoHost.ts`): TypeScript and TSX to `typescript`, JavaScript and JSX to `javascript`, TOML, ignore files and properties to `ini`, shell scripts to `shell`, C and C++ to `cpp`, the rest by name, otherwise `plaintext`. A rename that changes the extension changes the model's language. JSON is registered as its own id and coloured with the JavaScript tokenizer: Monaco's JSON language feature starts a language service and needs contributions this build leaves out. No language service runs; completion, hover and parameter hints are off until language tooling arrives.
+
+**Settings and themes.** `editor/editorSettings.ts` is the one place editor options are made (`editorOptions(settings, view)`), from `DEFAULT_EDITOR_SETTINGS` plus the window's word wrap, zoom and read-only state. The themes `yavin-dark` and `yavin-light` are defined in `editor/monaco.ts`.
+
+**Decorations.** `bridge.setDecorations(key, owner, decorations)` replaces one owner's decorations on one document (offset ranges, a class name, whole-line, a plain-text hover); other owners' are untouched. They live on the model, so they follow renames. Hover text is never treated as HTML or as a trusted link.
+
+**Read-only and proposals.** `readOnly` is an editor option. A proposed document is a model like any other; saving it is refused by the Document Model, not by the editor.
+
+**Diff editor.** `createDiffView(container, {original, modified})` shows an original text (an in-memory `yavin-original:` model, not editable) beside a document's model. Disposing the view disposes only the original; the document's model stays. It is the foundation for Git and ChangeSet diffs; nothing in the UI opens one yet.
+
+**Workers.** Only `editor.worker` is used (link and diff computation). It is imported with Vite's `?worker`, so it is emitted as a same-origin script under `assets/` and allowed by the CSP (`script-src 'self'`) in the development server, the production build and the packaged app. No worker is loaded from a CDN, a blob or a data URL.
+
+**Security.** Document text is only ever given to Monaco as model text, so it is rendered as text: markup in a file is never parsed or run. Decoration hovers are plain text.
+
+**Focus.** Showing a document (a tab opened or switched to) focuses its editor. A document that only changed key (renamed in the Explorer, or saved under a new name) keeps focus where it was: its editor takes focus back only if it had it (`EditorViews.takeFocus`). The decision is made once per key, because React StrictMode runs effects twice in development.
+
+**Cleanup.** The bridge counts holders (`retain`/`release`). A model is disposed when its document closes and nothing holds it, or when the last holder releases a closed document; `reset` (changing workspace, Close All) disposes all of them. Unmounting the editor releases its model and disposes the Monaco instance. The bridge itself is disposed on `pagehide`.
+
+**Test hooks.** `window.__yavinEditor` and `window.__yavinMonaco` exist only when `TEST_HOOKS` is on (`import.meta.env.DEV`, or a build with `VITE_TEST_HOOKS=1`); a release build contains neither.
+
+**Large files.** The limit is the native 10 MB (`MAX_EDITOR_FILE_SIZE`). Monaco renders only the viewport, so a keystroke no longer costs more in a larger file. Measured by the UI tests on the development machine:
+
+| File   | Open and paint | Keystroke to paint | Same keystroke, plain textarea |
+| ------ | -------------- | ------------------ | ------------------------------ |
+| 1 MB   | 484 ms         | 16 ms              | 34 ms                          |
+| 5 MB   | 601 ms         | 17 ms              | 217 ms                         |
+| 9.5 MB | 686 ms         | 17 ms              | 387 ms                         |
+
+A tab switch measured inside the page takes about 90-160 ms until painted, the same for a 9.5 MB file as for a tiny one. Monaco's model swap is about 17 ms of that; the rest is React changing the active tab and the browser painting.
 
 **Invariants**
 
-1. The editor is never the authoritative owner of persisted document content.
-2. An editor changes content only through `DocumentService.edit`, and never writes a file.
-3. A change the document makes is shown only when the editor does not already show that version, so edits and displays cannot loop.
-4. Typing that does not change what the window shows redraws only the editor showing it.
-5. Caret, selection, scroll and undo history are editor state; the Document Model never holds them.
+1. Monaco is an editor implementation, not the source of truth for Yavin documents.
+2. Every open document has at most one canonical Monaco TextModel.
+3. Editor operations never bypass DocumentService or Module 03 for persistence.
+4. React renders the editor shell; Monaco owns the high-frequency editing state.
+5. A change the document makes is applied to the model only when the model does not already hold that version, so edits and displays cannot loop.
+6. Cursor, selection, scroll and undo history are editor state; the Document Model never holds them.
 
 ## Explorer provider platform
 

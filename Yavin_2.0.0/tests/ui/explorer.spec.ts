@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
+import { appAlert } from "./editor-harness";
 
 const deep = "/work/a/b/c/d/e/f/g";
 
@@ -147,7 +148,7 @@ test("expanded folders survive switching to Search and back", async ({ page }) =
 test("a folder that cannot be read reports the error and can be retried", async ({ page }) => {
   await explorer(page);
   await page.getByLabel("locked", { exact: true }).click();
-  await expect(page.getByRole("alert")).toContainText("permission denied");
+  await expect(appAlert(page)).toContainText("permission denied");
   await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
 });
 
@@ -176,12 +177,12 @@ test("inline names are validated before a file is created", async ({ page }) => 
   await page.getByTitle("New File", { exact: true }).click();
   const input = page.getByPlaceholder("new file...");
   await input.fill("bad:name.ts");
-  await expect(page.getByRole("alert")).toContainText("cannot contain");
+  await expect(appAlert(page)).toContainText("cannot contain");
   await input.press("Enter");
   expect(await calls(page, "create_file")).toHaveLength(0);
   await input.fill("good.ts");
   await input.press("Enter");
-  await expect(page.getByRole("textbox", { name: "good.ts", exact: true })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "good.ts", exact: true })).toBeFocused();
   expect((await calls(page, "create_file")).map((call) => call.args.path)).toEqual([
     "/work/good.ts",
   ]);
@@ -212,7 +213,7 @@ test("arrow keys walk the tree and type-to-find jumps by name", async ({ page })
   await page.keyboard.press("f");
   await expect(page.getByLabel("file.ts", { exact: true })).toBeFocused();
   await page.keyboard.press("Enter");
-  await expect(page.getByRole("textbox", { name: "file.ts", exact: true })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "file.ts", exact: true })).toBeFocused();
 });
 
 test("F2 renames the focused entry", async ({ page }) => {

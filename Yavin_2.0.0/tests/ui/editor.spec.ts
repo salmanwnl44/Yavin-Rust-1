@@ -1,5 +1,16 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
+import {
+  editorInput,
+  editorLength,
+  editorScroll,
+  editorSelections,
+  editorText,
+  expectText,
+  fillEditor,
+  setEditorScroll,
+  setEditorSelections,
+} from "./editor-harness";
 
 /**
  * The editor as a view of the Document Model: it shows the document's text, puts the user's
@@ -137,19 +148,15 @@ const open = async (page: Page, name: string) => {
   await page.getByLabel(name, { exact: true }).click();
   return page.getByRole("textbox", { name, exact: true });
 };
-const caret = (page: Page, name: string) =>
-  page
-    .getByRole("textbox", { name, exact: true })
-    .evaluate((element: HTMLTextAreaElement) => [element.selectionStart, element.selectionEnd]);
-const setCaret = (page: Page, name: string, start: number, end = start) =>
-  page.getByRole("textbox", { name, exact: true }).evaluate(
-    (element: HTMLTextAreaElement, [a, b]) => {
-      element.focus();
-      element.setSelectionRange(a, b);
-      element.dispatchEvent(new Event("select", { bubbles: true }));
-    },
-    [start, end] as const,
-  );
+/** The editor's primary selection, as offsets into the document's text. */
+const caret = async (page: Page) => {
+  const [first] = (await editorSelections(page)) ?? [];
+  return first ? [first.start, first.end] : null;
+};
+const setCaret = async (page: Page, name: string, start: number, end = start) => {
+  await editorInput(page, name).focus();
+  await setEditorSelections(page, [{ start, end }]);
+};
 const saveDisabled = async (page: Page) => {
   await page.getByRole("menubar").getByRole("menuitem", { name: "File", exact: true }).click();
   const disabled = await page
@@ -172,11 +179,11 @@ test("type, save, type, undo: the document is clean again at the saved text", as
   await editor.pressSequentially("!");
   await expect(unsaved(page)).toBeVisible();
   await menu(page, "Edit", "Undo");
-  await expect(editor).toHaveValue("one two");
+  await expectText(page, "one two");
   await expect(unsaved(page)).toHaveCount(0);
   expect(await saveDisabled(page)).toBe(true);
   await menu(page, "Edit", "Redo");
-  await expect(editor).toHaveValue("one two!");
+  await expectText(page, "one two!");
   await expect(unsaved(page)).toBeVisible();
 });
 
@@ -188,13 +195,13 @@ test("an untitled file: type, undo, redo, Save As, keep editing, save", async ({
   await untitled.pressSequentially(" world");
   await menu(page, "Edit", "Undo");
   await menu(page, "Edit", "Redo");
-  await expect(untitled).toHaveValue("hello world");
+  await expectText(page, "hello world");
   await page.evaluate(() => {
     (window as unknown as { __saveTarget: string }).__saveTarget = "/work/hello.txt";
   });
   await page.keyboard.press("Control+s");
   const saved = page.getByRole("textbox", { name: "hello.txt", exact: true });
-  await expect(saved).toHaveValue("hello world");
+  await expectText(page, "hello world");
   expect(await disk(page, "/work/hello.txt")).toBe("hello world");
   await saved.focus();
   await saved.press("End");
@@ -214,8 +221,8 @@ test("a reload from disk keeps the caret where it was in the text", async ({ pag
   await setCaret(page, "a.ts", 8); // in "second"
   await setDisk(page, "/work/a.ts", "zeroth\nfirst\nsecond\n");
   await report(page, "modified", "/work/a.ts");
-  await expect(editor).toHaveValue("zeroth\nfirst\nsecond\n");
-  expect(await caret(page, "a.ts")).toEqual([15, 15]);
+  await expectText(page, "zeroth\nfirst\nsecond\n");
+  expect(await caret(page)).toEqual([15, 15]);
   await expect(editor).toBeFocused();
   await expect(unsaved(page)).toHaveCount(0);
 });
@@ -224,28 +231,35 @@ test("each document's caret and scroll position survive switching tabs", async (
   const long = Array.from({ length: 400 }, (_, n) => `line ${n}`).join("\n");
   await fixture(page, { "/work/a.ts": long, "/work/b.ts": "b" });
   const a = await open(page, "a.ts");
-  await a.evaluate((element: HTMLTextAreaElement) => {
-    element.scrollTop = 2000;
-    element.dispatchEvent(new Event("scroll"));
-  });
   await setCaret(page, "a.ts", 1200, 1210);
+  // A second cursor too, and the view scrolled both ways: all of it is the editor's state.
+  await setEditorSelections(page, [
+    { start: 1200, end: 1210 },
+    { start: 2000, end: 2000 },
+  ]);
+  await setEditorScroll(page, 2000, 0);
+  await expect.poll(async () => (await editorScroll(page))?.top).toBe(2000);
   await open(page, "b.ts");
+  await expect.poll(() => editorText(page)).toBe("b");
   await page.getByRole("tab", { name: /a\.ts/ }).click();
   await expect(a).toBeFocused();
-  expect(await caret(page, "a.ts")).toEqual([1200, 1210]);
-  expect(await a.evaluate((element: HTMLTextAreaElement) => element.scrollTop)).toBe(2000);
+  expect(await editorSelections(page)).toEqual([
+    { start: 1200, end: 1210 },
+    { start: 2000, end: 2000 },
+  ]);
+  expect((await editorScroll(page))?.top).toBe(2000);
 });
 
 test("a deleted file keeps its text; the same text back is in step, other text is a conflict", async ({
   page,
 }) => {
   await fixture(page, { "/work/a.ts": "only copy" });
-  const editor = await open(page, "a.ts");
+  await open(page, "a.ts");
   const note = page.getByRole("note", { name: "Document state" });
   await setDisk(page, "/work/a.ts", null);
   await report(page, "deleted", "/work/a.ts");
   await expect(note).toContainText("deleted on disk");
-  await expect(editor).toHaveValue("only copy");
+  await expectText(page, "only copy");
   // The same content returning puts it back in step.
   await setDisk(page, "/work/a.ts", "only copy");
   await report(page, "created", "/work/a.ts");
@@ -257,7 +271,7 @@ test("a deleted file keeps its text; the same text back is in step, other text i
   await setDisk(page, "/work/a.ts", "someone else's file");
   await report(page, "created", "/work/a.ts");
   await expect(note).toContainText("changed on disk while it had unsaved changes");
-  await expect(editor).toHaveValue("only copy");
+  await expectText(page, "only copy");
   expect(await disk(page, "/work/a.ts")).toBe("someone else's file");
 });
 
@@ -265,33 +279,33 @@ test("the conflict notice's actions resolve it through the document", async ({ p
   await fixture(page, { "/work/a.ts": "base", "/work/b.ts": "base" });
   const note = page.getByRole("note", { name: "Document state" });
   // Keep My Version: the next save replaces the disk's text.
-  const a = await open(page, "a.ts");
-  await a.fill("mine");
+  await open(page, "a.ts");
+  await fillEditor(page, "mine");
   await setDisk(page, "/work/a.ts", "theirs");
   await report(page, "modified", "/work/a.ts");
   await expect(note).toContainText("changed on disk");
   await note.getByRole("button", { name: "Keep My Version" }).click();
   await expect(note).toHaveCount(0);
-  await expect(a).toHaveValue("mine");
+  await expectText(page, "mine");
   await page.keyboard.press("Control+s");
   await expect.poll(() => disk(page, "/work/a.ts")).toBe("mine");
   // Revert File: the disk's text, after asking.
-  const b = await open(page, "b.ts");
-  await b.fill("mine");
+  await open(page, "b.ts");
+  await fillEditor(page, "mine");
   await setDisk(page, "/work/b.ts", "theirs");
   await report(page, "modified", "/work/b.ts");
   await expect(note).toContainText("changed on disk");
   page.once("dialog", (dialog) => void dialog.accept());
   await note.getByRole("button", { name: "Revert File" }).click();
-  await expect(b).toHaveValue("theirs");
+  await expectText(page, "theirs");
   await expect(note).toHaveCount(0);
   await expect(unsaved(page)).toHaveCount(0);
 });
 
 test("a failed save says so and keeps the edits", async ({ page }) => {
   await fixture(page, { "/work/a.ts": "a" });
-  const editor = await open(page, "a.ts");
-  await editor.fill("b");
+  await open(page, "a.ts");
+  await fillEditor(page, "b");
   await page.evaluate(() => {
     (window as unknown as { __failWrite: boolean }).__failWrite = true;
   });
@@ -299,7 +313,7 @@ test("a failed save says so and keeps the edits", async ({ page }) => {
   await expect(page.getByRole("note", { name: "Document state" })).toContainText(
     "The last save failed",
   );
-  await expect(editor).toHaveValue("b");
+  await expectText(page, "b");
   expect(await disk(page, "/work/a.ts")).toBe("a");
 });
 
@@ -311,13 +325,13 @@ test("a proposal opens in the same editor, can be edited, and is never saved", a
     ).__yavinPropose("/work/a.ts", "proposed"),
   );
   const editor = page.getByRole("textbox", { name: "a.ts", exact: true });
-  await expect(editor).toHaveValue("proposed");
+  await expectText(page, "proposed");
   await expect(page.getByRole("note", { name: "Document state" })).toContainText(
     "Proposed content",
   );
   await editor.press("End");
   await editor.pressSequentially(", edited");
-  await expect(editor).toHaveValue("proposed, edited");
+  await expectText(page, "proposed, edited");
   expect(await saveDisabled(page)).toBe(true);
   await page.keyboard.press("Control+s");
   expect(await disk(page, "/work/a.ts")).toBe("base");
@@ -325,29 +339,31 @@ test("a proposal opens in the same editor, can be edited, and is never saved", a
 
 test("one file opened by two spellings is one document in one tab", async ({ page }) => {
   await fixture(page, { "/work/a.ts": "a" }, {}, "/work/src/../a.ts");
-  const editor = await open(page, "a.ts");
-  await editor.fill("edited");
+  await open(page, "a.ts");
+  await fillEditor(page, "edited");
   await menu(page, "File", "Open File…");
   await expect(page.getByRole("tab", { name: /a\.ts/ })).toHaveCount(1);
-  await expect(editor).toHaveValue("edited");
+  await expectText(page, "edited");
 });
 
 test("closing a dirty editor asks; reopening reads the file afresh", async ({ page }) => {
   await fixture(page, { "/work/a.ts": "saved" });
-  const editor = await open(page, "a.ts");
-  await editor.fill("unsaved");
+  await open(page, "a.ts");
+  await fillEditor(page, "unsaved");
   page.once("dialog", (dialog) => void dialog.dismiss());
   await page.getByRole("button", { name: "Close a.ts" }).click();
-  await expect(editor).toHaveValue("unsaved");
+  await expectText(page, "unsaved");
   page.once("dialog", (dialog) => void dialog.accept());
   await page.getByRole("button", { name: "Close a.ts" }).click();
   await expect(page.getByRole("tab", { name: /a\.ts/ })).toHaveCount(0);
-  const reopened = await open(page, "a.ts");
-  await expect(reopened).toHaveValue("saved");
+  await open(page, "a.ts");
+  await expectText(page, "saved");
   await expect(unsaved(page)).toHaveCount(0);
 });
 
-test("typing redraws the editor, not the window around it", async ({ page }) => {
+test("typing renders nothing in React: not the window, not the editor component", async ({
+  page,
+}) => {
   // React reports every commit to the DevTools hook; a component function that ran in a
   // render carries the PerformedWork flag (1) on its fiber in that commit.
   await page.addInitScript(() => {
@@ -374,7 +390,7 @@ test("typing redraws the editor, not the window around it", async ({ page }) => 
         onCommitFiberUnmount: () => {},
         onPostCommitFiberRoot: () => {},
         onCommitFiberRoot: (_id: number, root: { current: unknown }) => {
-          for (const name of ["App", "TextEditor"])
+          for (const name of ["App", "CodeEditor"])
             if (((find(root.current, name)?.flags ?? 0) & 1) === 1)
               renders[name] = (renders[name] ?? 0) + 1;
         },
@@ -390,11 +406,12 @@ test("typing redraws the editor, not the window around it", async ({ page }) => 
     ...(window as unknown as { __renders: Record<string, number> }).__renders,
   }));
   await editor.pressSequentially("cdefghij");
-  await expect(editor).toHaveValue("abcdefghij");
+  await expectText(page, "abcdefghij");
   const after = await page.evaluate(() => ({
     ...(window as unknown as { __renders: Record<string, number> }).__renders,
   }));
-  expect(after.TextEditor - before.TextEditor).toBeGreaterThanOrEqual(8);
+  // Monaco owns the keystroke: neither the window nor the editor's React component renders.
+  expect(after.CodeEditor ?? 0).toBe(before.CodeEditor ?? 0);
   expect(after.App ?? 0).toBe(before.App ?? 0);
 });
 
@@ -407,51 +424,70 @@ for (const [label, size] of [
     page,
   }) => {
     test.setTimeout(120_000);
-    await fixture(page, {}, { "/work/big.ts": size });
-    const editor = await open(page, "big.ts");
-    await expect(editor).toHaveJSProperty("textLength", size);
-    // Keystrokes timed inside the page: each one goes through the input event, the document
-    // edit and the editor's render before the next starts. Compared with the same keystrokes
-    // in a plain textarea holding the same text -- what the browser itself costs, which grows
-    // with the text -- so what is measured is what the editor adds.
-    const timing = await editor.evaluate((element: HTMLTextAreaElement) => {
-      const median = (target: HTMLTextAreaElement) => {
-        target.focus();
-        target.setSelectionRange(0, 0);
+    await fixture(page, { "/work/small.ts": "small" }, { "/work/big.ts": size });
+    // Opening: the click until the editor shows the whole document and has painted it (the
+    // first open also loads the editor itself, so the small file goes first).
+    await open(page, "small.ts");
+    await expectText(page, "small");
+    const opening = Date.now();
+    await open(page, "big.ts");
+    await expect.poll(() => editorLength(page), { timeout: 30_000, intervals: [10] }).toBe(size);
+    await expect(page.locator("[data-editor=monaco] .view-line").first()).toBeVisible();
+    const opened = Date.now() - opening;
+    // Switching tabs: the model is kept, so coming back is a swap, not a reload.
+    await page.getByRole("tab", { name: /small\.ts/ }).click();
+    await expectText(page, "small");
+    const switching = Date.now();
+    await page.getByRole("tab", { name: /big\.ts/ }).click();
+    await expect.poll(() => editorLength(page), { intervals: [10] }).toBe(size);
+    const switched = Date.now() - switching;
+    console.log(`${label}: opened and painted in ${opened} ms; tab switch back in ${switched} ms`);
+    // Keystrokes timed inside the page, each from the input event until the next frame is
+    // painted -- the latency someone typing sees -- and compared with the same keystrokes in a
+    // plain textarea holding the same text (Module 06's measure).
+    const timing = await page.evaluate(async () => {
+      const frame = () =>
+        new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve)));
+      const median = async (key: () => void) => {
         const spent: number[] = [];
-        for (let key = 0; key < 20; key++) {
+        for (let count = 0; count < 20; count++) {
           const start = performance.now();
-          document.execCommand("insertText", false, "x");
+          key();
+          await frame();
           spent.push(performance.now() - start);
         }
         return spent.sort((a, b) => a - b)[10];
       };
+      const hook = (
+        window as unknown as { __yavinEditor: { value(): string; type(text: string): void } }
+      ).__yavinEditor;
       const plain = document.createElement("textarea");
       plain.wrap = "off";
-      plain.style.cssText = `position:fixed;left:0;top:0;width:${element.clientWidth}px;height:${element.clientHeight}px`;
+      plain.style.cssText = "position:fixed;left:0;top:0;width:800px;height:600px";
       document.body.append(plain);
-      plain.value = element.value;
-      const browser = median(plain);
+      plain.value = hook.value();
+      plain.focus();
+      plain.setSelectionRange(0, 0);
+      const browser = await median(() => document.execCommand("insertText", false, "x"));
       plain.remove();
-      return { editor: median(element), browser };
+      // In the editor: Monaco's `type` command -- what a keystroke becomes once the browser's
+      // EditContext hands it over -- then the frame Monaco paints it in.
+      return { editor: await median(() => hook.type("x")), browser };
     });
     console.log(
-      `${label}: median keystroke ${timing.editor.toFixed(1)} ms in the editor, ` +
+      `${label}: median keystroke to paint ${timing.editor.toFixed(1)} ms in the editor, ` +
         `${timing.browser.toFixed(1)} ms in a plain textarea`,
     );
     expect(timing.editor).toBeLessThan(timing.browser * 1.3 + 15);
-    await expect(editor).toHaveJSProperty("textLength", size + 20);
+    await expect.poll(() => editorLength(page)).toBe(size + 20);
     // Scrolling to the end.
-    await editor.evaluate((element: HTMLTextAreaElement) => {
-      element.scrollTop = element.scrollHeight;
-    });
-    expect(await editor.evaluate((element: HTMLTextAreaElement) => element.scrollTop > 0)).toBe(
-      true,
-    );
+    await setEditorScroll(page, 1e9, 0);
+    await expect.poll(async () => (await editorScroll(page))?.top ?? 0).toBeGreaterThan(0);
     await page.keyboard.press("Control+s");
     await expect
       .poll(async () => (await disk(page, "/work/big.ts"))?.length, { timeout: 30_000 })
       .toBe(size + 20);
+    // Typed where the cursor was: the start of the file.
     expect((await disk(page, "/work/big.ts"))!.startsWith("x".repeat(20) + "const value")).toBe(
       true,
     );
@@ -461,7 +497,7 @@ for (const [label, size] of [
       store["/work/big.ts"] = "// replaced\n" + store["/work/big.ts"];
     });
     await report(page, "modified", "/work/big.ts");
-    await expect(editor).toHaveJSProperty("textLength", size + 20 + 12, { timeout: 30_000 });
+    await expect.poll(() => editorLength(page), { timeout: 30_000 }).toBe(size + 20 + 12);
     await expect(unsaved(page)).toHaveCount(0);
   });
 }

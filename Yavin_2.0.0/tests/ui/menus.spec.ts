@@ -1,5 +1,12 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
+import {
+  appAlert,
+  editorOptions,
+  editorSelections,
+  expectText,
+  fillEditor,
+} from "./editor-harness";
 
 async function menu(page: Page, name: string, action: string) {
   await page.getByRole("menubar").getByRole("menuitem", { name, exact: true }).click();
@@ -48,39 +55,42 @@ test("keyboard navigation crosses menus and disabled commands cannot run", async
 
 test("selection, duplication, undo and redo change the document", async ({ page }) => {
   const editor = await newEditor(page);
-  await editor.fill("alpha\nbeta");
+  await fillEditor(page, "alpha\nbeta");
   await menu(page, "Selection", "Select All");
   await expect(editor).toBeFocused();
   await menu(page, "Selection", "Duplicate Selection or Line");
-  await expect(editor).toHaveValue("alpha\nbetaalpha\nbeta");
+  await expectText(page, "alpha\nbetaalpha\nbeta");
   await menu(page, "Edit", "Undo");
-  await expect(editor).toHaveValue("alpha\nbeta");
+  await expectText(page, "alpha\nbeta");
   await menu(page, "Edit", "Redo");
-  await expect(editor).toHaveValue("alpha\nbetaalpha\nbeta");
+  await expectText(page, "alpha\nbetaalpha\nbeta");
 });
 
 test("history survives switching editors", async ({ page }) => {
-  const first = await newEditor(page);
-  await first.fill("first");
-  const second = await newEditor(page);
-  await second.fill("second");
+  await newEditor(page);
+  await fillEditor(page, "first");
+  await newEditor(page);
+  await fillEditor(page, "second");
   await menu(page, "Go", "Previous Editor");
-  await expect(page.getByRole("textbox", { name: "Untitled.ts" })).toHaveValue("first");
+  await expectText(page, "first");
   await menu(page, "Edit", "Undo");
-  await expect(page.getByRole("textbox", { name: "Untitled.ts" })).toHaveValue("");
+  await expectText(page, "");
 });
 
 test("find/replace supports no matches and literal replacement", async ({ page }) => {
-  const editor = await newEditor(page);
-  await editor.fill("alpha alpha");
+  await newEditor(page);
+  await fillEditor(page, "alpha alpha");
   await menu(page, "Edit", "Replace…");
-  await page.getByRole("textbox", { name: "Find text", exact: true }).fill("missing");
-  await page.getByRole("button", { name: "Find next", exact: true }).click();
-  await expect(page.getByRole("status").filter({ hasText: "No matches" })).toBeVisible();
-  await page.getByRole("textbox", { name: "Find text", exact: true }).fill("alpha");
-  await page.getByRole("textbox", { name: "Replacement text", exact: true }).fill("$&");
-  await page.getByRole("button", { name: "Replace all", exact: true }).click();
-  await expect(editor).toHaveValue("$& $&");
+  // Monaco's own find and replace widget.
+  const find = page.getByRole("textbox", { name: "Find", exact: true });
+  await expect(find).toBeFocused();
+  await find.fill("missing");
+  await expect(page.locator(".find-widget .matchesCount")).toHaveText("No results");
+  await find.fill("alpha");
+  await expect(page.locator(".find-widget .matchesCount")).toHaveText("1 of 2");
+  await page.getByRole("textbox", { name: "Replace", exact: true }).fill("$&");
+  await page.getByRole("button", { name: /^Replace All/ }).click();
+  await expectText(page, "$& $&");
 });
 
 test("command search executes shared commands and closes its dialog", async ({ page }) => {
@@ -92,30 +102,30 @@ test("command search executes shared commands and closes its dialog", async ({ p
   }).toPass();
   await search.fill(">new file");
   await search.press("Enter");
-  await expect(page.getByRole("textbox", { name: "Untitled.ts" })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "Untitled.ts" })).toBeFocused();
   await expect(page.getByRole("dialog", { name: "Quick open and commands" })).not.toBeVisible();
 });
 
 test("go to line validates input and selects the requested line", async ({ page }) => {
   const editor = await newEditor(page);
-  await editor.fill("one\ntwo\nthree");
+  await fillEditor(page, "one\ntwo\nthree");
   await menu(page, "Go", "Go to Line…");
   const input = page.getByRole("textbox", { name: "Go to line", exact: true });
   await input.fill("100");
   await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("alert")).toContainText("3 lines");
+  await expect(appAlert(page)).toContainText("3 lines");
   await input.fill("2");
   await page.getByRole("button", { name: "Continue" }).click();
   await expect(editor).toBeFocused();
-  expect(await editor.evaluate((element: HTMLTextAreaElement) => element.selectionStart)).toBe(4);
+  expect(await editorSelections(page)).toEqual([{ start: 4, end: 4 }]);
 });
 
 test("closing a dirty file can be cancelled", async ({ page }) => {
   const editor = await newEditor(page);
-  await editor.fill("keep this");
+  await fillEditor(page, "keep this");
   page.once("dialog", (dialog) => dialog.dismiss());
   await menu(page, "File", "Close Editor");
-  await expect(editor).toHaveValue("keep this");
+  await expectText(page, "keep this");
   page.once("dialog", (dialog) => dialog.accept());
   await menu(page, "File", "Close Editor");
   await expect(editor).not.toBeVisible();
@@ -135,22 +145,22 @@ test("menus fit narrow viewports and dismiss on outside click", async ({ page })
 
 test("clipboard selection is preserved when menus take focus", async ({ page, context }) => {
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
-  const editor = await newEditor(page);
-  await editor.fill("copy me");
+  await newEditor(page);
+  await fillEditor(page, "copy me");
   await menu(page, "Selection", "Select All");
   await menu(page, "Edit", "Copy");
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe("copy me");
   await menu(page, "Edit", "Cut");
-  await expect(editor).toHaveValue("");
+  await expectText(page, "");
   await menu(page, "Edit", "Paste");
-  await expect(editor).toHaveValue("copy me");
+  await expectText(page, "copy me");
 });
 
 test("checkbox menu commands reflect state and Tab exits the menu", async ({ page }) => {
-  const editor = await newEditor(page);
+  await newEditor(page);
   await page.getByRole("menubar").getByRole("menuitem", { name: "View", exact: true }).click();
   await page.getByRole("menuitemcheckbox", { name: "Word Wrap", exact: true }).click();
-  await expect(editor).toHaveAttribute("wrap", "soft");
+  await expect.poll(async () => (await editorOptions(page))?.wordWrap).toBe("on");
   await page.getByRole("menubar").getByRole("menuitem", { name: "View", exact: true }).click();
   await expect(
     page.getByRole("menuitemcheckbox", { name: "Word Wrap", exact: true }),
@@ -211,16 +221,16 @@ test("desktop File menu reports save failure and only clears dirty state after s
 }) => {
   await desktopFixture(page);
   await menu(page, "File", "Open File…");
-  const editor = page.getByRole("textbox", { name: "file.ts", exact: true });
-  await expect(editor).toHaveValue("original");
-  await editor.fill("fail");
+  await expect(page.getByRole("textbox", { name: "file.ts", exact: true })).toBeAttached();
+  await expectText(page, "original");
+  await fillEditor(page, "fail");
   await menu(page, "File", "Save");
-  await expect(page.getByRole("alert")).toContainText("Disk write denied");
-  await expect(editor).toHaveValue("fail");
+  await expect(appAlert(page)).toContainText("Disk write denied");
+  await expectText(page, "fail");
   await page.getByRole("button", { name: "Dismiss" }).click();
   await menu(page, "File", "Save All");
-  await expect(page.getByRole("alert")).toContainText("Disk write denied");
-  await editor.fill("saved");
+  await expect(appAlert(page)).toContainText("Disk write denied");
+  await fillEditor(page, "saved");
   await menu(page, "File", "Save");
   await page.getByRole("menubar").getByRole("menuitem", { name: "File", exact: true }).click();
   await expect(page.getByRole("menuitem", { name: "Save", exact: true })).toHaveAttribute(
@@ -235,13 +245,13 @@ test("desktop New File validates paths and refuses overwrite", async ({ page }) 
   const input = page.getByRole("textbox", { name: "New file", exact: true });
   await input.fill("../escape.ts");
   await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("alert")).toContainText("not a valid name");
+  await expect(appAlert(page)).toContainText("not a valid name");
   await input.fill("file.ts");
   await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("alert")).toContainText("already exists");
+  await expect(appAlert(page)).toContainText("already exists");
   await input.fill("new.ts");
   await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("textbox", { name: "new.ts", exact: true })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "new.ts", exact: true })).toBeFocused();
 });
 
 test("Explorer context menu opens with Shift+F10 and is keyboard operable", async ({ page }) => {
