@@ -1,0 +1,21 @@
+[
+  { "input": "C:\\Work\\Project", "id": "file://c:/work/project" },
+  { "input": "c:/work/project/", "id": "file://c:/work/project" },
+  { "input": "C:/Work/Project/../Project/./", "id": "file://c:/work/project" },
+  { "input": "\\\\?\\C:\\Work\\Project", "id": "file://c:/work/project" },
+  { "input": "//?/C:/Work/Project", "id": "file://c:/work/project" },
+  { "input": "\\??\\C:\\Work\\Project", "id": "file://c:/work/project" },
+  { "input": "C:\\", "id": "file://c:/" },
+  { "input": "C:\\Work\\Ünïcode Folder\\😀", "id": "file://c:/work/ünïcode folder/😀" },
+  { "input": "\\\\?\\UNC\\Server\\Share\\Project", "id": "file://server/share/project" },
+  { "input": "\\\\Server\\Share\\Project\\", "id": "file://server/share/project" },
+  { "input": "//Server/Share", "id": "file://server/share" },
+  { "input": "/home/Me/Project", "id": "file:///home/Me/Project" },
+  { "input": "/home/me/project/", "id": "file:///home/me/project" },
+  { "input": "/", "id": "file:///" },
+  { "input": "relative/path", "id": null },
+  { "input": "C:relative", "id": null },
+  { "input": "\\\\Server", "id": null },
+  { "input": "/..", "id": null },
+  { "input": "", "id": null }
+]

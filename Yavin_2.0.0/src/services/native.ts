@@ -4,6 +4,15 @@ import type { FileNode } from "../types";
 import type { Shell } from "./terminal";
 import type { Session, WorkspaceSession } from "./session";
 import type { TrustState } from "./trust";
+import type {
+  LocalGitBlobInfo,
+  LocalGitCommit,
+  LocalGitFinding,
+  LocalGitInfo,
+  LocalGitReflogRecord,
+  LocalGitRefs,
+  LocalGitTreeEntry,
+} from "./localgit/types";
 import { asResourceChangeBatch, asWatcherStatus } from "./resourceEvents.ts";
 import type { ResourceChangeBatch, WatcherStatus } from "./resourceEvents.ts";
 
@@ -108,6 +117,20 @@ interface Commands {
   terminal_resize: { args: { id: string; cols: number; rows: number }; result: void };
   terminal_close: { args: { id: string; generation?: number }; result: void };
   terminal_close_all: { args: undefined; result: void };
+  /** Local Git (`services/localgit`): by handle and object id only, never by path. */
+  localgit_open: { args: { folders: string[] }; result: LocalGitInfo };
+  localgit_close: { args: { handle: string }; result: void };
+  localgit_info: { args: { handle: string }; result: LocalGitInfo };
+  localgit_verify: { args: { handle: string; full: boolean }; result: LocalGitFinding[] };
+  localgit_refs: { args: { handle: string }; result: LocalGitRefs };
+  localgit_reflog: { args: { handle: string; limit: number }; result: LocalGitReflogRecord[] };
+  localgit_read_commit: { args: { handle: string; id: string }; result: LocalGitCommit };
+  localgit_read_tree: { args: { handle: string; id: string }; result: LocalGitTreeEntry[] };
+  localgit_blob_info: { args: { handle: string; id: string }; result: LocalGitBlobInfo };
+  localgit_read_blob: {
+    args: { handle: string; id: string; maxBytes: number };
+    result: ArrayBuffer;
+  };
 }
 
 /** A local TCP port something is listening on, as the Ports view shows it. */

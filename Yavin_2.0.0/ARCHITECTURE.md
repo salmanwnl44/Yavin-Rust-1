@@ -815,6 +815,81 @@ SOURCE CONTROL                                   ⋯   view options: which secti
 
 **Dialogs.** A dialog may open the next from its answer (pick a remote, then name the branch). Each request gets its own dialog element and clears only itself, so the first closing never takes the second with it.
 
+## Local Git
+
+Local Git is Yavin's own history for a workspace -- checkpoints, local commits, branches and restore, eventually "Undo AI Run" -- that works with or without real Git. It is **not Git**: it never reads or writes `.git`, never runs `git`, never reads `.gitignore`, and nothing it stores ends up in the project. Real Git stays what the Source Control panel shows. Local Git never owns live document content either: DocumentService does, and Local Git only records snapshots of it.
+
+LG-01 (this module) is the storage layer: the object store, the repository lifecycle and crash-safe persistence. Snapshots, status and every command that writes arrive in later phases (see "Not yet").
+
+```text
+renderer                                    native (src-tauri)
+WorkspaceContext ──owns── LocalGitService ─── localgit_* ──> LocalGit (src/localgit.rs)
+  (services/workspaces.ts)  (services/localgit)  handle        handles → stores (one per workspace key)
+                                                                │
+                                                        crates/ide-localgit (pure Rust, no Tauri)
+                                                                │
+                              <app_local_data_dir>/local-git/<key>/
+                                workspace.json   identity, folders, settings (versioned)
+                                repo.lock        single writer (OS file lock)
+                                refs.json        HEAD + refs + revision (atomic replace)
+                                logs/refs.log    reflog, append-only JSON lines
+                                objects/seg-*.ylseg   immutable segments
+                                tmp/             segments being written; swept by the writer
+                                quarantine/      damaged files set aside; never deleted automatically
+```
+
+**Ownership.**
+
+| Owner                                | Owns                                                                                                        |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| `crates/ide-localgit`                | the format: ids, objects, segments, refs, reflog, locking, recovery, verification. No Tauri, no processes   |
+| `src-tauri/src/localgit.rs`          | the storage location, one open store per workspace key, handles, checking the workspace the window has open |
+| `services/localgit/service.ts`       | one workspace's calls; refuses and drops everything once its context is no longer active                    |
+| `WorkspaceContext` (`workspaces.ts`) | the service's lifetime: made with the context (folders, app only), closed by its disposal                   |
+| DocumentService                      | document content -- unchanged; LG-01 does not read it                                                       |
+
+**Storage and identity.** Stores live in Yavin's private data (`app_local_data_dir()/local-git/`), never in the project. A store's directory is `<slug>-<20 hex>`: the first folder's name, then `sha256("ylg-workspace\0" + WorkspaceId)`. The native side computes the `WorkspaceId` itself with the same rules as `resource.ts` (`resource_id_of`; a shared fixture, `services/localgit/workspaceIds.fixtures.json`, is run by both languages), so every spelling of a folder (`\\?\`, case, separators) is one store. `workspace.json` records the WorkspaceId, a `folderId` per folder, and settings (`maxBlobBytes`, 20 MiB). Opening a store whose WorkspaceId differs is refused (`WorkspaceMismatch`); missing metadata over existing data is `RecoveryRequired`; unreadable metadata is quarantined and refused; a newer format is `UnsupportedVersion`. None of these is ever repaired by rewriting.
+
+**Objects.** An id is `sha256("ylg1 " + kind + " " + length + "\0" + payload)`, 64 lowercase hex characters. SHA-256 because AI writes arbitrary content and ids must not collide; stored bytes are re-hashed on every read.
+
+- **Blob**: raw bytes, binary-safe, streamed in 64 KiB reads. A file over `maxBlobBytes` is hashed but not stored: its tree entry is marked unstored with its size, so a change is still detected, and reading it is `ContentUnavailable`.
+- **Tree**: entries strictly sorted by name bytes; kind (file, directory, symlink), flags (executable, unstored, directory target, junction), name, id, and the size of an unstored file. Names are UTF-8, 1-255 bytes, never `.` or `..`, never containing `/` or NUL; anything else is refused, never converted. Case is preserved (a case-only rename is a change); empty directories are kept (the empty tree). Links are recorded, never followed. Unknown flags or kinds are corruption.
+- **Root**: `folderId → tree`, sorted. Absolute paths never enter a hash.
+- **Commit**: canonical text (decoding re-encodes and requires the same bytes): root, an optional disk root (when unsaved documents were applied), ordered parents, workspace, author, time (display only; order comes from parents), source (`human`, `ai`, `agent`, `automatic`, `recovery`, `checkpoint`), sorted `meta` and `metaobj` (object ids for later ChangeSets and AI provenance), then the message.
+
+**Segments.** Objects are written into segment files, not one file per object (on NTFS with Defender a file per object makes a 100k-file first snapshot take minutes). A write transaction streams its new objects (already known ones are skipped) into one temp file in `tmp/`, then appends a sorted index and a trailer carrying the index's SHA-256, syncs, checks its own index, renames it into `objects/`, and only then makes the objects visible. Segments are never modified. On open each segment's index is read from its trailer; one that does not verify is moved (by the writer) to `quarantine/` and reported, and its objects are missing (reported where refs need them). Each entry has a codec byte; v1 stores raw bytes (compression is reserved for later).
+
+**Refs and reflog.** `refs.json` holds HEAD (on a ref, possibly unborn, or detached), every ref and a monotonic `revision`, replaced atomically, so several refs and HEAD change together. `update_refs` is compare-and-swap: the caller's revision and every ref's expected old value must match (`StaleRevision`, `RefConflict`), and every new id must exist. The reflog line is appended and synced first, `refs.json` written second. Ref names start with `refs/`, are `/`-separated `[A-Za-z0-9._-]` segments, and cannot collide ignoring case (namespaces reserved for later: `refs/heads/`, `refs/tags/`, `refs/yavin/…`).
+
+**Crash safety.** Every write step is either invisible until it completes or detected on the next open, and nothing is guessed:
+
+| Interrupted after                     | On the next open                                                                                                                              |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| a temp segment was started or written | the writer removes it (`staleTempsRemoved`)                                                                                                   |
+| a segment was renamed into place      | kept; its objects are unreachable until a later ref points at them (GC is later)                                                              |
+| part of a reflog line                 | the torn tail is copied to `quarantine/`, cut off and reported (`tornReflog`)                                                                 |
+| the reflog line, before `refs.json`   | refs stay as they were; the update is marked aborted in the reflog and reported (`interruptedRefUpdate`) -- **never completed automatically** |
+| `refs.json`                           | the new state, complete                                                                                                                       |
+
+A revision is never reused: the next one is past both `refs.json` and the reflog. A ref whose object is missing is reported (`danglingRef`), never rewritten. `verify(full)` re-reads and re-hashes every object and walks every ref's history. Fault injection (the `fault-injection` feature, tests only) crashes at each step; the tests reopen and require old-or-new refs and a clean verify.
+
+**Locking.** `repo.lock` is an OS file lock. The first process to open a store is its writer; a second process (another Yavin instance on the same workspace) opens it **read-only**, sees the same history (reloaded on `info`), and every write it attempts is `ReadOnly`. Only the writer sweeps temps or repairs a torn reflog. The lock dies with its process, so a crashed writer never blocks the next one. Within one process, every handle for a workspace shares one open store.
+
+**Workspace lifecycle.** The renderer's `LocalGitService` belongs to its `WorkspaceContext`: `localgit_open` must be asked with the folders the native side has open (`NotInWorkspace` otherwise) and gets a random handle. Every call checks the context before it goes and when it answers: a late answer from workspace A is dropped (`LocalGitClosedError`), never delivered to B; a store that finishes opening after its workspace went is handed straight back; A → B → A makes a new service with a new handle. The context's disposal closes its handle, and `enter_workspace` revokes every other workspace's handles natively; a store closes (releasing its lock) with its last handle. Commands take handles and ids, never paths; failures are `Code: message`.
+
+**Performance** (release build, idle development machine, `cargo test -p ide-localgit --release --test scale -- --ignored`): 10k objects write in 0.16 s (one 16.6 MB segment; writing them again, all duplicates, 31 ms), reopen in 5 ms, read in 0.12 ms each, and a commit plus ref update (synced reflog line and `refs.json`) takes 51 ms; 100k objects write in 1.2 s (166 MB, one segment; duplicates 189 ms), reopen in 35 ms, read in 0.11 ms each, commit plus ref update 50 ms.
+
+**Not yet** (later phases): snapshots of the folders and of unsaved documents, `.yavinignore` and the built-in exclusions, and status (LG-02); checkpoints, commits, history, diff and restore (LG-03); staging, branches and tags (LG-04); reset, revert and stash (LG-05); merge and cherry-pick (LG-06); AI checkpoints and Undo AI Run (LG-07); any UI (LG-08); comparison with real Git, GC, compaction, compression and a recovery UI (LG-09).
+
+**Invariants**
+
+1. Local Git never reads or writes the project's `.git`, never runs `git`, and never writes inside the project.
+2. An object's id is the hash of its canonical bytes, checked on every read.
+3. Refs are old or new after any crash, never a mixture; an interrupted update is reported, never completed.
+4. Corrupt data is set aside and reported, never deleted or silently repaired.
+5. One writer per store; everyone else reads.
+6. A workspace's Local Git work never reaches another workspace.
+
 ## Explorer provider platform
 
 The Explorer is a projection of the filesystem, never a store of filesystem truth. `src/services/explorerProvider.ts` holds what has been listed; `src/services/explorerStore.ts` holds what the user did to the view; the existing tree view (`Sidebar`, `TreeRow`) renders the one and reads and writes the other.

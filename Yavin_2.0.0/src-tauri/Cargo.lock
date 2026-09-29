@@ -1745,6 +1745,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ide-localgit"
+version = "0.1.0"
+dependencies = [
+ "ide-localgit",
+ "ide-workspace",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "ide-workspace"
 version = "0.1.0"
 dependencies = [
@@ -5129,6 +5140,7 @@ checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 name = "yavin-ide"
 version = "0.1.0"
 dependencies = [
+ "ide-localgit",
  "ide-workspace",
  "portable-pty",
  "serde",

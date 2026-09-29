@@ -16,6 +16,7 @@ mod checkers;
 mod config;
 mod external;
 mod git;
+mod localgit;
 mod lsp;
 mod paths;
 mod ports;
@@ -29,6 +30,11 @@ use git::{
     git_cancel_repo, git_clone_repo, git_close_repo, git_exec, git_init_repo, git_open_repo,
     git_probe_worktree, git_repo_state, git_unwatch_repo, git_watch_repo, GitJobs, GitWatches,
     NetworkLocks, Repos, StashLocks,
+};
+use localgit::{
+    localgit_blob_info, localgit_close, localgit_info, localgit_open, localgit_read_blob,
+    localgit_read_commit, localgit_read_tree, localgit_reflog, localgit_refs, localgit_verify,
+    LocalGit,
 };
 use lsp::{lsp_send, lsp_servers, lsp_start, lsp_stop, lsp_stop_all, LspSessions};
 use ports::{list_listening_ports, stop_listening_process};
@@ -471,6 +477,11 @@ fn enter_workspace(
     let (manager, root) = workspace_for(Path::new(path))?;
     let watched = manager.root().to_path_buf();
     *state.0.lock().map_err(|e| e.to_string())? = Some(manager);
+    // Local Git handles of the workspace left are revoked: nothing late from it gets through.
+    let now = ide_localgit::WorkspaceSpec::from_paths(&[&watched])
+        .ok()
+        .map(|spec| spec.workspace_id);
+    app.state::<LocalGit>().revoke_except(now.as_deref());
     watch_workspace(app, watch, &watched);
     Ok(root)
 }
@@ -635,11 +646,26 @@ pub fn run() {
         .manage(Checks::default())
         .manage(LspSessions::default())
         .manage(Recovery::default())
+        .manage(LocalGit::default())
         .setup(|app| {
             recover_at_startup(app.handle());
+            // Local Git lives in Yavin's private data, never in a project.
+            if let Ok(folder) = app.path().app_local_data_dir() {
+                app.state::<LocalGit>().set_base(folder.join("local-git"));
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            localgit_open,
+            localgit_close,
+            localgit_info,
+            localgit_verify,
+            localgit_refs,
+            localgit_reflog,
+            localgit_read_commit,
+            localgit_read_tree,
+            localgit_blob_info,
+            localgit_read_blob,
             recovery_report,
             recovery_dismiss,
             get_default_workspace,

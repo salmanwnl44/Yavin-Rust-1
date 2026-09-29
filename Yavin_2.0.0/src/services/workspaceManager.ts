@@ -59,8 +59,20 @@ export interface WorkspaceContext<S> {
   own(dispose: () => void | Promise<void>): void;
 }
 
+/** What a service may know of the workspace it belongs to. */
+export interface WorkspaceLifecycle {
+  readonly generation: number;
+  readonly signal: AbortSignal;
+  isActive(): boolean;
+}
+
 export interface WorkspaceServiceFactory<S> {
-  create(id: WorkspaceId, folders: readonly string[]): S;
+  /**
+   * Makes a workspace's services. `lifecycle` is the context being made: a service that works
+   * asynchronously checks `isActive()` before using an answer, so nothing of a workspace that
+   * has gone reaches the next.
+   */
+  create(id: WorkspaceId, folders: readonly string[], lifecycle: WorkspaceLifecycle): S;
   /** Ends every service of a workspace: watchers, polling, subscriptions, processes. */
   dispose(services: S): void | Promise<void>;
 }
@@ -117,7 +129,7 @@ export function createWorkspaceManager<S>(
         return ending;
       },
     };
-    (context as { services: S }).services = factory.create(id, folders);
+    (context as { services: S }).services = factory.create(id, folders, context);
     state = "active";
     return context;
   };

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ide-workspace"]
+members = ["crates/ide-workspace", "crates/ide-localgit"]
 exclude = ["crates/ide-core", "crates/ide-config", "crates/ide-syntax", "crates/ide-lsp", "crates/ide-dap", "crates/ide-terminal", "crates/ide-plugin-host"]
 
 [workspace.dependencies]
@@ -25,4 +25,5 @@ tauri = { version = "2", features = [] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ide-workspace = { path = "crates/ide-workspace" }
+ide-localgit = { path = "crates/ide-localgit" }
 portable-pty = "0.9.0"

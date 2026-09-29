@@ -3,6 +3,8 @@ import { isTauri } from "@tauri-apps/api/core";
 import { GitRegistry } from "./git/registry.ts";
 import { native } from "./native.ts";
 import { clearProblems } from "./panel/problems.ts";
+import { createLocalGitService } from "./localgit/service.ts";
+import type { LocalGitService } from "./localgit/service.ts";
 import { EMPTY_WORKSPACE, createWorkspaceManager } from "./workspaceManager.ts";
 import type { WorkspaceContext, WorkspaceId } from "./workspaceManager.ts";
 
@@ -20,6 +22,8 @@ import type { WorkspaceContext, WorkspaceId } from "./workspaceManager.ts";
 
 export interface WorkspaceServices {
   git: GitRegistry;
+  /** The workspace's Local Git (its own history store, never real Git); none without a folder. */
+  localGit: LocalGitService | null;
 }
 
 /** Where a workspace's Git repositories are remembered. */
@@ -29,7 +33,7 @@ const LEGACY_GIT_KEY = "yavin.git.repos";
 
 export const workspaces = createWorkspaceManager<WorkspaceServices>(
   {
-    create(id, folders) {
+    create(id, folders, lifecycle) {
       const git = new GitRegistry(
         id === EMPTY_WORKSPACE
           ? // No folder: repositories added by hand are kept for as long as the window is,
@@ -43,10 +47,21 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
         void git
           .restore()
           .then(() => Promise.all(folders.map((folder) => git.open(folder, { silent: true }))));
-      return { git };
+      // Local Git opens the store of the workspace the native side has open (which these
+      // folders must be); only in the app, where there is a native side.
+      const localGit =
+        folders.length && isTauri()
+          ? createLocalGitService(folders, lifecycle, (command, args) =>
+              (native as unknown as (c: string, a: unknown) => Promise<unknown>)(command, args),
+            )
+          : null;
+      return { git, localGit };
     },
     async dispose(services) {
       services.git.dispose();
+      // Its Local Git handle is given back (the store closes, releasing its writer lock, when
+      // no handle is left); anything still in flight is refused.
+      await services.localGit?.close();
       if (isTauri()) {
         // A checker still running in the folder left is stopped; its answer would be dropped
         // anyway (it checks the workspace it started in).

@@ -1,0 +1,19 @@
+[package]
+name = "ide-localgit"
+version = "0.1.0"
+edition = "2021"
+description = "Yavin Local Git: a workspace-scoped, content-addressed local history store (never real Git)"
+
+[dependencies]
+ide-workspace = { path = "../ide-workspace" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+
+[features]
+# Crash simulation at every durable boundary, for this crate's tests and the app's own.
+fault-injection = []
+
+[dev-dependencies]
+# The integration tests simulate crashes, so they build this crate with fault injection on.
+ide-localgit = { path = ".", features = ["fault-injection"] }
