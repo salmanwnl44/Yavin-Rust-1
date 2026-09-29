@@ -13,6 +13,20 @@ interface Commands {
   read_file_content: { args: { path: string }; result: string };
   is_read_only: { args: { path: string }; result: boolean };
   read_image_file: { args: { path: string }; result: ArrayBuffer };
+  lsp_servers: {
+    args: Record<string, never>;
+    result: {
+      trusted: boolean;
+      servers: { id: string; label: string; program: string | null }[];
+    };
+  };
+  lsp_start: {
+    args: { server: string; root: string };
+    result: { session: number; program: string };
+  };
+  lsp_send: { args: { session: number; message: string }; result: void };
+  lsp_stop: { args: { session: number }; result: void };
+  lsp_stop_all: { args: Record<string, never>; result: void };
   create_file: { args: { path: string }; result: void };
   /** Exclusive: fails if anything is there. Resolves to the operation's id (Module 03). */
   create_file_with_content: { args: { path: string; content: string }; result: number };

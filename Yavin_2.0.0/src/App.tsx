@@ -82,6 +82,19 @@ import {
 import type { Decorations } from "./services/git";
 import { hitOffset, listFiles } from "./services/search";
 import { createCursorStatus } from "./services/cursorStatus";
+import { createLspManager } from "./services/lsp/manager";
+import { describeStatus } from "./services/lsp/manager";
+import { createNativeTransport, nativeAvailability } from "./services/lsp/nativeTransport";
+import { applyWorkspaceEdit } from "./services/lsp/workspaceEdit";
+import type { WorkspaceEditHost } from "./services/lsp/workspaceEdit";
+import { flattenSymbols } from "./services/lsp/symbols";
+import type { DocumentSymbol, SymbolInformation } from "./services/lsp/protocol";
+import { LineIndex } from "./services/lsp/positions";
+import type { LanguageFeaturesHost } from "./editor/lspMonaco";
+import type { EditorRange } from "./editor/editorTypes";
+import type { PaletteSymbol, SymbolScope } from "./components/command-palette/CommandPalette";
+import { clearProblems, publishProblems } from "./services/panel/problems";
+import { fileUri } from "./services/resource";
 import { loadMinimapPreferences, saveMinimapPreferences } from "./services/minimapPreferences";
 import type { MinimapPreferences } from "./services/minimapPreferences";
 
@@ -145,6 +158,14 @@ const EDITOR_KEY_COMMANDS = [
   "edit.toggleComment",
   "edit.indent",
   "edit.outdent",
+  // Language features: F2 in the Explorer renames a file, not a symbol.
+  "lsp.definition",
+  "lsp.references",
+  "lsp.rename",
+  "lsp.format",
+  "lsp.quickFix",
+  "lsp.suggest",
+  "lsp.nextProblem",
 ];
 // Error boundary to prevent white/black screen crashes
 class ErrorBoundary extends Component<
@@ -203,7 +224,9 @@ export default function App() {
   const [dialog, setDialog] = useState<DialogRequest | null>(null);
   const [wordWrap, setWordWrap] = useState(false);
   const [zoom, setZoom] = useState(1);
-  const [paletteMode, setPaletteMode] = useState<"files" | "commands">("files");
+  const [paletteMode, setPaletteMode] = useState<
+    "files" | "commands" | "symbols" | "workspaceSymbols"
+  >("files");
   const [workspacePath, setWorkspacePath] = useState("");
   /**
    * The Explorer Provider (`services/explorerProvider.ts`): what the Explorer shows, as a
@@ -956,7 +979,10 @@ export default function App() {
       await refreshAround(path);
     });
   const handleRename = (oldPath: string, newPath: string) =>
-    run(async () => {
+    run(() => renameEntry(oldPath, newPath));
+  /** A rename, as the Explorer and a language server's edits both make one (Module 03). */
+  const renameEntry = async (oldPath: string, newPath: string) => {
+    {
       if (documents.anySaving())
         throw new Error("Wait for file saves to finish before renaming files.");
       await native("rename_path", { oldPath, newPath });
@@ -973,7 +999,276 @@ export default function App() {
         })),
       );
       await refreshAround(oldPath, newPath);
+    }
+  };
+  /** Deletes entries (Module 03 operations), closing what was open inside them. */
+  const deleteEntries = async (entries: { path: string; isDir: boolean }[]) => {
+    const doomed = (path: string) => entries.some((entry) => isWithin(path, entry.path));
+    for (const entry of entries) {
+      await native("delete_path", { path: entry.path, recursive: entry.isDir });
+      explorer.removed(entry.path);
+      documents.removed(entry.path);
+    }
+    setTabs((prev) => prev.filter((tab) => !doomed(tab.path)));
+    for (const tab of openTabs) if (doomed(tab.path)) views.forget(tab.path);
+    if (doomed(activeTabId)) setActiveTabId("welcome");
+    setRecentFiles((prev) => prev.filter((file) => !doomed(file.path)));
+    await refreshAround(...entries.map((entry) => entry.path));
+  };
+
+  // --- Language servers (Module 10) ------------------------------------------------------
+  /**
+   * The window's language servers: which one serves each document, what it is told, what it
+   * says. Created once; it follows the Document Model on its own, and the folder and trust
+   * below decide what may run.
+   */
+  const lspOutput = useRef(createOutputChannel("Language Servers")).current;
+  const latestForLsp = useRef({ workspacePath, editAnyway });
+  latestForLsp.current = { workspacePath, editAnyway };
+  /** Where a server's edit goes: the WorkspaceEdit engine, through the Document Model. */
+  const workspaceEditHost = useRef<WorkspaceEditHost | null>(null);
+  workspaceEditHost.current = {
+    documents,
+    canEdit: (doc) => !doc.readOnly || latestForLsp.current.editAnyway.has(doc.id),
+    documentForUri: (uri) =>
+      uri.startsWith("untitled:")
+        ? documents.all().find((doc) => `untitled:${encodeURIComponent(doc.name)}` === uri)
+        : undefined,
+    open: async (path) => {
+      const doc = await documents.open(path);
+      if (!doc) throw new Error(`${path} could not be opened.`);
+      return doc;
+    },
+    // Edited by a server but not shown: now unsaved, so they get tabs (not brought forward).
+    reveal: (docs) =>
+      setTabs((prev) => [
+        ...prev,
+        ...docs
+          .filter((doc) => !prev.some((tab) => tab.id === doc.key))
+          .map((doc) => ({ id: doc.key, path: doc.key, name: doc.name })),
+      ]),
+    createFile: async (path, options) => {
+      try {
+        await native("create_file", { path });
+      } catch (error) {
+        if (!options?.ignoreIfExists) throw error;
+      }
+      await refreshAround(path);
+    },
+    renameFile: (from, to) => renameEntry(from, to),
+    deleteFile: async (path, options) => {
+      try {
+        await deleteEntries([{ path, isDir: Boolean(options?.recursive) }]);
+      } catch (error) {
+        if (!options?.ignoreIfNotExists) throw error;
+      }
+    },
+  };
+  const lsp = useRef(
+    (() => {
+      const manager = createLspManager({
+        documents,
+        transport: createNativeTransport((serverId, line) =>
+          lspOutput.appendLine(`[${serverId}] ${line}`, "debug"),
+        ),
+        folders: () => {
+          const roots = explorer.getRootNodes().map((node) => node.path);
+          const paths = roots.length
+            ? roots
+            : latestForLsp.current.workspacePath
+              ? [latestForLsp.current.workspacePath]
+              : [];
+          return paths.map((path, index) => ({
+            uri: fileUri(path),
+            name: path.split("/").pop() || path,
+            index,
+          }));
+        },
+        availability: () =>
+          isTauri()
+            ? nativeAvailability()
+            : Promise.resolve({ trusted: false, installed: new Set<string>() }),
+        problems: { publish: publishProblems, clear: clearProblems },
+        applyEdit: (edit, encoding) =>
+          workspaceEditHost.current
+            ? applyWorkspaceEdit(edit, workspaceEditHost.current, encoding)
+            : Promise.resolve({ applied: false, failureReason: "Not ready" }),
+        log: (server, text, level) =>
+          lspOutput.appendLine(
+            `[${server}] ${text}`,
+            level === "error" ? "error" : level === "warning" ? "warn" : "info",
+          ),
+      });
+      return manager;
+    })(),
+  ).current;
+  const lspRevision = useSyncExternalStore(lsp.subscribe, lsp.revision);
+  // Development builds only: the UI tests read the servers' state.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const hook = window as unknown as { __yavinLsp?: unknown };
+    hook.__yavinLsp = lsp;
+    return () => {
+      delete hook.__yavinLsp;
+    };
+  }, [lsp]);
+  // Servers run for the folder that is open, and only once it is trusted; a change of either
+  // stops them all and starts what applies now.
+  // Safe to run twice for the same folder and trust (React runs effects twice in development):
+  // `start` does nothing once started, and only a real change reconsiders.
+  const lspFor = useRef<string | null>(null);
+  useEffect(() => {
+    lsp.start();
+    const now = `${workspacePath}|${trust.trusted}`;
+    if (lspFor.current !== null && lspFor.current !== now) void lsp.reconsider();
+    lspFor.current = now;
+    if (!workspacePath) void lsp.stopAll();
+  }, [lsp, workspacePath, trust.trusted]);
+  // Leaving the window shuts the servers down (and the native side ends whatever is left).
+  useEffect(() => {
+    const leave = () => void lsp.dispose();
+    window.addEventListener("pagehide", leave, { once: true });
+    return () => window.removeEventListener("pagehide", leave);
+  }, [lsp]);
+
+  /** A place to go once its file is in front: set by navigation, taken by the effect below. */
+  const [pendingLocation, setPendingLocation] = useState<{
+    key: string;
+    range?: EditorRange;
+  } | null>(null);
+  const openLocation = (path: string, range?: EditorRange) => {
+    const key = documents.get(path)?.key ?? path;
+    setPendingLocation({ key, range });
+    void handleOpenFile(path);
+  };
+  useEffect(() => {
+    if (!pendingLocation || activeTabId !== pendingLocation.key || diff) return;
+    // The first document opened loads the editor itself; it reports its state once it shows it.
+    if (!editorRef.current) return;
+    if (pendingLocation.range) editorRef.current.select(pendingLocation.range);
+    else editorRef.current.focus();
+    setPendingLocation(null);
+  }, [activeTabId, documentState, pendingLocation, diff, editorState]);
+
+  /** A list of places to go (references, several definitions), as a picker. */
+  const showLocations = (
+    title: string,
+    locations: { path: string; range: EditorRange; preview?: string }[],
+  ) => {
+    if (!locations.length) {
+      reportError(`${title}: nothing found.`);
+      return;
+    }
+    if (locations.length === 1) {
+      openLocation(locations[0].path, locations[0].range);
+      return;
+    }
+    setDialog({
+      title: `${title} (${locations.length})`,
+      options: locations.map((location, index) => ({
+        value: String(index),
+        label: `${location.path.split("/").pop()}:${location.range.startLineNumber}:${location.range.startColumn}`,
+        description: location.preview ?? location.path,
+      })),
+      submit: (value) => {
+        const chosen = locations[Number(value)];
+        if (chosen) openLocation(chosen.path, chosen.range);
+      },
     });
+  };
+  const languageFeaturesHost = useRef<LanguageFeaturesHost>({
+    openLocation: (path, range) => openLocationRef.current(path, range),
+    showLocations: (title, locations) => showLocationsRef.current(title, locations),
+    applyWorkspaceEdit: (edit, encoding) =>
+      workspaceEditHost.current
+        ? applyWorkspaceEdit(edit, workspaceEditHost.current, encoding)
+        : Promise.resolve({ applied: false, failureReason: "Not ready" }),
+    report: (message) => reportError(message),
+    openExternal: (url) => void native("open_external_url", { url }).catch(reportError),
+  }).current;
+  const openLocationRef = useRef(openLocation);
+  openLocationRef.current = openLocation;
+  const showLocationsRef = useRef(showLocations);
+  showLocationsRef.current = showLocations;
+  const languageFeatures = useMemo(
+    () => ({ manager: lsp, host: languageFeaturesHost }),
+    [lsp, languageFeaturesHost],
+  );
+
+  /** Symbols for the palette: `@` the file in front, `#` every server's workspace. */
+  const paletteSymbols = useCallback(
+    async (query: string, scope: SymbolScope, signal: AbortSignal): Promise<PaletteSymbol[]> => {
+      const toRange = (
+        index: LineIndex | null,
+        range: {
+          start: { line: number; character: number };
+          end: { line: number; character: number };
+        },
+        encoding: "utf-16" | "utf-8" | "utf-32",
+      ): EditorRange => {
+        if (!index)
+          return {
+            startLineNumber: range.start.line + 1,
+            startColumn: range.start.character + 1,
+            endLineNumber: range.end.line + 1,
+            endColumn: range.end.character + 1,
+          };
+        const start = index.positionAt(index.offsetAt(range.start, encoding));
+        const end = index.positionAt(index.offsetAt(range.end, encoding));
+        return {
+          startLineNumber: start.line + 1,
+          startColumn: start.character + 1,
+          endLineNumber: end.line + 1,
+          endColumn: end.character + 1,
+        };
+      };
+      if (scope === "document") {
+        const key = activeKeyRef.current;
+        const context = key ? lsp.context(key) : null;
+        if (!key || !context) throw new Error("No language server is ready for this file.");
+        const result = await lsp.request<(DocumentSymbol | SymbolInformation)[]>(
+          key,
+          "textDocument/documentSymbol",
+          { textDocument: { uri: context.uri } },
+          signal,
+        );
+        return flattenSymbols(result ?? []).map((symbol) => ({
+          name: symbol.name,
+          detail: symbol.detail,
+          open: () =>
+            openLocation(
+              key,
+              symbol.range ? toRange(context.index, symbol.range, context.encoding) : undefined,
+            ),
+        }));
+      }
+      const answers = await lsp.requestAll<SymbolInformation[]>(
+        "workspace/symbol",
+        { query },
+        signal,
+      );
+      return answers.flatMap((answer) =>
+        flattenSymbols(answer.result ?? []).flatMap((symbol) =>
+          symbol.path
+            ? [
+                {
+                  name: symbol.name,
+                  detail: `${symbol.detail} · ${symbol.path.split("/").pop()}`,
+                  open: () =>
+                    openLocation(
+                      symbol.path!,
+                      symbol.range ? toRange(null, symbol.range, answer.encoding) : undefined,
+                    ),
+                },
+              ]
+            : [],
+        ),
+      );
+    },
+    [lsp],
+  );
+  const activeKeyRef = useRef<string | null>(null);
+
   // Deletes one entry or a whole Explorer selection behind a single confirmation.
   const handleDelete = (entries: { path: string; isDir: boolean }[]) => {
     if (!entries.length) return;
@@ -994,19 +1289,8 @@ export default function App() {
       message:
         `Permanently delete ${subject}? This cannot be undone.` +
         (dirty ? "\n\nUnsaved changes in open editors will be discarded." : ""),
-      submit: async () => {
-        for (const entry of entries) {
-          await native("delete_path", { path: entry.path, recursive: entry.isDir });
-          explorer.removed(entry.path);
-          // The user agreed to lose their edits in the confirmation above.
-          documents.removed(entry.path);
-        }
-        setTabs((prev) => prev.filter((tab) => !doomed(tab.path)));
-        for (const tab of openTabs) if (doomed(tab.path)) views.forget(tab.path);
-        if (doomed(activeTabId)) setActiveTabId("welcome");
-        setRecentFiles((prev) => prev.filter((file) => !doomed(file.path)));
-        await refreshAround(...entries.map((entry) => entry.path));
-      },
+      // The user agreed to lose their edits in the confirmation.
+      submit: () => deleteEntries(entries),
     });
   };
   const handleDuplicate = (path: string) =>
@@ -1297,6 +1581,29 @@ export default function App() {
   };
 
   const hasEditor = !!activeTab && activeTab.id !== "welcome";
+  activeKeyRef.current = hasEditor && activeTab ? activeTab.path : null;
+  /** The language server of the file in front, as the status bar shows it. */
+  const languageStatus = (() => {
+    void lspRevision;
+    const status = activeKeyRef.current ? lsp.statusFor(activeKeyRef.current) : null;
+    if (!status || status.state === "stopped" || status.state === "stopping") return undefined;
+    const described = describeStatus(status);
+    return {
+      ...described,
+      onClick: () => {
+        if (
+          status.state === "failed" ||
+          status.state === "crashed" ||
+          status.state === "unavailable"
+        )
+          void lsp.restart(activeKeyRef.current ?? undefined);
+        else {
+          showTerminal(true);
+          showPanelView("output", "language servers");
+        }
+      },
+    };
+  })();
   const desktop = isTauri();
   // Quick open lists the whole workspace through the packaged search tool, not the lazy tree.
   const loadQuickOpen = () => {
@@ -1310,7 +1617,7 @@ export default function App() {
       })
       .catch((error) => setQuickOpen({ files: [], note: String(error) }));
   };
-  const openPalette = (mode: "files" | "commands") => {
+  const openPalette = (mode: "files" | "commands" | "symbols" | "workspaceSymbols") => {
     if (!quickOpen?.files.length) loadQuickOpen();
     setPaletteMode(mode);
     setIsCommandPaletteOpen(true);
@@ -1766,6 +2073,142 @@ export default function App() {
       shortcut: "Mod+p",
       run: () => openPalette("files"),
     },
+    // Language features: each needs a server that offers it for the file in front.
+    ...(() => {
+      void lspRevision;
+      const key = hasEditor && activeTab ? activeTab.path : null;
+      const capabilities = key ? lsp.capabilities(key) : null;
+      const action = (
+        id: string,
+        menu: string,
+        label: string,
+        actionId: string,
+        available: unknown,
+        shortcut?: string,
+      ): AppCommand => ({
+        id,
+        menu,
+        label,
+        shortcut,
+        disabled: !available,
+        reason: "No language server offers this for the file in front",
+        run: () => editorRef.current?.runAction(actionId),
+      });
+      return [
+        action(
+          "lsp.definition",
+          "Go",
+          "Go to Definition",
+          "editor.action.revealDefinition",
+          capabilities?.definitionProvider,
+          "F12",
+        ),
+        action(
+          "lsp.declaration",
+          "Go",
+          "Go to Declaration",
+          "editor.action.revealDeclaration",
+          capabilities?.declarationProvider,
+        ),
+        action(
+          "lsp.typeDefinition",
+          "Go",
+          "Go to Type Definition",
+          "editor.action.goToTypeDefinition",
+          capabilities?.typeDefinitionProvider,
+        ),
+        action(
+          "lsp.implementation",
+          "Go",
+          "Go to Implementations",
+          "editor.action.goToImplementation",
+          capabilities?.implementationProvider,
+        ),
+        action(
+          "lsp.references",
+          "Go",
+          "Find All References",
+          "yavin.lsp.findReferences",
+          capabilities?.referencesProvider,
+          "Shift+F12",
+        ),
+        {
+          id: "lsp.documentSymbol",
+          menu: "Go",
+          label: "Go to Symbol in Editor…",
+          disabled: !capabilities?.documentSymbolProvider,
+          reason: "No language server offers symbols for the file in front",
+          run: () => openPalette("symbols"),
+        },
+        {
+          id: "lsp.workspaceSymbol",
+          menu: "Go",
+          label: "Go to Symbol in Workspace…",
+          shortcut: "Mod+t",
+          disabled: !lsp
+            .readyServers()
+            .some((server) => server.capabilities.workspaceSymbolProvider),
+          reason: "No language server offers workspace symbols",
+          run: () => openPalette("workspaceSymbols"),
+        },
+        action(
+          "lsp.nextProblem",
+          "Go",
+          "Next Problem",
+          "editor.action.marker.next",
+          hasEditor,
+          "F8",
+        ),
+        action(
+          "lsp.rename",
+          "Edit",
+          "Rename Symbol",
+          "editor.action.rename",
+          capabilities?.renameProvider,
+          "F2",
+        ),
+        action(
+          "lsp.format",
+          "Edit",
+          "Format Document",
+          "editor.action.formatDocument",
+          capabilities?.documentFormattingProvider,
+          "Shift+Alt+f",
+        ),
+        action(
+          "lsp.quickFix",
+          "Edit",
+          "Quick Fix…",
+          "editor.action.quickFix",
+          capabilities?.codeActionProvider,
+          "Mod+.",
+        ),
+        action(
+          "lsp.suggest",
+          "Edit",
+          "Trigger Suggest",
+          "editor.action.triggerSuggest",
+          capabilities?.completionProvider,
+        ),
+        {
+          id: "lsp.restart",
+          menu: "View",
+          label: "Restart Language Servers",
+          disabled: !desktop,
+          reason: "Available in the desktop app",
+          run: () => lsp.restart(),
+        },
+        {
+          id: "lsp.output",
+          menu: "View",
+          label: "Show Language Server Output",
+          run: () => {
+            showTerminal(true);
+            showPanelView("output", "language servers");
+          },
+        },
+      ];
+    })(),
     {
       id: "go.line",
       menu: "Go",
@@ -2167,6 +2610,7 @@ export default function App() {
                 loadImage={loadImage}
                 onOpenCode={openCode}
                 previewRef={previewRef}
+                languageFeatures={languageFeatures}
                 tabMenu={tabMenu}
                 onMenuError={reportError}
                 notice={notice}
@@ -2225,6 +2669,7 @@ export default function App() {
           restricted={!trust.trusted}
           onManageTrust={() => setTrustDialog("manage")}
           cursorStatus={cursorStatus}
+          languageStatus={languageStatus}
           onGoToLine={() => {
             const goToLine = commands.find((command) => command.id === "go.line");
             if (goToLine && !goToLine.disabled) void run(async () => goToLine.run());
@@ -2256,6 +2701,7 @@ export default function App() {
           isOpen={isCommandPaletteOpen}
           onClose={() => setIsCommandPaletteOpen(false)}
           onSelectFile={handleOpenFile}
+          symbols={paletteSymbols}
         />
       </div>
     </ErrorBoundary>

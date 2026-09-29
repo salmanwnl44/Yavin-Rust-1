@@ -19,6 +19,13 @@ interface StatusBarProps {
   cursorStatus?: CursorStatusStore;
   /** Opens Go to Line, as clicking the position does in VS Code. */
   onGoToLine?: () => void;
+  /** The language server of the file in front: its state, and what clicking does. */
+  languageStatus?: {
+    text: string;
+    title: string;
+    tone: "normal" | "busy" | "warning" | "error";
+    onClick?: () => void;
+  };
 }
 
 /**
@@ -57,6 +64,7 @@ export function StatusBar({
   onManageTrust,
   cursorStatus,
   onGoToLine,
+  languageStatus,
 }: StatusBarProps) {
   useSyncExternalStore(subscribeProblems, problemsVersion, problemsVersion);
   const branch = useRepoSnapshot(useActiveRepo()?.store)?.branch;
@@ -111,6 +119,29 @@ export function StatusBar({
       </div>
       <div className="flex shrink-0 items-center gap-4">
         {cursorStatus && <CursorItems store={cursorStatus} onGoToLine={onGoToLine} />}
+        {languageStatus && (
+          <button
+            onClick={languageStatus.onClick}
+            title={languageStatus.title}
+            aria-label={`Language server: ${languageStatus.text}`}
+            className={`flex items-center gap-1 hover:text-zinc-200 ${
+              languageStatus.tone === "error"
+                ? "text-red-400"
+                : languageStatus.tone === "warning"
+                  ? "text-amber-400"
+                  : ""
+            }`}
+          >
+            <span aria-hidden="true">
+              {languageStatus.tone === "busy"
+                ? "◌"
+                : languageStatus.tone === "normal"
+                  ? "{ }"
+                  : "⚠"}
+            </span>
+            {languageStatus.text}
+          </button>
+        )}
         {details?.map((detail) => (
           <span key={detail}>{detail}</span>
         ))}

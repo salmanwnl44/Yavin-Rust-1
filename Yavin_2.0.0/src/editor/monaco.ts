@@ -61,6 +61,23 @@ import "monaco-editor/editor/contrib/wordOperations/browser/wordOperations";
 import "monaco-editor/editor/contrib/wordPartOperations/browser/wordPartOperations";
 import "monaco-editor/editor/common/standaloneStrings";
 
+// Language intelligence (Module 10): the widgets and commands the language servers' providers
+// drive (`lspMonaco.ts`). Without a provider for a document each of these does nothing.
+import "monaco-editor/editor/contrib/suggest/browser/suggestController";
+import "monaco-editor/editor/contrib/hover/browser/hoverContribution";
+import "monaco-editor/editor/contrib/gotoSymbol/browser/goToCommands";
+import "monaco-editor/editor/contrib/gotoSymbol/browser/link/goToDefinitionAtPosition";
+import "monaco-editor/editor/contrib/parameterHints/browser/parameterHints";
+import "monaco-editor/editor/contrib/codeAction/browser/codeActionContributions";
+import "monaco-editor/editor/contrib/rename/browser/rename";
+import "monaco-editor/editor/contrib/codelens/browser/codelensController";
+import "monaco-editor/editor/contrib/inlayHints/browser/inlayHintsContribution";
+import "monaco-editor/editor/contrib/semanticTokens/browser/documentSemanticTokens";
+import "monaco-editor/editor/contrib/semanticTokens/browser/viewportSemanticTokens";
+import "monaco-editor/editor/contrib/links/browser/links";
+import "monaco-editor/editor/contrib/gotoError/browser/gotoError";
+import "monaco-editor/editor/contrib/documentSymbols/browser/documentSymbols";
+
 // Syntax colouring: Monarch tokenizers only, each loaded when a document first needs it.
 import "monaco-editor/languages/definitions/bat/register";
 import "monaco-editor/languages/definitions/cpp/register";
@@ -136,6 +153,22 @@ monaco.editor.defineTheme("yavin-dark", {
     { token: "tag.python", foreground: "C586C0" },
     { token: "delimiter", foreground: "D4D4D4" },
     { token: "operator", foreground: "D4D4D4" },
+    // Semantic tokens, from a language server: what a tokenizer cannot tell (a function from
+    // a variable, a type from a value), coloured by the same palette.
+    { token: "function", foreground: "DCDCAA" },
+    { token: "method", foreground: "DCDCAA" },
+    { token: "variable", foreground: "9CDCFE" },
+    { token: "parameter", foreground: "9CDCFE" },
+    { token: "property", foreground: "9CDCFE" },
+    { token: "class", foreground: "4EC9B0" },
+    { token: "interface", foreground: "4EC9B0" },
+    { token: "enum", foreground: "4EC9B0" },
+    { token: "struct", foreground: "4EC9B0" },
+    { token: "typeParameter", foreground: "4EC9B0" },
+    { token: "namespace", foreground: "4EC9B0" },
+    { token: "enumMember", foreground: "4FC1FF" },
+    { token: "macro", foreground: "569CD6" },
+    { token: "decorator", foreground: "C586C0" },
   ],
   colors: {
     "editor.background": "#000000",
@@ -166,6 +199,14 @@ monaco.editor.defineTheme("yavin-light", {
 if (TEST_HOOKS)
   (window as unknown as { __yavinMonaco?: unknown }).__yavinMonaco = {
     modelCount: () => monaco.editor.getModels().length,
+    /** Every marker on every model: what the editor draws as squiggles. */
+    markers: () =>
+      monaco.editor.getModelMarkers({}).map((marker) => ({
+        resource: marker.resource.toString(),
+        message: marker.message,
+        line: marker.startLineNumber,
+      })),
+    models: () => monaco.editor.getModels().map((model) => model.uri.toString()),
   };
 
 export { monaco };

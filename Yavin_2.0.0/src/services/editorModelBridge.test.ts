@@ -312,3 +312,39 @@ test("an editor following its document to a new key takes focus only if it had i
   views.rename("/w/b.ts", "/w/c.ts");
   assert.equal(views.takeFocus("/w/c.ts"), true, "Save As from the editor keeps the editor");
 });
+
+test("changedSpan finds the same span as a character-by-character comparison, at any size", () => {
+  const naive = (before: string, after: string) => {
+    const shorter = Math.min(before.length, after.length);
+    let prefix = 0;
+    while (prefix < shorter && before[prefix] === after[prefix]) prefix++;
+    let suffix = 0;
+    while (
+      suffix < shorter - prefix &&
+      before[before.length - 1 - suffix] === after[after.length - 1 - suffix]
+    )
+      suffix++;
+    return {
+      start: prefix,
+      end: before.length - suffix,
+      text: after.slice(prefix, after.length - suffix),
+    };
+  };
+  let seed = 7;
+  const random = (n: number) => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed % n;
+  };
+  const alphabet = "ab\né😀";
+  const make = (length: number) =>
+    Array.from({ length }, () => alphabet[random(alphabet.length)]).join("");
+  for (let i = 0; i < 400; i++) {
+    const base = make(random(3) === 0 ? 5000 + random(5000) : random(40));
+    const at = random(base.length + 1);
+    const removed = random(Math.min(20, base.length - at) + 1);
+    const after = base.slice(0, at) + make(random(8)) + base.slice(at + removed);
+    assert.deepEqual(changedSpan(base, after), naive(base, after), `case ${i}`);
+  }
+  assert.deepEqual(changedSpan("same", "same"), { start: 4, end: 4, text: "" });
+  assert.deepEqual(changedSpan("", "new"), { start: 0, end: 0, text: "new" });
+});

@@ -33,7 +33,7 @@ The seven excluded crates (`ide-core`, `ide-config`, `ide-syntax`, `ide-lsp`, `i
 ## Remaining product and release work
 
 1. Add language tooling (language servers, completion, diagnostics) to the Monaco editor; see [Editor](#editor). Existing inactive Rust buffers were never connected to the UI.
-2. Implement actual language-server, debugging, AI, and extension services in TypeScript. Keep any Rust process transport small and restrict process spawning to explicit user actions and validated arguments. The terminal follows this shape: `src-tauri/src/terminal.rs` only opens a PTY, starts the user's own shell with no arguments, and streams bytes; xterm.js does the emulation in TypeScript. One session exists per window, started by an explicit user action and ended when the panel closes.
+2. Implement debugging, AI, and extension services in TypeScript (language servers: see [Language servers](#language-servers-lsp-platform)). Keep any Rust process transport small and restrict process spawning to explicit user actions and validated arguments. The terminal follows this shape: `src-tauri/src/terminal.rs` only opens a PTY, starts the user's own shell with no arguments, and streams bytes; xterm.js does the emulation in TypeScript. One session exists per window, started by an explicit user action and ended when the panel closes.
 3. Add desktop end-to-end coverage for folder selection, CRUD, unsaved-close prompts, window controls, and failure recovery. Exercise nested Git repositories, UNC paths, read-only files, symlinks/junctions, and non-ASCII names on supported platforms.
 4. Add conflict detection for open documents before enabling autosave. The watcher reports external changes (see [Filesystem events](#filesystem-events)) and the explorer follows them, but an open, dirty document is not yet told that its file changed on disk; the guarded save still refuses to overwrite it.
 5. Measure large-workspace traversal and memory use. Native scans currently run synchronously and stop at a bounded depth; add incremental loading or background execution when needed.
@@ -542,7 +542,7 @@ Filesystem -> resource-changes (Module 02) -> DocumentService.applyResourceChang
 
 **Saving** goes through the window's commands. Ctrl+S calls `DocumentService.save`, which is one Module 03 operation with its Module 04 intent. Save As goes through `save_file_dialog` and then `DocumentService.saveAs`, and keeps the model. Monaco never writes a file.
 
-**Languages** are mapped from the Document Model's language id (`monacoLanguage` in `editor/monacoHost.ts`): TypeScript and TSX to `typescript`, JavaScript and JSX to `javascript`, TOML, ignore files and properties to `ini`, shell scripts to `shell`, C and C++ to `cpp`, the rest by name, otherwise `plaintext`. A rename that changes the extension changes the model's language. JSON is registered as its own id and coloured with the JavaScript tokenizer: Monaco's JSON language feature starts a language service and needs contributions this build leaves out. No language service runs; completion, hover and parameter hints are off until language tooling arrives.
+**Languages** are mapped from the Document Model's language id (`monacoLanguage` in `editor/monacoHost.ts`): TypeScript and TSX to `typescript`, JavaScript and JSX to `javascript`, TOML, ignore files and properties to `ini`, shell scripts to `shell`, C and C++ to `cpp`, the rest by name, otherwise `plaintext`. A rename that changes the extension changes the model's language. JSON is registered as its own id and coloured with the JavaScript tokenizer: Monaco's JSON language feature starts a language service and needs contributions this build leaves out. Completion, hover, signature help and the rest come from language servers ([Language servers](#language-servers-lsp-platform)); with none for a document, nothing pretends to be one.
 
 **Settings and themes.** `editor/editorSettings.ts` is the one place editor options are made (`editorOptions(settings, view)`), from `DEFAULT_EDITOR_SETTINGS` plus the window's word wrap, zoom and read-only state, and the minimap's look. That one is changed from the minimap's right-click menu or View › Minimap and remembered on this computer (`services/minimapPreferences.ts`: browser storage, validated field by field, failures ignored). The editor's own right-click menu is Monaco's editing menu with Command Palette added last. The themes `yavin-dark` and `yavin-light` are defined in `editor/monaco.ts`.
 
@@ -606,6 +606,87 @@ A tab switch measured inside the page takes about 90-160 ms until painted, the s
 4. React renders the editor shell; Monaco owns the high-frequency editing state.
 5. A change the document makes is applied to the model only when the model does not already hold that version, so edits and displays cannot loop.
 6. Cursor, selection, scroll and undo history are editor state; the Document Model never holds them.
+
+## Language servers (LSP platform)
+
+Language intelligence comes from language servers, through a platform under the Monaco editor. None of it owns a document: the Document Model does.
+
+```text
+                  Monaco (editing surface)
+                     ^            | provider calls
+    markers          |            v
+Problems store <- src/editor/lspMonaco.ts (LSP <-> Monaco, conversions only)
+       ^                          | request(document, method)       edits
+       |                          v                                   v
+       +-- diagnostics -- src/services/lsp/manager.ts --------> workspaceEdit.ts -> DocumentService
+                               |  ^ documents' events                          -> Module 03 file ops
+                  one client per server & folder (client.ts: lifecycle, initialize)
+                               |
+                         jsonrpc.ts (requests, notifications, cancellation, timeouts)
+                               |
+            nativeTransport.ts -> lsp_start / lsp_send / lsp_stop  (src-tauri/src/lsp.rs)
+                               |
+            ide-workspace: lsp_process.rs (process, pipes)  lsp_framing.rs (Content-Length)
+                               |
+                         the server process, in the workspace folder
+```
+
+| Owner              | Owns                                                                               |
+| ------------------ | ---------------------------------------------------------------------------------- |
+| Document Model     | document content, versions, dirty state -- what a server is told, and nothing else |
+| Monaco             | the editing surface; widgets (suggest, hover, peek, rename box)                    |
+| Language servers   | language intelligence: answers about a document at a version                       |
+| Problems store     | diagnostics, per owner (`lsp:<server>                                              | <folder>:<uri>`), feeding markers and the view |
+| Filesystem (03/04) | disk; nothing in this platform writes to it                                        |
+
+**Native side.** `src-tauri/src/lsp.rs` is an allow-list, like the checkers: each server id has a fixed program and fixed arguments (`typescript-language-server --stdio`, `rust-analyzer`...). The renderer picks an id and a folder; nothing it sends becomes part of a command. Starting one requires the folder to be trusted (Restricted Mode starts none). The program is looked for in the project's `node_modules/.bin` (for npm-installed servers) and on `PATH`; the working directory is validated to be inside the workspace; the environment is Yavin's own. `lsp_process.rs` spawns it without a console window, turns its stdout into whole messages (`lsp_framing.rs`: `Content-Length` framing, bodies reassembled across reads and multi-byte characters, a malformed header ends the session because the stream cannot be resynchronized), forwards stderr lines to the Language Servers output channel, and reports its exit. Stopping kills the process tree (`taskkill /T` on Windows), and every server is stopped when the window exits.
+
+**Lifecycle.** A client (`client.ts`) is `starting -> initializing -> ready`, then `stopping -> stopped`; a process that goes away is `crashed`; one that never comes up (spawn refused, `initialize` failed or timed out) is `failed`; a server that is not installed is `unavailable`; Restricted Mode is `disabled`. `initialize` sends the client's capabilities (only what is implemented), the root and workspace folders, the server's initialization options; the answer's capabilities, server info and position encoding are kept. Shutdown is `shutdown`, then `exit`, then the process is ended if it has not gone within a timeout. Server-to-client requests are answered: `workspace/configuration` (from the registry's settings), `workspace/workspaceFolders`, `workspace/applyEdit` (through the engine), capability registration, progress; logs go to the output channel.
+
+**Which server.** `registry.ts` maps a language id to servers in order of preference, with their settings and timeouts; the first installed one is used. A server is identified by its id and the workspace folder (`ResourceId`) a document belongs to (`folderFor`): one server per language and folder, two folders get two. Documents outside every folder are not sent.
+
+**Document synchronization.** The manager listens to the Document Model, never to Monaco:
+
+- `opened` -> `didOpen` (text and version); `changed` / `reloaded` -> `didChange`; `saved` -> `didSave`; `closed` -> `didClose`; `sourceChanged` (Save As, a rename) -> `didClose` of the old URI and `didOpen` of the new one (possibly with another server).
+- LSP versions are the document's own versions. A change is sent only for a newer version than the server has, so an older state can never follow a newer one.
+- Incremental sync sends the one changed span (`changedSpan`, found with native string comparison), converted to a range in the server's position encoding; full sync sends the text; servers with neither are not told about changes.
+- Positions (`positions.ts`) convert between UTF-16 offsets and LSP positions in UTF-16, UTF-8 or UTF-32, never splitting a surrogate pair, with line breaks of any kind. Document text is always `\n`; the file's own line endings are the Document Model's to restore on save.
+- Untitled documents are sent only to servers that handle them (`untitled:` URIs); proposed documents never (they share their file's URI).
+
+**URIs.** `uris.ts` is the one conversion: a `ResourceUri` goes out as RFC 8089 (`file:///C:/My%20Project/a.ts`); anything a server sends -- including VS Code's `file:///c%3A/...` -- is parsed back to a `ResourceUri` and compared by `ResourceId`, never as a string. Monaco's URIs stay `monacoHost.ts`'s; the adapter maps between models and documents through the bridge.
+
+**Stale results and cancellation.** Every request is made at the document's current version; when the answer comes, a document that changed (or closed) meanwhile makes it a `StaleResultError`, and nothing is shown or applied from it. Monaco's cancellation tokens become `$/cancelRequest` (typing again, closing, a newer request); every request has a timeout; a closed connection rejects everything pending.
+
+**Diagnostics.** `publishDiagnostics` goes to the Problems store, per server and document (empty clears it). A publication for an older version than the server has is dropped. A document's diagnostics are cleared when it closes, is renamed or saved as another file, when its server crashes or is restarted, and when the workspace closes. The adapter draws the store as Monaco markers (squiggles, the hover, `F8`), also in read-only files; the Problems view lists them with their source.
+
+**Language features.** Providers are registered per server when it first becomes ready, for the Monaco languages of its languages, and only for what its capabilities advertise -- a feature a server lacks has no provider and no command (menu items are disabled with the reason). Implemented: completion (with resolve, snippets, text edits, additional edits, commit characters, deprecated tags), hover (Markdown shown as untrusted text), definition, declaration, type definition, implementation (navigation through the window: another file opens as any file does), references (Shift+F12: a list to pick from, because Monaco's peek view cannot show files that are not open), rename (prepare, then the edit through the engine), formatting, range and on-type formatting, code actions (quick fixes, refactorings, source actions, command-backed actions), document symbols (outline, `@` in the palette), workspace symbols (`#` / Ctrl+T), signature help, document links, semantic tokens (full and delta; colours in the theme), inlay hints, CodeLens (with resolve). Server commands run only if the server advertised them (`executeCommand`); VS Code's `editor.action.showReferences` from a lens opens the references list.
+
+**WorkspaceEdit.** `workspaceEdit.ts` is the one way an edit from a server (rename, code action, `workspace/applyEdit`) -- and later AI changes and refactorings -- is applied:
+
+```text
+WorkspaceEdit -> check everything -> DocumentService.edit (text, undoable, unsaved)
+                                   -> create / rename / delete file (Module 03 operations)
+```
+
+Everything is checked before anything changes: every target resolves, every versioned document is still at its version (else stale), no target is read-only (unless the user chose Edit Anyway), no proposal is edited, no edits overlap. One failure refuses the whole edit, and documents opened only to check it are closed again. Files not open are opened for the edit and left open, unsaved, with tabs. A file operation failing part-way stops there and says what was done. Nothing is written: saving is the user's.
+
+**Crash recovery.** A crash clears the server's diagnostics and restarts it after a backoff (0.5 s, 2 s, 5 s); a ready server is told every open document again from the Document Model. More than three crashes within three minutes leaves it `failed`, with the reason; clicking the status or View › Restart Language Servers starts it again with the count reset.
+
+**Status.** The status bar shows the server of the file in front: its name when ready, "starting…" / "restarting…" while it is, "not installed", "Restricted Mode", "crashed" or "not running" (with the reason) otherwise. The Language Servers output channel has the servers' own log.
+
+**Tests.** A deterministic fake server (`fakeServer.ts`, no imports) implements everything above and keeps its own copy of each document from the changes it is sent, so a synchronization bug is a wrong answer. The unit tests run it in memory (`testing.ts`); the UI tests bundle it into the page in place of the native commands (`tests/ui/lsp-harness.ts`), so the manager, client, JSON-RPC and Monaco adapter under test are the real ones. The native framing and process layer is tested with a real Node process.
+
+**Performance** (development machine, fake server): a keystroke in a 1.1 MB file costs the sync about 1.7 ms (the changed span and its position; incremental changes of ~170 bytes); twenty keystrokes send 3.5 KB. A server starts and initializes in under 0.6 s (fake; a real server is its own). Completion and diagnostics appear in 0.1-0.25 s. Requests are asynchronous; React never waits on a server.
+
+**Invariants**
+
+1. LSP never owns document contents.
+2. LSP never writes files directly.
+3. WorkspaceEdits always pass through the WorkspaceEdit engine and DocumentService.
+4. Filesystem writes always pass through Module 03/04.
+5. Monaco never communicates directly with the filesystem.
+6. Stale LSP results cannot overwrite newer document state.
+7. Language servers cannot bypass Yavin's trust and security controls: fixed command lines, trusted folders only, advertised commands only.
 
 ## Explorer provider platform
 

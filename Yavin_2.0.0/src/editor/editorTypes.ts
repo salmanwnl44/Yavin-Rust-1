@@ -33,5 +33,22 @@ export interface EditorHandle {
   goToLine: (line: number) => void;
   /** Selects and shows the span between two offsets into the document's text. */
   revealRange: (start: number, end: number) => void;
+  /** Selects and shows a range given in lines and columns (1-based, as the editor counts). */
+  select: (range: EditorRange) => void;
+  /** Runs one of the editing engine's own actions by id (Go to Definition, Rename...). */
+  runAction: (id: string) => Promise<void>;
   focus: () => void;
+}
+
+export interface EditorRange {
+  startLineNumber: number;
+  startColumn: number;
+  endLineNumber: number;
+  endColumn: number;
+}
+
+/** What the language servers give the editor: their manager, and the window's side of them. */
+export interface LanguageFeatures {
+  manager: import("../services/lsp/manager").LspManager;
+  host: import("./lspMonaco").LanguageFeaturesHost;
 }

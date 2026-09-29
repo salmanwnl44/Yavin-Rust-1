@@ -236,6 +236,30 @@ export function createEditorModelBridge(
 }
 
 /**
+ * How many characters `a` and `b` have in common from the start (or, with `fromEnd`, from the
+ * end), up to `max`. Compared in growing chunks with native string equality rather than a
+ * character at a time: a keystroke in a megabyte file compares the whole file on every edit,
+ * and that is the difference between a fraction of a millisecond and several.
+ */
+function matching(a: string, b: string, max: number, fromEnd: boolean): number {
+  let at = 0;
+  let step = 256;
+  while (at < max) {
+    const size = Math.min(step, max - at);
+    const same = fromEnd
+      ? a.slice(a.length - at - size, a.length - at) ===
+        b.slice(b.length - at - size, b.length - at)
+      : a.slice(at, at + size) === b.slice(at, at + size);
+    if (same) {
+      at += size;
+      step *= 2;
+    } else if (size === 1) break;
+    else step = size >> 1;
+  }
+  return at;
+}
+
+/**
  * The span of `before` that became something else in `after`: the text between their longest
  * common prefix and suffix. What an external change replaces, so cursors outside it stay put.
  */
@@ -244,14 +268,8 @@ export function changedSpan(
   after: string,
 ): { start: number; end: number; text: string } {
   const shorter = Math.min(before.length, after.length);
-  let prefix = 0;
-  while (prefix < shorter && before.charCodeAt(prefix) === after.charCodeAt(prefix)) prefix++;
-  let suffix = 0;
-  while (
-    suffix < shorter - prefix &&
-    before.charCodeAt(before.length - 1 - suffix) === after.charCodeAt(after.length - 1 - suffix)
-  )
-    suffix++;
+  const prefix = matching(before, after, shorter, false);
+  const suffix = matching(before, after, shorter - prefix, true);
   return {
     start: prefix,
     end: before.length - suffix,

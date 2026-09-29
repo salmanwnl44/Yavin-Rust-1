@@ -77,12 +77,23 @@ export function editorOptions(
     folding: settings.folding,
     // The window lays the editor out; Monaco follows its container's size.
     automaticLayout: true,
-    // No language intelligence here (Module 10): word-based suggestions only would pretend.
-    quickSuggestions: false,
+    // Language intelligence comes from language servers (`lspMonaco.ts`); with none for a
+    // document these show nothing. Word-based suggestions would pretend to be one, so no.
+    quickSuggestions: { other: true, comments: false, strings: false },
     wordBasedSuggestions: "off",
-    suggestOnTriggerCharacters: false,
-    parameterHints: { enabled: false },
-    hover: { enabled: "off" },
+    suggestOnTriggerCharacters: true,
+    parameterHints: { enabled: true },
+    hover: { enabled: "on", delay: 300 },
+    formatOnType: true,
+    // Problems show in read-only files too (Monaco's default hides them there).
+    renderValidationDecorations: "on",
+    inlayHints: { enabled: "on" },
+    codeLens: true,
+    links: true,
+    "semanticHighlighting.enabled": true,
+    lightbulb: { enabled: "on" as never },
+    // Several definitions: go to the first; the peek view cannot show files that are not open.
+    gotoLocation: { multiple: "goto", multipleReferences: "goto" },
     // Monaco's editing menu, with the Command Palette added (see `CodeEditor`).
     contextmenu: true,
     scrollBeyondLastLine: false,

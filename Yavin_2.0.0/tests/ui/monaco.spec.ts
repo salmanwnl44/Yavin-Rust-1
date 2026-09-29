@@ -746,7 +746,7 @@ test("the editor's right-click menu ends with the Command Palette", async ({ pag
   expect(labels.slice(0, 4)).toEqual(["Change All Occurrences", "Cut", "Copy", "Paste"]);
   expect(labels.at(-1)).toBe("Command Palette…");
   await items.filter({ hasText: "Command Palette…" }).click();
-  await expect(page.getByPlaceholder(/type > for commands|Type a command/i)).toBeFocused();
+  await expect(page.getByRole("combobox", { name: "Search files or commands" })).toBeFocused();
 });
 
 test("the minimap's right-click menu changes it, and the choice is remembered", async ({

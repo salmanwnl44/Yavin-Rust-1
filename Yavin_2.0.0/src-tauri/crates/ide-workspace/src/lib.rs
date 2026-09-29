@@ -1,5 +1,7 @@
 pub mod durable;
 pub mod file_tree;
+pub mod lsp_framing;
+pub mod lsp_process;
 pub mod operations;
 pub mod process;
 pub mod recovery;

@@ -19,6 +19,17 @@ export interface Diagnostic {
   message: string;
   /** The rule or error code, e.g. `TS2345`, `E0425`, `no-unused-vars`. */
   code?: string;
+  /** Where the problem ends (1-based), when the tool says: language servers always do. */
+  endLine?: number;
+  endColumn?: number;
+  /** The tool's own name for itself, e.g. `ts` or `pyright`, when it gives one. */
+  origin?: string;
+  /** A hint rather than information (LSP severity 4): shown fainter, counted as info. */
+  hint?: boolean;
+  /** Unused code is drawn faded, deprecated code struck through. */
+  tags?: ("unnecessary" | "deprecated")[];
+  /** Other places the problem involves. */
+  related?: { file: string; line: number; column: number; message: string }[];
 }
 
 export interface ProblemMatcher {

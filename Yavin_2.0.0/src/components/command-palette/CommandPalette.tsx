@@ -4,6 +4,17 @@ import type { AppCommand } from "../../services/commands";
 
 const MAX_RESULTS = 200;
 
+/** A symbol a language server found, as the palette lists it (`@` and `#`). */
+export interface PaletteSymbol {
+  name: string;
+  /** Its kind and container, e.g. "function · Outer". */
+  detail: string;
+  open: () => void;
+}
+
+/** Where symbols come from: the file in front (`@`) or the workspace (`#`). */
+export type SymbolScope = "document" | "workspace";
+
 interface PaletteItem {
   id: string;
   title: string;
@@ -21,6 +32,7 @@ export function CommandPalette({
   commands,
   mode,
   onError,
+  symbols,
 }: {
   isOpen: boolean;
   onClose: () => void;
@@ -28,8 +40,10 @@ export function CommandPalette({
   files: string[];
   filesNote: string;
   commands: AppCommand[];
-  mode: "files" | "commands";
+  mode: "files" | "commands" | "symbols" | "workspaceSymbols";
   onError: (reason: unknown) => void;
+  /** Symbols from the language servers; the `@` and `#` modes are absent without it. */
+  symbols?: (query: string, scope: SymbolScope, signal: AbortSignal) => Promise<PaletteSymbol[]>;
 }) {
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -37,14 +51,54 @@ export function CommandPalette({
   const input = useRef<HTMLInputElement>(null);
   useEffect(() => {
     if (isOpen) {
-      setQuery(mode === "commands" ? ">" : "");
+      setQuery(
+        mode === "commands"
+          ? ">"
+          : mode === "symbols"
+            ? "@"
+            : mode === "workspaceSymbols"
+              ? "#"
+              : "",
+      );
       setSelectedIndex(0);
       dialog.current?.showModal();
       input.current?.focus();
     } else dialog.current?.close();
   }, [isOpen, mode]);
   const commandMode = query.startsWith(">");
-  const search = (commandMode ? query.slice(1) : query).trim().toLowerCase();
+  const symbolScope: SymbolScope | null = !symbols
+    ? null
+    : query.startsWith("@")
+      ? "document"
+      : query.startsWith("#")
+        ? "workspace"
+        : null;
+  const search = (commandMode || symbolScope ? query.slice(1) : query).trim().toLowerCase();
+
+  // Symbols are asked for as the query changes; an answer to an older query is dropped.
+  const [found, setFound] = useState<{ query: string; symbols: PaletteSymbol[]; loading: boolean }>(
+    { query: "", symbols: [], loading: false },
+  );
+  useEffect(() => {
+    if (!isOpen || !symbolScope || !symbols) return;
+    const controller = new AbortController();
+    setFound((previous) => ({ ...previous, loading: true }));
+    const timer = setTimeout(() => {
+      symbols(search, symbolScope, controller.signal)
+        .then((list) => {
+          if (!controller.signal.aborted) setFound({ query, symbols: list, loading: false });
+        })
+        .catch((reason) => {
+          if (controller.signal.aborted) return;
+          setFound({ query, symbols: [], loading: false });
+          onError(reason);
+        });
+    }, 80);
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, [isOpen, query, symbolScope, search, symbols, onError]);
   let items: PaletteItem[] = [];
   let total = 0;
   // Nothing is filtered while closed; the file list can hold tens of thousands of paths.
@@ -63,6 +117,17 @@ export function CommandPalette({
       }))
       .filter((item) => `${item.title} ${item.subtitle}`.toLowerCase().includes(search));
     total = items.length;
+  } else if (isOpen && symbolScope) {
+    const matches = found.symbols.filter(
+      (symbol) => symbolScope === "workspace" || symbol.name.toLowerCase().includes(search),
+    );
+    total = matches.length;
+    items = matches.slice(0, MAX_RESULTS).map((symbol, at) => ({
+      id: `${symbol.name}#${at}`,
+      title: symbol.name,
+      subtitle: symbol.detail,
+      run: symbol.open,
+    }));
   } else if (isOpen) {
     const matches = search ? files.filter((path) => path.toLowerCase().includes(search)) : files;
     total = matches.length;
@@ -108,7 +173,11 @@ export function CommandPalette({
             setQuery(event.target.value);
             setSelectedIndex(0);
           }}
-          placeholder="Search files, or type > for commands"
+          placeholder={
+            symbols
+              ? "Search files, > for commands, @ for symbols here, # for symbols anywhere"
+              : "Search files, or type > for commands"
+          }
           className="w-full rounded border border-zinc-600 bg-black px-3 py-2 text-sm outline-indigo-500"
           onKeyDown={(event) => {
             if (event.isPropagationStopped() || event.nativeEvent.isComposing) return;
@@ -131,7 +200,9 @@ export function CommandPalette({
         >
           {!items.length && (
             <p className="p-4 text-sm text-zinc-500">
-              No matching {commandMode ? "commands" : "files"}
+              {symbolScope && found.loading
+                ? "Asking the language server…"
+                : `No matching ${commandMode ? "commands" : symbolScope ? "symbols" : "files"}`}
             </p>
           )}
           {items.map((item, itemIndex) => (
@@ -159,6 +230,7 @@ export function CommandPalette({
         )}
         <div className="mt-2 text-xs text-zinc-500">
           ↑ ↓ Navigate · Enter Open · Esc Close · &gt; Commands
+          {symbols ? " · @ Symbols here · # Symbols anywhere" : ""}
         </div>
       </div>
     </dialog>

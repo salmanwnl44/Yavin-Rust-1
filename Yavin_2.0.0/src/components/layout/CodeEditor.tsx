@@ -8,7 +8,8 @@ import { createEditorModelBridge } from "../../services/editorModelBridge";
 import type { EditorModel, EditorModelBridge } from "../../services/editorModelBridge";
 import type { DocumentService, TextDocument } from "../../services/documents";
 import type { EditorViews } from "../../services/editorViews";
-import type { EditorHandle, EditorState } from "../../editor/editorTypes";
+import type { EditorHandle, EditorState, LanguageFeatures } from "../../editor/editorTypes";
+import { addReferencesAction, installLanguageFeatures } from "../../editor/lspMonaco";
 import { createDiffView } from "../../editor/diff";
 import type { EditorDecoration } from "../../services/editorModelBridge";
 import type { CursorStatusStore } from "../../services/cursorStatus";
@@ -34,6 +35,8 @@ import type { MenuItem } from "../ui/ContextMenu";
  */
 
 const bridges = new WeakMap<DocumentService, EditorModelBridge>();
+/** Language features are connected to Monaco once per window (per manager). */
+const featuresInstalled = new WeakSet<object>();
 
 /** The window's line commands, by the Monaco action each one runs. */
 const LINE_ACTIONS = {
@@ -75,6 +78,7 @@ export default function CodeEditor({
   onCommandPalette,
   minimap = DEFAULT_EDITOR_SETTINGS.minimap,
   onMinimapChange,
+  languageFeatures,
 }: {
   documentKey: string;
   documents: DocumentService;
@@ -91,6 +95,8 @@ export default function CodeEditor({
   /** How the minimap looks: the window's, which remembers it and offers View › Minimap. */
   minimap?: MinimapPreferences;
   onMinimapChange?: (change: Partial<MinimapPreferences>) => void;
+  /** Language servers: connected to the engine here, and nothing more (see `lspMonaco.ts`). */
+  languageFeatures?: LanguageFeatures;
 }) {
   const container = useRef<HTMLDivElement>(null);
   const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -218,6 +224,18 @@ export default function CodeEditor({
     ];
     // Development builds only: the UI tests read and drive the editor through this, since
     // Monaco's input element does not hold the document's text.
+    if (languageFeatures) {
+      if (!featuresInstalled.has(languageFeatures.manager)) {
+        featuresInstalled.add(languageFeatures.manager);
+        installLanguageFeatures({
+          manager: languageFeatures.manager,
+          bridge,
+          host: languageFeatures.host,
+          documents: () => documents.all(),
+        });
+      }
+      subscriptions.push(addReferencesAction(instance));
+    }
     if (TEST_HOOKS) installTestHook(instance, bridge, () => shown.current?.key ?? null);
     return () => {
       element.removeEventListener("contextmenu", minimapClick, true);
@@ -319,6 +337,19 @@ export default function CodeEditor({
       instance.setSelection(range);
       instance.revealRangeInCenter(range);
       instance.focus();
+    },
+    select(range) {
+      const instance = editor.current;
+      if (!instance?.getModel()) return;
+      instance.setSelection(range);
+      instance.revealRangeInCenter(range);
+      instance.focus();
+    },
+    async runAction(id) {
+      const instance = editor.current;
+      if (!instance?.getModel()) return;
+      instance.focus();
+      await instance.getAction(id)?.run();
     },
     goToLine(line) {
       const instance = editor.current;

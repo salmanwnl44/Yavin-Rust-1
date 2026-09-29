@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import type { Ref } from "react";
-import type { EditorHandle, EditorState } from "../../editor/editorTypes";
+import type { EditorHandle, EditorState, LanguageFeatures } from "../../editor/editorTypes";
 import type { DocumentService } from "../../services/documents";
 import type { EditorViews } from "../../services/editorViews";
 import type { CursorStatusStore } from "../../services/cursorStatus";
@@ -89,6 +89,7 @@ export function EditorArea({
   loadImage,
   onOpenCode,
   previewRef,
+  languageFeatures,
   tabMenu,
   onMenuError,
 }: {
@@ -138,6 +139,8 @@ export function EditorArea({
   /** "Open in Editor" on a code block in the preview. */
   onOpenCode?: (code: string, languageId: string | undefined) => void;
   previewRef?: Ref<MarkdownPreviewHandle>;
+  /** Language servers, for the editor's language features. */
+  languageFeatures?: LanguageFeatures;
   /** What a tab's context menu offers (close others, copy its path, ...). */
   tabMenu?: (id: string) => MenuItem[];
   onMenuError?: (error: unknown) => void;
@@ -451,6 +454,7 @@ export function EditorArea({
                       onCommandPalette={onOpenCommandPalette}
                       minimap={minimap}
                       onMinimapChange={onMinimapChange}
+                      languageFeatures={languageFeatures}
                     />
                   </div>
                   {markdownMode && markdownMode !== "edit" && (

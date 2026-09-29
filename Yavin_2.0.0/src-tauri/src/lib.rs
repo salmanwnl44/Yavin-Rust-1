@@ -16,6 +16,7 @@ mod checkers;
 mod config;
 mod external;
 mod git;
+mod lsp;
 mod paths;
 mod ports;
 mod session;
@@ -29,6 +30,7 @@ use git::{
     git_probe_worktree, git_repo_state, git_unwatch_repo, git_watch_repo, GitJobs, GitWatches,
     NetworkLocks, Repos, StashLocks,
 };
+use lsp::{lsp_send, lsp_servers, lsp_start, lsp_stop, lsp_stop_all, LspSessions};
 use ports::{list_listening_ports, stop_listening_process};
 use session::{forget_workspace, read_session, save_workspace_session, Sessions};
 use terminal::{
@@ -631,6 +633,7 @@ pub fn run() {
         .manage(Trust::default())
         .manage(Sessions::default())
         .manage(Checks::default())
+        .manage(LspSessions::default())
         .manage(Recovery::default())
         .setup(|app| {
             recover_at_startup(app.handle());
@@ -689,6 +692,11 @@ pub fn run() {
             terminal_resize,
             terminal_close,
             terminal_close_all,
+            lsp_servers,
+            lsp_start,
+            lsp_send,
+            lsp_stop,
+            lsp_stop_all,
         ])
         .build(tauri::generate_context!())
         .map(|app| {
@@ -700,6 +708,9 @@ pub fn run() {
                     tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
                 ) {
                     terminal::close_all(&handle.state::<Terminals>());
+                    // Language servers too: the renderer shuts them down politely when it
+                    // can, and whatever is left is ended here rather than orphaned.
+                    lsp::stop_all(&handle.state::<LspSessions>());
                     // A checker is a child process too, and a cold `cargo check` outlives
                     // the window by minutes if nothing stops it.
                     checkers::cancel_running(&handle.state::<Checks>());

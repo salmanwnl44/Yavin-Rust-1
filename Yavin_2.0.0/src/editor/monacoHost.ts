@@ -158,6 +158,9 @@ class MonacoModel implements EditorModel {
   }
 }
 
+/** Each Monaco text model's bridge model, for finding the document a model shows. */
+const bridged = new WeakMap<monaco.editor.ITextModel, MonacoModel>();
+
 export const monacoHost: EditorModelHost = {
   create(text, languageId, uri) {
     // Monaco allows one model per URI. A document keeps its model -- and so the URI it was
@@ -171,10 +174,16 @@ export const monacoHost: EditorModelHost = {
     // Document text is always `\n` (the Document Model keeps the file's own line endings and
     // writes them back); the model must never turn a paste into `\r\n`.
     model.setEOL(monaco.editor.EndOfLineSequence.LF);
-    return new MonacoModel(model);
+    const wrapped = new MonacoModel(model);
+    bridged.set(model, wrapped);
+    return wrapped;
   },
 };
 
 /** The Monaco text model behind a bridge model, for binding it to an editor. */
 export const textModelOf = (model: EditorModel): monaco.editor.ITextModel =>
   (model as MonacoModel).model;
+
+/** The bridge model behind a Monaco text model, if the bridge made it. */
+export const editorModelOf = (model: monaco.editor.ITextModel): EditorModel | undefined =>
+  bridged.get(model);

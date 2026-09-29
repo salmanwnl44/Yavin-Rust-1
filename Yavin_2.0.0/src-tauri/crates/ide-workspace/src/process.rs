@@ -151,7 +151,7 @@ pub fn capture_within(
 /// `git-remote-http`/`ssh`/hooks as children (and some installs put a launcher in
 /// front of the real `git.exe`), so killing just the parent leaves the network
 /// process alive and its pipes open. `taskkill /T` walks the tree.
-fn kill_tree(child: &mut std::process::Child) {
+pub fn kill_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
