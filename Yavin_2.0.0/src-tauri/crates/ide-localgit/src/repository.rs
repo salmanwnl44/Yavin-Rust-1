@@ -649,6 +649,11 @@ impl Repository {
 
     /// A blob's size and whether it looks binary (a NUL in its first 8 KiB, the rule the
     /// editor's own file reading uses).
+    /// An object's kind and size, from the segment index (nothing is read or hashed).
+    pub fn object_info(&self, id: &ObjectId) -> Result<(ObjectKind, u64)> {
+        self.odb.info(id)
+    }
+
     pub fn blob_info(&self, id: &ObjectId) -> Result<(u64, bool)> {
         self.expect_kind(id, ObjectKind::Blob)?;
         let (_, size) = self.odb.info(id)?;

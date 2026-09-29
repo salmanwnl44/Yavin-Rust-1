@@ -54,6 +54,8 @@ pub enum OperationKind {
     Delete,
     Copy,
     Git,
+    /// A Local Git restore: files, folders and links set to a historical state.
+    Restore,
 }
 
 /// What an operation leaves at a path when it succeeds. Each is checked against the disk when

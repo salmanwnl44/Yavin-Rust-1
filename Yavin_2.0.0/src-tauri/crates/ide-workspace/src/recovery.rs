@@ -69,6 +69,9 @@ pub enum IntentKind {
     Delete,
     Copy,
     Git,
+    /// A Local Git restore. Settled like any operation, as a whole; a half-done one is
+    /// `partial` (reported, never replayed or undone).
+    Restore,
 }
 
 impl From<crate::operations::OperationKind> for IntentKind {
@@ -82,6 +85,7 @@ impl From<crate::operations::OperationKind> for IntentKind {
             K::Delete => IntentKind::Delete,
             K::Copy => IntentKind::Copy,
             K::Git => IntentKind::Git,
+            K::Restore => IntentKind::Restore,
         }
     }
 }
@@ -522,6 +526,7 @@ fn name(kind: IntentKind) -> &'static str {
         IntentKind::Delete => "delete",
         IntentKind::Copy => "copy",
         IntentKind::Git => "Git command",
+        IntentKind::Restore => "Local Git restore",
     }
 }
 
@@ -566,9 +571,15 @@ fn settle_generic(record: &IntentRecord) -> RecoveryItem {
             Outcome::NotApplied,
             format!("The {what} of {first} had not started."),
         )
-    } else if !neither.is_empty() && matches!(record.kind, IntentKind::Delete | IntentKind::Copy) {
-        // A tree half deleted or half copied is in neither state either -- the likelier story
-        // than someone else changing it, though the disk cannot tell the two apart.
+    } else if !neither.is_empty()
+        && matches!(
+            record.kind,
+            IntentKind::Delete | IntentKind::Copy | IntentKind::Restore
+        )
+    {
+        // A tree half deleted or half copied (or a restore's folder half emptied, its
+        // temporary file left) is in neither state either -- the likelier story than someone
+        // else changing it, though the disk cannot tell the two apart.
         item(
             record,
             Outcome::Partial,

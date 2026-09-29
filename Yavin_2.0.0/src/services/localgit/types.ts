@@ -257,3 +257,188 @@ export interface LocalGitOverlayRef {
   key: string;
   version: number;
 }
+
+// --- Checkpoints, commits, history, diff and restore (LG-03) --------------------------------
+
+/** Who makes a commit, and when (what the native side records). */
+export interface LocalGitSignature {
+  name: string;
+  id: string;
+  timeMs: number;
+  /** Minutes east of UTC. */
+  tzOffsetMin: number;
+}
+
+export interface LocalGitCommitInfo {
+  id: string;
+  shortId: string;
+  message: string;
+  summary: string;
+  timeMs: number;
+  tzOffsetMin: number;
+  authorName: string;
+  authorId: string;
+  parents: string[];
+  /** `human`, `checkpoint` or `recovery`. */
+  source: string;
+  root: string;
+  diskRoot: string | null;
+  overlays: string | null;
+}
+
+export interface LocalGitCreated {
+  commit: LocalGitCommitInfo;
+  revision: number;
+}
+
+export interface LocalGitHeadInfo {
+  symbolic: string | null;
+  unborn: boolean;
+  commit: LocalGitCommitInfo | null;
+  revision: number;
+}
+
+export interface LocalGitHistoryPage {
+  /** Newest first. */
+  items: LocalGitCommitInfo[];
+  /** Pass as the cursor for the next page; null at the first commit. */
+  next: string | null;
+  /** Set when a commit on the way could not be read: the page ends before it. */
+  broken: { id: string; code: string; message: string } | null;
+}
+
+export interface LocalGitCheckpointEntry {
+  id: string;
+  revision: number;
+  ms: number;
+  reason: string;
+}
+
+export interface LocalGitTreeItem {
+  name: string;
+  kind: "file" | "directory" | "symlink";
+  id: string;
+  executable: boolean;
+  link: "file" | "directory" | "junction" | null;
+  stored: boolean;
+  size: number | null;
+  entries: number | null;
+}
+
+export interface LocalGitDiffLine {
+  kind: "context" | "addition" | "deletion";
+  text: string;
+  oldLine: number | null;
+  newLine: number | null;
+  noNewline: boolean;
+}
+
+export interface LocalGitHunk {
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  lines: LocalGitDiffLine[];
+}
+
+export interface LocalGitDiffEntry {
+  folderId: string;
+  path: string;
+  oldPath: string | null;
+  kind: LocalGitChangeKind;
+  old: LocalGitSide | null;
+  new: LocalGitSide | null;
+  contentAvailable: boolean;
+  unavailable: "notStored" | "missing" | "changedOnDisk" | "notAFile" | null;
+  binary: boolean;
+  lineDiff: { hunks: LocalGitHunk[]; additions: number; deletions: number } | null;
+  lineDiffSkipped:
+    "binary" | "unavailable" | "tooLarge" | "budget" | "notRequested" | "notAFile" | null;
+}
+
+export interface LocalGitDiffEnd {
+  kind: "commit" | "workspace" | "empty";
+  commit: string | null;
+  root: string | null;
+}
+
+export interface LocalGitDiff {
+  from: LocalGitDiffEnd;
+  to: LocalGitDiffEnd;
+  identical: boolean;
+  entries: LocalGitDiffEntry[];
+  counts: LocalGitCounts;
+}
+
+export type LocalGitRestorePolicy = "refuseIfDirty" | "replaceDocument";
+
+export interface LocalGitRestoreOp {
+  kind:
+    | "removeFile"
+    | "removeLink"
+    | "removeDirectory"
+    | "createDirectory"
+    | "writeFile"
+    | "createLink";
+  folderId: string;
+  path: string;
+  expected:
+    | { kind: "absent" }
+    | { kind: "file"; id: string; stored: boolean }
+    | { kind: "directory" }
+    | { kind: "link"; id: string };
+  blob: string | null;
+  size: number | null;
+  executable: boolean;
+  link: string | null;
+}
+
+export type LocalGitRestoreConflict =
+  | { kind: "dirtyDocumentWouldBeOverwritten"; folderId: string; path: string }
+  | { kind: "dirtyDocumentWouldBeDeleted"; folderId: string; path: string }
+  | {
+      kind: "historicalContentUnavailable";
+      folderId: string;
+      path: string;
+      reason: "notStored" | "missing";
+    }
+  | { kind: "currentContentNotStored"; folderId: string; path: string }
+  | { kind: "currentStateUnknown"; folderId: string; path: string; reason: string }
+  | { kind: "pathBlocked"; folderId: string; path: string }
+  | { kind: "caseOnlyRename"; folderId: string; path: string; onDisk: string }
+  | { kind: "targetUnavailable"; folderId: string; path: string }
+  | { kind: "wouldRemoveUntracked"; folderId: string; path: string; entry: string }
+  | { kind: "diskChangedSinceSnapshot"; folderId: string; path: string }
+  | { kind: "linkNotRestorable"; folderId: string; path: string; reason: string };
+
+export interface LocalGitRestorePlan {
+  commit: string;
+  targetRoot: string;
+  scope: string | null;
+  scopeFolder: string | null;
+  policy: LocalGitRestorePolicy;
+  operations: LocalGitRestoreOp[];
+  conflicts: LocalGitRestoreConflict[];
+  /** Documents whose unsaved changes the window discards (policy `replaceDocument`). */
+  documents: { folderId: string; path: string; action: "overwrite" | "delete"; version: number }[];
+  unchanged: boolean;
+  snapshotSequence: number;
+  diskRoot: string;
+}
+
+export interface LocalGitRestoreResult {
+  status: "planned" | "unchanged" | "refused" | "completed" | "failed" | "verificationFailed";
+  plan: LocalGitRestorePlan;
+  conflicts: LocalGitRestoreConflict[];
+  /** The checkpoint of the workspace taken just before anything changed. */
+  checkpoint: LocalGitCommitInfo | null;
+  operation: number | null;
+  applied: number;
+  error: string | null;
+  verification: {
+    matches: boolean;
+    mismatches: string[];
+    diskRoot: string;
+    snapshotSequence: number;
+  } | null;
+}

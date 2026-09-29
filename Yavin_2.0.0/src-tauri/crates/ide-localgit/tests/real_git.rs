@@ -223,3 +223,79 @@ fn snapshots_and_status_leave_a_real_git_repository_exactly_as_it_was() {
     assert_eq!(listing(&f.project), project_before);
     assert_eq!(after_write.len(), project_before.len() + 1);
 }
+
+#[test]
+fn checkpoints_commits_history_and_diffs_leave_real_git_exactly_as_it_was() {
+    use ide_localgit::diff::{diff_commits, DiffOptions};
+    use ide_localgit::history::*;
+    let f = Fixture::new("realgit-lg03");
+    if git(&f.project, &["--version"]).is_none() {
+        eprintln!("git is not installed: skipping the real-Git non-interference test");
+        return;
+    }
+    git(&f.project, &["init", "-q", "-b", "main"]).unwrap();
+    git(&f.project, &["config", "user.email", "t@yavin"]).unwrap();
+    git(&f.project, &["config", "user.name", "T"]).unwrap();
+    git(&f.project, &["config", "core.autocrlf", "false"]).unwrap();
+    write(&f.project.join("a.txt"), "one\n");
+    git(&f.project, &["add", "."]).unwrap();
+    git(&f.project, &["commit", "-q", "-m", "first"]).unwrap();
+    write(&f.project.join("a.txt"), "one, edited\n");
+    write(&f.project.join("new.txt"), "untracked\n");
+
+    let status_before = git(&f.project, &["status", "--porcelain"]).unwrap();
+    let head_before = git(&f.project, &["rev-parse", "HEAD"]).unwrap();
+    let git_before = fingerprint(&f.project.join(".git"));
+    let project_before = listing(&f.project);
+
+    let repo = std::sync::Mutex::new(f.open().unwrap());
+    let engine = engine_for(&repo, &f.project);
+    let request = |message: &str| CommitRequest {
+        message: message.into(),
+        author: Author {
+            name: "T".into(),
+            id: "t".into(),
+        },
+        time_ms: 0,
+        tz_offset_min: 0,
+    };
+    let snap = persist(&engine, &repo);
+    let first = commit_snapshot(&mut repo.lock().unwrap(), &snap, &request("one")).unwrap();
+    let again = persist(&engine, &repo);
+    let cp = checkpoint_snapshot(
+        &mut repo.lock().unwrap(),
+        &again,
+        Source::Checkpoint,
+        &request("cp"),
+    )
+    .unwrap();
+    let second =
+        commit_checkpoint(&mut repo.lock().unwrap(), cp.commit.id.0, &request("two")).unwrap();
+    {
+        let repo = repo.lock().unwrap();
+        assert_eq!(history(&repo, None, 10).items.len(), 2);
+        diff_commits(
+            &repo,
+            Some(first.commit.id.0),
+            second.commit.id.0,
+            &DiffOptions::default(),
+        )
+        .unwrap();
+        assert!(repo.verify(true).is_empty());
+    }
+
+    assert_eq!(
+        fingerprint(&f.project.join(".git")),
+        git_before,
+        ".git changed"
+    );
+    assert_eq!(
+        git(&f.project, &["status", "--porcelain"]).unwrap(),
+        status_before
+    );
+    assert_eq!(
+        git(&f.project, &["rev-parse", "HEAD"]).unwrap(),
+        head_before
+    );
+    assert_eq!(listing(&f.project), project_before);
+}

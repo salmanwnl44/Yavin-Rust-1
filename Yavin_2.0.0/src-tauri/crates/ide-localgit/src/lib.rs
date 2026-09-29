@@ -11,16 +11,19 @@
 //! `exclude`, `status`). Commits made by people, branches and everything that builds on them
 //! come in later phases on top of these APIs.
 
+pub mod diff;
 pub mod error;
 pub mod exclude;
 pub mod fault;
 pub mod finding;
+pub mod history;
 pub mod id;
 pub mod object;
 pub mod odb;
 pub mod reflog;
 pub mod refs;
 pub mod repository;
+pub mod restore;
 pub mod scan;
 pub mod segment;
 pub mod snapshot;

@@ -17,6 +17,7 @@ mod config;
 mod external;
 mod git;
 mod localgit;
+mod localgit_restore;
 mod lsp;
 mod paths;
 mod ports;
@@ -32,9 +33,11 @@ use git::{
     NetworkLocks, Repos, StashLocks,
 };
 use localgit::{
-    localgit_blob_info, localgit_cancel, localgit_close, localgit_info, localgit_open,
-    localgit_put_overlays, localgit_read_blob, localgit_read_commit, localgit_read_tree,
-    localgit_reflog, localgit_refs, localgit_snapshot, localgit_status, localgit_verify, LocalGit,
+    localgit_blob_info, localgit_cancel, localgit_checkpoint, localgit_checkpoints, localgit_close,
+    localgit_commit, localgit_diff_commits, localgit_diff_workspace, localgit_head,
+    localgit_history, localgit_info, localgit_open, localgit_put_overlays, localgit_read_blob,
+    localgit_read_commit, localgit_read_tree, localgit_reflog, localgit_refs, localgit_restore,
+    localgit_snapshot, localgit_status, localgit_tree, localgit_verify, LocalGit,
 };
 use lsp::{lsp_send, lsp_servers, lsp_start, lsp_stop, lsp_stop_all, LspSessions};
 use ports::{list_listening_ports, stop_listening_process};
@@ -672,6 +675,15 @@ pub fn run() {
             localgit_snapshot,
             localgit_status,
             localgit_cancel,
+            localgit_checkpoint,
+            localgit_commit,
+            localgit_head,
+            localgit_history,
+            localgit_checkpoints,
+            localgit_tree,
+            localgit_diff_commits,
+            localgit_diff_workspace,
+            localgit_restore,
             recovery_report,
             recovery_dismiss,
             get_default_workspace,

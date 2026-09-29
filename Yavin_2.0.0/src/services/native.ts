@@ -6,7 +6,16 @@ import type { Session, WorkspaceSession } from "./session";
 import type { TrustState } from "./trust";
 import type {
   LocalGitBlobInfo,
+  LocalGitCheckpointEntry,
   LocalGitCommit,
+  LocalGitCreated,
+  LocalGitDiff,
+  LocalGitHeadInfo,
+  LocalGitHistoryPage,
+  LocalGitRestorePolicy,
+  LocalGitRestoreResult,
+  LocalGitSignature,
+  LocalGitTreeItem,
   LocalGitFinding,
   LocalGitInfo,
   LocalGitOverlayArg,
@@ -164,6 +173,69 @@ interface Commands {
     result: { snapshot: LocalGitSnapshot; status: LocalGitStatus };
   };
   localgit_cancel: { args: { handle: string; jobId: string }; result: void };
+  localgit_checkpoint: {
+    args: {
+      handle: string;
+      jobId: string;
+      message: string | null;
+      overlays: LocalGitOverlayRef[];
+      untitled: LocalGitOverlayRef[];
+      by: LocalGitSignature;
+    };
+    result: LocalGitCreated & { snapshot: LocalGitSnapshot };
+  };
+  localgit_commit: {
+    args: {
+      handle: string;
+      jobId: string;
+      message: string;
+      fromCheckpoint: string | null;
+      overlays: LocalGitOverlayRef[];
+      by: LocalGitSignature;
+    };
+    result: LocalGitCreated;
+  };
+  localgit_head: { args: { handle: string }; result: LocalGitHeadInfo };
+  localgit_history: {
+    args: { handle: string; cursor: string | null; limit: number };
+    result: LocalGitHistoryPage;
+  };
+  localgit_checkpoints: {
+    args: { handle: string; limit: number };
+    result: LocalGitCheckpointEntry[];
+  };
+  localgit_tree: {
+    args: { handle: string; commit: string; folderId: string | null; path: string };
+    result: LocalGitTreeItem[];
+  };
+  localgit_diff_commits: {
+    args: { handle: string; from: string | null; to: string; lineDiffs: boolean };
+    result: LocalGitDiff;
+  };
+  localgit_diff_workspace: {
+    args: {
+      handle: string;
+      jobId: string;
+      from: string | null;
+      overlays: LocalGitOverlayRef[];
+      lineDiffs: boolean;
+    };
+    result: { snapshot: LocalGitSnapshot; diff: LocalGitDiff };
+  };
+  localgit_restore: {
+    args: {
+      handle: string;
+      jobId: string;
+      commit: string;
+      folderId: string | null;
+      path: string | null;
+      policy: LocalGitRestorePolicy;
+      dryRun: boolean;
+      overlays: LocalGitOverlayRef[];
+      by: LocalGitSignature;
+    };
+    result: LocalGitRestoreResult;
+  };
 }
 
 /** A local TCP port something is listening on, as the Ports view shows it. */

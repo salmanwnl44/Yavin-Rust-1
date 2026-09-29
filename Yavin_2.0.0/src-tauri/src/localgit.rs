@@ -53,6 +53,9 @@ struct Inner {
 struct Store {
     repo: Arc<Mutex<Repository>>,
     engine: Arc<SnapshotEngine>,
+    /// Held by whatever changes Local Git state or the workspace (a checkpoint, a commit, a
+    /// restore): one at a time, and a second is refused (`Busy`), never queued behind.
+    mutating: Arc<Mutex<()>>,
 }
 
 /// An unsaved document's bytes as the renderer sent them, kept until a snapshot no longer
@@ -216,6 +219,40 @@ impl LocalGit {
 }
 
 const CLOSED: &str = "HandleClosed: this Local Git handle is closed (its workspace was left)";
+
+impl LocalGit {
+    /// Ends a job whose work may have changed the disk: a cancellation that came too late does
+    /// not turn its result into "cancelled" -- only a closed handle stops the answer.
+    fn finish_changed<T>(
+        &self,
+        handle: &str,
+        job: &str,
+        result: Result<T, String>,
+    ) -> Result<T, String> {
+        let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
+        let Some(entry) = inner.handles.get_mut(handle) else {
+            return Err(CLOSED.into());
+        };
+        entry.jobs.remove(job);
+        result
+    }
+}
+
+/// Whether the window's workspace (the native side's) is still `workspace_id`.
+pub(crate) fn workspace_is_open(workspace: &Workspace, workspace_id: &str) -> bool {
+    with_workspace(workspace, |manager| Ok(manager.root().to_path_buf()))
+        .ok()
+        .and_then(|root| WorkspaceSpec::from_paths(&[root]).ok())
+        .is_some_and(|now| now.workspace_id == workspace_id)
+}
+
+/// Takes the store's mutation lock, or says another change is under way.
+fn exclusive(store: &Store) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+    store.mutating.try_lock().map_err(|_| {
+        "Busy: another Local Git operation is changing this workspace; try again when it ends"
+            .to_string()
+    })
+}
 
 /// Whether `engine` belongs to the folder the watcher reports on.
 fn watches(engine: &SnapshotEngine, root: &str) -> bool {
@@ -382,6 +419,7 @@ pub fn localgit_open(
             Store {
                 repo: Arc::new(Mutex::new(repo)),
                 engine: Arc::new(engine),
+                mutating: Arc::new(Mutex::new(())),
             }
         }
     };
@@ -953,6 +991,7 @@ mod tests {
                 Store {
                     repo: Arc::new(Mutex::new(repo)),
                     engine: Arc::new(engine),
+                    mutating: Arc::new(Mutex::new(())),
                 },
             );
             inner.handles.insert(
@@ -1084,5 +1123,478 @@ mod tests {
             .unwrap();
         assert_eq!(full.watcher_generation, None);
         assert_eq!(full.stats.files, 1);
+    }
+}
+
+// --- Checkpoints, commits, history, diff and restore (LG-03) ----------------------------------
+
+use ide_localgit::diff::{DiffOptions, DiffResult};
+use ide_localgit::history::{
+    self, CheckpointEntry, CommitRequest, Created, HeadInfo, HistoryPage, TreeItem,
+};
+use ide_localgit::restore::{RestoreConflict, RestorePlan, RestorePolicy, Verification};
+use ide_localgit::{Author, Source};
+
+/// Who makes a commit, and when, as the window knows it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Signature {
+    name: String,
+    id: String,
+    time_ms: i64,
+    /// Minutes east of UTC.
+    tz_offset_min: i16,
+}
+
+fn commit_request(message: String, by: Signature) -> CommitRequest {
+    CommitRequest {
+        message,
+        author: Author {
+            name: by.name,
+            id: by.id,
+        },
+        time_ms: by.time_ms,
+        tz_offset_min: by.tz_offset_min,
+    }
+}
+
+fn parse_opt(id: Option<String>) -> Result<Option<ObjectId>, String> {
+    id.as_deref().map(parse_id).transpose()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Recorded {
+    snapshot: Snapshot,
+    #[serde(flatten)]
+    created: Created,
+}
+
+/// Captures the workspace (unsaved documents included) as a checkpoint: durable, and in the
+/// checkpoint list, but HEAD does not move. Incremental from a warm engine.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_checkpoint(
+    app: AppHandle,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    message: Option<String>,
+    overlays: Vec<OverlayRef>,
+    untitled: Vec<OverlayRef>,
+    by: Signature,
+) -> Result<Recorded, String> {
+    let (store, mut request) = prepare(&local_git, &handle, "auto", true, &overlays, &untitled)?;
+    request.allow_incremental_persist = true;
+    let _only = exclusive(&store)?;
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let control = Control {
+        cancel: &cancel,
+        progress: &progress,
+    };
+    let message = message.unwrap_or_else(|| "Checkpoint".into());
+    let result = store
+        .engine
+        .snapshot(&store.repo, &request, &control)
+        .and_then(|snapshot| {
+            let mut repo = store.repo.lock().map_err(|e| LgError::Io(e.to_string()))?;
+            let created = history::checkpoint_snapshot(
+                &mut repo,
+                &snapshot,
+                Source::Checkpoint,
+                &commit_request(message, by),
+            )?;
+            Ok(Recorded { snapshot, created })
+        });
+    local_git.finish_job(&handle, &job_id, result)
+}
+
+/// Makes a commit on top of HEAD and moves HEAD to it: of the workspace as it is now (a Full
+/// persisted snapshot, unsaved documents included), or of a checkpoint (`fromCheckpoint`: its
+/// roots as they are, nothing scanned).
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_commit(
+    app: AppHandle,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    message: String,
+    from_checkpoint: Option<String>,
+    overlays: Vec<OverlayRef>,
+    by: Signature,
+) -> Result<Created, String> {
+    history::validate_message(&message).map_err(fail)?;
+    let from_checkpoint = parse_opt(from_checkpoint)?;
+    let (store, request) = prepare(&local_git, &handle, "full", true, &overlays, &[])?;
+    let _only = exclusive(&store)?;
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let control = Control {
+        cancel: &cancel,
+        progress: &progress,
+    };
+    let request_by = commit_request(message, by);
+    let result = match from_checkpoint {
+        Some(checkpoint) => store
+            .repo
+            .lock()
+            .map_err(|e| LgError::Io(e.to_string()))
+            .and_then(|mut repo| history::commit_checkpoint(&mut repo, checkpoint, &request_by)),
+        None => store
+            .engine
+            .snapshot(&store.repo, &request, &control)
+            .and_then(|snapshot| {
+                let mut repo = store.repo.lock().map_err(|e| LgError::Io(e.to_string()))?;
+                history::commit_snapshot(&mut repo, &snapshot, &request_by)
+            }),
+    };
+    local_git.finish_job(&handle, &job_id, result)
+}
+
+#[tauri::command(async)]
+pub fn localgit_head(local_git: State<'_, LocalGit>, handle: String) -> Result<HeadInfo, String> {
+    local_git.with(&handle, |repo| history::head_info(repo))
+}
+
+/// Up to `limit` commits along first parents from `cursor` (or HEAD), newest first.
+#[tauri::command(async)]
+pub fn localgit_history(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    cursor: Option<String>,
+    limit: usize,
+) -> Result<HistoryPage, String> {
+    let cursor = parse_opt(cursor)?;
+    local_git.with(&handle, |repo| Ok(history::history(repo, cursor, limit)))
+}
+
+#[tauri::command(async)]
+pub fn localgit_checkpoints(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    limit: usize,
+) -> Result<Vec<CheckpointEntry>, String> {
+    local_git.with(&handle, |repo| history::checkpoints(repo, limit))
+}
+
+/// The entries of a directory (`path`, `""` for the folder) in a commit.
+#[tauri::command(async)]
+pub fn localgit_tree(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    commit: String,
+    folder_id: Option<String>,
+    path: String,
+) -> Result<Vec<TreeItem>, String> {
+    let commit = parse_id(&commit)?;
+    local_git.with(&handle, |repo| {
+        let root = repo.read_commit(&commit)?.root;
+        let folder = folder_id.as_deref().map(FolderId::new).transpose()?;
+        history::list_tree(repo, root, folder.as_ref(), &path)
+    })
+}
+
+fn diff_options(line_diffs: bool) -> DiffOptions {
+    DiffOptions {
+        line_diffs,
+        ..Default::default()
+    }
+}
+
+/// Commit `from` (none: before the first commit) to commit `to`.
+#[tauri::command(async)]
+pub fn localgit_diff_commits(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    from: Option<String>,
+    to: String,
+    line_diffs: bool,
+) -> Result<DiffResult, String> {
+    let (from, to) = (parse_opt(from)?, parse_id(&to)?);
+    local_git.with(&handle, |repo| {
+        ide_localgit::diff::diff_commits(repo, from, to, &diff_options(line_diffs))
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDiff {
+    snapshot: Snapshot,
+    diff: DiffResult,
+}
+
+/// A commit (`from`, or HEAD) to the workspace as the user has it, unsaved documents
+/// included. Nothing is saved.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_diff_workspace(
+    app: AppHandle,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    from: Option<String>,
+    overlays: Vec<OverlayRef>,
+    line_diffs: bool,
+) -> Result<WorkspaceDiff, String> {
+    let from = parse_opt(from)?;
+    let (store, request) = prepare(&local_git, &handle, "auto", false, &overlays, &[])?;
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let result = store.engine.diff_workspace(
+        &store.repo,
+        &request,
+        &Control {
+            cancel: &cancel,
+            progress: &progress,
+        },
+        from,
+        &diff_options(line_diffs),
+    );
+    local_git
+        .finish_job(&handle, &job_id, result)
+        .map(|(snapshot, diff)| WorkspaceDiff { snapshot, diff })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreResult {
+    /// `planned` (dry run), `unchanged`, `refused`, `completed`, `failed`, `verificationFailed`.
+    status: &'static str,
+    plan: RestorePlan,
+    /// Everything that stopped it (the plan's, and what the last check before changing
+    /// anything found).
+    conflicts: Vec<RestoreConflict>,
+    /// The checkpoint of the workspace taken just before anything changed (source `recovery`).
+    checkpoint: Option<history::CommitInfo>,
+    /// The file operation's id (Module 03), which the watcher credits the changes to.
+    operation: Option<u64>,
+    applied: usize,
+    error: Option<String>,
+    verification: Option<Verification>,
+}
+
+fn policy_of(policy: &str) -> Result<RestorePolicy, String> {
+    match policy {
+        "refuseIfDirty" => Ok(RestorePolicy::RefuseIfDirty),
+        "replaceDocument" => Ok(RestorePolicy::ReplaceDocument),
+        other => Err(format!("InvalidFormat: unknown restore policy {other:?}")),
+    }
+}
+
+/// Makes the workspace match a commit -- all of it, or one path (`path`) -- or, with `dryRun`,
+/// only plans it. The plan is complete and every conflict found before anything changes; a
+/// checkpoint of the workspace is taken; the disk is changed as one recorded file operation;
+/// and a Full snapshot verifies the result. Documents are the window's to reconcile after.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_restore(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    watch: State<'_, crate::Watch>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    commit: String,
+    folder_id: Option<String>,
+    path: Option<String>,
+    policy: String,
+    dry_run: bool,
+    overlays: Vec<OverlayRef>,
+    by: Signature,
+) -> Result<RestoreResult, String> {
+    let commit = parse_id(&commit)?;
+    let policy = policy_of(&policy)?;
+    let folder = folder_id
+        .as_deref()
+        .map(FolderId::new)
+        .transpose()
+        .map_err(fail)?;
+    let (store, mut request) = prepare(&local_git, &handle, "full", !dry_run, &overlays, &[])?;
+    request.mode = RequestedMode::Full;
+    let guard = if dry_run {
+        None
+    } else {
+        Some(exclusive(&store)?)
+    };
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let control = Control {
+        cancel: &cancel,
+        progress: &progress,
+    };
+    let planned = store.engine.plan_restore(
+        &store.repo,
+        &request,
+        &control,
+        commit,
+        path.map(|path| (folder, path)),
+        policy,
+    );
+    let (snapshot, plan) = match planned {
+        Ok(planned) => planned,
+        Err(error) => return local_git.finish_job(&handle, &job_id, Err(error)),
+    };
+    let answer = |status, conflicts: Vec<RestoreConflict>, plan: RestorePlan| RestoreResult {
+        status,
+        plan,
+        conflicts,
+        checkpoint: None,
+        operation: None,
+        applied: 0,
+        error: None,
+        verification: None,
+    };
+    if !plan.conflicts.is_empty() {
+        let conflicts = plan.conflicts.clone();
+        return local_git.finish_job(&handle, &job_id, Ok(answer("refused", conflicts, plan)));
+    }
+    if dry_run {
+        return local_git.finish_job(&handle, &job_id, Ok(answer("planned", vec![], plan)));
+    }
+    if plan.unchanged {
+        return local_git.finish_job(&handle, &job_id, Ok(answer("unchanged", vec![], plan)));
+    }
+    // The last point a restore can be cancelled, and the last check that this is still the
+    // window's workspace: past here the disk changes.
+    if cancel.load(Ordering::SeqCst) {
+        return local_git.finish_job(&handle, &job_id, Err(LgError::Cancelled));
+    }
+    let workspace_id = {
+        let inner = local_git.inner.lock().map_err(|e| e.to_string())?;
+        inner
+            .handles
+            .get(&handle)
+            .ok_or(CLOSED)?
+            .workspace_id
+            .clone()
+    };
+    if !workspace_is_open(&workspace, &workspace_id) {
+        return Err("NotInWorkspace: the workspace was left before the restore began".into());
+    }
+    // A checkpoint of what is about to be replaced, so the restore itself can be undone.
+    let checkpoint = {
+        let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+        let short = &commit.to_hex()[..history::SHORT_ID_LEN];
+        history::checkpoint_snapshot(
+            &mut repo,
+            &snapshot,
+            Source::Recovery,
+            &commit_request(format!("Before restoring {short}"), by),
+        )
+        .map_err(fail)?
+    };
+    let scratch = std::env::temp_dir().join("yavin-localgit-link-probe");
+    let outcome =
+        crate::localgit_restore::execute(&watch, &store.repo, &store.engine, &plan, &scratch);
+    let mut result = answer("completed", vec![], plan);
+    result.checkpoint = Some(checkpoint.commit);
+    match outcome {
+        crate::localgit_restore::Outcome::Refused(conflicts) => {
+            result.status = "refused";
+            result.conflicts = conflicts;
+        }
+        crate::localgit_restore::Outcome::Failed {
+            operation,
+            applied,
+            error,
+        } => {
+            result.status = "failed";
+            result.operation = operation;
+            result.applied = applied;
+            result.error = Some(error);
+        }
+        crate::localgit_restore::Outcome::Done { operation, applied } => {
+            result.operation = Some(operation);
+            result.applied = applied;
+            // Verified by a Full snapshot, never assumed. (Not cancellable: the disk changed.)
+            let settled = AtomicBool::new(false);
+            match store.engine.verify_restore(
+                &store.repo,
+                &Control {
+                    cancel: &settled,
+                    progress: &progress,
+                },
+                &result.plan,
+            ) {
+                Ok((_, verification)) => {
+                    if !verification.matches {
+                        result.status = "verificationFailed";
+                    }
+                    result.verification = Some(verification);
+                }
+                Err(error) => {
+                    result.status = "verificationFailed";
+                    result.error = Some(fail(error));
+                }
+            }
+        }
+    }
+    drop(guard);
+    local_git.finish_changed(&handle, &job_id, Ok(result))
+}
+
+#[cfg(test)]
+mod lg03_tests {
+    use super::*;
+
+    fn store_for(label: &str) -> Store {
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "yavin-localgit-lg03-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project")).unwrap();
+        let spec = WorkspaceSpec::from_paths(&[dir.join("project")]).unwrap();
+        let repo = Repository::open(&dir.join("base"), &spec, OpenOptions::default()).unwrap();
+        let engine = SnapshotEngine::new(Vec::new(), repo.meta().max_blob_bytes);
+        Store {
+            repo: Arc::new(Mutex::new(repo)),
+            engine: Arc::new(engine),
+            mutating: Arc::new(Mutex::new(())),
+        }
+    }
+
+    #[test]
+    fn a_second_change_while_one_runs_is_refused_not_queued() {
+        let store = store_for("busy");
+        let first = exclusive(&store).unwrap();
+        // Commit + restore, restore + restore, commit + commit: all the same lock.
+        let second = exclusive(&store);
+        assert!(second.unwrap_err().starts_with("Busy:"));
+        drop(first);
+        assert!(exclusive(&store).is_ok());
+    }
+
+    #[test]
+    fn a_restore_result_is_refused_after_its_workspace_was_left_but_never_relabelled_cancelled() {
+        let local_git = LocalGit::default();
+        {
+            let mut inner = local_git.inner.lock().unwrap();
+            inner.handles.insert(
+                "lg-a".into(),
+                Handle {
+                    key: "k".into(),
+                    workspace_id: "a".into(),
+                    overlays: HashMap::new(),
+                    untitled: HashMap::new(),
+                    jobs: HashMap::new(),
+                    status_job: None,
+                },
+            );
+        }
+        let flag = local_git.start_job("lg-a", "restore-1", false).unwrap();
+        // Cancelled after the disk changed: the answer is still what happened.
+        flag.store(true, Ordering::SeqCst);
+        assert_eq!(
+            local_git.finish_changed("lg-a", "restore-1", Ok("completed")),
+            Ok("completed")
+        );
+        // The workspace was left meanwhile: nothing is delivered.
+        local_git.start_job("lg-a", "restore-2", false).unwrap();
+        local_git.revoke_except(Some("b"));
+        let late = local_git.finish_changed("lg-a", "restore-2", Ok("completed"));
+        assert!(late.unwrap_err().starts_with("HandleClosed:"));
     }
 }

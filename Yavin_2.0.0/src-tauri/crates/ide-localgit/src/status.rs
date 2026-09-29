@@ -43,7 +43,7 @@ pub enum EntryClass {
     Symlink,
 }
 
-fn class(kind: &EntryKind) -> EntryClass {
+pub(crate) fn class(kind: &EntryKind) -> EntryClass {
     match kind {
         EntryKind::File { .. } => EntryClass::File,
         EntryKind::Directory => EntryClass::Directory,
@@ -75,7 +75,7 @@ pub struct Side {
     pub link: Option<&'static str>,
 }
 
-fn side(entry: &TreeEntry) -> Side {
+pub(crate) fn side(entry: &TreeEntry) -> Side {
     let (executable, stored, size, link) = match entry.kind {
         EntryKind::File { executable, stored } => match stored {
             Stored::Yes => (executable, true, None, None),
@@ -190,12 +190,13 @@ pub struct Status {
     pub unsaved: usize,
 }
 
-struct Leaf {
-    path: String,
-    kind: ChangeKind,
-    old: Option<TreeEntry>,
-    new: Option<TreeEntry>,
-    from: Option<String>,
+/// One change between two trees (`diff.rs` and `restore.rs` share it).
+pub(crate) struct Leaf {
+    pub(crate) path: String,
+    pub(crate) kind: ChangeKind,
+    pub(crate) old: Option<TreeEntry>,
+    pub(crate) new: Option<TreeEntry>,
+    pub(crate) from: Option<String>,
 }
 
 fn join(prefix: &str, name: &str) -> String {
@@ -206,7 +207,7 @@ fn join(prefix: &str, name: &str) -> String {
     }
 }
 
-fn tree_of(lookup: &dyn TreeLookup, id: &ObjectId) -> Result<Tree> {
+pub(crate) fn tree_of(lookup: &dyn TreeLookup, id: &ObjectId) -> Result<Tree> {
     lookup.tree(id).ok_or(LgError::MissingObject(*id))
 }
 
@@ -402,7 +403,11 @@ fn pair_renames(leaves: Vec<Leaf>) -> Vec<Leaf> {
         .collect()
 }
 
-fn changes(lookup: &dyn TreeLookup, old: Option<ObjectId>, new: ObjectId) -> Result<Vec<Leaf>> {
+pub(crate) fn changes(
+    lookup: &dyn TreeLookup,
+    old: Option<ObjectId>,
+    new: ObjectId,
+) -> Result<Vec<Leaf>> {
     if old == Some(new) {
         return Ok(Vec::new());
     }
@@ -414,7 +419,11 @@ fn changes(lookup: &dyn TreeLookup, old: Option<ObjectId>, new: ObjectId) -> Res
 }
 
 /// The entry at `path` under the directory `root`, if any.
-fn find(lookup: &dyn TreeLookup, root: Option<ObjectId>, path: &str) -> Result<Option<TreeEntry>> {
+pub(crate) fn find(
+    lookup: &dyn TreeLookup,
+    root: Option<ObjectId>,
+    path: &str,
+) -> Result<Option<TreeEntry>> {
     let Some(mut dir) = root else {
         return Ok(None);
     };

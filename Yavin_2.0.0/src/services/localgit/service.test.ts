@@ -376,3 +376,217 @@ test("a snapshot or status answering after the workspace was left is dropped", a
   await assert.rejects(service.snapshot({ persist: true }), LocalGitClosedError);
   assert.equal(native.calls.length, before);
 });
+
+// --- Checkpoints, commits, history, diff and restore (LG-03) -------------------------------
+
+test("a commit and a checkpoint carry who and when, with the offset east of UTC", async () => {
+  const native = scriptedNative({
+    localgit_commit: () => ({ commit: { id: "c" }, revision: 1 }),
+    localgit_checkpoint: () => ({ commit: { id: "k" }, revision: 2 }),
+  });
+  const service = createLocalGitService(
+    ["/work"],
+    { isActive: () => true },
+    native.invoke,
+    undefined,
+    () => ({ name: "Ada", id: "ada@yavin" }),
+  );
+  service.attachOverlays(overlaySource([{ key: "a.ts", version: 3, text: "A" }]).source);
+  await service.commit("message", { fromCheckpoint: "k1" });
+  await service.checkpoint({ includeUntitled: true });
+  const commit = native.calls.find((c) => c.command === "localgit_commit")!;
+  assert.equal(commit.args.message, "message");
+  assert.equal(commit.args.fromCheckpoint, "k1");
+  assert.deepEqual(commit.args.overlays, [{ key: "a.ts", version: 3 }]);
+  const by = commit.args.by as { name: string; id: string; timeMs: number; tzOffsetMin: number };
+  assert.equal(by.name, "Ada");
+  assert.equal(by.tzOffsetMin, -new Date().getTimezoneOffset());
+  assert.ok(Math.abs(by.timeMs - Date.now()) < 60_000);
+  const checkpoint = native.calls.find((c) => c.command === "localgit_checkpoint")!;
+  assert.deepEqual(checkpoint.args.untitled, [{ key: "untitled:1", version: 2 }]);
+  assert.equal(checkpoint.args.message, null);
+});
+
+test("history, trees and diffs are asked for by id, with the defaults stated", async () => {
+  const native = scriptedNative({});
+  const service = createLocalGitService(["/work"], { isActive: () => true }, native.invoke);
+  await service.history();
+  await service.history({ cursor: "abc", limit: 5 });
+  await service.tree("c1", "src");
+  await service.diffCommits(null, "c2", { lineDiffs: false });
+  await service.diffWorkspace();
+  const args = (command: string) =>
+    native.calls.filter((c) => c.command === command).map((c) => c.args);
+  assert.deepEqual(args("localgit_history"), [
+    { handle: "lg-7", cursor: null, limit: 100 },
+    { handle: "lg-7", cursor: "abc", limit: 5 },
+  ]);
+  assert.deepEqual(args("localgit_tree"), [
+    { handle: "lg-7", commit: "c1", folderId: null, path: "src" },
+  ]);
+  assert.deepEqual(args("localgit_diff_commits"), [
+    { handle: "lg-7", from: null, to: "c2", lineDiffs: false },
+  ]);
+  const workspace = args("localgit_diff_workspace")[0];
+  assert.equal(workspace.from, null);
+  assert.equal(workspace.lineDiffs, true);
+});
+
+function restoreResult(status: string, operations: unknown[], applied = operations.length) {
+  return {
+    status,
+    plan: {
+      commit: "c",
+      targetRoot: "r",
+      scope: null,
+      scopeFolder: null,
+      policy: "refuseIfDirty",
+      operations,
+      conflicts: [],
+      documents: [{ folderId: "f-1", path: "doc.txt", action: "overwrite", version: 4 }],
+      unchanged: false,
+      snapshotSequence: 1,
+      diskRoot: "d",
+    },
+    conflicts: [],
+    checkpoint: null,
+    operation: 9,
+    applied,
+    error: null,
+    verification: null,
+  };
+}
+
+const op = (kind: string, path: string, expected = "file") => ({
+  kind,
+  folderId: "f-1",
+  path,
+  expected: { kind: expected },
+  blob: null,
+  size: null,
+  executable: false,
+  link: null,
+});
+
+test("a completed restore has its documents reconciled, by absolute path", async () => {
+  const reconciled: unknown[] = [];
+  const native = scriptedNative({
+    localgit_restore: () =>
+      restoreResult("completed", [
+        op("removeFile", "old.txt"),
+        op("createDirectory", "dir", "absent"),
+        op("writeFile", "dir/new.txt", "absent"),
+        op("writeFile", "doc.txt"),
+      ]),
+  });
+  const service = createLocalGitService(
+    ["C:/Work/Project"],
+    { isActive: () => true },
+    native.invoke,
+  );
+  service.attachOverlays({
+    ...overlaySource([]).source,
+    reconcileRestore: async (restored) => {
+      reconciled.push(restored);
+      return { ok: true, reloaded: [], closed: [], failed: [] };
+    },
+  });
+  const outcome = await service.restore("c", { policy: "replaceDocument" });
+  assert.equal(outcome.succeeded, true);
+  const call = native.calls.find((c) => c.command === "localgit_restore")!;
+  assert.equal(call.args.policy, "replaceDocument");
+  assert.equal(call.args.dryRun, false);
+  assert.deepEqual(reconciled, [
+    {
+      changes: [
+        { kind: "deleted", path: "C:/Work/Project/old.txt" },
+        { kind: "created", path: "C:/Work/Project/dir/new.txt" },
+        { kind: "modified", path: "C:/Work/Project/doc.txt" },
+      ],
+      replace: [{ path: "C:/Work/Project/doc.txt", action: "overwrite" }],
+    },
+  ]);
+});
+
+test("a failed restore reconciles only what was done and never reports success", async () => {
+  let restored: { changes: unknown[] } | null = null;
+  const native = scriptedNative({
+    localgit_restore: () =>
+      restoreResult("failed", [op("writeFile", "a.txt"), op("writeFile", "b.txt")], 1),
+  });
+  const service = createLocalGitService(["/work"], { isActive: () => true }, native.invoke);
+  service.attachOverlays({
+    ...overlaySource([]).source,
+    reconcileRestore: async (paths) => {
+      restored = paths;
+      return { ok: true, reloaded: [], closed: [], failed: [] };
+    },
+  });
+  const outcome = await service.restore("c");
+  assert.equal(outcome.succeeded, false);
+  assert.equal(outcome.status, "failed");
+  assert.deepEqual(restored!.changes, [{ kind: "modified", path: "C:/Work/Project/a.txt" }]);
+});
+
+test("a restore whose documents could not be reconciled is not a success", async () => {
+  const native = scriptedNative({
+    localgit_restore: () => restoreResult("completed", [op("writeFile", "a.txt")]),
+  });
+  const service = createLocalGitService(["/work"], { isActive: () => true }, native.invoke);
+  service.attachOverlays({
+    ...overlaySource([]).source,
+    reconcileRestore: async () => ({
+      ok: false,
+      reloaded: [],
+      closed: [],
+      failed: [{ path: "a.txt", error: "locked" }],
+    }),
+  });
+  const outcome = await service.restore("c");
+  assert.equal(outcome.status, "completed");
+  assert.equal(outcome.succeeded, false);
+});
+
+test("a refused or dry-run restore touches no document", async () => {
+  let reconciles = 0;
+  for (const status of ["refused", "planned", "unchanged"]) {
+    const native = scriptedNative({ localgit_restore: () => restoreResult(status, []) });
+    const service = createLocalGitService(["/work"], { isActive: () => true }, native.invoke);
+    service.attachOverlays({
+      ...overlaySource([]).source,
+      reconcileRestore: async () => {
+        reconciles++;
+        return { ok: true, reloaded: [], closed: [], failed: [] };
+      },
+    });
+    const outcome = await service.restore("c", { dryRun: status === "planned" });
+    assert.equal(outcome.succeeded, false);
+    assert.equal(outcome.documents, null);
+  }
+  assert.equal(reconciles, 0);
+});
+
+test("a restore answering after its workspace was left is dropped; no document is touched", async () => {
+  const native = fakeNative();
+  let active = true;
+  let reconciles = 0;
+  const service = createLocalGitService(["/a"], { isActive: () => active }, native.invoke);
+  service.attachOverlays({
+    ...overlaySource([]).source,
+    reconcileRestore: async () => {
+      reconciles++;
+      return { ok: true, reloaded: [], closed: [], failed: [] };
+    },
+  });
+  await native.answer("localgit_open");
+  const late = service.restore("c").then(
+    () => "delivered",
+    (error: unknown) => error,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  // A -> B while A's restore is in flight.
+  active = false;
+  await native.answer("localgit_restore", restoreResult("completed", [op("writeFile", "a.txt")]));
+  assert.ok((await late) instanceof LocalGitClosedError);
+  assert.equal(reconciles, 0);
+});

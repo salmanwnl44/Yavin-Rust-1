@@ -123,6 +123,11 @@ pub struct UntitledInput {
 pub struct SnapshotRequest {
     pub mode: RequestedMode,
     pub persist: bool,
+    /// Lets a persisted snapshot be incremental (a checkpoint from a warm engine): directories
+    /// the watcher did not report are reused only when their trees are already in the store,
+    /// and a change made within the watcher's latency (about a second) can be missed. Off, a
+    /// persisted snapshot is always Full.
+    pub allow_incremental_persist: bool,
     pub overlays: Vec<OverlayInput>,
     pub untitled: Vec<UntitledInput>,
 }
@@ -270,6 +275,15 @@ fn now_ns() -> i128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i128)
         .unwrap_or(0)
+}
+
+/// The trees an engine holds in memory (its last snapshot's).
+struct MemoryTrees<'a>(&'a HashMap<ObjectId, Tree>);
+
+impl TreeLookup for MemoryTrees<'_> {
+    fn tree(&self, id: &ObjectId) -> Option<Tree> {
+        self.0.get(id).cloned()
+    }
 }
 
 /// Where a scan reads trees it did not compute itself.
@@ -481,6 +495,192 @@ impl SnapshotEngine {
         Ok((snapshot, status))
     }
 
+    /// Diffs a commit (`from`, or HEAD; none before the first commit) against the workspace
+    /// as the user has it: an ephemeral snapshot, unsaved documents included. Nothing is saved
+    /// and no document is touched.
+    pub fn diff_workspace(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        from: Option<ObjectId>,
+        options: &crate::diff::DiffOptions,
+    ) -> Result<(Snapshot, crate::diff::DiffResult)> {
+        use crate::diff::{diff_trees, DiffEnd, DiffResult, StoreContent, Trees, WorkspaceContent};
+        if request.persist {
+            return Err(LgError::InvalidFormat(
+                "a diff is taken from an ephemeral snapshot".into(),
+            ));
+        }
+        let mut state = self.state.lock().unwrap();
+        let snapshot = self.snapshot_in(&mut state, repo, request, control)?;
+        let repo = repo.lock().unwrap();
+        let base = crate::diff::base_commit(&repo, from)?;
+        let effective: BTreeMap<FolderId, ObjectId> = self
+            .folders
+            .iter()
+            .filter_map(|folder| {
+                snapshot
+                    .folders
+                    .iter()
+                    .find(|f| f.folder_id == folder.folder_id.as_str())
+                    .map(|f| (folder.folder_id.clone(), f.effective_tree.0))
+            })
+            .collect();
+        let to = DiffEnd {
+            kind: "workspace",
+            commit: None,
+            root: Some(snapshot.effective_root),
+        };
+        let from_end = DiffEnd {
+            kind: if base.is_some() { "commit" } else { "empty" },
+            commit: base.as_ref().map(|(id, _, _)| ObjectIdText(*id)),
+            root: base.as_ref().map(|(_, root, _)| ObjectIdText(*root)),
+        };
+        if base.as_ref().map(|(_, root, _)| *root) == Some(snapshot.effective_root.0) {
+            return Ok((
+                snapshot,
+                DiffResult {
+                    from: from_end,
+                    to,
+                    identical: true,
+                    entries: Vec::new(),
+                    counts: Default::default(),
+                },
+            ));
+        }
+        let memory = MemoryTrees(&state.trees);
+        let trees = Trees {
+            repo: Some(&repo),
+            extra: Some(&memory),
+        };
+        let overlays = request
+            .overlays
+            .iter()
+            .map(|o| (hash_object(ObjectKind::Blob, &o.bytes), o.bytes.clone()))
+            .collect();
+        let workspace = WorkspaceContent {
+            repo: &repo,
+            overlays,
+            folders: self
+                .folders
+                .iter()
+                .map(|f| (f.folder_id.clone(), f.path.clone()))
+                .collect(),
+        };
+        let history = StoreContent { repo: &repo };
+        let old = base.map(|(_, _, folders)| folders).unwrap_or_default();
+        let (entries, counts) =
+            diff_trees(&trees, &old, &effective, &history, &workspace, options)?;
+        Ok((
+            snapshot,
+            DiffResult {
+                from: from_end,
+                to,
+                identical: false,
+                entries,
+                counts,
+            },
+        ))
+    }
+
+    /// Plans restoring `commit` (all of it, or `scope`: a path, in a folder or the only one)
+    /// over the workspace as a fresh snapshot sees it. With `request.persist` the snapshot is
+    /// kept in the store (what a restore checkpoints before it changes anything).
+    pub fn plan_restore(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        commit: ObjectId,
+        scope: Option<(Option<FolderId>, String)>,
+        policy: crate::restore::RestorePolicy,
+    ) -> Result<(Snapshot, crate::restore::RestorePlan)> {
+        let mut state = self.state.lock().unwrap();
+        {
+            let repo = repo.lock().unwrap();
+            crate::history::require_commit(&repo, &commit)?;
+        }
+        let snapshot = self.snapshot_in(&mut state, repo, request, control)?;
+        let repo = repo.lock().unwrap();
+        let target_root = repo.read_commit(&commit)?.root;
+        let target_folders = repo.read_root(&target_root)?.folders;
+        let scope = match scope {
+            Some((folder, path)) => {
+                let folder = match folder {
+                    Some(folder) => folder,
+                    None if self.folders.len() == 1 => self.folders[0].folder_id.clone(),
+                    None => {
+                        return Err(LgError::InvalidName(
+                            "name the folder of a multi-folder workspace".into(),
+                        ))
+                    }
+                };
+                for name in path.split('/').filter(|n| !n.is_empty()) {
+                    EntryName::new(name)?;
+                }
+                Some((folder, path.trim_matches('/').to_string()))
+            }
+            None => None,
+        };
+        let memory = MemoryTrees(&state.trees);
+        let trees = crate::diff::Trees {
+            repo: Some(&repo),
+            extra: Some(&memory),
+        };
+        let plan = crate::restore::plan(
+            &trees,
+            &repo,
+            &self.folders,
+            &snapshot,
+            commit,
+            target_root,
+            &target_folders,
+            scope.as_ref().map(|(folder, path)| (folder, path.as_str())),
+            policy,
+        )?;
+        Ok((snapshot, plan))
+    }
+
+    /// After a restore: a Full snapshot of the disk (authoritative; unsaved documents are not
+    /// part of what a restore writes) compared with what `plan` aimed for.
+    pub fn verify_restore(
+        &self,
+        repo: &Mutex<Repository>,
+        control: &Control,
+        plan: &crate::restore::RestorePlan,
+    ) -> Result<(Snapshot, crate::restore::Verification)> {
+        let mut state = self.state.lock().unwrap();
+        let request = SnapshotRequest {
+            mode: RequestedMode::Full,
+            ..Default::default()
+        };
+        let snapshot = self.snapshot_in(&mut state, repo, &request, control)?;
+        let repo = repo.lock().unwrap();
+        let target_folders = repo.read_root(&plan.target_root.0)?.folders;
+        let memory = MemoryTrees(&state.trees);
+        let trees = crate::diff::Trees {
+            repo: Some(&repo),
+            extra: Some(&memory),
+        };
+        let folder = plan.scope_folder.clone();
+        let folder = folder.map(|f| FolderId::new(&f)).transpose()?;
+        let scope = match (&folder, &plan.scope) {
+            (Some(folder), Some(path)) => Some((folder, path.as_str())),
+            _ => None,
+        };
+        let verification = crate::restore::verify(&trees, &snapshot, &target_folders, scope)?;
+        Ok((snapshot, verification))
+    }
+
+    /// Where the workspace's folders are, for the layer that carries out a restore.
+    pub fn folder_root(&self, folder: &str) -> Option<&Path> {
+        self.folders
+            .iter()
+            .find(|f| f.folder_id.as_str() == folder)
+            .map(|f| f.path.as_path())
+    }
+
     fn snapshot_in(
         &self,
         state: &mut EngineState,
@@ -578,7 +778,9 @@ impl SnapshotEngine {
         };
         let reason = match request.mode {
             RequestedMode::Full | RequestedMode::Verify => Some(FullReason::Requested),
-            RequestedMode::Auto if request.persist => Some(FullReason::Persisted),
+            RequestedMode::Auto if request.persist && !request.allow_incremental_persist => {
+                Some(FullReason::Persisted)
+            }
             RequestedMode::Auto => {
                 if self
                     .folders
@@ -663,8 +865,12 @@ impl SnapshotEngine {
                 let node = plan.dirty.get(key);
                 if incremental && node.is_none_or(DirtyNode::is_empty) {
                     if let Some(id) = state.last_disk.get(key) {
-                        disk.insert(folder.folder_id.clone(), *id);
-                        continue;
+                        // Persisting, it is reused only if it is already stored.
+                        let stored = sink.is_none_or(|sink| sink.lock().unwrap().has(id));
+                        if stored {
+                            disk.insert(folder.folder_id.clone(), *id);
+                            continue;
+                        }
                     }
                 }
                 let base = state

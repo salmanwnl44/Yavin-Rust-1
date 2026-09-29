@@ -116,3 +116,85 @@ test("a clean document, a saved one and a closed one do not take part", async ()
   documents.close(`${ROOT}/a.ts`, { discard: true });
   assert.deepEqual(tracker.overlays(), []);
 });
+
+// --- After a restore (LG-03) ---------------------------------------------------------------
+
+test("after a restore, clean documents follow the disk and nothing unsaved is lost silently", async () => {
+  const d = disk({
+    [`${ROOT}/clean.ts`]: "before\n",
+    [`${ROOT}/dirty.ts`]: "before\n",
+  });
+  const documents = createDocumentService(d.io);
+  await documents.open(`${ROOT}/clean.ts`);
+  await documents.open(`${ROOT}/dirty.ts`);
+  documents.edit(`${ROOT}/dirty.ts`, "unsaved\n");
+  const tracker = createOverlayTracker(documents, [ROOT]);
+  // The restore rewrote both files on disk (the dirty one was not the user's choice to lose).
+  d.content.set(`${ROOT}/clean.ts`, "restored\n");
+  d.content.set(`${ROOT}/dirty.ts`, "restored\n");
+  const outcome = await tracker.reconcileRestore!({
+    changes: [
+      { kind: "modified", path: `${ROOT}/clean.ts` },
+      { kind: "modified", path: `${ROOT}/dirty.ts` },
+    ],
+    replace: [],
+  });
+  assert.equal(documents.get(`${ROOT}/clean.ts`)!.text, "restored\n");
+  assert.equal(documents.get(`${ROOT}/clean.ts`)!.dirty, false);
+  // The unsaved text is still there, and the outcome says the document does not match.
+  assert.equal(documents.get(`${ROOT}/dirty.ts`)!.text, "unsaved\n");
+  assert.equal(outcome.ok, false);
+  assert.deepEqual(
+    outcome.failed.map((f) => f.path),
+    [`${ROOT}/dirty.ts`],
+  );
+  assert.deepEqual(d.writes, []);
+});
+
+test("documents the user chose to replace are reloaded or closed, their edits discarded", async () => {
+  const d = disk({
+    [`${ROOT}/over.ts`]: "before\n",
+    [`${ROOT}/gone.ts`]: "before\n",
+  });
+  const documents = createDocumentService(d.io);
+  await documents.open(`${ROOT}/over.ts`);
+  await documents.open(`${ROOT}/gone.ts`);
+  documents.edit(`${ROOT}/over.ts`, "unsaved\n");
+  documents.edit(`${ROOT}/gone.ts`, "unsaved\n");
+  const tracker = createOverlayTracker(documents, [ROOT]);
+  d.content.set(`${ROOT}/over.ts`, "historical\n");
+  d.content.delete(`${ROOT}/gone.ts`);
+  const outcome = await tracker.reconcileRestore!({
+    changes: [
+      { kind: "modified", path: `${ROOT}/over.ts` },
+      { kind: "deleted", path: `${ROOT}/gone.ts` },
+    ],
+    replace: [
+      { path: `${ROOT}/over.ts`, action: "overwrite" },
+      { path: `${ROOT}/gone.ts`, action: "delete" },
+    ],
+  });
+  assert.equal(outcome.ok, true, JSON.stringify(outcome.failed));
+  assert.deepEqual(outcome.reloaded, [`${ROOT}/over.ts`]);
+  assert.deepEqual(outcome.closed, [`${ROOT}/gone.ts`]);
+  assert.equal(documents.get(`${ROOT}/over.ts`)!.text, "historical\n");
+  assert.equal(documents.get(`${ROOT}/over.ts`)!.dirty, false);
+  assert.equal(documents.get(`${ROOT}/gone.ts`), undefined);
+  assert.deepEqual(d.writes, []);
+});
+
+test("a document that cannot be reloaded after a restore is reported, not passed over", async () => {
+  const d = disk({ [`${ROOT}/locked.ts`]: "before\n" });
+  const documents = createDocumentService(d.io);
+  await documents.open(`${ROOT}/locked.ts`);
+  documents.edit(`${ROOT}/locked.ts`, "unsaved\n");
+  const tracker = createOverlayTracker(documents, [ROOT]);
+  // The file is gone from under the reload: it fails.
+  d.content.delete(`${ROOT}/locked.ts`);
+  const outcome = await tracker.reconcileRestore!({
+    changes: [{ kind: "modified", path: `${ROOT}/locked.ts` }],
+    replace: [{ path: `${ROOT}/locked.ts`, action: "overwrite" }],
+  });
+  assert.equal(outcome.ok, false);
+  assert.ok(outcome.failed.some((f) => f.path === `${ROOT}/locked.ts`));
+});

@@ -819,7 +819,7 @@ SOURCE CONTROL                                   ⋯   view options: which secti
 
 Local Git is Yavin's own history for a workspace -- checkpoints, local commits, branches and restore, eventually "Undo AI Run" -- that works with or without real Git. It is **not Git**: it never reads or writes `.git`, never runs `git`, never reads `.gitignore`, and nothing it stores ends up in the project. Real Git stays what the Source Control panel shows. Local Git never owns live document content either: DocumentService does, and Local Git only records snapshots of it.
 
-LG-01 is the storage layer: the object store, the repository lifecycle and crash-safe persistence. LG-02 adds snapshots of the workspace -- on disk, and with unsaved documents applied -- and status against Local HEAD ("Snapshots and status" below). Commits made by people and everything that builds on them arrive in later phases (see "Not yet").
+LG-01 is the storage layer: the object store, the repository lifecycle and crash-safe persistence. LG-02 adds snapshots of the workspace -- on disk, and with unsaved documents applied -- and status against Local HEAD ("Snapshots and status" below). LG-03 adds checkpoints, commits, history, diffs and restore ("History, diff and restore" below). Branches and everything that builds on them arrive in later phases (see "Not yet").
 
 ```text
 renderer                                    native (src-tauri)
@@ -961,7 +961,67 @@ sorted, with fields `%XX`-escaped as commit headers are, so the same overlays al
 | store after the first snapshot          | 20,113 objects, 4.4 MB | 110,113 objects, 35.2 MB |                 |
 | peak memory (process)                   |                        | 85 MB                    | < 250 MB        |
 
-**Not yet** (later phases): checkpoints, commits, history, diff and restore -- including reporting unstored content (LG-03); staging, branches and tags (LG-04); reset, revert and stash (LG-05); merge and cherry-pick (LG-06); AI checkpoints and Undo AI Run (LG-07); any UI (LG-08); comparison with real Git, GC, compaction, compression and a recovery UI (LG-09).
+### History, diff and restore (LG-03)
+
+**Local Git never owns live document content, and never writes into a project.** Checkpoints and commits record what LG-02 snapshots saw; diffs read the store (and, for the workspace side, the snapshot's own bytes); a restore is _planned_ by Local Git and _carried out_ by the file-operation layer (Module 03, recorded by Module 04), and the window's documents are reconciled through DocumentService's public API.
+
+```text
+checkpoint:  LG-02 snapshot (persisted, incremental when warm) ──▶ commit object (source checkpoint, parent HEAD) ──▶ refs/yavin/checkpoint
+commit:      LG-02 snapshot (persisted, Full) ─┐
+             or a checkpoint's roots as they are ┴▶ commit object (source human, parent HEAD) ──▶ HEAD (refs/heads/main) moves
+restore:     snapshot (Full, persisted) ─▶ plan (crate: ops + conflicts) ─▶ recovery checkpoint ─▶ execute (app: one M03 operation, M04 intent) ─▶ verify (Full snapshot) ─▶ window reconciles documents
+```
+
+**Checkpoint and commit.** A _checkpoint_ captures the workspace -- its effective root, so unsaved documents are in it, with the disk root and the overlay set beside it -- as a commit object of source `checkpoint` whose parent is HEAD. It moves only `refs/yavin/checkpoint`: durable, listed (that ref's reflog is the list of every checkpoint), but not history. A _commit_ is history: a commit object of source `human` on top of HEAD, after which HEAD moves to it. A commit is made from a fresh persisted snapshot, or from a checkpoint -- taking its roots as they are, with no scan and no hashing, so the same tree is never stored twice (objects are content-addressed; the same metadata gives the same commit id). A restore takes a checkpoint of source `recovery` first, so what it replaced can be restored in turn. A checkpoint from a warm engine is an incremental persisted snapshot: a directory the watcher did not report is reused only if its tree is already in the store (and, like any incremental snapshot, it can miss a change made within the watcher's latency); a commit's snapshot is always Full.
+
+**The commit object** is LG-01's canonical commit: root (the effective root), `disk-root` when unsaved documents made it differ, parents, workspace, author (name and id), time (milliseconds and minutes east of UTC, for display), source, `meta snapshot 1`, `metaobj overlays <id>` when there was an overlay set, and the message (not empty, no NUL, at most 64 KiB).
+
+**HEAD.** Until branches exist (LG-04) history is one line. HEAD names `refs/heads/main`, unborn until the first commit; each commit's first parent is the HEAD it was made on. HEAD moves by LG-01's compare-and-swap with the reflog written first, after the commit object is published (synced, renamed into place): after a crash HEAD is the old commit or the new one, both complete, and an interrupted move is reported and never finished on its own (crash-tested at every durable boundary).
+
+**History** is a walk along first parents from HEAD (or a cursor), newest first, deterministic (order comes from parents, never from times), in pages (`limit`, `next`). A commit that cannot be read ends the page with the reason (`MissingObject`, `CorruptObject`), never skipped. Each item has the id, a 12-character short id, message and summary, time, author, parents, source and roots. A commit's tree can be listed directory by directory, with sizes (from the segment index, nothing read), link kinds, empty directories and unstored large files as such.
+
+**Diff** (`diff.rs`) compares commit to commit, or a commit (HEAD by default) to the workspace as the user has it -- an ephemeral LG-02 snapshot with the unsaved documents, never a second scanner, and nothing saved. Which paths changed comes from status's tree comparison (equal subtrees skipped, so identical commits cost nothing; added, deleted, modified, type-changed, and exact-content renames paired deterministically). Each file gets a line diff in structured hunks (`oldStart`, `oldLines`, `newStart`, `newLines`, lines of `context`/`addition`/`deletion` with their line numbers; a Myers diff, three lines of context), suited to Monaco's diff editor later. There is none for a binary side (a NUL in the first 8 KiB, or not UTF-8), for content that is unavailable -- `notStored` (over the limit when recorded: **its historical content is never read from disk in its place**), `missing`, `changedOnDisk` (a workspace file that changed after the snapshot) -- or beyond the size (2 MiB a file) and total (32 MiB) budgets.
+
+**Restore** makes the workspace match a commit: all of it, or one path. It never goes _scan, change, discover more_:
+
+1. **Snapshot** (Full, persisted) with the unsaved documents.
+2. **Plan** (`restore.rs`, in the crate, writing nothing): the ordered operations -- removals deepest first, then folders shallowest first, then files and links -- each naming the state the plan saw at its path; and every conflict.
+3. **Refuse** if there is any conflict, before anything is touched:
+
+| Conflict                                                          | Meaning                                                                                                        |
+| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `dirtyDocumentWouldBeOverwritten` / `dirtyDocumentWouldBeDeleted` | a document with unsaved changes would lose them (default policy `refuseIfDirty`)                               |
+| `historicalContentUnavailable`                                    | the commit's content was never stored (over 20 MiB) or is missing -- the whole restore fails before any change |
+| `currentContentNotStored`                                         | a file over 20 MiB would be replaced or removed, and no checkpoint can keep it                                 |
+| `currentStateUnknown`                                             | the snapshot could not read a path in scope                                                                    |
+| `caseOnlyRename`                                                  | the disk and the commit spell a name differently only in case (Windows)                                        |
+| `pathBlocked`, `targetUnavailable`                                | a single-path restore needs a folder where a file is; the path or folder is not in the commit                  |
+| `diskChangedSinceSnapshot`                                        | found at the last moment: a path no longer holds what the plan saw                                             |
+| `wouldRemoveUntracked`                                            | a folder to remove holds something snapshots leave out (a nested `.git`, `node_modules`): never deleted        |
+| `linkNotRestorable`                                               | this system cannot create the link (Windows symbolic links need Developer Mode)                                |
+
+With policy `replaceDocument` -- the user's explicit choice, never the default -- the two document conflicts become document actions instead. 4. **Checkpoint** the workspace (source `recovery`), so the restore can be undone. 5. **Execute** (`src-tauri/src/localgit_restore.rs`): every path is checked again against what the plan saw, every folder on the way must be a real folder (never a link: nothing is written through a junction out of the workspace), and link creation is tried in a scratch folder -- any failure refuses, untouched. Then **one Module 03 operation** of kind `restore`, whose Module 04 intent records one effect per path (its state before and after: a file's exact bytes, a folder, a link, nothing) plus each file's temporary file. Each file is written beside itself and renamed into place (old bytes or new, never half); junctions are created with their reparse point, never by a process; links are removed as links. The last point of cancellation is before the intent is recorded; the command also checks there that its workspace is still the window's. 6. **Verify** with a Full snapshot: the disk tree (or the restored path) must equal the commit's. Otherwise the result is `verificationFailed`, never success. 7. **Reconcile documents** (the window, `OverlayTracker.reconcileRestore`): documents the user chose to replace are reloaded or closed with their edits discarded (`reload`/`close` with `discard`); every change is given to `applyResourceChanges`, so clean documents follow the disk; then each restored file's open document is confirmed to show the disk. A failure is reported (`succeeded: false`), never passed over.
+
+A restore that fails partway (a disk error) reports how many operations were done and never claims success. A crash partway leaves the Module 04 record; the next start settles it as a whole -- `completed`, `notApplied`, or `partial` (reported in Recovery, nothing replayed or undone) -- as for any file operation. After a restore, status against the restored commit is clean for what was restored.
+
+**Isolation and concurrency.** Every command goes through the workspace's handle; leaving the workspace revokes it, cancels its jobs and refuses their results (`HandleClosed`), and the window drops a late answer (`LocalGitClosedError`) before touching any document. A restore planned for workspace A only ever touches A's folders, and checks right before changing anything that A is still the window's workspace. Checkpoints, commits and restores of a store are serialized: a second while one runs is refused (`Busy`), never queued. Reads (history, diffs, trees) go on. A second Yavin process is read-only: it can read history and diff, and cannot checkpoint, commit or restore.
+
+**Real Git** is untouched: no `git` is run, `.git` is never snapshotted, planned, written or removed (a folder holding one is never removed), and tests prove `.git` (every file's bytes and time), Git's HEAD, index and `git status` are unchanged by checkpoints, commits, diffs and restores -- restore changes the working tree, and Git sees exactly that.
+
+**Performance** (release, idle development machine, `cargo test -p ide-localgit --release --test history_scale -- --ignored --nocapture --test-threads=1`):
+
+|                                                            | 10k files | 100k files | Target                                     |
+| ---------------------------------------------------------- | --------- | ---------- | ------------------------------------------ |
+| first checkpoint (everything stored)                       | 1.73 s    | 10.6 s     |                                            |
+| checkpoint after 3 changed files (incremental, warm)       | 130 ms    | 118 ms     | < 150 ms                                   |
+| commit from that checkpoint (object + HEAD move)           | 56 ms     | 47 ms      | < 100 ms                                   |
+| diff of identical commits                                  | 1.3 ms    | 1.3 ms     | near zero                                  |
+| diff of commits 3 files apart, with line diffs             | 6.4 ms    | 8.4 ms     |                                            |
+| restore plan for 10 changed files (Full snapshot included) | 0.58 s    | 1.14 s     | proportional to changes, plus the snapshot |
+
+History over 10,000 commits: the first page of 100 in 24.5 ms; all 10,000, in pages of 500, in 1.26 s (0.13 ms a commit, each read and re-hashed). The commit and HEAD move are dominated by the reflog's and `refs.json`'s syncs to disk.
+
+**Not yet** (later phases): staging, branches and tags (LG-04); reset, revert and stash (LG-05); merge and cherry-pick (LG-06); AI checkpoints and Undo AI Run (LG-07); any UI (LG-08); comparison with real Git, GC, compaction, compression and a recovery UI (LG-09).
 
 **Invariants**
 
@@ -975,6 +1035,10 @@ sorted, with fields `%XX`-escaped as commit headers are, so the same overlays al
 8. What a snapshot records never depends on Git's ignore rules or configuration.
 9. An incremental snapshot is an optimisation: it gives the Full answer, and anything uncertain makes the scan Full.
 10. A file that could not be read reliably is carried forward or left out, and always reported -- never recorded as deleted, never recorded inconsistent.
+11. HEAD only ever names a complete commit; a checkpoint never moves it.
+12. A restore is planned completely, and refused on any conflict, before anything changes; unsaved documents are never overwritten or deleted unless the user chose to replace them.
+13. A restore changes the disk only as one recorded file operation, never through a link, never removing what snapshots leave out; it is verified, never assumed.
+14. Historical content that was never stored is never invented, read from disk in its place, or skipped silently.
 
 ## Explorer provider platform
 

@@ -439,6 +439,18 @@ impl<'r> Walk<'_, 'r> {
                 _ => return Ok(None),
             }
         }
+        // Persisting, every entry kept as it was must already be stored.
+        let targeted: std::collections::HashSet<usize> =
+            targets.iter().map(|(at, _)| *at).collect();
+        if self.sink.is_some()
+            && base
+                .entries()
+                .iter()
+                .enumerate()
+                .any(|(at, entry)| !targeted.contains(&at) && !self.can_carry(entry))
+        {
+            return Ok(None);
+        }
         let Ok(inner) = self.rules_in(abs, rel, rules, None) else {
             return Ok(None);
         };
@@ -634,12 +646,15 @@ impl<'r> Walk<'_, 'r> {
                             dirty.map(|node| node.children.get(&name_key(name.as_str())));
                         let previous_dir =
                             previous.filter(|entry| entry.kind == EntryKind::Directory);
-                        // Incremental and nothing changed below it: taken as it was, unopened.
+                        // Incremental and nothing changed below it: taken as it was, unopened
+                        // (persisting, only if it is already stored).
                         if let (Some(None), Some(entry)) = (child_dirty, previous_dir.as_ref()) {
-                            self.counters
-                                .reused_directories
-                                .fetch_add(1, Ordering::Relaxed);
-                            return Ok(Some(entry.clone()));
+                            if self.sink_has(&entry.id) {
+                                self.counters
+                                    .reused_directories
+                                    .fetch_add(1, Ordering::Relaxed);
+                                return Ok(Some(entry.clone()));
+                            }
                         }
                         let child_base = previous_dir
                             .as_ref()
