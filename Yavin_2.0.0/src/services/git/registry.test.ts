@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { chooseActiveWorktree, GitRegistry, gitRegistry } from "./registry.ts";
+import { chooseActiveWorktree, GitRegistry } from "./registry.ts";
 import type { RepoEntry, RepositoryEntry } from "./registry.ts";
 import type { WorktreeStatus } from "./backend.ts";
 import { nativeCalls, overrideNative, realRepo, resetNativeOverrides } from "./testing/realGit.ts";
+
+/** A registry of its own for the tests that need no storage (the app makes one per workspace). */
+const gitRegistry = new GitRegistry({ storageKey: null });
 
 /** Lets any rejection that was left unhandled reach `process`'s `unhandledRejection`. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 60));
@@ -378,6 +381,85 @@ test("a worktree whose .git link is removed is invalid, and ready again once it 
   } finally {
     storage.restore();
     rmSync(linked, { recursive: true, force: true });
+    r.dispose();
+  }
+});
+
+test("each workspace remembers its own repositories; the old shared list is adopted once", async () => {
+  const storage = withStorage();
+  const r = realRepo();
+  try {
+    storage.data.set(
+      "yavin.git.repos",
+      JSON.stringify({
+        schemaVersion: 1,
+        repositories: [{ commonDirHint: "x", worktrees: [r.root] }],
+      }),
+    );
+    const a = new GitRegistry({ storageKey: "yavin.git.repos:A", adoptFrom: "yavin.git.repos" });
+    await a.restore();
+    assert.deepEqual(
+      a.getSnapshot().repos.map((w) => w.root.replaceAll("\\", "/")),
+      [r.root.replaceAll("\\", "/")],
+      "the first workspace adopts the shared list",
+    );
+    assert.ok(storage.data.has("yavin.git.repos:A"));
+    assert.equal(storage.data.get("yavin.git.repos"), undefined, "and it is nobody's any more");
+
+    const b = new GitRegistry({ storageKey: "yavin.git.repos:B", adoptFrom: "yavin.git.repos" });
+    await b.restore();
+    assert.deepEqual(b.getSnapshot().repos, [], "another workspace starts with its own, empty");
+    a.dispose();
+    b.dispose();
+  } finally {
+    storage.restore();
+    r.dispose();
+  }
+});
+
+test("disposing a workspace's registry closes its repositories, stops their watchers and keeps what it remembered", async () => {
+  const storage = withStorage();
+  const r = realRepo();
+  try {
+    const registry = new GitRegistry({ storageKey: "yavin.git.repos:A" });
+    const entry = await registry.open(r.root, { makeActive: true });
+    assert.ok(entry);
+    const remembered = storage.data.get("yavin.git.repos:A");
+    let notified = 0;
+    registry.subscribe(() => notified++);
+    const before = nativeCalls.length;
+
+    registry.dispose();
+    assert.ok(registry.isDisposed);
+    assert.deepEqual(registry.getSnapshot().repos, [], "nothing of it is visible any more");
+    assert.equal(registry.getSnapshot().activeRepoId, null);
+    assert.equal(notified, 1, "holders were told once, and then let go");
+    await settle();
+    assert.ok(
+      nativeCalls.slice(before).some((call) => call.command === "git_unwatch_repo"),
+      "its watcher was stopped",
+    );
+    assert.equal(storage.data.get("yavin.git.repos:A"), remembered, "remembered for next time");
+
+    // Late work of the workspace that went changes nothing.
+    assert.equal(await registry.open(r.root, { makeActive: true }), null);
+    assert.deepEqual(registry.getSnapshot().repos, []);
+    assert.equal(notified, 1);
+  } finally {
+    storage.restore();
+    r.dispose();
+  }
+});
+
+test("a repository still opening when its workspace goes is closed, not added", async () => {
+  const r = realRepo();
+  try {
+    const registry = new GitRegistry({ storageKey: null });
+    const opening = registry.open(r.root, { makeActive: true });
+    registry.dispose();
+    assert.equal(await opening, null);
+    assert.deepEqual(registry.getSnapshot().repos, []);
+  } finally {
     r.dispose();
   }
 });

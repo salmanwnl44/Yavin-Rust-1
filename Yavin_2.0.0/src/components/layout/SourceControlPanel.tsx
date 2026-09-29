@@ -4,9 +4,15 @@ import { divergence } from "../../services/git/parsers/branch";
 import type { GitEntry } from "../../services/git/parsers/status";
 import type { GitOperation } from "../../services/git/backend";
 import { cloneRepository as cloneRepositoryFlow } from "../../services/git/clone";
-import { gitRegistry } from "../../services/git/registry";
 import { containsPath, relativePath as relativeTo } from "../../services/resource";
-import { useActiveRepo, useGitRegistry, useRepoSnapshot } from "../../services/git/hooks";
+import { useWorkspace } from "../../services/workspaces";
+import { workspaceIdOf } from "../../services/workspaceManager";
+import {
+  useActiveRepo,
+  useGitRegistry,
+  useGitRegistryInstance,
+  useRepoSnapshot,
+} from "../../services/git/hooks";
 import { useGitRevision } from "../../services/git/revision";
 import { guardedAffecting } from "../../services/git/sync";
 import type { RefreshField } from "../../services/git/store";
@@ -162,6 +168,12 @@ export function SourceControlPanel({
   // Subscribed here rather than taken as a prop: a counter held by the root component
   // re-rendered the whole window every time anything asked Git to look again.
   const revision = useGitRevision();
+  // The workspace's own registry: opening another folder gives the panel another one.
+  const gitRegistry = useGitRegistryInstance();
+  // The workspace switches before this panel's `workspace` prop does: until they agree, the
+  // folder is the old workspace's and must not be opened into the new one's registry.
+  const workspaceId = useWorkspace().id;
+  const ownFolder = !!workspace && workspaceIdOf([workspace]) === workspaceId;
   const registrySnapshot = useGitRegistry();
   const activeRepo = useActiveRepo();
   const snapshot = useRepoSnapshot(activeRepo?.store);
@@ -256,29 +268,25 @@ export function SourceControlPanel({
     };
   }, []);
 
-  // Restoring persisted repos and tracking the open workspace folder are both
-  // idempotent against the shared registry, so this runs safely on every mount.
-  useEffect(() => {
-    void gitRegistry.restore();
-  }, []);
-
   useEffect(() => {
     let cancelled = false;
     setWorkspaceError("");
-    if (!workspace) return;
+    if (!workspace || !ownFolder) return;
     // Registers the workspace's repository without stealing focus from whichever
     // repository the user has already selected in the switcher -- `open()` still
     // activates it when nothing is active yet (e.g. on first load), matching
     // `GitRegistry.openNew`'s own default-activation rule. See the Repository &
     // Worktree Architecture plan's Gap 1: Explorer navigation must never silently
     // reassign the active repository once the user has made an explicit choice.
+    // The workspace restores its repositories and opens its folder's itself
+    // (`services/workspaces.ts`); this is the same open, joined, for its error.
     gitRegistry.open(workspace).catch((error) => {
       if (!cancelled) setWorkspaceError(String(error));
     });
     return () => {
       cancelled = true;
     };
-  }, [workspace]);
+  }, [gitRegistry, workspace, ownFolder]);
 
   useEffect(() => {
     callbacks.current.onEntries(workspaceSnapshot?.entries ?? []);

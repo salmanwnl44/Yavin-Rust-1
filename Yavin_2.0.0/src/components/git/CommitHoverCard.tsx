@@ -30,7 +30,9 @@ const cache = new Map<string, Promise<CardData>>();
 const CACHE_LIMIT = 100;
 
 function load(repository: Repository, fullHash: string): Promise<CardData> {
-  const known = cache.get(fullHash);
+  // Per repository: the same commit in two clones has each one's own remote link.
+  const key = `${repository.repoId}\n${fullHash}`;
+  const known = cache.get(key);
   if (known) return known;
   const pending = Promise.all([
     repository.commitDetails(fullHash).catch(() => ""),
@@ -46,7 +48,7 @@ function load(repository: Repository, fullHash: string): Promise<CardData> {
       remote,
     };
   });
-  cache.set(fullHash, pending);
+  cache.set(key, pending);
   if (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value!);
   return pending;
 }

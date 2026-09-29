@@ -72,7 +72,6 @@ import { createExplorerStore } from "./services/explorerStore";
 import {
   buildDecorations,
   bumpGitRevision,
-  gitRegistry,
   guardedAffecting,
   sameDecorations,
   useActiveRepo,
@@ -96,6 +95,7 @@ import type { LanguageFeaturesHost } from "./editor/lspMonaco";
 import type { EditorRange } from "./editor/editorTypes";
 import type { PaletteSymbol, SymbolScope } from "./components/command-palette/CommandPalette";
 import { clearProblems, publishProblems } from "./services/panel/problems";
+import { currentGit, useWorkspace, workspaces } from "./services/workspaces";
 import { fileUri } from "./services/resource";
 import { loadMinimapPreferences, saveMinimapPreferences } from "./services/minimapPreferences";
 import type { MinimapPreferences } from "./services/minimapPreferences";
@@ -450,6 +450,10 @@ export default function App() {
   const loadWorkspace = useCallback(
     async (target: string) => {
       const revision = workspaceRevision.current;
+      // The workspace itself first: the one left is disposed -- its Git repositories closed,
+      // their watchers and polling stopped -- before anything of the new one exists.
+      await workspaces.open([target]);
+      if (revision !== workspaceRevision.current) return;
       explorer.setRoots([target]);
       await explorer.loadChildren(explorer.idFor(target));
       // A folder opened while this listing was in flight owns the window now. Setting the
@@ -906,6 +910,8 @@ export default function App() {
     setPendingHit(null);
     documents.reset();
     views.clear();
+    // Problems were about the folder left (a language server clears its own as it stops).
+    clearProblems();
     setTabs([WELCOME_TAB]);
     setActiveTabId("welcome");
     setRecentFiles([]);
@@ -1110,6 +1116,8 @@ export default function App() {
   ).current;
   lspRef.current = lsp;
   const lspRevision = useSyncExternalStore(lsp.subscribe, lsp.revision);
+  /** The workspace in the window (`services/workspaces.ts`): what its services belong to. */
+  const workspace = useWorkspace();
   /**
    * The symbols of the document in front, for the Outline and the breadcrumbs: asked of its
    * server when it comes to the front, and again a moment after each edit.
@@ -1580,7 +1588,9 @@ export default function App() {
 
   const handleHunkAction = async (action: "stage" | "unstage" | "discard", hunkIndex: number) => {
     if (!diff?.repoId || !diff.kind) return;
-    const entry = gitRegistry.getSnapshot().repos.find((r) => r.repoId === diff.repoId);
+    const entry = currentGit()
+      .getSnapshot()
+      .repos.find((r) => r.repoId === diff.repoId);
     if (!entry) return;
     const repo = entry.store.repository;
     const targetPath = diff.path;
@@ -2699,6 +2709,9 @@ export default function App() {
             {wasTerminalOpened && (
               <Suspense fallback={null}>
                 <TerminalPanel
+                  // One panel per workspace: leaving a folder closes its shells (each
+                  // terminal's cleanup ends its process) and a new one starts in the next.
+                  key={workspace.id}
                   hidden={!isTerminalOpen}
                   onClose={() => setIsTerminalOpen(false)}
                   isMaximized={isTerminalMaximized}

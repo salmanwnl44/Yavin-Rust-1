@@ -1,4 +1,3 @@
-import { gitRegistry } from "../git/registry.ts";
 import type { RepoEntry } from "../git/registry.ts";
 import { parseCommitDetails, parseGraphLog } from "../git/parsers/log.ts";
 import type { CommitDetailedInfo, RawCommit } from "../git/parsers/log.ts";
@@ -28,7 +27,7 @@ function truncate(text: string): { text: string; truncated: boolean } {
  * existing `Repository`/`RepoStore` methods -- no Git process is spawned here and
  * nothing in this file imports the native `git_exec` bridge.
  */
-export function createGitReadTools(registry: WorktreeRegistry = gitRegistry) {
+export function createGitReadTools(registry: WorktreeRegistry) {
   const withEntry = async <T>(
     ref: WorktreeRef,
     work: (entry: RepoEntry) => Promise<T> | T,

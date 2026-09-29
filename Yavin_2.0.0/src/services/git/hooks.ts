@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
-import { gitRegistry } from "./registry.ts";
 import type { RepoEntry } from "./registry.ts";
+import { currentGit, useWorkspace } from "../workspaces.ts";
 import type { RepoSnapshot, RepoStore } from "./store.ts";
 import { GraphLoader } from "./graph/incremental.ts";
 import type { GraphScope, GraphSnapshot } from "./graph/incremental.ts";
@@ -10,8 +10,14 @@ import type { Repository } from "./repository.ts";
 const EMPTY_SUBSCRIBE = () => () => {};
 const NO_SNAPSHOT = () => null;
 
+/** The Git registry of the workspace in the window: another folder, another registry. */
+export function useGitRegistryInstance() {
+  return useWorkspace().services.git;
+}
+
 export function useGitRegistry() {
-  return useSyncExternalStore(gitRegistry.subscribe, gitRegistry.getSnapshot);
+  const registry = useGitRegistryInstance();
+  return useSyncExternalStore(registry.subscribe, registry.getSnapshot);
 }
 
 export function useActiveRepo(): RepoEntry | null {
@@ -67,7 +73,7 @@ const NO_GRAPH_SNAPSHOT = () => EMPTY_GRAPH_SNAPSHOT;
  * finishes attaching a newly-opened worktree to its `RepositoryEntry`).
  */
 function graphLoaderKey(repository: Repository): string {
-  return gitRegistry.repositoryFor(repository.repoId)?.repositoryId ?? repository.repoId;
+  return currentGit().repositoryFor(repository.repoId)?.repositoryId ?? repository.repoId;
 }
 
 /**

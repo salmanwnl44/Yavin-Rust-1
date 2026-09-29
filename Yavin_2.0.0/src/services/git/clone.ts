@@ -1,5 +1,5 @@
 import { native } from "../native";
-import { gitRegistry } from "./registry";
+import { currentGit } from "../workspaces";
 import type { DialogRequest } from "../../components/ui/AppDialog";
 
 /**
@@ -51,7 +51,7 @@ export function cloneRepository(
           // Reported by the dialog itself (it renders a thrown error), so a failed clone
           // explains itself instead of closing as though it had worked.
           const info = await native("git_clone_repo", { parent, url: trimmed, folder: name });
-          await gitRegistry.open(info.root, { makeActive: true });
+          await currentGit().open(info.root, { makeActive: true });
           onCloned?.(info.root);
         },
       });

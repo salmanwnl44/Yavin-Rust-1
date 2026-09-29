@@ -692,6 +692,48 @@ Everything is checked before anything changes: every target resolves, every vers
 6. Stale LSP results cannot overwrite newer document state.
 7. Language servers cannot bypass Yavin's trust and security controls: fixed command lines, trusted folders only, advertised commands only.
 
+## Workspace lifecycle
+
+A workspace is the folder (later, folders) a window has open, and everything that belongs to it. Opening another folder must leave nothing of the one left behind active: the bug that motivated this was Source Control still showing folder A's repository after folder B was opened, because the Git registry was one object for the whole application, remembered one list for every folder, and deliberately left the active repository alone when a folder was opened.
+
+```text
+WorkspaceManager (services/workspaceManager.ts; the window's instance: services/workspaces.ts)
+      │ open(folders)
+      v
+WorkspaceContext { id, folders, services, signal, own() }
+      │ services: Git registry                     │ window state reset on the same switch:
+      │   repositories, .git watchers, polling,    │   documents, editor views, tabs, Explorer,
+      │   active repository, remembered list       │   Problems, terminals (App.tsx)
+      v
+disposed completely before the next context exists
+```
+
+| Owner             | Owns                                                                               |
+| ----------------- | ---------------------------------------------------------------------------------- |
+| Workspace manager | which workspace is open; creating and disposing its context; the order of a switch |
+| Workspace context | the workspace's identity, folders and services; cleanups it has been given (`own`) |
+| Git registry      | that workspace's repositories, watchers, active repository and remembered list     |
+| The window        | its own per-workspace UI state, reset or remounted on the same switch              |
+
+**Identity.** `WorkspaceId` is the folders' `ResourceId`s, so every spelling of a path is one workspace; the window with no folder is the empty workspace.
+
+**Switching.** `open(folders)` with the same folders keeps the workspace as it is. Other folders dispose the current context completely -- its services first, then everything it owns, newest first, each failure logged and never stopping the rest -- and only then create the next. Opening quickly A → B → C disposes A once, never creates B, and answers every caller with C. Every way into a folder (startup, the default workspace, Open Folder, the recent list) goes through `loadWorkspace`, which opens the workspace before the Explorer lists anything.
+
+**Late work.** The context's `signal` is aborted and its `state` leaves `active` when it is disposed. A disposed Git registry is inert: it shows no repositories, persists and notifies nothing, and a repository that finishes opening after its workspace went is closed rather than added. Nothing an old workspace started can change the new one.
+
+**Git.** One registry per workspace. It restores what was remembered for that workspace (`yavin.git.repos:<WorkspaceId>`) and opens the workspace folder's own repository; the active repository is the one remembered for that workspace, else the folder's. Leaving the workspace closes every repository, stops its `.git` watcher and drops its shared commit graph; what was remembered is kept for the next time. The list every folder shared before (`yavin.git.repos`) is adopted by the first workspace opened after the upgrade and then removed, so it cannot seed another. The window with no folder remembers nothing. Watcher events, guarded operations, cloning and the commit graph resolve the workspace in front (`currentGit()`); the AI Git tools take the registry of the workspace they were made for, with no global default. The commit hover card caches per repository, so two clones of one project never show each other's remote.
+
+**The window's own state.** On the same switch the window resets documents, editor views, tabs, the Explorer and Problems (a language server clears its own diagnostics as it stops), and remounts the terminal panel per workspace: each terminal's cleanup ends its shell, and the new folder's first terminal starts in it. Language servers follow the Explorer's roots (see [Language servers](#language-servers-lsp-platform)).
+
+**Not yet workspace-scoped** (later modules): suspending a workspace so A → B → A keeps A's services alive; a SessionManager persisting per-workspace state beyond tabs and the Explorer (Git selection is already per workspace); dirty-document backup; multi-root folders; `.yavin/` project metadata; an `ActiveResourceContext` for command targets. The Output channels are application-wide logs.
+
+**Invariants**
+
+1. No project-specific service is application-global: each belongs to one workspace context.
+2. A workspace is fully disposed before the next one is created.
+3. Work that finishes after its workspace was disposed changes nothing.
+4. What a workspace remembers is stored under its own identity, never shared with another.
+
 ## Explorer provider platform
 
 The Explorer is a projection of the filesystem, never a store of filesystem truth. `src/services/explorerProvider.ts` holds what has been listed; `src/services/explorerStore.ts` holds what the user did to the view; the existing tree view (`Sidebar`, `TreeRow`) renders the one and reads and writes the other.

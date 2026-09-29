@@ -1,4 +1,3 @@
-import { gitRegistry } from "../git/registry.ts";
 import type { RepoEntry } from "../git/registry.ts";
 import type { RepoSnapshot } from "../git/store.ts";
 import { guardedAffecting } from "../git/sync.ts";
@@ -79,10 +78,11 @@ const pre = (message: string): ToolFailure => fail("precondition", message);
 export function createGitMutatingTools(options: {
   /** Whether any editor has unsaved changes -- only the host application knows. */
   isDirty: () => boolean;
-  registry?: WorktreeRegistry;
+  /** The workspace's Git registry: the tools act on its repositories and no others. */
+  registry: WorktreeRegistry;
   guard?: Guard;
 }) {
-  const registry = options.registry ?? gitRegistry;
+  const registry = options.registry;
   const guard: Guard = options.guard ?? guardedAffecting;
 
   async function run(

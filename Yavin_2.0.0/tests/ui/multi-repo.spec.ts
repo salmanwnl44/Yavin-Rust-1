@@ -215,39 +215,65 @@ test("removing a repository from the switcher stops tracking it", async ({ page 
   await expect(region.getByRole("group", { name: "other" })).toHaveCount(0);
 });
 
-test("opening a different workspace folder does not steal the active repository", async ({
+test("opening another folder shows only its repositories; going back brings the first's back", async ({
   page,
 }) => {
+  // The original bug: open folder A, then folder B, and Source Control still showed A.
   const region = await panel(page, {
     workspace: "/work",
     repos: {
       "/work": repo("main", " M a.ts\0"),
+      "/extra": repo("extra-branch"),
       "/other": repo("feature", " M b.ts\0"),
     },
+    pick: "/extra",
   });
-  // Nothing had been selected yet, so the workspace's own repository became active
-  // on load.
   await expect(region.getByRole("group", { name: "work" })).toContainText("main");
+  // A repository added to this workspace by hand, which becomes the active one.
+  await region.getByTitle("Add Repository Folder").click();
+  await expect(region.getByRole("group", { name: "extra" })).toBeVisible();
 
-  await page.evaluate(() => {
-    (window as unknown as { __openFolder?: string }).__openFolder = "/other";
-  });
-  await page.getByRole("menubar").getByRole("menuitem", { name: "File", exact: true }).click();
-  await page
-    .getByRole("menu", { name: "File", exact: true })
-    .getByRole("menuitem", { name: "Open Folder…", exact: true })
-    .click();
+  const openFolder = async (path: string) => {
+    await page.evaluate((folder) => {
+      (window as unknown as { __openFolder?: string }).__openFolder = folder;
+    }, path);
+    await page.getByRole("menubar").getByRole("menuitem", { name: "File", exact: true }).click();
+    await page
+      .getByRole("menu", { name: "File", exact: true })
+      .getByRole("menuitem", { name: "Open Folder…", exact: true })
+      .click();
+  };
+  const branchesOffered = async () => {
+    await region.getByTitle("Branches and remotes").click();
+    const options = await region.getByLabel("Switch branch").getByRole("option").allTextContents();
+    await region.getByTitle("Branches and remotes").click();
+    // The placeholder is not a branch.
+    return options.map((option) => option.trim()).filter((option) => option !== "Choose branch");
+  };
+  const unwatched = () =>
+    page.evaluate(
+      () =>
+        (window as unknown as { __calls: { command: string }[] }).__calls.filter(
+          (call) => call.command === "git_unwatch_repo",
+        ).length,
+    );
 
-  // The new workspace's repository is registered and shown in the switcher...
+  await openFolder("/other");
+  // Only the new folder's repository, and it is the active one.
   await expect(region.getByRole("group", { name: "other" })).toBeVisible();
-  // ...but the previously active repository is left alone: its own row still shows
-  // its branch, and the active repo's branch drawer still lists only its branch,
-  // not the newly-opened repository's.
-  await expect(region.getByRole("group", { name: "work" })).toContainText("main");
-  await region.getByTitle("Branches and remotes").click();
-  const branchSelect = region.getByLabel("Switch branch");
-  await expect(branchSelect.getByRole("option", { name: "main" })).toHaveCount(1);
-  await expect(branchSelect.getByRole("option", { name: "feature" })).toHaveCount(0);
+  await expect(region.getByRole("group", { name: "work" })).toHaveCount(0);
+  await expect(region.getByRole("group", { name: "extra" })).toHaveCount(0);
+  await expect.poll(branchesOffered).toEqual(["feature"]);
+  // The folder left no longer watches its repositories.
+  await expect.poll(unwatched).toBe(2);
+
+  // Back: the first folder's repositories, with the one chosen by hand still active.
+  await openFolder("/work");
+  await expect(region.getByRole("group", { name: "work" })).toBeVisible();
+  await expect(region.getByRole("group", { name: "extra" })).toBeVisible();
+  await expect(region.getByRole("group", { name: "other" })).toHaveCount(0);
+  await expect.poll(branchesOffered).toEqual(["extra-branch"]);
+  await expect.poll(unwatched).toBe(3);
 });
 
 test("a pre-worktree persisted repository list is restored and migrated on read", async ({
@@ -270,7 +296,9 @@ test("a pre-worktree persisted repository list is restored and migrated on read"
   await expect(region.getByRole("group", { name: "other" })).toBeVisible();
 
   // Restoring rewrote the persisted value under the versioned schema.
-  const persisted = await page.evaluate(() => localStorage.getItem("yavin.git.repos"));
+  // Adopted by the workspace: remembered under its own key, and the shared one is gone.
+  const persisted = await page.evaluate(() => localStorage.getItem("yavin.git.repos:file:///work"));
+  expect(await page.evaluate(() => localStorage.getItem("yavin.git.repos"))).toBeNull();
   const parsed = JSON.parse(persisted ?? "null");
   expect(parsed.schemaVersion).toBe(1);
   expect(parsed.repositories).toHaveLength(2);

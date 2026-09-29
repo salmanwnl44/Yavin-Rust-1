@@ -1,4 +1,4 @@
-import { gitRegistry } from "./registry.ts";
+import { currentGit } from "../workspaces.ts";
 import type { RepoEntry, RepositoryEntry } from "./registry.ts";
 import type { RefreshField } from "./store.ts";
 import { resetSharedGraphLoader } from "./hooks.ts";
@@ -256,7 +256,7 @@ export async function guardedAffecting(
     entry.store.getSnapshot().operationInProgress,
   );
 
-  const repository = gitRegistry.repositoryFor(entry.repoId);
+  const repository = currentGit().repositoryFor(entry.repoId);
   if (repository && effects.siblingFields) {
     for (const sibling of repository.worktrees) {
       if (sibling !== entry) void sibling.store.refresh(effects.siblingFields);
@@ -304,7 +304,7 @@ const PER_WORKTREE_KINDS: ReadonlySet<GitChangeEvent["kind"]> = new Set([
  * refreshes exactly the worktree(s) and fields `WATCHER_INVALIDATES` says can
  * have gone stale, and resets the repository's shared graph if warranted. Split
  * out from `handleGitChangeEvent` (which resolves `event.repositoryId` against
- * the real `gitRegistry` singleton) purely so this routing logic -- given a
+ * the workspace's registry) purely so this routing logic -- given a
  * `RepositoryEntry`, do the right thing -- can be exercised directly in a test
  * with duck-typed fake worktrees, the same convention `store.test.ts` already
  * uses for a fake `Repository`, without needing the real registry populated.
@@ -331,7 +331,8 @@ export function applyGitChangeEvent(repository: RepositoryEntry, event: GitChang
  * likewise a silent no-op, handled inside `applyGitChangeEvent`.
  */
 export function handleGitChangeEvent(event: GitChangeEvent): void {
-  const repository = gitRegistry.repositoryById(event.repositoryId);
+  // Only the workspace in the window has watchers; another's were stopped when it went.
+  const repository = currentGit().repositoryById(event.repositoryId);
   if (repository) applyGitChangeEvent(repository, event);
 }
 

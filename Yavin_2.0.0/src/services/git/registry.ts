@@ -69,9 +69,20 @@ interface RegistrySnapshot {
 
 const STORAGE_KEY = "yavin.git.repos";
 
-function readPersisted(): PersistedGitState {
+export interface GitRegistryOptions {
+  /** Where the open repositories are remembered; null remembers them nowhere. */
+  storageKey?: string | null;
+  /**
+   * A key read when `storageKey` has nothing yet, and removed once `storageKey` is written:
+   * how the list every folder shared before workspaces had their own is adopted, once.
+   */
+  adoptFrom?: string;
+}
+
+function readPersisted(key: string, adoptFrom?: string): PersistedGitState {
   try {
-    return parsePersistedState(localStorage.getItem(STORAGE_KEY));
+    const own = localStorage.getItem(key);
+    return parsePersistedState(own ?? (adoptFrom ? localStorage.getItem(adoptFrom) : null));
   } catch {
     return { schemaVersion: 1, repositories: [] };
   }
@@ -134,14 +145,34 @@ export function chooseActiveWorktree(
  * the main workspace folder) and is reachable from the repo switcher, the status
  * bar, and the activity bar badge alike.
  */
+const EMPTY_SNAPSHOT: RegistrySnapshot = {
+  repos: [],
+  repositories: [],
+  activeRepoId: null,
+  activeRepositoryId: null,
+  activeWorktreePath: null,
+};
+
+/**
+ * The Git repositories of one workspace (`services/workspaces.ts` makes one per workspace and
+ * disposes it with the workspace): which are open, which one is active, their watchers, and
+ * the list remembered for the workspace.
+ */
 export class GitRegistry {
-  private snapshot: RegistrySnapshot = {
-    repos: [],
-    repositories: [],
-    activeRepoId: null,
-    activeRepositoryId: null,
-    activeWorktreePath: null,
-  };
+  private snapshot: RegistrySnapshot = EMPTY_SNAPSHOT;
+  private readonly storageKey: string | null;
+  private readonly adoptFrom: string | undefined;
+  /** Set by `dispose`: nothing may change, persist or notify after it. */
+  private disposed = false;
+
+  constructor(options: GitRegistryOptions = {}) {
+    this.storageKey = options.storageKey === undefined ? STORAGE_KEY : options.storageKey;
+    this.adoptFrom = options.adoptFrom;
+  }
+
+  get isDisposed(): boolean {
+    return this.disposed;
+  }
   private listeners = new Set<() => void>();
   private opening = new Map<string, Promise<RepoEntry | null>>();
   private restorePromise: Promise<void> | null = null;
@@ -163,6 +194,7 @@ export class GitRegistry {
     repositories: RepositoryEntry[],
     active: { repositoryId: string | null; worktreePath: string | null },
   ) {
+    if (this.disposed) return;
     const repos = flatten(repositories);
     const activeWorktree = repos.find((r) => r.root === active.worktreePath) ?? null;
     this.snapshot = {
@@ -182,11 +214,13 @@ export class GitRegistry {
    * active selection themselves.
    */
   private notifyChange(): void {
+    if (this.disposed) return;
     this.snapshot = { ...this.snapshot };
     for (const listener of this.listeners) listener();
   }
 
   private persist() {
+    if (!this.storageKey) return;
     try {
       const state: PersistedGitState = {
         schemaVersion: 1,
@@ -206,7 +240,10 @@ export class GitRegistry {
           ? { activeRepository: this.snapshot.activeRepositoryId }
           : {}),
       };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      localStorage.setItem(this.storageKey, JSON.stringify(state));
+      // Adopted: the shared list is no longer anyone's, and must not seed another workspace.
+      if (this.adoptFrom && this.adoptFrom !== this.storageKey)
+        localStorage.removeItem(this.adoptFrom);
     } catch {
       /* Repo list stays session-only when storage is unavailable. */
     }
@@ -220,7 +257,8 @@ export class GitRegistry {
   restore(): Promise<void> {
     if (!this.restorePromise) {
       this.restorePromise = (async () => {
-        const persisted = readPersisted();
+        if (!this.storageKey) return;
+        const persisted = readPersisted(this.storageKey, this.adoptFrom);
         for (const repository of persisted.repositories)
           for (const path of repository.worktrees) await this.open(path, { silent: true });
 
@@ -367,6 +405,11 @@ export class GitRegistry {
   ): Promise<RepoEntry | null> {
     try {
       const repository = await Repository.open(path);
+      // The workspace went while the repository was opening: it is not this registry's.
+      if (this.disposed) {
+        void repository.close();
+        return null;
+      }
       // Repository.open() normalizes to the true top-level, which may already be
       // tracked under a different path that pointed at one of its subfolders.
       const already = this.findWorktree(repository.repoId);
@@ -403,6 +446,11 @@ export class GitRegistry {
         .listWorktrees()
         .then(parseWorktreeList)
         .catch(() => []);
+      if (this.disposed) {
+        worktree.store.dispose();
+        void repository.close();
+        return null;
+      }
       const repositories = attached.map((r) =>
         r.repositoryId === repositoryId ? { ...r, knownWorktrees } : r,
       );
@@ -481,6 +529,32 @@ export class GitRegistry {
     return repositories.find((r) => r.worktrees.includes(worktree));
   }
 
+  /**
+   * The workspace is going: every repository is closed, its watcher stopped and its shared
+   * graph dropped, and the registry is left empty and inert. What was remembered for the
+   * workspace is kept, for the next time it is opened.
+   */
+  dispose(): void {
+    if (this.disposed) return;
+    const repositories = this.snapshot.repositories;
+    this.disposed = true;
+    for (const repository of repositories) {
+      for (const worktree of repository.worktrees) {
+        worktree.store.dispose();
+        void worktree.store.repository.close();
+      }
+      dropLoader(repository.repositoryId);
+      this.syncWatcher(repository.repositoryId, null);
+    }
+    this.watcherDown.clear();
+    this.probing.clear();
+    this.opening.clear();
+    // Anything still holding this registry sees no repositories, never another workspace's.
+    this.snapshot = EMPTY_SNAPSHOT;
+    for (const listener of [...this.listeners]) listener();
+    this.listeners.clear();
+  }
+
   setActive(repoId: string): void {
     const found = this.findWorktree(repoId);
     if (found) this.makeActive(found.worktree);
@@ -532,5 +606,3 @@ export class GitRegistry {
     );
   }
 }
-
-export const gitRegistry = new GitRegistry();

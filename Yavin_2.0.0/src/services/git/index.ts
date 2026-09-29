@@ -28,7 +28,7 @@ export type { RepoSnapshot } from "./store.ts";
 export { RepoStore, DIRTY_BLOCKED } from "./store.ts";
 
 export type { RepoEntry } from "./registry.ts";
-export { gitRegistry } from "./registry.ts";
+export { GitRegistry } from "./registry.ts";
 
 export { guardedAffecting, SIBLING_INVALIDATES, GRAPH_RESETS } from "./sync.ts";
 
