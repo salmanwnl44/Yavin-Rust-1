@@ -88,6 +88,8 @@ import { createNativeTransport, nativeAvailability } from "./services/lsp/native
 import { applyWorkspaceEdit } from "./services/lsp/workspaceEdit";
 import type { WorkspaceEditHost } from "./services/lsp/workspaceEdit";
 import { flattenSymbols } from "./services/lsp/symbols";
+import { createOutlineStore, toOutline } from "./services/lsp/outline";
+import { OutlineSection, SymbolCrumbs } from "./components/layout/Outline";
 import type { DocumentSymbol, SymbolInformation } from "./services/lsp/protocol";
 import { LineIndex } from "./services/lsp/positions";
 import type { LanguageFeaturesHost } from "./editor/lspMonaco";
@@ -663,6 +665,8 @@ export default function App() {
   }, [reportError]);
 
   const watchTracker = useRef(createWatchTracker());
+  /** The language servers (set once they exist, below); the watcher tells them about files. */
+  const lspRef = useRef<ReturnType<typeof createLspManager> | null>(null);
   useEffect(() => {
     const log = createOutputChannel("Workspace");
     const stopChanges = onResourceChanges((batch) => {
@@ -672,6 +676,8 @@ export default function App() {
         log.appendLine(`Changes under ${scope} were not all reported; re-reading it.`, "info");
       // Open documents check every change to their files, their own saves excepted.
       void documents.applyResourceChanges(batch.changes, batch.rescan).catch(reportError);
+      // Language servers hear about the files they registered for, whoever changed them.
+      lspRef.current?.filesChanged(batch.changes);
       const external = batch.changes.filter((change) => change.operation === undefined);
       void explorer
         .applyResourceChanges(external, batch.rescan)
@@ -1102,7 +1108,37 @@ export default function App() {
       return manager;
     })(),
   ).current;
+  lspRef.current = lsp;
   const lspRevision = useSyncExternalStore(lsp.subscribe, lsp.revision);
+  /**
+   * The symbols of the document in front, for the Outline and the breadcrumbs: asked of its
+   * server when it comes to the front, and again a moment after each edit.
+   */
+  const outline = useRef(
+    createOutlineStore({
+      fetch: async (key, signal) => {
+        const context = lsp.context(key);
+        if (!context || !lsp.capabilities(key)?.documentSymbolProvider) return null;
+        const result = await lsp.request<(DocumentSymbol | SymbolInformation)[]>(
+          key,
+          "textDocument/documentSymbol",
+          { textDocument: { uri: context.uri } },
+          signal,
+        );
+        return toOutline(result, documents.get(key)?.text ?? null, context.encoding);
+      },
+    }),
+  ).current;
+  useEffect(
+    () =>
+      documents.subscribe((event) => {
+        if (event.type !== "changed" && event.type !== "reloaded") return;
+        const key = documents.all().find((doc) => doc.id === event.id)?.key;
+        if (key) outline.refresh(key);
+      }),
+    [documents, outline],
+  );
+  const revealSymbol = useCallback((range: EditorRange) => editorRef.current?.select(range), []);
   // Development builds only: the UI tests read the servers' state.
   useEffect(() => {
     if (!import.meta.env.DEV) return;
@@ -1112,18 +1148,25 @@ export default function App() {
       delete hook.__yavinLsp;
     };
   }, [lsp]);
-  // Servers run for the folder that is open, and only once it is trusted; a change of either
-  // stops them all and starts what applies now.
-  // Safe to run twice for the same folder and trust (React runs effects twice in development):
-  // `start` does nothing once started, and only a real change reconsiders.
-  const lspFor = useRef<string | null>(null);
+  // Servers run only once the folder is trusted; a change of trust stops them all and starts
+  // what applies now. Safe to run twice (React runs effects twice in development): `start` does
+  // nothing once started, and only a real change reconsiders.
+  const lspTrusted = useRef<boolean | null>(null);
   useEffect(() => {
     lsp.start();
-    const now = `${workspacePath}|${trust.trusted}`;
-    if (lspFor.current !== null && lspFor.current !== now) void lsp.reconsider();
-    lspFor.current = now;
+    if (lspTrusted.current !== null && lspTrusted.current !== trust.trusted) void lsp.reconsider();
+    lspTrusted.current = trust.trusted;
     if (!workspacePath) void lsp.stopAll();
   }, [lsp, workspacePath, trust.trusted]);
+  // A folder opened, closed or added: servers that follow folders are told; only a removed
+  // folder's servers stop.
+  useEffect(
+    () =>
+      explorer.subscribe((event) => {
+        if (event.type === "reset") void lsp.foldersChanged();
+      }),
+    [explorer, lsp],
+  );
   // Leaving the window shuts the servers down (and the native side ends whatever is left).
   useEffect(() => {
     const leave = () => void lsp.dispose();
@@ -1582,6 +1625,12 @@ export default function App() {
 
   const hasEditor = !!activeTab && activeTab.id !== "welcome";
   activeKeyRef.current = hasEditor && activeTab ? activeTab.path : null;
+  const activeKey = activeKeyRef.current;
+  // The Outline and the symbol breadcrumbs follow the document in front.
+  useEffect(() => outline.show(activeKey), [outline, activeKey]);
+  useEffect(() => {
+    if (activeKey) outline.refresh(activeKey);
+  }, [outline, activeKey, lspRevision]);
   /** The language server of the file in front, as the status bar shows it. */
   const languageStatus = (() => {
     void lspRevision;
@@ -2537,6 +2586,9 @@ export default function App() {
             onOpenFolderDialog={handleOpenFolderDialog}
             initialScroll={explorerRef.current.scroll}
             onExplorerState={rememberExplorer}
+            outline={
+              <OutlineSection store={outline} cursor={cursorStatus} onReveal={revealSymbol} />
+            }
           />
 
           {/* Center: Editor + Bottom Terminal Panel */}
@@ -2611,6 +2663,14 @@ export default function App() {
                 onOpenCode={openCode}
                 previewRef={previewRef}
                 languageFeatures={languageFeatures}
+                symbolCrumbs={
+                  <SymbolCrumbs
+                    store={outline}
+                    cursor={cursorStatus}
+                    activeKey={activeKey}
+                    onReveal={revealSymbol}
+                  />
+                }
                 tabMenu={tabMenu}
                 onMenuError={reportError}
                 notice={notice}

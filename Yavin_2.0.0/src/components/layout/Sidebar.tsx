@@ -93,6 +93,8 @@ interface SidebarProps {
     focused: string | null;
     scroll: number;
   }) => void;
+  /** The Outline section, under the tree. */
+  outline?: React.ReactNode;
 }
 
 export function Sidebar(props: SidebarProps) {
@@ -1026,6 +1028,8 @@ export function Sidebar(props: SidebarProps) {
             </div>
           ) : null}
         </div>
+
+        {props.outline}
 
         {inlineError && (
           <p

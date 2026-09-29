@@ -27,6 +27,77 @@ pub struct ServerProcess {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
 }
 
+/// Every language server, and everything it starts, lives in one Windows Job Object that ends
+/// its processes when its last handle closes. Yavin holds that handle for as long as it runs, so
+/// however Yavin ends -- closed, killed, crashed -- Windows ends the servers too, grandchildren
+/// included (a TypeScript server's `tsserver`, say). An orderly exit still stops them first.
+#[cfg(windows)]
+pub mod job {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    /// A job whose processes end when it is dropped (or when this process ends).
+    pub struct Job(HANDLE);
+
+    // A job handle may be used from any thread.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    impl Job {
+        pub fn new() -> Option<Job> {
+            // SAFETY: plain Win32 calls on a handle this function owns; the information
+            // structure is zeroed and then given its one limit.
+            unsafe {
+                let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if handle.is_null() {
+                    return None;
+                }
+                let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let set = SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &limits as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                if set == 0 {
+                    CloseHandle(handle);
+                    return None;
+                }
+                Some(Job(handle))
+            }
+        }
+
+        /// Puts `child` in the job; what it starts from now on is in the job too.
+        pub fn assign(&self, child: &Child) -> bool {
+            // SAFETY: both handles are live: the job's is owned here, the child's by `child`.
+            unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as HANDLE) != 0 }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: the handle is owned by this value and closed once.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// The job every language server is put in, created on first use and never closed while
+    /// Yavin runs (closing it would end every server).
+    pub fn servers() -> Option<&'static Job> {
+        static JOB: std::sync::OnceLock<Option<Job>> = std::sync::OnceLock::new();
+        JOB.get_or_init(Job::new).as_ref()
+    }
+}
+
 /// The longest a stderr line is kept; a server printing a megabyte on one line is truncated.
 const MAX_LOG_LINE: usize = 16 * 1024;
 
@@ -59,6 +130,11 @@ impl ServerProcess {
             }
             _ => format!("{} could not be started: {error}", program.display()),
         })?;
+        // In the servers' job before it can start anything of its own that would outlive it.
+        #[cfg(windows)]
+        if let Some(job) = job::servers() {
+            job.assign(&child);
+        }
         let stdout = child.stdout.take().ok_or("The server has no output")?;
         let stderr = child
             .stderr
@@ -298,6 +374,61 @@ process.stdin.on("data", (chunk) => {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A real language server, found and started exactly as Yavin does it: the project's pinned
+    /// `typescript-language-server` (on Windows an npm `.cmd` shim) resolved from its
+    /// `node_modules/.bin`, spoken to over framed stdio, shut down politely. Skipped where the
+    /// project's dependencies are not installed.
+    #[test]
+    fn the_projects_typescript_server_initializes_and_shuts_down() {
+        let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let Some(program) = resolve_program("typescript-language-server", true, &project, None)
+        else {
+            return;
+        };
+        let dir = temp("tsls");
+        std::fs::write(dir.join("a.ts"), "export const a: number = 1;\n").unwrap();
+        let (sender, received) = mpsc::channel();
+        let events = Arc::new(Recorder(Mutex::new(sender)));
+        let server = ServerProcess::spawn(&program, &["--stdio"], &dir, events).unwrap();
+        let root = format!("file:///{}", dir.display().to_string().replace('\\', "/"))
+            .replace("file:////", "file:///");
+        server
+            .send(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"processId":null,"rootUri":"{root}","capabilities":{{}}}}}}"#
+            ))
+            .unwrap();
+        // The answer to `initialize` (logs and notifications may come first).
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let answer = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = received
+                .recv_timeout(remaining)
+                .expect("an initialize answer");
+            assert!(!event.starts_with("exit"), "the server ended: {event}");
+            if event.starts_with("message ") && event.contains(r#""id":1"#) {
+                break event;
+            }
+        };
+        assert!(answer.contains(r#""capabilities""#), "{answer}");
+        assert!(answer.contains(r#""completionProvider""#), "{answer}");
+
+        server
+            .send(r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#)
+            .unwrap();
+        server.send(r#"{"jsonrpc":"2.0","method":"exit"}"#).unwrap();
+        let exited = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = received
+                .recv_timeout(remaining)
+                .expect("the server to exit");
+            if event.starts_with("exit") {
+                break event;
+            }
+        };
+        assert!(exited.starts_with("exit Some(0)"), "{exited}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn stopping_a_server_ends_it_and_a_broken_stream_ends_the_session() {
         let Some(node) = node() else { return };
@@ -340,6 +471,55 @@ setInterval(() => {}, 1000);"#,
         assert!(exit.starts_with("exit "), "{exit}");
         assert!(started.elapsed() < Duration::from_secs(8));
         assert!(idle.send("{}").is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// What the job is for: when its handle closes -- as it does when Yavin dies, however it
+    /// dies -- the server and what the server started end, without anyone stopping them.
+    #[cfg(windows)]
+    #[test]
+    fn closing_the_job_ends_a_server_and_what_it_started() {
+        let Some(node) = node() else { return };
+        let dir = temp("job");
+        // A "server" that starts a child of its own and reports the child's process id.
+        std::fs::write(
+            dir.join("parent.js"),
+            r#"const child = require("child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+process.stdout.write(String(child.pid) + "\n");
+setInterval(() => {}, 1000);"#,
+        )
+        .unwrap();
+        let job = job::Job::new().expect("a job object");
+        let mut parent = Command::new(&node)
+            .arg("parent.js")
+            .current_dir(&dir)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert!(job.assign(&parent));
+        let mut line = String::new();
+        BufReader::new(parent.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild: u32 = line.trim().parse().unwrap();
+        let alive = |pid: u32| {
+            let output = Command::new(&node)
+                .args(["-e", &format!("try {{ process.kill({pid}, 0); console.log('alive') }} catch {{ console.log('gone') }}")])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim() == "alive"
+        };
+        assert!(alive(grandchild), "the server's own child is running");
+
+        drop(job);
+        let started = Instant::now();
+        while parent.try_wait().unwrap().is_none() || alive(grandchild) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the job did not end its processes"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

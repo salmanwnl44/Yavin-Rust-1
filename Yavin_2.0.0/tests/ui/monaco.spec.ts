@@ -965,7 +965,8 @@ test("the preview's code blocks, outline, find, images and footnotes", async ({
   expect(clipboard.replace(/\r\n/g, "\n")).toBe("def hello():\n    return 'hi'");
 
   // The outline: every heading, the one in view marked, a click scrolls, a level collapses.
-  await page.getByRole("button", { name: "Outline" }).click();
+  // The preview's own Outline toggle (the Explorer has an Outline section too).
+  await page.getByRole("tabpanel").getByRole("button", { name: "Outline" }).click();
   const outline = page.getByRole("navigation", { name: "Outline" });
   await expect(outline.getByRole("button", { name: "Advanced" })).toBeVisible();
   await expect(outline.getByRole("button", { name: "Guide", exact: true })).toHaveAttribute(

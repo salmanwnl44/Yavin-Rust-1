@@ -248,6 +248,21 @@ test("an answer about an older text is never used, and a request can be cancelle
   documents.edit("/w/a.ts", "let value = 2;\n");
   await assert.rejects(hover, StaleResultError);
 
+  // Completion alone may outlive a keystroke (Monaco filters the list against what was typed
+  // since) -- but never a document that closed.
+  const typedOn = manager.request("/w/a.ts", "textDocument/hover", params("/w/a.ts"), undefined, {
+    staleOk: true,
+  });
+  documents.edit("/w/a.ts", "let value = 3;\n");
+  assert.ok(await typedOn);
+  const closing = manager.request("/w/a.ts", "textDocument/hover", params("/w/a.ts"), undefined, {
+    staleOk: true,
+  });
+  documents.close("/w/a.ts", { discard: true });
+  await assert.rejects(closing, StaleResultError);
+  await documents.open("/w/a.ts");
+  await until(() => manager.context("/w/a.ts") !== null);
+
   const fresh = await manager.request<{ contents: { value: string } }>(
     "/w/a.ts",
     "textDocument/hover",
@@ -416,4 +431,81 @@ test("a server that never answers shutdown is ended anyway, after the timeout", 
   assert.ok(took >= 1_500 && took < 6_000, `stopped after ${took} ms`);
   assert.ok(server.received.some((message) => message.method === "shutdown"));
   assert.equal(manager.status().length, 0);
+});
+
+test("file changes reach the servers that registered for them, by pattern and kind", async () => {
+  const { documents, manager, fake } = setup({ "/w/a.ts": "a\n" });
+  await documents.open("/w/a.ts");
+  await until(() => manager.status()[0]?.state === "ready");
+  const server = fake.server("typescript");
+  // The fake registers `**/*.ts` (any kind) and `*.json` in its root (created only).
+  await until(() => server.received.some((one) => one.method === "initialized"));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  manager.filesChanged([
+    { path: "/w/src/b.ts", kind: "created" },
+    { path: "/w/src/c.ts", kind: "modified" },
+    { path: "/w/old.ts", kind: "renamed", from: "/w/older.ts" },
+    { path: "/w/package.json", kind: "created" },
+    { path: "/w/tsconfig.json", kind: "modified" },
+    { path: "/w/deep/x.json", kind: "created" },
+    { path: "/w/readme.md", kind: "deleted" },
+  ]);
+  const told = () =>
+    server.received.filter((one) => one.method === "workspace/didChangeWatchedFiles");
+  await until(() => told().length === 1);
+  assert.deepEqual(told()[0].params.changes, [
+    { uri: "file:///w/src/b.ts", type: 1 },
+    { uri: "file:///w/src/c.ts", type: 2 },
+    { uri: "file:///w/older.ts", type: 3 },
+    { uri: "file:///w/old.ts", type: 1 },
+    { uri: "file:///w/package.json", type: 1 },
+  ]);
+  // Nothing it asked about: nothing sent.
+  manager.filesChanged([{ path: "/w/readme.md", kind: "modified" }]);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(told().length, 1);
+});
+
+test("a folder added or removed is told to servers that follow folders, not restarted", async () => {
+  const roots = [{ uri: fileUri("/w"), name: "w", index: 0 }];
+  const { documents, manager, fake } = setup(
+    { "/w/a.ts": "a\n", "/v/b.ts": "b\n" },
+    { manager: { folders: () => roots } },
+  );
+  await documents.open("/w/a.ts");
+  await until(() => manager.status()[0]?.state === "ready");
+  const first = fake.server("typescript");
+
+  roots.push({ uri: fileUri("/v"), name: "v", index: 1 });
+  await manager.foldersChanged();
+  const notices = () =>
+    first.received.filter((one) => one.method === "workspace/didChangeWorkspaceFolders");
+  await until(() => notices().length === 1);
+  assert.deepEqual(notices()[0].params.event, {
+    added: [{ uri: "file:///v", name: "v" }],
+    removed: [],
+  });
+  assert.equal(fake.started.length, 1, "no server was restarted");
+
+  // A document of the new folder gets that folder's server.
+  await documents.open("/v/b.ts");
+  await until(() => manager.status().filter((one) => one.state === "ready").length === 2);
+  const second = fake.started.find((one) => one.root === "/v")!;
+
+  // Removing it stops its own server only, and tells the other.
+  roots.pop();
+  await manager.foldersChanged();
+  await until(() => notices().length === 2);
+  assert.deepEqual(notices()[1].params.event, {
+    added: [],
+    removed: [{ uri: "file:///v", name: "v" }],
+  });
+  assert.ok(second.server.received.some((one) => one.method === "shutdown"));
+  assert.deepEqual(
+    manager.status().map((one) => one.state),
+    ["ready"],
+  );
+  // Nothing changed: nothing sent.
+  await manager.foldersChanged();
+  assert.equal(notices().length, 2);
 });

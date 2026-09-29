@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
-import type { Ref } from "react";
+import type { ReactNode, Ref } from "react";
 import type { EditorHandle, EditorState, LanguageFeatures } from "../../editor/editorTypes";
 import type { DocumentService } from "../../services/documents";
 import type { EditorViews } from "../../services/editorViews";
@@ -92,6 +92,7 @@ export function EditorArea({
   languageFeatures,
   tabMenu,
   onMenuError,
+  symbolCrumbs,
 }: {
   tabs: EditorTab[];
   activeTabId: string;
@@ -144,6 +145,8 @@ export function EditorArea({
   /** What a tab's context menu offers (close others, copy its path, ...). */
   tabMenu?: (id: string) => MenuItem[];
   onMenuError?: (error: unknown) => void;
+  /** The symbols the cursor is in, after the file's path. */
+  symbolCrumbs?: ReactNode;
 }) {
   const activeTab = tabs.find((t) => t.id === activeTabId);
   const [menu, setMenu] = useState<{ x: number; y: number; id: string } | null>(null);
@@ -370,7 +373,8 @@ export function EditorArea({
           {activeTab && activeTab.id !== "welcome" && (
             <FileIcon name={activeTab.name} className="size-3.5 mr-0.5" />
           )}
-          <span className="text-zinc-300 truncate">{getBreadcrumbs()}</span>
+          <span className="text-zinc-300 truncate shrink">{getBreadcrumbs()}</span>
+          {activeTab && activeTab.id !== "welcome" && symbolCrumbs}
         </div>
         <div className="flex items-center gap-3 shrink-0 text-zinc-500 font-mono text-[10px]">
           {details?.join(" • ")}

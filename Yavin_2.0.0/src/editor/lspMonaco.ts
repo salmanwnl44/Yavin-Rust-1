@@ -7,6 +7,7 @@ import type { LspManager } from "../services/lsp/manager";
 import { StaleResultError } from "../services/lsp/manager";
 import { CancelledError } from "../services/lsp/jsonrpc";
 import { LineIndex } from "../services/lsp/positions";
+import { applySemanticDelta, toUtf16Tokens } from "../services/lsp/semanticTokens";
 import type { PositionEncoding } from "../services/lsp/positions";
 import type * as P from "../services/lsp/protocol";
 import type { LanguageServerDefinition } from "../services/lsp/registry";
@@ -86,6 +87,7 @@ async function ask<T>(
   method: string,
   params: (context: NonNullable<ReturnType<LspManager["context"]>>) => unknown,
   token: monaco.CancellationToken,
+  options: { staleOk?: boolean } = {},
 ): Promise<
   | { result: T; context: NonNullable<ReturnType<LspManager["context"]>>; doc: TextDocument }
   | undefined
@@ -101,6 +103,7 @@ async function ask<T>(
       method,
       params(context),
       signalOf(token),
+      options,
     );
     if (result === null || result === undefined) return undefined;
     return { result, context, doc };
@@ -327,6 +330,8 @@ function registerServer(definition: LanguageServerDefinition, capabilities: P.Se
             },
           }),
           token,
+          // Typing on while the list comes: Monaco filters it against what was typed since.
+          { staleOk: true },
         );
         if (!answer) return undefined;
         const { result, context: ctx, doc } = answer;
@@ -850,10 +855,19 @@ function registerServer(definition: LanguageServerDefinition, capabilities: P.Se
   const semantic = capabilities.semanticTokensProvider;
   if (semantic?.full) {
     const delta = typeof semantic.full === "object" && semantic.full.delta;
+    /**
+     * Each model's last tokens from the server, in the server's units: a delta edits them.
+     * A UTF-16 server's deltas go to Monaco as they are; any other encoding's are applied
+     * here and the whole array converted, since converting columns needs every token.
+     */
+    const last = new WeakMap<monaco.editor.ITextModel, { resultId?: string; data: number[] }>();
     register(L.registerDocumentSemanticTokensProvider, {
       getLegend: () => semantic.legend,
       async provideDocumentSemanticTokens(model, lastResultId, token) {
-        const useDelta = Boolean(delta && lastResultId);
+        const previous = last.get(model);
+        const useDelta = Boolean(
+          delta && lastResultId && previous && previous.resultId === lastResultId,
+        );
         const answer = await ask<P.SemanticTokens | P.SemanticTokensDelta>(
           id,
           model,
@@ -866,7 +880,10 @@ function registerServer(definition: LanguageServerDefinition, capabilities: P.Se
         );
         if (!answer) return null;
         const { result, context: ctx } = answer;
-        if ("edits" in result)
+        const data =
+          "edits" in result ? applySemanticDelta(previous?.data ?? [], result.edits) : result.data;
+        last.set(model, { resultId: result.resultId, data });
+        if ("edits" in result && ctx.encoding === "utf-16")
           return {
             resultId: result.resultId,
             edits: result.edits.map((edit) => ({
@@ -877,7 +894,7 @@ function registerServer(definition: LanguageServerDefinition, capabilities: P.Se
           };
         return {
           resultId: result.resultId,
-          data: new Uint32Array(reencodeTokens(result.data, ctx)),
+          data: new Uint32Array(toUtf16Tokens(data, ctx.index, ctx.encoding)),
         };
       },
       releaseDocumentSemanticTokens() {},
@@ -973,37 +990,6 @@ function registerServer(definition: LanguageServerDefinition, capabilities: P.Se
       },
     } satisfies monaco.languages.CodeLensProvider);
   }
-}
-
-/** Semantic tokens in the server's encoding, re-encoded to UTF-16 columns when they differ. */
-function reencodeTokens(
-  data: number[],
-  ctx: { index: LineIndex; encoding: PositionEncoding },
-): number[] {
-  if (ctx.encoding === "utf-16") return data;
-  const out: number[] = [];
-  let line = 0;
-  let character = 0;
-  let previousLine = 0;
-  let previousStart = 0;
-  for (let i = 0; i + 4 < data.length + 1; i += 5) {
-    line += data[i];
-    character = data[i] ? data[i + 1] : character + data[i + 1];
-    const start = ctx.index.offsetAt({ line, character }, ctx.encoding);
-    const end = ctx.index.offsetAt({ line, character: character + data[i + 2] }, ctx.encoding);
-    const at = ctx.index.positionAt(start);
-    const deltaLine = at.line - previousLine;
-    out.push(
-      deltaLine,
-      deltaLine ? at.character : at.character - previousStart,
-      end - start,
-      data[i + 3],
-      data[i + 4],
-    );
-    previousLine = at.line;
-    previousStart = at.character;
-  }
-  return out;
 }
 
 // --- Commands --------------------------------------------------------------------------------

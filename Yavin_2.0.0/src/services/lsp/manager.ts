@@ -1,6 +1,13 @@
 import type { DocumentService, TextDocument } from "../documents.ts";
 import type { Diagnostic as ProblemDiagnostic } from "../panel/problemMatchers.ts";
-import { folderFor, fsPath, resourceId } from "../resource.ts";
+import {
+  fileUri,
+  folderFor,
+  fsPath,
+  isCaseInsensitive,
+  relativePath,
+  resourceId,
+} from "../resource.ts";
 import type { ResourceId, WorkspaceFolder } from "../resource.ts";
 import { createLanguageClient } from "./client.ts";
 import type {
@@ -19,6 +26,8 @@ import type {
 } from "./protocol.ts";
 import { DiagnosticSeverity, DiagnosticTag, TextDocumentSyncKind } from "./protocol.ts";
 import { serversFor } from "./registry.ts";
+import { globToRegExp, matchesGlob } from "./glob.ts";
+import type { FileWatcher } from "./client.ts";
 import type { LanguageServerDefinition } from "./registry.ts";
 import { fromLspUri, lspPath, toLspUri } from "./uris.ts";
 
@@ -126,6 +135,8 @@ export function createLspManager(options: LspManagerOptions) {
   let checking: Promise<void> | null = null;
   let disposed = false;
   let unsubscribe: (() => void) | null = null;
+  /** The workspace folders servers were last told about, by `ResourceId`. */
+  let knownFolders = new Map<ResourceId, WorkspaceFolder>();
   let revision = 0;
 
   const changed = () => {
@@ -509,8 +520,102 @@ export function createLspManager(options: LspManagerOptions) {
     /** Starts following the Document Model: every open document, and each one opened. */
     start() {
       if (unsubscribe) return;
+      knownFolders = new Map(options.folders().map((folder) => [resourceId(folder.uri), folder]));
       unsubscribe = documents.subscribe(onDocumentEvent);
       for (const doc of documents.all()) void attach(doc);
+    },
+
+    /**
+     * The workspace's folders changed (one added or removed): servers that follow folder
+     * changes are told, instead of being restarted; a removed folder's own servers stop; the
+     * documents of an added folder get theirs.
+     */
+    async foldersChanged() {
+      const now = new Map(options.folders().map((folder) => [resourceId(folder.uri), folder]));
+      const added = [...now].filter(([id]) => !knownFolders.has(id)).map(([, folder]) => folder);
+      const removed = [...knownFolders].filter(([id]) => !now.has(id)).map(([, folder]) => folder);
+      knownFolders = now;
+      if (!added.length && !removed.length) return;
+      const event = {
+        added: added.map((folder) => ({ uri: toLspUri(folder.uri), name: folder.name })),
+        removed: removed.map((folder) => ({ uri: toLspUri(folder.uri), name: folder.name })),
+      };
+      const gone = new Set(removed.map((folder) => resourceId(folder.uri)));
+      for (const server of [...servers.values()]) {
+        if (gone.has(resourceId(server.folder.uri))) {
+          servers.delete(server.key);
+          clearTimeout(server.restartTimer);
+          clearDiagnostics(server);
+          for (const [docId, entry] of synced)
+            if (entry.clientKey === server.key) synced.delete(docId);
+          await server.client.stop();
+          continue;
+        }
+        const folders = (
+          server.client.capabilities.workspace as
+            { workspaceFolders?: { changeNotifications?: boolean | string } } | undefined
+        )?.workspaceFolders;
+        if (folders?.changeNotifications)
+          server.client.notify("workspace/didChangeWorkspaceFolders", { event });
+      }
+      for (const doc of documents.all()) void attach(doc);
+      changed();
+    },
+
+    /**
+     * Files changed on disk (the watcher's report): each server is told about the ones it
+     * registered to watch, by pattern and kind (`workspace/didChangeWatchedFiles`).
+     */
+    filesChanged(changes: readonly { path: string; kind: string; from?: string }[]) {
+      type FileEvent = { path: string; uri: string; insensitive: boolean; type: 1 | 2 | 3 };
+      const events: FileEvent[] = [];
+      const push = (path: string, type: 1 | 2 | 3) => {
+        try {
+          const uri = fileUri(path);
+          events.push({
+            path: fsPath(uri),
+            uri: toLspUri(uri),
+            insensitive: isCaseInsensitive(uri),
+            type,
+          });
+        } catch {
+          // Not a path a server could be told about.
+        }
+      };
+      for (const change of changes) {
+        if (change.kind === "renamed") {
+          if (change.from) push(change.from, 3);
+          push(change.path, 1);
+        } else push(change.path, change.kind === "created" ? 1 : change.kind === "deleted" ? 3 : 2);
+      }
+      if (!events.length) return;
+      const bit = { 1: 1, 2: 2, 3: 4 } as const;
+      const watched = (watcher: FileWatcher, event: FileEvent) => {
+        if (((watcher.kind ?? 7) & bit[event.type]) === 0) return false;
+        const pattern = watcher.globPattern;
+        if (typeof pattern === "string") return matchesGlob(pattern, event.path, event.insensitive);
+        const base = lspPath(
+          typeof pattern.baseUri === "string" ? pattern.baseUri : pattern.baseUri.uri,
+        );
+        const inside = base ? relativePath(base, event.path) : undefined;
+        return (
+          inside !== undefined &&
+          inside !== "." &&
+          globToRegExp(pattern.pattern, event.insensitive).test(inside)
+        );
+      };
+      for (const server of servers.values()) {
+        if (server.client.state !== "ready") continue;
+        const watchers = server.client.watchers;
+        if (!watchers.length) continue;
+        const matching = events.filter((event) =>
+          watchers.some((watcher) => watched(watcher, event)),
+        );
+        if (matching.length)
+          server.client.notify("workspace/didChangeWatchedFiles", {
+            changes: matching.map((event) => ({ uri: event.uri, type: event.type })),
+          });
+      }
     },
 
     /** The id of the server serving the document at `key`, when one is ready. */
@@ -561,12 +666,18 @@ export function createLspManager(options: LspManagerOptions) {
      * A request about the document at `key`, made at its current version. Throws
      * `StaleResultError` when the document changed (or closed) before the answer came: an
      * answer about an older text must not be shown for a newer one. Null when no server is ready.
+     *
+     * `staleOk` is for completion alone: typing on while the list is being fetched moves the
+     * document on, and Monaco filters the answer against what was typed since (and cancels
+     * the request itself when the answer no longer applies). The document must still be the
+     * same one.
      */
     async request<T>(
       key: string,
       method: string,
       params: unknown,
       signal?: AbortSignal,
+      options: { staleOk?: boolean } = {},
     ): Promise<T | null> {
       const found = target(key);
       if (!found) return null;
@@ -575,7 +686,8 @@ export function createLspManager(options: LspManagerOptions) {
       const version = doc.version;
       const result = await server.client.request<T>(method, params, { signal });
       const now = documents.get(key);
-      if (!now || now.id !== doc.id || now.version !== version) throw new StaleResultError();
+      if (!now || now.id !== doc.id) throw new StaleResultError();
+      if (now.version !== version && !options.staleOk) throw new StaleResultError();
       return result;
     },
 
@@ -706,6 +818,7 @@ export function createLspManager(options: LspManagerOptions) {
       unserved.clear();
       synced.clear();
       disposed = false;
+      knownFolders = new Map(options.folders().map((folder) => [resourceId(folder.uri), folder]));
       for (const doc of documents.all()) void attach(doc);
       changed();
     },

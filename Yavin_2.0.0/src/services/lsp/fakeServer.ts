@@ -55,6 +55,7 @@ export function createFakeServer(options: FakeServerOptions, io: FakeServerIO) {
   let semanticResult = 0;
   const previousTokens = new Map<string, number[]>();
   let exited = false;
+  let rootUri: string | null = null;
 
   const send = (message: object) => {
     if (!exited) io.send(JSON.stringify({ jsonrpc: "2.0", ...message }));
@@ -174,12 +175,35 @@ export function createFakeServer(options: FakeServerOptions, io: FakeServerIO) {
       selectionRange: object;
       children: Symbol[];
       indent: number;
+      start: number;
+      closed: boolean;
     }
     const roots: Symbol[] = [];
+    // A symbol runs from its line to the last line before one indented no deeper (its own
+    // closing bracket included), as a real server's range covers the body.
     const stack: Symbol[] = [];
+    const finish = (end: number) => {
+      const symbol = stack.pop()!;
+      symbol.range = rangeOf(doc.text, symbol.start, end);
+    };
     const lines = doc.text.split("\n");
     let offset = 0;
+    let lastEnd = 0;
     for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed) {
+        const indent = line.length - line.trimStart().length;
+        const closer = /^[}\])]/.test(trimmed);
+        for (;;) {
+          const top = stack[stack.length - 1];
+          if (!top || top.indent < indent) break;
+          if (closer && top.indent === indent && !top.closed) {
+            top.closed = true;
+            break;
+          }
+          finish(lastEnd);
+        }
+      }
       const match = /^(\s*)(function|def|class)\s+([A-Za-z_]\w*)/.exec(line);
       if (match) {
         const indent = match[1].length;
@@ -191,16 +215,22 @@ export function createFakeServer(options: FakeServerOptions, io: FakeServerIO) {
           selectionRange: rangeOf(doc.text, nameStart, nameStart + match[3].length),
           children: [],
           indent,
+          start: offset,
+          closed: false,
         };
-        while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
         (stack.length ? stack[stack.length - 1].children : roots).push(symbol);
         stack.push(symbol);
       }
+      if (trimmed) lastEnd = offset + line.length;
       offset += line.length + 1;
     }
+    while (stack.length) finish(lastEnd);
     const strip = (symbols: Symbol[]): object[] =>
-      symbols.map(({ indent: _indent, children, ...rest }) => ({
-        ...rest,
+      symbols.map(({ name, kind, range, selectionRange, children }) => ({
+        name,
+        kind,
+        range,
+        selectionRange,
         children: strip(children),
       }));
     return strip(roots);
@@ -257,6 +287,7 @@ export function createFakeServer(options: FakeServerOptions, io: FakeServerIO) {
       documentOnTypeFormattingProvider: { firstTriggerCharacter: ";" },
       renameProvider: { prepareProvider: true },
       executeCommandProvider: { commands: ["fake.echo", "fake.applyEdit"] },
+      workspace: { workspaceFolders: { supported: true, changeNotifications: true } },
       semanticTokensProvider: {
         legend: { tokenTypes: TOKEN_TYPES, tokenModifiers: ["declaration"] },
         full: { delta: true },
@@ -289,6 +320,7 @@ export function createFakeServer(options: FakeServerOptions, io: FakeServerIO) {
     const doc = params?.textDocument ? docs.get(params.textDocument.uri) : undefined;
     switch (method) {
       case "initialize":
+        rootUri = params.rootUri ?? null;
         return { capabilities: capabilities(), serverInfo: { name: "fake-lsp", version: "1.0" } };
       case "shutdown":
         return null;
@@ -600,6 +632,27 @@ export function createFakeServer(options: FakeServerOptions, io: FakeServerIO) {
           id: `s${nextServerRequest++}`,
           method: "workspace/configuration",
           params: { items: [{ section: "fake" }] },
+        });
+        // And to hear about files: TypeScript sources anywhere, JSON created in the root.
+        send({
+          id: `s${nextServerRequest++}`,
+          method: "client/registerCapability",
+          params: {
+            registrations: [
+              {
+                id: "watch-sources",
+                method: "workspace/didChangeWatchedFiles",
+                registerOptions: {
+                  watchers: [
+                    { globPattern: "**/*.ts" },
+                    ...(rootUri
+                      ? [{ globPattern: { baseUri: rootUri, pattern: "*.json" }, kind: 1 }]
+                      : []),
+                  ],
+                },
+              },
+            ],
+          },
         });
         return;
       case "exit":

@@ -424,3 +424,51 @@ test("semantic tokens, inlay hints, CodeLens and document links come from the se
     .toBe(true);
   await expect(lines).toContainText("let more: number = 2;");
 });
+
+test("outline and breadcrumbs: the file's symbols, the one the cursor is in, and going there", async ({
+  page,
+}) => {
+  await installFakeLsp(page);
+  await fixture(page, {
+    "/work/a.ts":
+      "class Shape {\n  function area() {\n    return 1;\n  }\n}\nfunction helper() {}\n",
+  });
+  await openServed(page, "a.ts");
+  const outline = page.getByRole("region", { name: "Outline" });
+  // Collapsed until opened, as VS Code's is.
+  await expect(outline.getByRole("button", { name: "Outline" })).toHaveAttribute(
+    "aria-expanded",
+    "false",
+  );
+  await outline.getByRole("button", { name: "Outline" }).click();
+  const symbols = outline.getByRole("treeitem");
+  await expect(symbols).toHaveText(["CShape", "Farea", "Fhelper"]);
+
+  // Choosing a symbol puts the cursor on its name; the breadcrumbs follow the cursor.
+  await outline.getByRole("treeitem", { name: /^area/ }).click();
+  await expect.poll(() => editorSelections(page)).toEqual([{ start: 25, end: 25 }]);
+  const crumbs = page.getByRole("navigation", { name: "Symbol breadcrumbs" });
+  await expect(crumbs.getByRole("button")).toHaveText(["CShape", "Farea"]);
+  await expect(outline.getByRole("treeitem", { selected: true })).toHaveText("Farea");
+  await crumbs.getByRole("button", { name: /^Shape/ }).click();
+  await expect.poll(() => editorSelections(page)).toEqual([{ start: 6, end: 6 }]);
+  await expect(crumbs.getByRole("button")).toHaveText(["CShape"]);
+
+  // An edit is reflected a moment later.
+  await page.keyboard.press("Control+End");
+  await page.keyboard.type("function added");
+  await expect(symbols).toHaveText(["CShape", "Farea", "Fhelper", "Fadded"]);
+  await expect(crumbs.getByRole("button")).toHaveText(["Fadded"]);
+
+  // A symbol with children folds; the section itself folds too.
+  await outline
+    .getByRole("treeitem", { name: /^Shape/ })
+    .locator("span")
+    .first()
+    .click();
+  await expect(symbols).toHaveText(["CShape", "Fhelper", "Fadded"]);
+  await outline.getByRole("button", { name: "Outline" }).click();
+  await expect(symbols).toHaveCount(0);
+  await outline.getByRole("button", { name: "Outline" }).click();
+  await expect(symbols).toHaveCount(3);
+});

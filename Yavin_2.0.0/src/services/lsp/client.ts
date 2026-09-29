@@ -75,8 +75,17 @@ export const NOT_INSTALLED = "not-installed:";
 const SHUTDOWN_TIMEOUT = 2_000;
 const EXIT_TIMEOUT = 2_000;
 
+/** A server's request to hear about files (`workspace/didChangeWatchedFiles` registration). */
+export interface FileWatcher {
+  globPattern: string | { baseUri: string | { uri: string }; pattern: string };
+  /** Created 1, Changed 2, Deleted 4 (a bit set); all by default. */
+  kind?: number;
+}
+
 export interface LanguageClient {
   readonly definition: LanguageServerDefinition;
+  /** The files the server asked to be told about. */
+  readonly watchers: readonly FileWatcher[];
   readonly state: ServerState;
   /** Why the state is what it is, when that needs saying. */
   readonly message: string;
@@ -110,6 +119,8 @@ export function createLanguageClient(init: {
   let closed: Promise<void> = Promise.resolve();
   let generation = 0;
   const listeners = new Set<(state: ServerState) => void>();
+  /** Capabilities the server registered after `initialize`, by registration id. */
+  const registrations = new Map<string, { method: string; registerOptions?: unknown }>();
 
   const setState = (next: ServerState, why = "") => {
     state = next;
@@ -137,8 +148,22 @@ export function createLanguageClient(init: {
     conn.onRequest("workspace/workspaceFolders", () =>
       init.folders().map((folder) => ({ uri: folder.uri, name: folder.name })),
     );
-    conn.onRequest("client/registerCapability", () => null);
-    conn.onRequest("client/unregisterCapability", () => null);
+    conn.onRequest("client/registerCapability", (params) => {
+      for (const registration of (
+        params as { registrations?: { id: string; method: string; registerOptions?: unknown }[] }
+      )?.registrations ?? [])
+        registrations.set(registration.id, registration);
+      return null;
+    });
+    conn.onRequest("client/unregisterCapability", (params) => {
+      // The protocol's own misspelling: `unregisterations`.
+      const list =
+        (params as { unregisterations?: { id: string }[]; unregistrations?: { id: string }[] }) ??
+        {};
+      for (const one of list.unregisterations ?? list.unregistrations ?? [])
+        registrations.delete(one.id);
+      return null;
+    });
     conn.onRequest("window/workDoneProgress/create", () => null);
     conn.onRequest("window/showMessageRequest", (params) => {
       logMessage(params);
@@ -186,6 +211,14 @@ export function createLanguageClient(init: {
     get serverInfo() {
       return serverInfo;
     },
+    get watchers() {
+      return [...registrations.values()]
+        .filter((one) => one.method === "workspace/didChangeWatchedFiles")
+        .flatMap(
+          (one) =>
+            (one.registerOptions as { watchers?: FileWatcher[] } | undefined)?.watchers ?? [],
+        );
+    },
     setState,
     onState(listener) {
       listeners.add(listener);
@@ -195,6 +228,8 @@ export function createLanguageClient(init: {
     async start() {
       if (state === "starting" || state === "initializing" || state === "ready") return;
       const mine = ++generation;
+      // A new process registers afresh.
+      registrations.clear();
       setState("starting");
       let opened: ServerChannel;
       try {
@@ -350,6 +385,7 @@ export const CLIENT_CAPABILITIES = {
     configuration: true,
     workspaceFolders: true,
     didChangeConfiguration: { dynamicRegistration: false },
+    didChangeWatchedFiles: { dynamicRegistration: true, relativePatternSupport: true },
     symbol: { symbolKind: { valueSet: range(26) } },
     executeCommand: {},
     semanticTokens: { refreshSupport: true },
