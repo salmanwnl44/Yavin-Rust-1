@@ -533,6 +533,12 @@ impl Repository {
 
     // --- Reading ---------------------------------------------------------------------------
 
+    /// `cache/`: disposable data a later open may use to go faster (the snapshot scan cache).
+    /// Nothing in it is ever needed for correctness.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.dir.join("cache")
+    }
+
     pub fn key(&self) -> &str {
         &self.key
     }
@@ -896,7 +902,8 @@ pub struct WriteTxn<'a> {
 }
 
 impl WriteTxn<'_> {
-    fn has(&self, id: &ObjectId) -> bool {
+    /// Whether the store, or this transaction, already has `id`.
+    pub fn has(&self, id: &ObjectId) -> bool {
         self.repo.odb.contains(id) || self.segment.as_ref().is_some_and(|s| s.contains(id))
     }
 
@@ -921,6 +928,11 @@ impl WriteTxn<'_> {
             return Ok(id);
         }
         self.segment()?.put(kind, payload)
+    }
+
+    /// The store this transaction writes to, for reading while it is open.
+    pub fn repository(&self) -> &Repository {
+        self.repo
     }
 
     /// Stores bytes as a blob. The store itself sets no size limit; deciding what is too big to

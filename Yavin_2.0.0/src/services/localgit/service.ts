@@ -1,10 +1,16 @@
+import type { OverlaySource } from "./overlays.ts";
 import type {
   LocalGitBlobInfo,
   LocalGitCommit,
   LocalGitFinding,
   LocalGitInfo,
+  LocalGitOverlayRef,
+  LocalGitProgress,
   LocalGitReflogRecord,
   LocalGitRefs,
+  LocalGitSnapshot,
+  LocalGitSnapshotMode,
+  LocalGitStatus,
   LocalGitTreeEntry,
 } from "./types.ts";
 
@@ -18,8 +24,11 @@ import type {
  * from workspace A is dropped (`LocalGitClosedError`) rather than reaching B, and the second A
  * of A → B → A is another context with another service, which never sees the first one's work.
  *
- * LG-01 is read-only from here: open, inspect, verify. Snapshots, commits and everything that
- * writes arrive in later phases.
+ * LG-01 gave it open, inspect and verify; LG-02 adds snapshots and status. Unsaved documents
+ * come from the overlay source the window attaches (`attachOverlays`, see `overlays.ts`): each
+ * document version is sent to the native pool once, and every snapshot names the versions it
+ * uses. A newer status cancels the one in flight (it rejects with code `Cancelled`). Commits
+ * and everything that builds on them arrive in later phases.
  */
 
 /** The workspace context, as far as this service needs it. */
@@ -29,6 +38,16 @@ export interface LocalGitLifecycle {
 
 /** How native commands are called: `native()` in the app, a fake in tests. */
 export type LocalGitInvoke = (command: string, args: Record<string, unknown>) => Promise<unknown>;
+
+/** Native events the service listens to: `onLocalGitProgress` in the app. */
+export interface LocalGitEvents {
+  onProgress(handler: (progress: LocalGitProgress) => void): () => void;
+}
+
+const NO_EVENTS: LocalGitEvents = { onProgress: () => () => {} };
+
+/** How many status entries are asked for when the caller does not say. */
+export const DEFAULT_STATUS_LIMIT = 5000;
 
 /** The workspace the service belonged to was left (or the service closed). */
 export class LocalGitClosedError extends Error {
@@ -59,9 +78,15 @@ export function createLocalGitService(
   folders: readonly string[],
   lifecycle: LocalGitLifecycle,
   invoke: LocalGitInvoke,
+  events: LocalGitEvents = NO_EVENTS,
 ) {
   let closed = false;
   let handle: string | null = null;
+  let source: OverlaySource | null = null;
+  // Document versions the native pool has, by key (named) and id (untitled).
+  const sent = new Map<string, number>();
+  const sentUntitled = new Map<string, number>();
+  let jobs = 0;
   const live = () => !closed && lifecycle.isActive();
 
   const opening: Promise<LocalGitInfo> = (async () => {
@@ -98,6 +123,63 @@ export function createLocalGitService(
     return result as T;
   }
 
+  /** Sends the pool what it lacks; returns the versions a snapshot should name. */
+  async function syncOverlays(includeUntitled: boolean) {
+    const docs = source?.overlays() ?? [];
+    const untitled = includeUntitled ? (source?.untitled() ?? []) : [];
+    const put = docs
+      .filter((doc) => sent.get(doc.key) !== doc.version)
+      .map((doc) => ({
+        key: doc.key,
+        path: doc.path,
+        text: doc.text(),
+        encoding: doc.encoding,
+        lineEnding: doc.lineEnding,
+        version: doc.version,
+      }));
+    const putUntitled = untitled
+      .filter((doc) => sentUntitled.get(doc.id) !== doc.version)
+      .map((doc) => ({
+        id: doc.id,
+        text: doc.text(),
+        encoding: doc.encoding,
+        lineEnding: doc.lineEnding,
+        version: doc.version,
+      }));
+    if (put.length || putUntitled.length)
+      await call("localgit_put_overlays", { overlays: put, untitled: putUntitled });
+    for (const doc of put) sent.set(doc.key, doc.version);
+    for (const doc of putUntitled) sentUntitled.set(doc.id, doc.version);
+    // The native side forgets what a snapshot no longer names; so does this.
+    for (const key of [...sent.keys()]) if (!docs.some((doc) => doc.key === key)) sent.delete(key);
+    if (includeUntitled)
+      for (const id of [...sentUntitled.keys()])
+        if (!untitled.some((doc) => doc.id === id)) sentUntitled.delete(id);
+    const refs = (entries: [string, number][]): LocalGitOverlayRef[] =>
+      entries.map(([key, version]) => ({ key, version }));
+    return {
+      overlays: refs(docs.map((doc) => [doc.key, doc.version])),
+      untitled: refs(untitled.map((doc) => [doc.id, doc.version])),
+    };
+  }
+
+  /** Runs a job that names overlays; once more, resending everything, if the pool lost any. */
+  async function withOverlays<T>(
+    includeUntitled: boolean,
+    run: (refs: { overlays: LocalGitOverlayRef[]; untitled: LocalGitOverlayRef[] }) => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await run(await syncOverlays(includeUntitled));
+    } catch (error) {
+      if (!(error instanceof LocalGitError) || error.code !== "OverlayMissing") throw error;
+      sent.clear();
+      sentUntitled.clear();
+      return run(await syncOverlays(includeUntitled));
+    }
+  }
+
+  const nextJob = () => `job-${++jobs}`;
+
   return {
     /** Resolves once the store is open (writer or read-only), with what it found on opening. */
     ready: opening,
@@ -111,6 +193,54 @@ export function createLocalGitService(
     blobInfo: (id: string) => call<LocalGitBlobInfo>("localgit_blob_info", { id }),
     readBlob: (id: string, maxBytes: number) =>
       call<ArrayBuffer>("localgit_read_blob", { id, maxBytes }),
+
+    /** Where unsaved documents come from; returns a detach. One source at a time. */
+    attachOverlays(next: OverlaySource): () => void {
+      source = next;
+      return () => {
+        if (source === next) source = null;
+      };
+    },
+
+    /**
+     * A snapshot of the workspace: `persist` writes it into the store (a later phase refers to
+     * it); `includeUntitled` adds untitled documents (recovery snapshots only).
+     */
+    snapshot(
+      options: { mode?: LocalGitSnapshotMode; persist?: boolean; includeUntitled?: boolean } = {},
+      jobId: string = nextJob(),
+    ): Promise<LocalGitSnapshot> {
+      const { mode = "auto", persist = false, includeUntitled = false } = options;
+      return withOverlays(includeUntitled, (refs) =>
+        call<LocalGitSnapshot>("localgit_snapshot", { jobId, mode, persist, ...refs }),
+      );
+    },
+
+    /** Status against Local HEAD, on disk and with the unsaved documents. */
+    status(
+      options: { mode?: LocalGitSnapshotMode; limit?: number } = {},
+      jobId: string = nextJob(),
+    ): Promise<{ snapshot: LocalGitSnapshot; status: LocalGitStatus }> {
+      const { mode = "auto", limit = DEFAULT_STATUS_LIMIT } = options;
+      return withOverlays(false, (refs) =>
+        call<{ snapshot: LocalGitSnapshot; status: LocalGitStatus }>("localgit_status", {
+          jobId,
+          mode,
+          overlays: refs.overlays,
+          limit,
+        }),
+      );
+    },
+
+    /** Stops a snapshot or status of this service (it rejects with code `Cancelled`). */
+    cancel: (jobId: string) => call<void>("localgit_cancel", { jobId }),
+
+    /** This service's jobs' progress, while its workspace is the active one. */
+    onProgress(listener: (progress: LocalGitProgress) => void): () => void {
+      return events.onProgress((progress) => {
+        if (live() && handle !== null && progress.handle === handle) listener(progress);
+      });
+    },
 
     /** Ends the service with its workspace: pending and later calls are refused. */
     async close() {

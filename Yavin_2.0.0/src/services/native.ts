@@ -9,9 +9,16 @@ import type {
   LocalGitCommit,
   LocalGitFinding,
   LocalGitInfo,
+  LocalGitOverlayArg,
+  LocalGitOverlayRef,
+  LocalGitProgress,
   LocalGitReflogRecord,
   LocalGitRefs,
+  LocalGitSnapshot,
+  LocalGitSnapshotMode,
+  LocalGitStatus,
   LocalGitTreeEntry,
+  LocalGitUntitledArg,
 } from "./localgit/types";
 import { asResourceChangeBatch, asWatcherStatus } from "./resourceEvents.ts";
 import type { ResourceChangeBatch, WatcherStatus } from "./resourceEvents.ts";
@@ -131,6 +138,32 @@ interface Commands {
     args: { handle: string; id: string; maxBytes: number };
     result: ArrayBuffer;
   };
+  localgit_put_overlays: {
+    args: { handle: string; overlays: LocalGitOverlayArg[]; untitled: LocalGitUntitledArg[] };
+    result: void;
+  };
+  localgit_snapshot: {
+    args: {
+      handle: string;
+      jobId: string;
+      mode: LocalGitSnapshotMode;
+      persist: boolean;
+      overlays: LocalGitOverlayRef[];
+      untitled: LocalGitOverlayRef[];
+    };
+    result: LocalGitSnapshot;
+  };
+  localgit_status: {
+    args: {
+      handle: string;
+      jobId: string;
+      mode: LocalGitSnapshotMode;
+      overlays: LocalGitOverlayRef[];
+      limit: number;
+    };
+    result: { snapshot: LocalGitSnapshot; status: LocalGitStatus };
+  };
+  localgit_cancel: { args: { handle: string; jobId: string }; result: void };
 }
 
 /** A local TCP port something is listening on, as the Ports view shows it. */
@@ -193,6 +226,15 @@ export const onResourceChanges = (handler: (batch: ResourceChangeBatch) => void)
 /** The watcher starting, or failing to keep watching. */
 export const onWatcherStatus = (handler: (status: WatcherStatus) => void) =>
   onNativeEvent("watcher-status", asWatcherStatus, handler);
+
+const asLocalGitProgress = (payload: unknown): LocalGitProgress | null =>
+  payload && typeof payload === "object" && typeof (payload as LocalGitProgress).jobId === "string"
+    ? (payload as LocalGitProgress)
+    : null;
+
+/** A Local Git snapshot's progress (at most 10 a second), for every handle's jobs. */
+export const onLocalGitProgress = (handler: (progress: LocalGitProgress) => void) =>
+  onNativeEvent("localgit-progress", asLocalGitProgress, handler);
 
 /** The payload `git_watch_repo`'s Rust-side watcher emits -- see the Git State &
  * Synchronization plan's Section H/Z. `worktreeRoot` is only present for the two

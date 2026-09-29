@@ -525,7 +525,7 @@ fn check_token(what: &str, value: &str) -> Result<()> {
 
 /// `%XX` for `%`, space and every control character; everything else as it is. An empty value
 /// is `%` alone, so every header keeps its field count.
-fn escape(value: &str) -> String {
+pub(crate) fn escape(value: &str) -> String {
     if value.is_empty() {
         return "%".into();
     }

@@ -96,6 +96,7 @@ import type { EditorRange } from "./editor/editorTypes";
 import type { PaletteSymbol, SymbolScope } from "./components/command-palette/CommandPalette";
 import { clearProblems, publishProblems } from "./services/panel/problems";
 import { currentGit, useWorkspace, workspaces } from "./services/workspaces";
+import { createOverlayTracker } from "./services/localgit/overlays";
 import { fileUri } from "./services/resource";
 import { loadMinimapPreferences, saveMinimapPreferences } from "./services/minimapPreferences";
 import type { MinimapPreferences } from "./services/minimapPreferences";
@@ -470,6 +471,15 @@ export default function App() {
       // their watchers and polling stopped -- before anything of the new one exists.
       await workspaces.open([target]);
       if (revision !== workspaceRevision.current) return;
+      // Local Git's snapshots see this workspace's unsaved documents (read, never changed),
+      // for as long as the workspace is open.
+      const context = workspaces.current();
+      const localGit = context.services.localGit;
+      if (localGit) {
+        const tracker = createOverlayTracker(documents, context.folders);
+        context.own(localGit.attachOverlays(tracker));
+        context.own(tracker.dispose);
+      }
       explorer.setRoots([target]);
       await explorer.loadChildren(explorer.idFor(target));
       // A folder opened while this listing was in flight owns the window now. Setting the

@@ -142,3 +142,200 @@ pub fn listing(dir: &Path) -> Vec<String> {
     out.sort();
     out
 }
+
+// --- Snapshots (LG-02) --------------------------------------------------------------------------
+
+use std::sync::atomic::AtomicBool;
+use std::sync::Mutex;
+
+/// The snapshot engine for a fixture's store, with the store's own settings.
+pub fn engine_for(repo: &Mutex<Repository>, project: &Path) -> SnapshotEngine {
+    let repo = repo.lock().unwrap();
+    engine_with(&repo, project, repo.meta().max_blob_bytes)
+}
+
+pub fn engine_with(repo: &Repository, project: &Path, max_blob: u64) -> SnapshotEngine {
+    let folder = &repo.meta().folders[0];
+    SnapshotEngine::new(
+        vec![FolderRoot {
+            folder_id: FolderId::new(&folder.folder_id).unwrap(),
+            path: project.to_path_buf(),
+            resource_id: folder.resource_id.clone(),
+        }],
+        max_blob,
+    )
+}
+
+pub fn try_snapshot(
+    engine: &SnapshotEngine,
+    repo: &Mutex<Repository>,
+    request: &SnapshotRequest,
+) -> Result<Snapshot> {
+    let cancel = AtomicBool::new(false);
+    engine.snapshot(
+        repo,
+        request,
+        &Control {
+            cancel: &cancel,
+            progress: &|_| {},
+        },
+    )
+}
+
+pub fn snapshot(engine: &SnapshotEngine, repo: &Mutex<Repository>) -> Snapshot {
+    try_snapshot(engine, repo, &SnapshotRequest::default()).unwrap()
+}
+
+pub fn snapshot_mode(
+    engine: &SnapshotEngine,
+    repo: &Mutex<Repository>,
+    mode: RequestedMode,
+) -> Snapshot {
+    try_snapshot(
+        engine,
+        repo,
+        &SnapshotRequest {
+            mode,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+pub fn persist(engine: &SnapshotEngine, repo: &Mutex<Repository>) -> Snapshot {
+    try_snapshot(
+        engine,
+        repo,
+        &SnapshotRequest {
+            persist: true,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+pub fn status_with(
+    engine: &SnapshotEngine,
+    repo: &Mutex<Repository>,
+    request: &SnapshotRequest,
+) -> (Snapshot, Status) {
+    let cancel = AtomicBool::new(false);
+    engine
+        .status(
+            repo,
+            request,
+            &Control {
+                cancel: &cancel,
+                progress: &|_| {},
+            },
+            usize::MAX,
+        )
+        .unwrap()
+}
+
+pub fn status(engine: &SnapshotEngine, repo: &Mutex<Repository>) -> Status {
+    status_with(engine, repo, &SnapshotRequest::default()).1
+}
+
+/// The id of a folder's tree in a root.
+pub fn folder_tree(repo: &Repository, root: ObjectId) -> ObjectId {
+    *repo
+        .read_root(&root)
+        .unwrap()
+        .folders
+        .values()
+        .next()
+        .unwrap()
+}
+
+/// Every entry under a stored tree: `path -> description`, e.g. `file <id>`, `file! <id>`
+/// (executable), `unstored <size> <id>`, `dir`, `link:<kind> <target>`.
+pub fn tree_listing(repo: &Repository, tree: ObjectId) -> BTreeMap<String, String> {
+    fn walk(repo: &Repository, tree: ObjectId, prefix: &str, out: &mut BTreeMap<String, String>) {
+        for entry in repo.read_tree(&tree).unwrap().entries() {
+            let path = if prefix.is_empty() {
+                entry.name.as_str().to_string()
+            } else {
+                format!("{prefix}/{}", entry.name.as_str())
+            };
+            let what = match entry.kind {
+                EntryKind::File {
+                    executable,
+                    stored: Stored::Yes,
+                } => format!("file{} {}", if executable { "!" } else { "" }, entry.id),
+                EntryKind::File {
+                    stored: Stored::No { size },
+                    ..
+                } => format!("unstored {size} {}", entry.id),
+                EntryKind::Directory => {
+                    walk(repo, entry.id, &path, out);
+                    "dir".into()
+                }
+                EntryKind::Symlink(kind) => format!(
+                    "link:{kind:?} {}",
+                    String::from_utf8(repo.read_blob(&entry.id, 1 << 20).unwrap()).unwrap()
+                ),
+            };
+            out.insert(path, what);
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(repo, tree, "", &mut out);
+    out
+}
+
+/// A persisted snapshot's listing of its (only) folder's disk tree.
+pub fn disk_listing(repo: &Mutex<Repository>, snapshot: &Snapshot) -> BTreeMap<String, String> {
+    let repo = repo.lock().unwrap();
+    let tree = folder_tree(&repo, snapshot.disk_root.0);
+    tree_listing(&repo, tree)
+}
+
+/// Makes a persisted snapshot's disk root HEAD (a commit on `refs/heads/main`).
+pub fn commit_root(repo: &Mutex<Repository>, root: ObjectId) -> ObjectId {
+    let mut repo = repo.lock().unwrap();
+    let workspace = repo.meta().workspace.clone();
+    let parent = repo.refs().head_commit();
+    let mut txn = repo.begin_write().unwrap();
+    let commit = txn
+        .put_commit(&Commit {
+            root,
+            disk_root: None,
+            parents: parent.into_iter().collect(),
+            workspace,
+            author: Author {
+                name: "Test".into(),
+                id: "test@yavin".into(),
+            },
+            time_ms: 1_790_000_000_000,
+            tz_offset_min: 0,
+            source: Source::Checkpoint,
+            meta: BTreeMap::new(),
+            meta_objects: BTreeMap::new(),
+            message: "head".into(),
+        })
+        .unwrap();
+    txn.commit().unwrap();
+    advance(&mut repo, commit);
+    commit
+}
+
+pub fn write(path: &Path, bytes: impl AsRef<[u8]>) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Sets a file's modification time well in the past, so the scan cache may trust it (a file
+/// modified within `RACY_WINDOW_NS` of a scan is always hashed again).
+pub fn age(path: &Path) {
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+}
+
+/// A blob id computed independently of the snapshot code.
+pub fn blob_id(bytes: &[u8]) -> ObjectId {
+    hash_object(ObjectKind::Blob, bytes)
+}

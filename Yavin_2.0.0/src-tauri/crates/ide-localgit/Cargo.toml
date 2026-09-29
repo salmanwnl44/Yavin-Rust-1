@@ -9,6 +9,15 @@ ide-workspace = { path = "../ide-workspace" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
+# `.yavinignore` patterns (gitignore *syntax*, fed only from `.yavinignore` text: Git's own
+# ignore files and configuration are never read).
+ignore = "0.4"
+# Parallel stat and hash over a workspace's directories.
+rayon = "1"
+
+[target.'cfg(windows)'.dependencies]
+# Tells a junction from a directory symbolic link (the reparse tag), without following either.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [features]
 # Crash simulation at every durable boundary, for this crate's tests and the app's own.
@@ -17,3 +26,7 @@ fault-injection = []
 [dev-dependencies]
 # The integration tests simulate crashes, so they build this crate with fault injection on.
 ide-localgit = { path = ".", features = ["fault-injection"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The scale tests report the process's peak memory.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

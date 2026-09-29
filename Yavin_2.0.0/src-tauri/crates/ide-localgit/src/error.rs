@@ -60,6 +60,8 @@ pub enum LgError {
         expected: &'static str,
         found: &'static str,
     },
+    /// The caller cancelled the operation (a newer status superseded it, or its handle closed).
+    Cancelled,
     Io(String),
 }
 
@@ -81,6 +83,7 @@ impl LgError {
             LgError::RecoveryRequired(_) => "RecoveryRequired",
             LgError::ContentUnavailable(_) => "ContentUnavailable",
             LgError::WrongKind { .. } => "WrongKind",
+            LgError::Cancelled => "Cancelled",
             LgError::Io(_) => "Io",
         }
     }
@@ -140,6 +143,7 @@ impl fmt::Display for LgError {
                 expected,
                 found,
             } => write!(f, "{id} is a {found}, not a {expected}"),
+            LgError::Cancelled => write!(f, "The operation was cancelled"),
             LgError::Io(detail) => write!(f, "{detail}"),
         }
     }

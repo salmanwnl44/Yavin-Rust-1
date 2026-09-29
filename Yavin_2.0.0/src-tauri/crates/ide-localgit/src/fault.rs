@@ -67,3 +67,47 @@ pub(crate) fn hit(point: FaultPoint) {
 #[cfg(not(any(test, feature = "fault-injection")))]
 #[inline(always)]
 pub(crate) fn hit(_point: FaultPoint) {}
+
+/// A test's hook into a file read: called after a file's bytes were read and before its
+/// metadata is checked again, with the path and the attempt (0, then 1 on the retry). Tests
+/// change, delete or lock the file here to exercise the snapshot's race detection. Hooks are
+/// keyed by path, so tests running in parallel (in other temp directories) never see each
+/// other's.
+#[cfg(any(test, feature = "fault-injection"))]
+pub mod read_hook {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    type Hook = Arc<dyn Fn(&Path, u32) + Send + Sync>;
+
+    fn hooks() -> &'static Mutex<HashMap<PathBuf, Hook>> {
+        static HOOKS: OnceLock<Mutex<HashMap<PathBuf, Hook>>> = OnceLock::new();
+        HOOKS.get_or_init(Default::default)
+    }
+
+    /// Calls `hook` whenever the file at `path` has just been read.
+    pub fn set(path: &Path, hook: impl Fn(&Path, u32) + Send + Sync + 'static) {
+        hooks()
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), Arc::new(hook));
+    }
+
+    pub fn clear(path: &Path) {
+        hooks().lock().unwrap().remove(path);
+    }
+
+    pub(crate) fn run(path: &Path, attempt: u32) {
+        let hook = hooks().lock().unwrap().get(path).cloned();
+        if let Some(hook) = hook {
+            hook(path, attempt);
+        }
+    }
+}
+
+#[cfg(not(any(test, feature = "fault-injection")))]
+pub(crate) mod read_hook {
+    #[inline(always)]
+    pub(crate) fn run(_path: &std::path::Path, _attempt: u32) {}
+}

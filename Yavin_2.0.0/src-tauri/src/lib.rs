@@ -32,9 +32,9 @@ use git::{
     NetworkLocks, Repos, StashLocks,
 };
 use localgit::{
-    localgit_blob_info, localgit_close, localgit_info, localgit_open, localgit_read_blob,
-    localgit_read_commit, localgit_read_tree, localgit_reflog, localgit_refs, localgit_verify,
-    LocalGit,
+    localgit_blob_info, localgit_cancel, localgit_close, localgit_info, localgit_open,
+    localgit_put_overlays, localgit_read_blob, localgit_read_commit, localgit_read_tree,
+    localgit_reflog, localgit_refs, localgit_snapshot, localgit_status, localgit_verify, LocalGit,
 };
 use lsp::{lsp_send, lsp_servers, lsp_start, lsp_stop, lsp_stop_all, LspSessions};
 use ports::{list_listening_ports, stop_listening_process};
@@ -76,6 +76,8 @@ fn watch_workspace(app: &AppHandle, watch: &Watch, root: &Path) {
     let handle = app.clone();
     let started =
         resource_events::start_resource_watcher(root, Arc::clone(&watch.expected), move |output| {
+            // Local Git's snapshots follow the same stream natively (incremental scans).
+            handle.state::<LocalGit>().observe(&output);
             let _ = match output {
                 WatchOutput::Changes(batch) => handle.emit("resource-changes", batch),
                 WatchOutput::Status(status) => handle.emit("watcher-status", status),
@@ -91,15 +93,15 @@ fn watch_workspace(app: &AppHandle, watch: &Watch, root: &Path) {
         // the UI is told, rather than left believing the folder is watched.
         Err(error) => {
             eprintln!("Cannot watch workspace: {error}");
-            let _ = app.emit(
-                "watcher-status",
-                WatcherStatus {
-                    generation: 0,
-                    root: file_tree::clean_path_str(root),
-                    state: WatcherState::Failed,
-                    message: Some(error),
-                },
-            );
+            let status = WatcherStatus {
+                generation: 0,
+                root: file_tree::clean_path_str(root),
+                state: WatcherState::Failed,
+                message: Some(error),
+            };
+            app.state::<LocalGit>()
+                .observe(&WatchOutput::Status(status.clone()));
+            let _ = app.emit("watcher-status", status);
         }
     }
 }
@@ -666,6 +668,10 @@ pub fn run() {
             localgit_read_tree,
             localgit_blob_info,
             localgit_read_blob,
+            localgit_put_overlays,
+            localgit_snapshot,
+            localgit_status,
+            localgit_cancel,
             recovery_report,
             recovery_dismiss,
             get_default_workspace,

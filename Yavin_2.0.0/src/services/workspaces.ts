@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { GitRegistry } from "./git/registry.ts";
-import { native } from "./native.ts";
+import { native, onLocalGitProgress } from "./native.ts";
 import { clearProblems } from "./panel/problems.ts";
 import { createLocalGitService } from "./localgit/service.ts";
 import type { LocalGitService } from "./localgit/service.ts";
@@ -51,8 +51,12 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
       // folders must be); only in the app, where there is a native side.
       const localGit =
         folders.length && isTauri()
-          ? createLocalGitService(folders, lifecycle, (command, args) =>
-              (native as unknown as (c: string, a: unknown) => Promise<unknown>)(command, args),
+          ? createLocalGitService(
+              folders,
+              lifecycle,
+              (command, args) =>
+                (native as unknown as (c: string, a: unknown) => Promise<unknown>)(command, args),
+              { onProgress: onLocalGitProgress },
             )
           : null;
       return { git, localGit };

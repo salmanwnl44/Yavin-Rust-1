@@ -97,3 +97,163 @@ export interface LocalGitBlobInfo {
   size: number;
   binary: boolean;
 }
+
+// --- Snapshots and status (LG-02) ----------------------------------------------------------
+
+/** How a snapshot scans: `auto` (incremental when safe), `full`, or `verify` (hash everything). */
+export type LocalGitSnapshotMode = "auto" | "full" | "verify";
+
+/** Something a snapshot could not record as it is. Always reported, never silent. */
+export type LocalGitProblem =
+  | { kind: "unstable"; folderId: string; path: string; carriedForward: boolean }
+  | { kind: "unreadable"; folderId: string; path: string; detail: string; carriedForward: boolean }
+  | { kind: "unrepresentable"; folderId: string; path: string; detail: string }
+  | { kind: "unsupported"; folderId: string; path: string; what: string }
+  | { kind: "invalidIgnorePattern"; folderId: string; path: string; line: number; detail: string }
+  | { kind: "overlayRefused"; path: string; reason: string };
+
+export interface LocalGitOverlayRecord {
+  folderId: string;
+  path: string;
+  blob: string;
+  size: number;
+  encoding: string;
+  lineEnding: string;
+  version: number;
+}
+
+export interface LocalGitUntitledRecord {
+  id: string;
+  blob: string;
+  size: number;
+  encoding: string;
+  lineEnding: string;
+  version: number;
+}
+
+export interface LocalGitSnapshot {
+  sequence: number;
+  mode: "full" | "incremental" | "verify";
+  fullReason:
+    | "firstScan"
+    | "watcherUnavailable"
+    | "watcherChanged"
+    | "periodic"
+    | "ignoreRulesChanged"
+    | "persisted"
+    | "requested"
+    | null;
+  takenMs: number;
+  durationMs: number;
+  workspace: string;
+  watcherGeneration: number | null;
+  /** What is on disk. */
+  diskRoot: string;
+  /** What is on disk with the unsaved documents applied. */
+  effectiveRoot: string;
+  folders: { folderId: string; diskTree: string; effectiveTree: string }[];
+  overlays: LocalGitOverlayRecord[];
+  untitled: LocalGitUntitledRecord[];
+  overlaySet: string | null;
+  problems: LocalGitProblem[];
+  stats: {
+    files: number;
+    directories: number;
+    reusedDirectories: number;
+    filesHashed: number;
+    bytesHashed: number;
+    cacheHits: number;
+  };
+  persisted: boolean;
+}
+
+export type LocalGitChangeKind = "added" | "modified" | "deleted" | "typeChanged" | "renamed";
+
+export interface LocalGitSide {
+  class: "file" | "directory" | "symlink";
+  id: string;
+  executable: boolean;
+  /** False for a file over the storage limit: hashed, content not stored. */
+  stored: boolean;
+  size: number | null;
+  link: "file" | "directory" | "junction" | null;
+}
+
+export interface LocalGitChange {
+  kind: LocalGitChangeKind;
+  /** For a rename: where the content was. */
+  from?: string;
+  old: LocalGitSide | null;
+  new: LocalGitSide | null;
+}
+
+export interface LocalGitStatusEntry {
+  folderId: string;
+  path: string;
+  /** Local HEAD against the disk. */
+  disk: LocalGitChange | null;
+  /** Local HEAD against what the user has (disk plus unsaved documents). */
+  effective: LocalGitChange | null;
+  /** Set when the path has an unsaved document. */
+  memory: {
+    state: "differsFromDisk" | "equalsDisk" | "openDeletedOnDisk";
+    equalsHead: boolean;
+    version: number;
+  } | null;
+}
+
+export interface LocalGitCounts {
+  added: number;
+  modified: number;
+  deleted: number;
+  typeChanged: number;
+  renamed: number;
+}
+
+export interface LocalGitStatus {
+  headCommit: string | null;
+  headRoot: string | null;
+  /** `head` until staging exists (LG-04). */
+  index: "head";
+  diskRoot: string;
+  effectiveRoot: string;
+  entries: LocalGitStatusEntry[];
+  total: number;
+  truncated: boolean;
+  disk: LocalGitCounts;
+  effective: LocalGitCounts;
+  unsaved: number;
+}
+
+export interface LocalGitProgress {
+  handle: string;
+  jobId: string;
+  phase: "scanning" | "overlays" | "writing";
+  files: number;
+  directories: number;
+  bytesHashed: number;
+  totalEstimate: number | null;
+}
+
+/** An unsaved named document as sent to the native pool (`text` is what saving would write). */
+export interface LocalGitOverlayArg {
+  key: string;
+  path: string;
+  text: string;
+  encoding: string;
+  lineEnding: string;
+  version: number;
+}
+
+export interface LocalGitUntitledArg {
+  id: string;
+  text: string;
+  encoding: string;
+  lineEnding: string;
+  version: number;
+}
+
+export interface LocalGitOverlayRef {
+  key: string;
+  version: number;
+}

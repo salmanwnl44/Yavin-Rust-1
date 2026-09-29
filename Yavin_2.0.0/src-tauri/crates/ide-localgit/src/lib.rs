@@ -6,10 +6,13 @@
 //! commits) in segment files, plus a small atomically replaced `refs.json` and an append-only
 //! reflog. See ARCHITECTURE.md, "Local Git".
 //!
-//! This is the storage foundation (LG-01): snapshots, status, commits made by people, branches
-//! and everything that builds on them come in later phases on top of these APIs.
+//! LG-01 is the storage foundation; LG-02 adds snapshots of the workspace -- the disk, and the
+//! disk with unsaved documents applied -- and status against Local HEAD (`snapshot`, `scan`,
+//! `exclude`, `status`). Commits made by people, branches and everything that builds on them
+//! come in later phases on top of these APIs.
 
 pub mod error;
+pub mod exclude;
 pub mod fault;
 pub mod finding;
 pub mod id;
@@ -18,7 +21,10 @@ pub mod odb;
 pub mod reflog;
 pub mod refs;
 pub mod repository;
+pub mod scan;
 pub mod segment;
+pub mod snapshot;
+pub mod status;
 pub mod workspace;
 
 pub use error::{LgError, Result};
@@ -33,4 +39,11 @@ pub use repository::{
     FolderRecord, Mode, Object, OpenOptions, ReadOnlyReason, Repository, WorkspaceMeta, WriteTxn,
     DEFAULT_MAX_BLOB_BYTES, FORMAT_VERSION,
 };
+pub use scan::{Problem, RACY_WINDOW_NS};
+pub use snapshot::{
+    Control, FolderRoot, FullReason, ObjectIdText, OverlayInput, OverlayRecord, Progress,
+    RequestedMode, ScanMode, Snapshot, SnapshotEngine, SnapshotRequest, UntitledInput,
+    UntitledRecord, WatchedChange, FULL_EVERY, FULL_EVERY_SNAPSHOTS,
+};
+pub use status::{ChangeKind, EntryClass, MemoryState, Status, StatusEntry};
 pub use workspace::{resource_id_of, FolderSpec, WorkspaceSpec};

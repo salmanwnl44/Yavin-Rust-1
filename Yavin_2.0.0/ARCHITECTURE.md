@@ -819,7 +819,7 @@ SOURCE CONTROL                                   ⋯   view options: which secti
 
 Local Git is Yavin's own history for a workspace -- checkpoints, local commits, branches and restore, eventually "Undo AI Run" -- that works with or without real Git. It is **not Git**: it never reads or writes `.git`, never runs `git`, never reads `.gitignore`, and nothing it stores ends up in the project. Real Git stays what the Source Control panel shows. Local Git never owns live document content either: DocumentService does, and Local Git only records snapshots of it.
 
-LG-01 (this module) is the storage layer: the object store, the repository lifecycle and crash-safe persistence. Snapshots, status and every command that writes arrive in later phases (see "Not yet").
+LG-01 is the storage layer: the object store, the repository lifecycle and crash-safe persistence. LG-02 adds snapshots of the workspace -- on disk, and with unsaved documents applied -- and status against Local HEAD ("Snapshots and status" below). Commits made by people and everything that builds on them arrive in later phases (see "Not yet").
 
 ```text
 renderer                                    native (src-tauri)
@@ -879,7 +879,89 @@ A revision is never reused: the next one is past both `refs.json` and the reflog
 
 **Performance** (release build, idle development machine, `cargo test -p ide-localgit --release --test scale -- --ignored`): 10k objects write in 0.16 s (one 16.6 MB segment; writing them again, all duplicates, 31 ms), reopen in 5 ms, read in 0.12 ms each, and a commit plus ref update (synced reflog line and `refs.json`) takes 51 ms; 100k objects write in 1.2 s (166 MB, one segment; duplicates 189 ms), reopen in 35 ms, read in 0.11 ms each, commit plus ref update 50 ms.
 
-**Not yet** (later phases): snapshots of the folders and of unsaved documents, `.yavinignore` and the built-in exclusions, and status (LG-02); checkpoints, commits, history, diff and restore (LG-03); staging, branches and tags (LG-04); reset, revert and stash (LG-05); merge and cherry-pick (LG-06); AI checkpoints and Undo AI Run (LG-07); any UI (LG-08); comparison with real Git, GC, compaction, compression and a recovery UI (LG-09).
+### Snapshots and status (LG-02)
+
+```text
+DocumentService ──(read only)── OverlayTracker ── LocalGitService ── localgit_put_overlays / _snapshot / _status
+ (App.tsx attaches it to the     services/localgit/overlays.ts                    │
+  workspace context: ctx.own)                                        SnapshotEngine (one per open store)
+workspace watcher ── observe() (native, no renderer round trip) ──────────▶ dirty set, watcher health
+                                                                             │
+                                          scan.rs: walk + hash ──▶ disk root ──┬── status.rs ◀── Local HEAD
+                                          overlays applied      ──▶ effective root┘   (index = HEAD)
+```
+
+**Local Git snapshot semantics are not Git ignore semantics.** A snapshot never reads `.gitignore`, `.git/info/exclude`, `core.excludesFile` or any Git configuration; a file Git ignores is in Local Git's snapshot like any other, and a source scan test forbids the code that could read them.
+
+**Disk root and effective root.** A snapshot has two roots. The **disk root** is exactly what is on disk. The **effective root** is the disk root with every unsaved named document applied: a dirty document's bytes replace its file, and a dirty document whose file was deleted puts it back. With no unsaved document they are the same object. Nothing is written to the project to take either; DocumentService is read, never changed, and nothing saves.
+
+| Disk                  | Editor            | Disk root  | Effective root   |
+| --------------------- | ----------------- | ---------- | ---------------- |
+| `foo.ts` = version 10 | clean             | version 10 | version 10       |
+| `foo.ts` = version 10 | dirty, version 11 | version 10 | version 11       |
+| `foo.ts` deleted      | open, dirty       | absent     | the unsaved text |
+
+**What is recorded.** Regular files (as blobs), directories -- empty ones included -- and links. A **link** (a symbolic link or a Windows junction, told apart by its reparse tag) is recorded as its target text and **never followed**: nothing behind it is read, so a loop, a broken link or a link out of the workspace is harmless. Names are kept exactly (case, Unicode). Anything a tree cannot hold exactly -- a name that is not UTF-8 or is longer than 255 bytes, a FIFO, socket or device -- is left out and reported as a problem, never converted. Only the workspace's folders are walked, and nothing is written inside them.
+
+**Exclusions** (`crates/ide-localgit/src/exclude.rs`), in order, the first that decides wins:
+
+1. `.git` -- a directory or a worktree's gitfile, at any depth, in any case -- always. Nothing re-includes it.
+2. `.yavinignore` files, the deepest directory's first; within one file the last matching line decides. Gitignore _syntax_ (`*`, `**`, a trailing `/` for directories, a leading `/` to anchor, `!` to re-include), compiled only from `.yavinignore` text. A directory left out is not entered, so nothing below it can be re-included. An invalid line is reported with its line number and skipped.
+3. The built-in list, lowest precedence (a `.yavinignore` `!node_modules/` brings it back): `node_modules/`, `target/`, `__pycache__/`, `.venv/`, `.gradle/`, `.next/`, `.nuxt/`, `.turbo/` (installed packages, build output and caches), `.env`, `.env.*` (secrets are never copied into history by default), `.DS_Store`, `Thumbs.db` (operating-system clutter). `dist/`, `build/`, `out/` and `obj/` are not in it: without `.gitignore` they may be source.
+
+Patterns match case-sensitively on every platform, so one set of files gives one snapshot anywhere. An unsaved document inside a left-out place (or `.git`) is refused as an overlay, and reported.
+
+**Large files.** A file over `maxBlobBytes` (20 MiB; exactly 20 MiB is still stored) is streamed through SHA-256 -- never held in memory -- and recorded as an _unstored_ entry with its id and size. Its id is its content's own, so status still sees it unchanged, modified, deleted, added or renamed; its content is not in the store (reading it is `ContentUnavailable`, and restoring it, from LG-03, will say so). "Unstored" is never "missing": the file is in the tree.
+
+**Reading a file safely.** Metadata, then the bytes, then metadata again: the file is accepted only if size, modification time and (Windows) creation time or (Unix) inode and change time are unchanged and exactly `size` bytes were read. Otherwise it is read once more, and if it changed again it is `unstable`. A file that disappears meanwhile is absent. A file that is unstable or cannot be read (locked, no permission) is **carried forward** -- its entry from the previous scan (or HEAD) kept, never recorded as deleted -- and reported; with nothing to carry forward it is left out and reported. An unreadable directory is carried forward the same way. Executable bits come from the file on Unix; Windows has none, so the previous entry's is kept (as Git's `core.fileMode=false`).
+
+**The scan cache** (`cache/scan-<folderId>.bin` in the store, checksummed) remembers each file's metadata and id so a scan need not hash it again. It is used only when the metadata is exactly what was recorded **and** the file was last modified more than 3 s before the scan that recorded it (a "racy" file, modified around a scan, could change again without its time changing -- it is always hashed). A damaged cache is ignored; an empty one only costs time. A `verify` scan ignores it entirely.
+
+**Full and incremental.** A Full scan lists every directory and stats every file (hashing only what the cache cannot vouch for); it is always authoritative. An incremental scan lists only the directories the watcher reported changes in, scans a rescan scope (dropped or overflowing events) as if new, and takes every other directory's tree from the previous scan without opening it. The watcher is an optimisation, never the source of truth. A scan is **Full** when:
+
+| Rule                                                                                                                                                                 | Why                                                                        |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| first scan since the store opened, or after a scan failed or was cancelled                                                                                           | nothing to build on (the changes that scan took from the watcher are gone) |
+| the watcher is failed, has not reported, or reported another generation than the one watching when the previous scan started; or events came from another generation | events may have been missed                                                |
+| every 20th snapshot, or 10 minutes since the last Full                                                                                                               | the periodic safety rescan (a change the watcher never reported is found)  |
+| a `.yavinignore` changed                                                                                                                                             | the rules for everything below it may have                                 |
+| the snapshot is persisted                                                                                                                                            | a persisted snapshot never builds on an ephemeral one                      |
+| the caller asked for `full` or `verify`                                                                                                                              |                                                                            |
+
+The watcher's batches reach Local Git natively (`LocalGit::observe`, from `watch_workspace`), never through the renderer; they never wait for a scan, and events arriving during one are kept for the next. The watcher reports a change up to about a second after it happens, so an incremental snapshot can miss a change made in that last second -- one reason persisted snapshots are Full.
+
+**Ephemeral and persisted.** A snapshot for status is ephemeral: hashed, its trees computed in memory, nothing written. A persisted snapshot writes every blob, tree, both roots and the overlay set in one transaction -- published atomically, or not at all. LG-02 creates no commit, checkpoint or ref: a persisted snapshot is what LG-03's checkpoints and commits will refer to.
+
+**Overlays.** The renderer's `OverlayTracker` (`services/localgit/overlays.ts`), attached to the workspace's `LocalGitService` by the window through the workspace context, takes part documents that are named files (`source: disk`), inside the workspace's folders, with unsaved changes -- including one whose file was deleted. Never proposed (AI) documents, never documents outside the workspace; untitled documents only in recovery snapshots that ask for them (they have no path, so they are in the overlay set but in no tree). An overlay's bytes are what saving would write: DocumentService's own `encode` (its UTF-8 or UTF-8 with BOM, its LF or CRLF), computed once per document version. The service sends each version to the handle's native pool once (`localgit_put_overlays`); a snapshot names the versions it uses and the pool forgets the rest (a version the pool no longer has is `OverlayMissing`, and the service sends everything again, once). The native side places each overlay in its folder by `ResourceId` and refuses one outside the workspace or in a left-out place.
+
+The **overlay set** is a canonical text blob, referenced by the snapshot:
+
+```text
+ylg-overlays 1
+doc <folderId> <path> <blob> <encoding> <lineEnding> <version>
+untitled <id> <blob> <encoding> <lineEnding> <version>
+```
+
+sorted, with fields `%XX`-escaped as commit headers are, so the same overlays always give the same id.
+
+**Status** (`status.rs`) compares, per path, Local HEAD with the disk root (**disk**: what is saved) and with the effective root (**effective**: what the user has), and says for each unsaved document how it relates to the disk (`differsFromDisk`, `equalsDisk`, `openDeletedOnDisk`) and whether it equals HEAD. The index is HEAD until staging exists (LG-04), and says so (`index: "head"`). Changes are `added`, `modified` (content, executable bit or link kind), `deleted`, `typeChanged` (file, directory and link turned into one another; a directory's own files are then listed as added or deleted beneath it) and `renamed` (exactly the same content gone from one path and present at another, paired deterministically in path order; unstored files take part by their hash; a case-only rename is a rename). There is no similarity-based rename detection. With no commit yet, everything is added. It is Yavin's own typed model, not `git status` output, and is cut at a limit (5000 by default) with the total and `truncated`.
+
+**Jobs, cancellation and progress.** A snapshot or status is a job of a handle with its own id. A newer status cancels the status in flight; `localgit_cancel` cancels any job; closing or revoking a handle (leaving the workspace) cancels all of its jobs, and a job's result is delivered only if its handle is still open and it was not cancelled -- otherwise `HandleClosed` or `Cancelled`, and the renderer drops a late answer anyway (`LocalGitClosedError`). One snapshot runs at a time per store; persisted ones cannot corrupt each other. Progress (`localgit-progress`: phase, files, directories, bytes hashed, the previous scan's file count as an estimate) is throttled to 10 a second and plays no part in correctness.
+
+**Multi-root.** Every structure is per folder: a root maps folder ids to trees, paths are folder-relative, and two folders' `foo.ts` never meet. The window opens one folder today.
+
+**Performance** (release, idle development machine, `cargo test -p ide-localgit --release --test snapshot_scale -- --ignored --nocapture --test-threads=1`; small source files in 10,000 directories):
+
+|                                         | 10k files              | 100k files               | Plan budget     |
+| --------------------------------------- | ---------------------- | ------------------------ | --------------- |
+| first persisted snapshot                | 1.64 s                 | 10.7 s                   | 3 s / 30 s      |
+| Full walk, nothing changed (warm cache) | 0.59 s                 | 1.14 s                   | 100k < 2.5 s    |
+| incremental, 10 files changed           | 44 ms                  | 38 ms                    | 100k < 150 ms   |
+| status (incremental / Full)             | 16 ms / 0.55 s         | 9 ms / 1.03 s            | warm 100k < 3 s |
+| store after the first snapshot          | 20,113 objects, 4.4 MB | 110,113 objects, 35.2 MB |                 |
+| peak memory (process)                   |                        | 85 MB                    | < 250 MB        |
+
+**Not yet** (later phases): checkpoints, commits, history, diff and restore -- including reporting unstored content (LG-03); staging, branches and tags (LG-04); reset, revert and stash (LG-05); merge and cherry-pick (LG-06); AI checkpoints and Undo AI Run (LG-07); any UI (LG-08); comparison with real Git, GC, compaction, compression and a recovery UI (LG-09).
 
 **Invariants**
 
@@ -889,6 +971,10 @@ A revision is never reused: the next one is past both `refs.json` and the reflog
 4. Corrupt data is set aside and reported, never deleted or silently repaired.
 5. One writer per store; everyone else reads.
 6. A workspace's Local Git work never reaches another workspace.
+7. A snapshot never writes to the project and never changes a document; the disk root is what is on disk, and the effective root differs from it only by unsaved documents.
+8. What a snapshot records never depends on Git's ignore rules or configuration.
+9. An incremental snapshot is an optimisation: it gives the Full answer, and anything uncertain makes the scan Full.
+10. A file that could not be read reliably is carried forward or left out, and always reported -- never recorded as deleted, never recorded inconsistent.
 
 ## Explorer provider platform
 
