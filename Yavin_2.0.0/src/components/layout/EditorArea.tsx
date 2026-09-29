@@ -169,125 +169,133 @@ export function EditorArea({
   return (
     <div className="flex flex-1 flex-col min-w-0 bg-[#000000] select-none text-[12px] overflow-hidden font-sans">
       {/* Tab Bar */}
-      <div
-        ref={strip}
-        // A mouse wheel scrolls the tabs sideways, as the missing scrollbar would.
-        onWheel={(event) => {
-          if (strip.current && !event.deltaX) strip.current.scrollLeft += event.deltaY;
-        }}
-        className="flex h-9 items-center border-b border-[#151515] bg-[#050505] px-1 overflow-x-auto no-scrollbar gap-0.5 shrink-0"
-      >
-        <div role="tablist" aria-label="Open editors" className="flex h-full items-center gap-0.5">
-          {tabs.map((tab) => {
-            const isActive = tab.id === activeTabId;
+      <div className="flex h-9 items-center border-b border-[#151515] bg-[#050505] pl-1 gap-0.5 shrink-0">
+        {/* Only the tabs scroll; the actions to their right stay where they are. */}
+        <div
+          ref={strip}
+          // A mouse wheel scrolls the tabs sideways, as the missing scrollbar would.
+          onWheel={(event) => {
+            if (strip.current && !event.deltaX) strip.current.scrollLeft += event.deltaY;
+          }}
+          className="flex h-full min-w-0 flex-1 overflow-x-auto no-scrollbar"
+        >
+          <div
+            role="tablist"
+            aria-label="Open editors"
+            className="flex h-full items-center gap-0.5"
+          >
+            {tabs.map((tab) => {
+              const isActive = tab.id === activeTabId;
 
-            return (
-              <div
-                key={tab.id}
-                role="tab"
-                id={`tab-${tab.id}`}
-                aria-controls="editor-panel"
-                aria-selected={isActive}
-                // One tab stop for the whole strip, with the arrows moving inside it: the
-                // pattern every tablist uses, and the reason a tab that is not selected is
-                // not separately tabbable.
-                tabIndex={isActive ? 0 : -1}
-                onClick={() => onSelectTab(tab.id)}
-                // The middle button closes a tab, as in a browser.
-                onAuxClick={(event) => {
-                  if (event.button !== 1) return;
-                  event.preventDefault();
-                  onCloseTab(tab.id);
-                }}
-                onContextMenu={(event) => {
-                  if (!tabMenu) return;
-                  event.preventDefault();
-                  setMenu({ x: event.clientX, y: event.clientY, id: tab.id });
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
+              return (
+                <div
+                  key={tab.id}
+                  role="tab"
+                  id={`tab-${tab.id}`}
+                  aria-controls="editor-panel"
+                  aria-selected={isActive}
+                  // One tab stop for the whole strip, with the arrows moving inside it: the
+                  // pattern every tablist uses, and the reason a tab that is not selected is
+                  // not separately tabbable.
+                  tabIndex={isActive ? 0 : -1}
+                  onClick={() => onSelectTab(tab.id)}
+                  // The middle button closes a tab, as in a browser.
+                  onAuxClick={(event) => {
+                    if (event.button !== 1) return;
                     event.preventDefault();
-                    onSelectTab(tab.id);
-                    return;
-                  }
-                  const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
-                  if (!step && event.key !== "Home" && event.key !== "End") return;
-                  event.preventDefault();
-                  // The arrows move focus and Enter opens it -- the tabs pattern's manual
-                  // activation. Selecting as focus moved would be the other half of the
-                  // pattern, but opening a tab hands focus to its editor, which would end
-                  // the walk along the strip after a single press.
-                  const index = tabs.findIndex((one) => one.id === tab.id);
-                  const next =
-                    event.key === "Home"
-                      ? 0
-                      : event.key === "End"
-                        ? tabs.length - 1
-                        : (index + step + tabs.length) % tabs.length;
-                  const target = tabs[next];
-                  if (target) document.getElementById(`tab-${target.id}`)?.focus();
-                }}
-                className={`group relative flex h-full items-center gap-2 px-3 border-r border-[#141414] cursor-pointer transition-all ${
-                  isActive
-                    ? "bg-[#000000] text-zinc-100 font-medium"
-                    : "bg-[#070707] text-zinc-400 hover:bg-[#0c0c0c] hover:text-zinc-200"
-                }`}
-              >
-                {/* Active top line */}
-                {isActive && (
-                  <span className="absolute top-0 left-0 right-0 h-[2px] bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.6)]" />
-                )}
-
-                {tab.id === "welcome" ? (
-                  <span className="text-indigo-400 font-mono text-[11px]">✦</span>
-                ) : (
-                  <FileIcon name={tab.name} className="size-3.5" />
-                )}
-
-                <span className="truncate max-w-[140px] text-[12px]">{tab.name}</span>
-
-                {/* The document's state: unsaved, saving, failed, or changed on disk. */}
-                {tab.dirty || tab.status === "externallyChanged" ? (
-                  <span
-                    title={statusTitle(tab)}
-                    className={`size-2 rounded-full ${
-                      tab.status === "conflicted" || tab.status === "saveFailed"
-                        ? "bg-red-500"
-                        : tab.status === "externallyChanged"
-                          ? "bg-zinc-500"
-                          : "bg-amber-400 hover:bg-amber-300"
-                    }`}
-                  />
-                ) : null}
-
-                {/* Every tab closes, the last one too: the window then shows Welcome. */}
-                <button
-                  aria-label={`Close ${tab.name}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
                     onCloseTab(tab.id);
                   }}
-                  className={`rounded p-0.5 text-zinc-500 ${isActive ? "opacity-100" : "opacity-0"} group-hover:opacity-100 focus-visible:opacity-100 hover:bg-[#1a1a1a] hover:text-white transition-all ml-0.5`}
+                  onContextMenu={(event) => {
+                    if (!tabMenu) return;
+                    event.preventDefault();
+                    setMenu({ x: event.clientX, y: event.clientY, id: tab.id });
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      onSelectTab(tab.id);
+                      return;
+                    }
+                    const step =
+                      event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+                    if (!step && event.key !== "Home" && event.key !== "End") return;
+                    event.preventDefault();
+                    // The arrows move focus and Enter opens it -- the tabs pattern's manual
+                    // activation. Selecting as focus moved would be the other half of the
+                    // pattern, but opening a tab hands focus to its editor, which would end
+                    // the walk along the strip after a single press.
+                    const index = tabs.findIndex((one) => one.id === tab.id);
+                    const next =
+                      event.key === "Home"
+                        ? 0
+                        : event.key === "End"
+                          ? tabs.length - 1
+                          : (index + step + tabs.length) % tabs.length;
+                    const target = tabs[next];
+                    if (target) document.getElementById(`tab-${target.id}`)?.focus();
+                  }}
+                  className={`group relative flex h-full items-center gap-2 px-3 border-r border-[#141414] cursor-pointer transition-all ${
+                    isActive
+                      ? "bg-[#000000] text-zinc-100 font-medium"
+                      : "bg-[#070707] text-zinc-400 hover:bg-[#0c0c0c] hover:text-zinc-200"
+                  }`}
                 >
-                  <svg
-                    width="10"
-                    height="10"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2.5"
+                  {/* Active top line */}
+                  {isActive && (
+                    <span className="absolute top-0 left-0 right-0 h-[2px] bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.6)]" />
+                  )}
+
+                  {tab.id === "welcome" ? (
+                    <span className="text-indigo-400 font-mono text-[11px]">✦</span>
+                  ) : (
+                    <FileIcon name={tab.name} className="size-3.5" />
+                  )}
+
+                  <span className="truncate max-w-[140px] text-[12px]">{tab.name}</span>
+
+                  {/* The document's state: unsaved, saving, failed, or changed on disk. */}
+                  {tab.dirty || tab.status === "externallyChanged" ? (
+                    <span
+                      title={statusTitle(tab)}
+                      className={`size-2 rounded-full ${
+                        tab.status === "conflicted" || tab.status === "saveFailed"
+                          ? "bg-red-500"
+                          : tab.status === "externallyChanged"
+                            ? "bg-zinc-500"
+                            : "bg-amber-400 hover:bg-amber-300"
+                      }`}
+                    />
+                  ) : null}
+
+                  {/* Every tab closes, the last one too: the window then shows Welcome. */}
+                  <button
+                    aria-label={`Close ${tab.name}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onCloseTab(tab.id);
+                    }}
+                    className={`rounded p-0.5 text-zinc-500 ${isActive ? "opacity-100" : "opacity-0"} group-hover:opacity-100 focus-visible:opacity-100 hover:bg-[#1a1a1a] hover:text-white transition-all ml-0.5`}
                   >
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                  </svg>
-                </button>
-              </div>
-            );
-          })}
+                    <svg
+                      width="10"
+                      height="10"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.5"
+                    >
+                      <line x1="18" y1="6" x2="6" y2="18" />
+                      <line x1="6" y1="6" x2="18" y2="18" />
+                    </svg>
+                  </button>
+                </div>
+              );
+            })}
+          </div>
         </div>
 
         {/* Action icons */}
-        <div className="ml-auto flex items-center gap-1 text-zinc-500 pr-2">
+        <div className="flex shrink-0 items-center gap-1 text-zinc-500 pl-1 pr-2">
           {activeTab && activeTab.id !== "welcome" && activeTab.dirty && (
             <button
               onClick={() => onSaveFile(activeTab.path)}

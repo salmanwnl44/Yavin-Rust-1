@@ -731,9 +731,16 @@ test("many tabs scroll without a scrollbar: by the wheel, and to the tab in fron
   expect(start.scrollbar).toBe(0);
   // The last tab opened is the one in front, scrolled into view.
   await expect(page.getByRole("tab", { selected: true })).toBeInViewport();
+  // The actions to the right are not part of what scrolls: fully shown, and fixed in place.
+  const newFile = page.getByTitle("New File (Ctrl+N)");
+  await expect(newFile).toBeInViewport({ ratio: 1 });
+  const before = await newFile.boundingBox();
   await strip.hover();
   await page.mouse.wheel(0, -400);
   await expect.poll(async () => (await box()).left).toBeLessThan(start.left);
+  expect(await newFile.boundingBox()).toEqual(before);
+  const tabsEnd = await strip.evaluate((element) => element.getBoundingClientRect().right);
+  expect(tabsEnd).toBeLessThanOrEqual(before!.x);
 });
 
 test("the editor's right-click menu ends with the Command Palette", async ({ page }) => {
