@@ -18,6 +18,8 @@ pub struct Session {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Which launch of the terminal this is (see `terminal_open`).
+    generation: Option<u64>,
 }
 
 impl Session {
@@ -37,12 +39,16 @@ pub struct Shell {
 #[derive(Clone, Serialize)]
 struct Output {
     id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation: Option<u64>,
     data: String,
 }
 
 #[derive(Clone, Serialize)]
 struct Exit {
     id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation: Option<u64>,
     code: Option<i32>,
 }
 
@@ -313,6 +319,10 @@ pub fn terminal_open(
     args: Option<Vec<String>>,
     env: Option<Vec<(String, String)>>,
     cwd: Option<String>,
+    // One terminal (one id) is launched again on Restart, and twice in a row when React
+    // mounts a view twice in development. Every launch has its own generation, carried by its
+    // events, so the exit of a shell that was replaced is never taken for its successor's.
+    generation: Option<u64>,
 ) -> Result<String, String> {
     if id.is_empty() {
         return Err("A terminal needs an identifier.".into());
@@ -387,6 +397,7 @@ pub fn terminal_open(
                             "terminal-output",
                             Output {
                                 id: reported.clone(),
+                                generation,
                                 data,
                             },
                         );
@@ -395,13 +406,21 @@ pub fn terminal_open(
             }
         }
         let code = child.wait().ok().map(|status| status.exit_code() as i32);
-        let _ = handle.emit("terminal-exit", Exit { id: reported, code });
+        let _ = handle.emit(
+            "terminal-exit",
+            Exit {
+                id: reported,
+                generation,
+                code,
+            },
+        );
     });
 
     let session = Session {
         master: pair.master,
         writer,
         killer,
+        generation,
     };
     if let Some(mut replaced) = terminals
         .0
@@ -449,11 +468,31 @@ pub fn terminal_resize(
 }
 
 #[tauri::command]
-pub fn terminal_close(terminals: State<'_, Terminals>, id: String) -> Result<(), String> {
-    if let Some(mut session) = terminals.0.lock().map_err(|e| e.to_string())?.remove(&id) {
+pub fn terminal_close(
+    terminals: State<'_, Terminals>,
+    id: String,
+    generation: Option<u64>,
+) -> Result<(), String> {
+    let mut sessions = terminals.0.lock().map_err(|e| e.to_string())?;
+    if let Some(mut session) = take_for_close(&mut sessions, &id, generation, |s| s.generation) {
         session.kill();
     }
     Ok(())
+}
+
+/// The session a close asks for. A close for an earlier launch arriving after the next one
+/// started (the requests are not ordered) must not end the new shell, so a close that names
+/// a generation takes the session only if it is still that launch.
+fn take_for_close<T>(
+    sessions: &mut HashMap<String, T>,
+    id: &str,
+    generation: Option<u64>,
+    generation_of: impl Fn(&T) -> Option<u64>,
+) -> Option<T> {
+    if generation.is_some() && sessions.get(id).map(&generation_of) != Some(generation) {
+        return None;
+    }
+    sessions.remove(id)
 }
 
 /// Ends every shell, so closing the window never leaves one running.
@@ -564,6 +603,29 @@ mod tests {
     /// A terminal has to answer the shell's cursor-position query (ESC[6n) or ConPTY's
     /// cmd.exe never draws a prompt and never reads input. xterm.js answers it in the
     /// application; this test answers it the same way.
+    #[test]
+    fn a_late_close_for_an_earlier_launch_never_ends_the_next_one() {
+        let mut sessions: HashMap<String, Option<u64>> = HashMap::new();
+        sessions.insert("t1".into(), Some(2));
+        // Launch 1's close arrives after launch 2 started: nothing is taken.
+        assert_eq!(take_for_close(&mut sessions, "t1", Some(1), |g| *g), None);
+        assert!(sessions.contains_key("t1"));
+        // Launch 2's own close, or a close naming no launch, takes it.
+        assert_eq!(
+            take_for_close(&mut sessions, "t1", Some(2), |g| *g),
+            Some(Some(2))
+        );
+        sessions.insert("t2".into(), Some(5));
+        assert_eq!(
+            take_for_close(&mut sessions, "t2", None, |g| *g),
+            Some(Some(5))
+        );
+        assert_eq!(
+            take_for_close(&mut sessions, "missing", Some(1), |g| *g),
+            None
+        );
+    }
+
     #[test]
     fn a_real_shell_runs_a_command_and_reports_its_output() {
         use std::sync::mpsc::{channel, RecvTimeoutError};

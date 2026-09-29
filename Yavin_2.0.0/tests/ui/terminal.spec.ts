@@ -366,6 +366,43 @@ test("an exited shell reports its code and can be restarted", async ({ page }) =
   expect(await uniqueIds(page)).toEqual([id]);
 });
 
+test("the end of a shell that was replaced is never taken for the one replacing it", async ({
+  page,
+}) => {
+  // What showed "[The shell exited with code 1.]" twice under a live prompt: React mounts the
+  // view twice in development, and the first launch's close -- a killed cmd.exe exits 1 --
+  // arrived under the same terminal id as the second launch.
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  const launches = async () =>
+    (await calls(page, "terminal_open"))
+      .filter((call) => call.args.id === id)
+      .map((call) => call.args.generation as number);
+  await expect.poll(async () => (await launches()).length).toBeGreaterThan(0);
+  const first = (await launches()).at(-1)!;
+
+  // Restarted: a new launch of the same terminal.
+  await emit(page, "terminal-exit", { id, generation: first, code: 130 });
+  await expect(view(page, id)).toContainText("exited with code 130");
+  await page.getByRole("button", { name: "Restart", exact: true }).click();
+  await expect.poll(async () => (await launches()).at(-1)).toBeGreaterThan(first);
+  const second = (await launches()).at(-1)!;
+
+  // The old shell's late output and exit are ignored; the new one's are shown.
+  await emit(page, "terminal-output", { id, generation: first, data: "from the old shell" });
+  await emit(page, "terminal-exit", { id, generation: first, code: 1 });
+  await emit(page, "terminal-output", { id, generation: second, data: "from the new shell" });
+  await expect(view(page, id)).toContainText("from the new shell");
+  await expect(view(page, id)).not.toContainText("from the old shell");
+  await expect(view(page, id)).not.toContainText("exited with code 1.");
+  await expect(page.getByRole("button", { name: "Restart", exact: true })).toHaveCount(0);
+
+  // Every close names the launch it is for, so a late one cannot end its successor.
+  for (const close of await calls(page, "terminal_close"))
+    expect(typeof close.args.generation).toBe("number");
+});
+
 test("a shell that ends cleanly is not reported as a failure", async ({ page }) => {
   await desktop(page);
   await openPanel(page);

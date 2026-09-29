@@ -9,13 +9,24 @@ export interface Shell {
 
 export interface TerminalOutput {
   id: string;
+  /** The launch it came from (see `terminal_open`); absent from older senders. */
+  generation?: number;
   data: string;
 }
 
 export interface TerminalExit {
   id: string;
+  generation?: number;
   code: number | null;
 }
+
+let launches = 0;
+/** A new launch's generation: unique for as long as the window runs. */
+export const nextGeneration = () => ++launches;
+
+/** Whether an event belongs to the launch `current`: one from another launch is stale. */
+export const fromLaunch = (payload: { generation?: number }, current: number) =>
+  payload.generation === undefined || payload.generation === current;
 
 /**
  * How a terminal is launched. A profile is a shell plus the extras VS Code lets a profile
@@ -170,13 +181,19 @@ export function deliverForTest(
 }
 
 /** This terminal's output only. */
-export function onOutputFor(id: string, handler: (data: string) => void): () => void {
-  return route(outputRouter, "terminal-output", id, (payload) => handler(payload.data));
+export function onOutputFor(
+  id: string,
+  handler: (data: string, payload: TerminalOutput) => void,
+): () => void {
+  return route(outputRouter, "terminal-output", id, (payload) => handler(payload.data, payload));
 }
 
 /** This terminal's exit only. */
-export function onExitFor(id: string, handler: (code: number | null) => void): () => void {
-  return route(exitRouter, "terminal-exit", id, (payload) => handler(payload.code));
+export function onExitFor(
+  id: string,
+  handler: (code: number | null, payload: TerminalExit) => void,
+): () => void {
+  return route(exitRouter, "terminal-exit", id, (payload) => handler(payload.code, payload));
 }
 
 /**

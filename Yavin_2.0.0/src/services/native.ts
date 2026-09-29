@@ -99,12 +99,14 @@ interface Commands {
       env?: [string, string][];
       /** Where the shell starts; the workspace root when omitted. */
       cwd?: string;
+      /** Which launch of this terminal it is; its events carry it back. */
+      generation?: number;
     };
     result: string;
   };
   terminal_write: { args: { id: string; data: string }; result: void };
   terminal_resize: { args: { id: string; cols: number; rows: number }; result: void };
-  terminal_close: { args: { id: string }; result: void };
+  terminal_close: { args: { id: string; generation?: number }; result: void };
   terminal_close_all: { args: undefined; result: void };
 }
 

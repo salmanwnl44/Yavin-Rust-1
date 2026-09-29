@@ -10,6 +10,8 @@ import {
   describeExit,
   onExitFor,
   onOutputFor,
+  nextGeneration,
+  fromLaunch,
   openArgsFor,
   terminalKeyAction,
   usableSize,
@@ -199,11 +201,15 @@ export const TerminalView = forwardRef<
       };
     }
 
+    /** The launch this view is showing; events of any other are ignored. */
+    let generation = 0;
     const open = (clear: boolean) => {
       if (clear) term.clear();
       setExited("");
+      running.current = false;
+      generation = nextGeneration();
       const size = usableSize(term.cols, term.rows);
-      void native("terminal_open", openArgsFor(launch.current, size))
+      void native("terminal_open", { ...openArgsFor(launch.current, size), generation })
         .then(() => {
           running.current = true;
           report.current.onStatus("Running");
@@ -226,8 +232,12 @@ export const TerminalView = forwardRef<
     });
     // Routed by id rather than filtered from a broadcast, so one terminal's output costs
     // one lookup instead of waking every other open terminal.
-    const stopOutput = onOutputFor(id, (data) => term.write(data));
-    const stopExit = onExitFor(id, (code) => {
+    const stopOutput = onOutputFor(id, (data, payload) => {
+      if (fromLaunch(payload, generation)) term.write(data);
+    });
+    const stopExit = onExitFor(id, (code, payload) => {
+      // The end of a shell this one replaced (a restart, or React's second mount).
+      if (!fromLaunch(payload, generation)) return;
       running.current = false;
       const message = describeExit(code);
       setExited(message);
@@ -264,7 +274,7 @@ export const TerminalView = forwardRef<
       stopExit();
       view.current = null;
       term.dispose();
-      void native("terminal_close", { id }).catch(() => undefined);
+      void native("terminal_close", { id, generation }).catch(() => undefined);
     };
   }, [id, shell]);
 
