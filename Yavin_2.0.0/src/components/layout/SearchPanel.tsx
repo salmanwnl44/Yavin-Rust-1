@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { replaceHits, searchWorkspace } from "../../services/search";
+import { workspaces } from "../../services/workspaces";
 import type { SearchHit, SearchResult } from "../../services/search";
 import type { SearchOptions } from "../../services/native";
 import { relativePath as relativeTo } from "../../services/resource";
@@ -115,6 +116,8 @@ export function SearchPanel({
     }
     const abort = new AbortController();
     controller.current = abort;
+    // Ended by a newer query, and by the workspace going: its results are not the next one's.
+    const signal = AbortSignal.any([abort.signal, workspaces.current().signal]);
     setBusy(true);
     setPreview([]);
     setSelected(new Set());
@@ -141,15 +144,9 @@ export function SearchPanel({
         filesOnly: false,
       };
       setStatus("Searching…");
-      void searchWorkspace(
-        workspace,
-        options,
-        latestBuffers.current(),
-        scope === "open",
-        abort.signal,
-      )
+      void searchWorkspace(workspace, options, latestBuffers.current(), scope === "open", signal)
         .then((next) => {
-          if (abort.signal.aborted) return;
+          if (signal.aborted) return;
           setResult(next);
           setSelected(new Set(next.hits.map(hitId)));
           setActiveHitId(next.hits[0] ? hitId(next.hits[0]) : null);
@@ -161,14 +158,14 @@ export function SearchPanel({
           );
         })
         .catch((error) => {
-          if (!abort.signal.aborted) {
+          if (!signal.aborted) {
             setStatus(String(error));
             setResult({ hits: [], warning: "", truncated: false });
             setActiveHitId(null);
           }
         })
         .finally(() => {
-          if (!abort.signal.aborted) setBusy(false);
+          if (!signal.aborted) setBusy(false);
         });
     }, 200);
     return () => {

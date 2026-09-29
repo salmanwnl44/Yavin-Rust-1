@@ -218,6 +218,9 @@ export function createLspManager(options: LspManagerOptions) {
   };
 
   const onDiagnostics = (server: Server, params: PublishDiagnosticsParams) => {
+    // A server no longer the manager's -- its folder left the workspace, or it was stopped or
+    // replaced -- may still publish while it shuts down: what it says is not shown.
+    if (servers.get(server.key) !== server) return;
     const resource = fromLspUri(params.uri);
     const id = resource ? resourceId(resource) : null;
     const entry = [...synced.values()].find(

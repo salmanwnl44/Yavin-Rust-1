@@ -10,6 +10,7 @@ import {
   describeExit,
   onExitFor,
   onOutputFor,
+  closeLeftoverShells,
   nextGeneration,
   fromLaunch,
   openArgsFor,
@@ -203,18 +204,30 @@ export const TerminalView = forwardRef<
 
     /** The launch this view is showing; events of any other are ignored. */
     let generation = 0;
+    /** Set when this view goes: a launch that answers after that is not left running. */
+    let closed = false;
     const open = (clear: boolean) => {
       if (clear) term.clear();
       setExited("");
       running.current = false;
       generation = nextGeneration();
+      const mine = generation;
       const size = usableSize(term.cols, term.rows);
-      void native("terminal_open", { ...openArgsFor(launch.current, size), generation })
+      void closeLeftoverShells(() => native("terminal_close_all"))
+        .then(() => native("terminal_open", { ...openArgsFor(launch.current, size), generation }))
         .then(() => {
+          // Started after its view (or its workspace) went: nobody would ever end it.
+          if (closed) {
+            void native("terminal_close", { id, generation: mine }).catch(() => undefined);
+            return;
+          }
+          // A restart since: that launch is the one to report.
+          if (mine !== generation) return;
           running.current = true;
           report.current.onStatus("Running");
         })
         .catch((error) => {
+          if (closed || mine !== generation) return;
           running.current = false;
           setExited(String(error));
           report.current.onStatus(String(error));
@@ -263,6 +276,7 @@ export const TerminalView = forwardRef<
     observer.observe(container);
 
     return () => {
+      closed = true;
       cancelAnimationFrame(firstFit);
       clearTimeout(pending);
       running.current = false;

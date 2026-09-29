@@ -910,8 +910,6 @@ export default function App() {
     setPendingHit(null);
     documents.reset();
     views.clear();
-    // Problems were about the folder left (a language server clears its own as it stops).
-    clearProblems();
     setTabs([WELCOME_TAB]);
     setActiveTabId("welcome");
     setRecentFiles([]);
@@ -1156,6 +1154,15 @@ export default function App() {
       delete hook.__yavinLsp;
     };
   }, [lsp]);
+  // Development builds only: the UI tests read the workspace's lifecycle and switch timings.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const hook = window as unknown as { __yavinWorkspaces?: unknown };
+    hook.__yavinWorkspaces = workspaces;
+    return () => {
+      delete hook.__yavinWorkspaces;
+    };
+  }, []);
   // Servers run only once the folder is trusted; a change of trust stops them all and starts
   // what applies now. Safe to run twice (React runs effects twice in development): `start` does
   // nothing once started, and only a real change reconsiders.

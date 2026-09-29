@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { native } from "../../../services/native";
+import { workspaces } from "../../../services/workspaces";
 import {
   allProblems,
   groupByFile,
@@ -88,10 +89,14 @@ export function ProblemsView({
   }, [trusted]);
 
   const run = useCallback(async (id: string, label: string) => {
+    // The workspace the check is about: if another is open by the time it answers, the answer
+    // is about files that are no longer in front, and is dropped.
+    const workspace = workspaces.current();
     setRunning(id);
     setError("");
     try {
       const result = await native("run_checker", { id });
+      if (!workspace.isActive()) return;
       const matcher = MATCHERS[id];
       if (!matcher) throw new Error(`No matcher for ${id}.`);
       const found = parseProblems(matcher, result.output);
@@ -105,7 +110,7 @@ export function ProblemsView({
       // Publishing an empty list is meaningful: it clears what this tool said last time.
       publishProblems(matcher.owner, label, found);
     } catch (reason) {
-      setError(String(reason));
+      if (workspace.isActive()) setError(String(reason));
     } finally {
       setRunning("");
     }

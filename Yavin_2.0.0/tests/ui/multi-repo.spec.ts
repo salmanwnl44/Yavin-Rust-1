@@ -267,6 +267,24 @@ test("opening another folder shows only its repositories; going back brings the 
   // The folder left no longer watches its repositories.
   await expect.poll(unwatched).toBe(2);
 
+  // A changes on disk while B is open: a late event from A's watcher refreshes nothing.
+  const gitRunsIn = (repoId: string) =>
+    page.evaluate(
+      (id) =>
+        (
+          window as unknown as { __calls: { command: string; args: { repoId?: string } }[] }
+        ).__calls.filter((call) => call.command === "git_exec" && call.args.repoId === id).length,
+      repoId,
+    );
+  const runsInA = await gitRunsIn("/work");
+  await emit(page, "git-changed", { repositoryId: "/work", kind: "head" });
+  await page.waitForTimeout(300);
+  expect(await gitRunsIn("/work")).toBe(runsInA);
+  // B changes: B refreshes as it always has.
+  const runsInB = await gitRunsIn("/other");
+  await emit(page, "git-changed", { repositoryId: "/other", kind: "head" });
+  await expect.poll(() => gitRunsIn("/other")).toBeGreaterThan(runsInB);
+
   // Back: the first folder's repositories, with the one chosen by hand still active.
   await openFolder("/work");
   await expect(region.getByRole("group", { name: "work" })).toBeVisible();
@@ -834,4 +852,101 @@ test("a folder that is already a repository never shows the initialise page", as
   const region = await panel(page, { workspace: "/work", repos: { "/work": repo("main") } });
   await expect(region.getByLabel("Commit message")).toBeVisible();
   await expect(region.getByRole("button", { name: "Initialize Repository" })).toHaveCount(0);
+});
+
+test("switching A → B → A → B → C → A, and ten more times, leaves only the last folder's Git alive", async ({
+  page,
+}) => {
+  const region = await panel(page, {
+    workspace: "/work",
+    repos: {
+      "/work": repo("main"),
+      "/other": repo("feature"),
+      "/third": repo("third-branch"),
+    },
+  });
+  await expect(region.getByRole("group", { name: "work" })).toBeVisible();
+  const openFolder = async (path: string) => {
+    await page.evaluate((folder) => {
+      (window as unknown as { __openFolder?: string }).__openFolder = folder;
+    }, path);
+    await page.getByRole("menubar").getByRole("menuitem", { name: "File", exact: true }).click();
+    await page
+      .getByRole("menu", { name: "File", exact: true })
+      .getByRole("menuitem", { name: "Open Folder…", exact: true })
+      .click();
+  };
+  const workspace = () =>
+    page.evaluate(() => {
+      const manager = (
+        window as unknown as {
+          __yavinWorkspaces: {
+            current(): { folders: string[]; generation: number; isActive(): boolean };
+            lastSwitch(): { closeMs: number; openMs: number };
+          };
+        }
+      ).__yavinWorkspaces;
+      const current = manager.current();
+      return {
+        folders: current.folders,
+        generation: current.generation,
+        active: current.isActive(),
+        timing: manager.lastSwitch(),
+      };
+    });
+  /** The repositories still watched: every watch replayed, less every unwatch. */
+  const watched = () =>
+    page.evaluate(() => {
+      const live = new Set<string>();
+      for (const call of (
+        window as unknown as {
+          __calls: { command: string; args: { repositoryId?: string } }[];
+        }
+      ).__calls) {
+        if (call.command === "git_watch_repo") live.add(call.args.repositoryId!);
+        if (call.command === "git_unwatch_repo") live.delete(call.args.repositoryId!);
+      }
+      return [...live];
+    });
+  const closedAll = () =>
+    page.evaluate(
+      () =>
+        (window as unknown as { __calls: { command: string }[] }).__calls.filter(
+          (call) => call.command === "terminal_close_all",
+        ).length,
+    );
+
+  const startGeneration = (await workspace()).generation;
+  const closesBefore = await closedAll();
+  const sequence = ["/other", "/work", "/other", "/third", "/work"];
+  for (const folder of sequence) await openFolder(folder);
+  await expect.poll(async () => (await workspace()).folders).toEqual(["/work"]);
+  await expect(region.getByRole("group", { name: "work" })).toBeVisible();
+  await expect(region.getByRole("group", { name: "other" })).toHaveCount(0);
+  await expect(region.getByRole("group", { name: "third" })).toHaveCount(0);
+  await expect.poll(watched).toEqual(["/work"]);
+  const after = await workspace();
+  expect(after.active).toBe(true);
+  expect(after.generation).toBeGreaterThan(startGeneration);
+
+  // Ten more round trips: nothing accumulates.
+  for (let round = 0; round < 5; round++) {
+    await openFolder("/other");
+    await expect.poll(async () => (await workspace()).folders).toEqual(["/other"]);
+    await openFolder("/work");
+    await expect.poll(async () => (await workspace()).folders).toEqual(["/work"]);
+  }
+  await expect.poll(watched).toEqual(["/work"]);
+  // One repository row: the Repositories section lists nothing of the folders left.
+  await expect(region.locator("section[aria-label='Repositories']").getByRole("group")).toHaveCount(
+    1,
+  );
+  // Every workspace left closed its terminals, whatever its views were doing.
+  expect((await closedAll()) - closesBefore).toBe(sequence.length + 10);
+
+  const timing = (await workspace()).timing;
+  console.log(
+    `workspace switch: close ${timing.closeMs.toFixed(1)} ms, open ${timing.openMs.toFixed(1)} ms`,
+  );
+  expect(timing.closeMs + timing.openMs).toBeLessThan(1000);
 });

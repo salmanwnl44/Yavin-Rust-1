@@ -472,3 +472,17 @@ test("outline and breadcrumbs: the file's symbols, the one the cursor is in, and
   await outline.getByRole("button", { name: "Outline" }).click();
   await expect(symbols).toHaveCount(3);
 });
+
+test("a page stops any server an earlier page left running before it starts its own", async ({
+  page,
+}) => {
+  // A reload replaces the page without it stopping its servers; the native side kept them, one
+  // orphaned server tree per reload. The next page clears them first.
+  await installFakeLsp(page);
+  await fixture(page, { "/work/a.ts": "let a = 1;\n" });
+  await openServed(page, "a.ts");
+  const lifecycle = await withLsp<string[]>(page, `(lsp) => lsp.lifecycle`);
+  expect(lifecycle[0]).toBe("lsp_stop_all");
+  expect(lifecycle.filter((one) => one === "lsp_stop_all")).toHaveLength(1);
+  expect(lifecycle.indexOf("lsp_start")).toBeGreaterThan(0);
+});

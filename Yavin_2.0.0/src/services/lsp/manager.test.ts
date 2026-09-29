@@ -509,3 +509,32 @@ test("a folder added or removed is told to servers that follow folders, not rest
   await manager.foldersChanged();
   assert.equal(notices().length, 2);
 });
+
+test("a server whose folder left the workspace cannot report into the next one", async () => {
+  const roots = [
+    { uri: fileUri("/w"), name: "w", index: 0 },
+    { uri: fileUri("/v"), name: "v", index: 1 },
+  ];
+  const { documents, manager, fake, all } = setup(
+    { "/v/b.ts": "let error = 1;\n" },
+    {
+      folders: ["/w", "/v"],
+      manager: { folders: () => roots },
+      // It answers slowly: its diagnostics, and its shutdown.
+      options: { typescript: { diagnosticsDelay: 60, delays: { shutdown: 200 } } },
+    },
+  );
+  await documents.open("/v/b.ts");
+  await until(() => manager.status()[0]?.state === "ready");
+  const server = fake.started.find((one) => one.root === "/v")!.server;
+  await until(() => server.received.some((one) => one.method === "textDocument/didOpen"));
+
+  // The folder goes before the server has said anything; it is still shutting down when its
+  // diagnostics arrive.
+  roots.pop();
+  const leaving = manager.foldersChanged();
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.deepEqual(all(), [], "nothing it said late was shown");
+  await leaving;
+  assert.deepEqual(all(), []);
+});

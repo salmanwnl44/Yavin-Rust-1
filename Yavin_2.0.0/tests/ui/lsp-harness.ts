@@ -54,6 +54,8 @@ export async function installFakeLsp(page: Page, setup: FakeLspSetup = {}) {
         return [...sessions.values()].reverse().find((one) => one.serverId === serverId)?.server;
       },
       started: () => [...sessions.values()].map((one) => one.serverId),
+      /** Lifecycle commands in the order the page sent them. */
+      lifecycle: [] as string[],
     };
     Object.assign(window, { __lsp: control });
     const emit = (event: string, payload: unknown) =>
@@ -72,6 +74,7 @@ export async function installFakeLsp(page: Page, setup: FakeLspSetup = {}) {
           })),
         });
       if (command === "lsp_start") {
+        control.lifecycle.push("lsp_start");
         const serverId = String(args.server);
         if (!(config.installed ?? ["typescript"]).includes(serverId))
           return Promise.reject(`not-installed: The ${serverId} language server is not installed.`);
@@ -100,7 +103,11 @@ export async function installFakeLsp(page: Page, setup: FakeLspSetup = {}) {
         found?.server.crash(0);
         return Promise.resolve(null);
       }
-      if (command === "lsp_stop_all") return Promise.resolve(null);
+      if (command === "lsp_stop_all") {
+        control.lifecycle.push("lsp_stop_all");
+        for (const found of sessions.values()) found.server.crash(0);
+        return Promise.resolve(null);
+      }
       // The bottom panel (where Problems is) asks for these; the shared fixture does not know them.
       if (
         command === "terminal_shells" ||

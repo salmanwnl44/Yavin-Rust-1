@@ -1,5 +1,8 @@
 import { useSyncExternalStore } from "react";
+import { isTauri } from "@tauri-apps/api/core";
 import { GitRegistry } from "./git/registry.ts";
+import { native } from "./native.ts";
+import { clearProblems } from "./panel/problems.ts";
 import { EMPTY_WORKSPACE, createWorkspaceManager } from "./workspaceManager.ts";
 import type { WorkspaceContext, WorkspaceId } from "./workspaceManager.ts";
 
@@ -7,10 +10,12 @@ import type { WorkspaceContext, WorkspaceId } from "./workspaceManager.ts";
  * The window's workspaces (see `workspaceManager.ts`): the one application-level owner of
  * which workspace is open, and of the services that belong to it.
  *
- * Workspace-scoped today: Git (repositories, their `.git` watchers and polling, which one is
- * selected, and the list remembered for the folder). The window's own per-workspace state --
- * documents, editor views, tabs, the Explorer, terminals, Problems -- is reset or remounted by
- * the window on the same switch (`App.tsx`, `enterWorkspace`).
+ * Owned by the workspace, and ended by its disposal (not by any view unmounting): its Git
+ * registry (repositories, their `.git` watchers and polling, which one is selected, the list
+ * remembered for it), the checker it is running, its terminals' shells and its Problems. The
+ * window's own per-workspace UI state -- documents, editor views, tabs, the Explorer -- is
+ * reset by the window on the same switch (`App.tsx`, `enterWorkspace`); language servers
+ * follow the Explorer's roots.
  */
 
 export interface WorkspaceServices {
@@ -33,11 +38,25 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
           : // The first folder opened after the upgrade adopts the old shared list, once.
             { storageKey: gitStorageKey(id), adoptFrom: LEGACY_GIT_KEY },
       );
-      // The workspace's repositories: those remembered for it, and its own folder's.
-      if (folders.length) void git.restore().then(() => git.open(folders[0], { silent: true }));
+      // The workspace's repositories: those remembered for it, and each of its folders' own.
+      if (folders.length)
+        void git
+          .restore()
+          .then(() => Promise.all(folders.map((folder) => git.open(folder, { silent: true }))));
       return { git };
     },
-    dispose: (services) => services.git.dispose(),
+    async dispose(services) {
+      services.git.dispose();
+      if (isTauri()) {
+        // A checker still running in the folder left is stopped; its answer would be dropped
+        // anyway (it checks the workspace it started in).
+        await native("cancel_checker").catch(() => undefined);
+        // Its shells end with it, whatever the terminal views are doing.
+        await native("terminal_close_all").catch(() => undefined);
+      }
+      // What it reported is about its files, not the next workspace's.
+      clearProblems();
+    },
   },
   { log: (message) => console.warn(message) },
 );

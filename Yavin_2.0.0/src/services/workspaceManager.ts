@@ -32,13 +32,26 @@ export function workspaceIdOf(folders: readonly string[]): WorkspaceId {
     .join("|") as WorkspaceId;
 }
 
-export type WorkspaceState = "active" | "disposing" | "disposed";
+/**
+ * `opening` while its services are made, `active` once they are, `closing` while they are
+ * disposed, `closed` after. There is no way back from `closing`: reopening the same folders
+ * makes a new context with a new generation. (Suspending a workspace to resume it later is a
+ * later module; today leaving a workspace closes it.)
+ */
+export type WorkspaceState = "opening" | "active" | "closing" | "closed";
 
 export interface WorkspaceContext<S> {
   readonly id: WorkspaceId;
   /** Its folders, as the native side spells them. Empty for a window with none. */
   readonly folders: readonly string[];
   readonly state: WorkspaceState;
+  /**
+   * Which activation this is, increasing for the life of the window: A, then B, then A again
+   * are three generations. Work captures it and checks it is still current before applying.
+   */
+  readonly generation: number;
+  /** Whether this is still the window's workspace, `active`: late work checks this. */
+  isActive(): boolean;
   readonly services: S;
   /** Aborted when the workspace is disposed: its late work checks this and stops. */
   readonly signal: AbortSignal;
@@ -57,11 +70,15 @@ export function createWorkspaceManager<S>(
   options: { log?: (message: string) => void } = {},
 ) {
   const listeners = new Set<() => void>();
+  let generations = 0;
+  /** How long the last switch took: disposing the old workspace, making the new one. */
+  let lastSwitch = { closeMs: 0, openMs: 0 };
 
   const create = (folders: readonly string[]) => {
     const controller = new AbortController();
     const cleanups: (() => void | Promise<void>)[] = [];
-    let state: WorkspaceState = "active";
+    let state: WorkspaceState = "opening";
+    const generation = ++generations;
     /** The disposal, once started: everyone waiting on it waits for the same one. */
     let ending: Promise<void> | null = null;
     const id = workspaceIdOf(folders);
@@ -71,16 +88,19 @@ export function createWorkspaceManager<S>(
       get state() {
         return state;
       },
-      services: factory.create(id, folders),
+      generation,
+      isActive: () => state === "active",
+      // Made below, once the context exists; a factory that throws leaves no context.
+      services: undefined as unknown as S,
       signal: controller.signal,
       own(dispose) {
-        if (state === "active") cleanups.push(dispose);
+        if (state === "opening" || state === "active") cleanups.push(dispose);
         // Owned after the workspace went: undone at once, never leaked.
         else void Promise.resolve().then(dispose);
       },
       end() {
         ending ??= (async () => {
-          state = "disposing";
+          state = "closing";
           controller.abort();
           // Services first (they may still use what the cleanups tear down), then everything
           // owned, newest first. One failure never keeps the rest from being disposed.
@@ -92,11 +112,13 @@ export function createWorkspaceManager<S>(
               options.log?.(`Disposing workspace ${id}: ${String(error)}`);
             }
           }
-          state = "disposed";
+          state = "closed";
         })();
         return ending;
       },
     };
+    (context as { services: S }).services = factory.create(id, folders);
+    state = "active";
     return context;
   };
 
@@ -112,6 +134,8 @@ export function createWorkspaceManager<S>(
   return {
     /** The workspace in the window. Always one: with no folder open, the empty workspace. */
     current: (): WorkspaceContext<S> => current,
+    /** Timings of the last switch, for measurement. */
+    lastSwitch: () => lastSwitch,
     subscribe(listener: () => void) {
       listeners.add(listener);
       return () => {
@@ -129,10 +153,28 @@ export function createWorkspaceManager<S>(
       const mine = ++opening;
       const task = (async (): Promise<WorkspaceContext<S>> => {
         if (id === current.id && current.state === "active") return current;
+        const started = performance.now();
         await (current as ReturnType<typeof create>).end();
+        const closed = performance.now();
         // A later open owns the window: this one answers with what that one makes.
         if (mine !== opening) return latest;
-        current = create(folders);
+        try {
+          current = create(folders);
+        } catch (error) {
+          // The workspace could not be made: the window is left with none, never with the
+          // old one's services half-active next to the new one's UI.
+          options.log?.(`Opening workspace ${id}: ${String(error)}`);
+          try {
+            current = create([]);
+          } catch (fallback) {
+            // Not even the empty workspace: the closed one stays, inactive, so every late
+            // result still checks against a workspace that is not active and drops itself.
+            options.log?.(`Opening the empty workspace: ${String(fallback)}`);
+          }
+          notify();
+          throw error;
+        }
+        lastSwitch = { closeMs: closed - started, openMs: performance.now() - closed };
         notify();
         return current;
       })();

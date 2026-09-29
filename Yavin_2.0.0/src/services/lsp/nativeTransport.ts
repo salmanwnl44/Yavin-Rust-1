@@ -68,12 +68,27 @@ function ensureListening(): Promise<void> {
   return listening;
 }
 
+/**
+ * Ends every server an earlier page left running, once, before this page starts its first.
+ * Reloading the window (a development rebuild, or a reload) replaces the page without it
+ * getting to stop its servers -- its `pagehide` cleanup cannot finish an IPC call -- and the
+ * native side kept them alive: one orphaned server, and everything it started, per reload.
+ * Only this window uses these servers, so whatever is running when a page starts is an
+ * earlier page's.
+ */
+let leftoversStopped: Promise<void> | null = null;
+const stopLeftovers = () =>
+  (leftoversStopped ??= native("lsp_stop_all", {}).then(
+    () => undefined,
+    () => undefined,
+  ));
+
 export function createNativeTransport(
   onLog?: (serverId: string, line: string) => void,
 ): ServerTransport {
   return {
     async start(serverId, root) {
-      await ensureListening();
+      await Promise.all([ensureListening(), stopLeftovers()]);
       const { session, program } = await native("lsp_start", { server: serverId, root });
       const stopLog = attach(logs, session, (payload) => onLog?.(serverId, payload.line));
       let ended = false;

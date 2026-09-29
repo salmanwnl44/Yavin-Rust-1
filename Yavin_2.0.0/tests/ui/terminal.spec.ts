@@ -104,11 +104,18 @@ async function desktop(
           }
           // A restricted folder is offered no checkers, matching the native side.
           if (command === "available_checkers") return trust.trusted ? (setup.checkers ?? []) : [];
+          // Open Folder… answers with whatever the test put in `__openFolder`.
+          if (command === "open_folder_dialog")
+            return (window as unknown as { __openFolder?: string }).__openFolder ?? null;
           if (command === "run_checker") {
             const scenario = window as unknown as {
               __scenarioCheckerOutput?: string;
               __scenarioCheckerCode?: number;
+              __checkerDelay?: number;
             };
+            // A slow checker (a cold `cargo check`), for what happens while it runs.
+            if (scenario.__checkerDelay)
+              await new Promise((resolve) => setTimeout(resolve, scenario.__checkerDelay));
             const output = scenario.__scenarioCheckerOutput ?? setup.checkerOutput ?? "";
             // A checker exits nonzero when it finds problems, so the tests say which.
             return { output, code: scenario.__scenarioCheckerCode ?? setup.checkerCode ?? 0 };
@@ -121,6 +128,12 @@ async function desktop(
             ];
           if (command === "terminal_open") {
             if (setup.failOpen) throw setup.failOpen;
+            // A slow start, for tests of what happens meanwhile; its end is recorded too.
+            const delay = (window as unknown as { __openDelay?: number }).__openDelay;
+            if (delay) {
+              await new Promise((resolve) => setTimeout(resolve, delay));
+              calls.push({ command: "terminal_open:done", args });
+            }
             return args.shell || "C:\\Windows\\System32\\cmd.exe";
           }
           if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
@@ -742,6 +755,65 @@ test("a plain arrow key still reaches the shell", async ({ page }) => {
     .toBe("\x1b[A");
 });
 
+test("a shell that finishes starting after its terminal was closed is ended, not orphaned", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.evaluate(() => {
+    (window as unknown as { __openDelay?: number }).__openDelay = 400;
+  });
+  await page.getByLabel("New Terminal").click();
+  const ids = await terminalIds(page, 2);
+  // Closed while its shell is still starting.
+  await view(page, ids[1]).click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Kill All Terminals" }).click();
+
+  // Every launch of it that finished starting was closed afterwards, by its generation.
+  const order = () =>
+    page.evaluate(
+      (id) =>
+        (
+          window as unknown as {
+            __calls: { command: string; args: { id?: string; generation?: number } }[];
+          }
+        ).__calls
+          .filter((call) => call.args?.id === id)
+          .map((call) => `${call.command}:${call.args.generation}`),
+      ids[1],
+    );
+  await expect
+    .poll(async () => {
+      const seen = await order();
+      const started = seen.filter((one) => one.startsWith("terminal_open:done:"));
+      return (
+        started.length > 0 &&
+        started.every((done) => {
+          const generation = done.split(":").pop();
+          return seen.slice(seen.indexOf(done) + 1).includes(`terminal_close:${generation}`);
+        })
+      );
+    })
+    .toBe(true);
+});
+
+test("a page closes the shells an earlier page left running before it opens its first", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  const order = await page.evaluate(() =>
+    (window as unknown as { __calls: { command: string }[] }).__calls
+      .map((call) => call.command)
+      .filter((command) => command === "terminal_close_all" || command === "terminal_open"),
+  );
+  // Closed first; the workspace's own disposal (when the folder opens) may close them too.
+  expect(order[0]).toBe("terminal_close_all");
+  expect(order).toContain("terminal_open");
+});
+
 test("Kill All Terminals closes every terminal at once", async ({ page }) => {
   await desktop(page);
   await openPanel(page);
@@ -978,6 +1050,46 @@ test("running a checker lists its diagnostics grouped by file", async ({ page })
   await expect(problems.getByRole("button", { name: /src\/other\.ts/ })).toBeVisible();
   await expect(problems.getByText(/not assignable/)).toBeVisible();
   await expect(problems.getByText(/Ln 12, Col 7/)).toBeVisible();
+});
+
+test("a checker that answers after another folder was opened reports nothing into it", async ({
+  page,
+}) => {
+  await desktop(page, {
+    checkers: [{ id: "tsc", label: "TypeScript" }],
+    checkerOutput: TSC_OUTPUT,
+  });
+  await showView(page, "PROBLEMS");
+  let problems = page.getByRole("region", { name: "Problems" });
+  await page.evaluate(() => {
+    const scenario = window as unknown as { __checkerDelay?: number; __openFolder?: string };
+    scenario.__checkerDelay = 800;
+    scenario.__openFolder = "/other";
+  });
+  await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
+
+  // Another folder, while the check of the first is still running.
+  await page.getByRole("menubar").getByRole("menuitem", { name: "File", exact: true }).click();
+  await page
+    .getByRole("menu", { name: "File", exact: true })
+    .getByRole("menuitem", { name: "Open Folder…", exact: true })
+    .click();
+  await expect.poll(async () => countCalls(page, "cancel_checker")).toBeGreaterThan(0);
+  await page.waitForTimeout(1200);
+  // The panel is still shown (it is the new workspace's now): straight to its Problems.
+  await page
+    .getByRole("tablist", { name: "Panel views" })
+    .getByRole("tab", { name: "PROBLEMS" })
+    .click();
+  problems = page.getByRole("region", { name: "Problems" });
+  await expect(problems.getByText(/not assignable/)).toHaveCount(0);
+
+  // The store itself still works: a check of this folder shows what it finds.
+  await page.evaluate(() => {
+    (window as unknown as { __checkerDelay?: number }).__checkerDelay = 0;
+  });
+  await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
+  await expect(problems.getByText(/not assignable/).first()).toBeVisible();
 });
 
 test("a problem opens its file at its line, even while another file is shown", async ({ page }) => {

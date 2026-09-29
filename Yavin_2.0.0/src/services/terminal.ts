@@ -206,6 +206,20 @@ export function usableSize(cols: number, rows: number): { cols: number; rows: nu
 
 let created = 0;
 
+/**
+ * Closes every shell an earlier page left running, once, before this page opens its first.
+ * Reloading the window replaces the page without its terminal views getting to close their
+ * shells (an IPC call cannot finish during unload), and the native side kept them running.
+ * Only this window has terminals, so whatever is running when a page starts is an earlier
+ * page's.
+ */
+let leftoversClosed: Promise<void> | null = null;
+export const closeLeftoverShells = (close: () => Promise<unknown>): Promise<void> =>
+  (leftoversClosed ??= close().then(
+    () => undefined,
+    () => undefined,
+  ));
+
 /** Identifies a session for the life of the window; never reused after a close. */
 export function createTerminalId(): string {
   created += 1;
