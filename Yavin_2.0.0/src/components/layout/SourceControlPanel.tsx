@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { native } from "../../services/native";
-import { divergence } from "../../services/git/parsers/branch";
 import type { GitEntry } from "../../services/git/parsers/status";
 import type { GitOperation } from "../../services/git/backend";
 import { cloneRepository as cloneRepositoryFlow } from "../../services/git/clone";
@@ -17,8 +17,20 @@ import { useGitRevision } from "../../services/git/revision";
 import { guardedAffecting } from "../../services/git/sync";
 import type { RefreshField } from "../../services/git/store";
 import { RepositoriesSection } from "../git/RepositoriesSection";
-import { CommitBox } from "../git/CommitBox";
-import type { CommitBoxHandle } from "../git/CommitBox";
+import { CommitComposer } from "../git/CommitComposer";
+import type { CommitBoxHandle } from "../git/CommitComposer";
+import { BranchBar } from "../git/BranchBar";
+import { GroupIcon, IconAction, ListIcon, SectionHeader, TreeIcon } from "../git/SectionHeader";
+import { ContextMenu } from "../ui/ContextMenu";
+import {
+  groupChanges,
+  hasStagedPart,
+  hasUnstagedPart,
+  isDiscardable,
+  opensStagedDiff,
+} from "../../services/git/changeGroups";
+import type { ChangeGroup } from "../../services/git/changeGroups";
+import { buildChangeMenu, gitignoreLine, withIgnored } from "../../services/git/changeMenu";
 import { InlineGraphSection } from "../git/InlineGraphSection";
 import { StashesSection } from "../git/StashesSection";
 import { GitMenu } from "../git/GitMenu";
@@ -27,7 +39,6 @@ import {
   readChangesViewAsTree,
   saveChangesSort,
   saveChangesViewAsTree,
-  sortChanges,
   statusLetter,
 } from "../../services/git/changesSort";
 import type { ChangesSort } from "../../services/git/changesSort";
@@ -36,6 +47,7 @@ import type { DiffDocument } from "./DiffEditor";
 import type { Replacement } from "./SearchPanel";
 import type { DialogRequest } from "../ui/AppDialog";
 import { buildFileTree, collectFiles, flattenVisible } from "../../services/git/fileTree";
+import type { TreeFolder } from "../../services/git/fileTree";
 import { ChevronIcon, FileIcon } from "../ui/FileIcons";
 import {
   AlertCircleIcon,
@@ -46,7 +58,6 @@ import {
   MoreIcon,
   PlusIcon,
   RefreshIcon,
-  TrashIcon,
   UndoIcon,
 } from "../ui/Icons";
 
@@ -62,20 +73,16 @@ const letterColor: Record<string, string> = {
   "!": "text-red",
 };
 
-/** Whether the index holds a staged change for this entry (conflicts are never "staged"). */
-const hasStagedPart = (e: GitEntry) => !e.conflict && !e.untracked && e.index !== " ";
-/** What "Discard All" restores: tracked files modified in the working tree. Untracked,
- * deleted, added, renamed-only, staged-only and conflicted files are never touched by it. */
-const isDiscardable = (e: GitEntry) => e.worktree === "M" && !e.conflict;
-/** Whether the working tree still has changes the index does not (untracked counts). */
-const hasUnstagedPart = (e: GitEntry) => e.untracked || e.worktree !== " ";
+/** The change list shows a filter box once it has more files than this. */
+const FILTER_FROM = 20;
+const GROUPED_STORAGE_KEY = "yavin.scm.grouped";
 
-/** One merged list, one letter per file: conflict, untracked, else the working-tree state
- * if any remains, else the staged state -- the same letter VS Code-style panels show. */
-function getStatusInfo(entry: GitEntry) {
-  const letter = statusLetter(entry);
-  return { letter, color: letterColor[letter] ?? "text-ink-2" };
-}
+/** A path relative to a repository root, for display, grouping and filtering; the root itself
+ * is "" (compared by the rules in `resource.ts`, so a differently-cased drive still matches). */
+const relativePathOf = (root: string) => (path: string) => {
+  const rel = relativeTo(root, path);
+  return rel === undefined ? path : rel === "." ? "" : rel;
+};
 
 const OPERATION_LABEL: Record<Exclude<GitOperation, "">, string> = {
   merge: "Merge",
@@ -143,6 +150,8 @@ export function SourceControlPanel({
   onOpenGraph,
   onShowOutput,
   onDialog,
+  onOpenFile,
+  onReveal,
 }: {
   workspace: string;
   visible: boolean;
@@ -164,6 +173,10 @@ export function SourceControlPanel({
    * name-, remote- or target-requiring Git menu action goes through this, the same modal the
    * rest of the app already uses for New File/Delete/Go to Line. */
   onDialog: (request: DialogRequest) => void;
+  /** Opens a changed file in the editor ("Open File"). */
+  onOpenFile?: (path: string) => void;
+  /** Shows a changed file in the Explorer ("Reveal in Explorer"). */
+  onReveal?: (path: string) => void;
 }) {
   // Subscribed here rather than taken as a prop: a counter held by the root component
   // re-rendered the whole window every time anything asked Git to look again.
@@ -193,8 +206,24 @@ export function SourceControlPanel({
   const [workspaceError, setWorkspaceError] = useState("");
   const [initError, setInitError] = useState("");
   const [initBusy, setInitBusy] = useState(false);
-  // The nested "Changes" group inside the Changes section can be folded on its own.
-  const [changesGroupCollapsed, setChangesGroupCollapsed] = useState(false);
+  // Staged / Unstaged / Conflicts groups (the default), or one list with a checkbox per file.
+  // A view preference, remembered like the sort order.
+  const [grouped, setGrouped] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(GROUPED_STORAGE_KEY) !== "false";
+    } catch {
+      return true;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(GROUPED_STORAGE_KEY, String(grouped));
+    } catch {
+      /* Remembered where storage works. */
+    }
+  }, [grouped]);
+  const [collapsedGroups, setCollapsedGroups] = useState<ReadonlySet<string>>(new Set());
+  const [filter, setFilter] = useState("");
   // The commit draft itself lives in <CommitBox>; the panel keeps only whether one
   // exists (re-rendering only when that flips) and a ref for click-time reads.
   const [hasMessage, setHasMessage] = useState(false);
@@ -205,8 +234,6 @@ export function SourceControlPanel({
     setHasMessage(next.trim().length > 0);
   }, []);
   const getMessage = useCallback(() => messageRef.current, []);
-  const [newBranch, setNewBranch] = useState("");
-  const [chosenRemote, setChosenRemote] = useState("");
   const [branchesOpen, setBranchesOpen] = useState(false);
   const [rowLimits, setRowLimits] = useState<Record<string, number>>({});
   const [recovery, setRecovery] = useState<Replacement[] | null>(null);
@@ -238,7 +265,7 @@ export function SourceControlPanel({
   // discard-undo offer, which `App.tsx` already clears on a switch.
   useEffect(() => {
     setCollapsedFolders(new Set());
-    setNewBranch("");
+    setFilter("");
     setRowLimits({});
   }, [activeRepo?.repoId]);
   const [sectionVisible, setSectionVisible] = useState<SectionVisibility>(readSectionVisibility);
@@ -378,13 +405,6 @@ export function SourceControlPanel({
     };
   }, [visible, registrySnapshot.repos, registrySnapshot.activeRepoId]);
 
-  useEffect(() => {
-    if (!snapshot) return;
-    setChosenRemote((prev) =>
-      snapshot.remotes.includes(prev) ? prev : (snapshot.remotes[0] ?? ""),
-    );
-  }, [snapshot?.remotes]);
-
   const addRepository = async () => {
     const path = await native("pick_folder_dialog").catch(() => null);
     if (!path) return;
@@ -462,11 +482,6 @@ export function SourceControlPanel({
       if (alive.current) activeRepo.store.setNotice(String(error));
     }
   };
-
-  /** Clicking a row shows what is still uncommitted-and-unstaged; a fully staged file shows
-   * its staged change instead. (A partly staged file offers both.) */
-  const openEntry = (entry: GitEntry) =>
-    showDiff(entry, hasStagedPart(entry) && !hasUnstagedPart(entry));
 
   /** The row checkbox: checked means fully staged, so clicking it unstages; anything less
    * (empty or partly staged) stages what is left. */
@@ -653,29 +668,27 @@ export function SourceControlPanel({
   // it were current: no status, no actions, just what happened and how to move on.
   const unusable = !!activeRepo && activeRepo.status !== "ready";
 
-  // One list for everything: conflicts first, then every other changed file, ordered by the
-  // chosen "Sort Changes" mode. Whether a file is staged is shown by its checkbox, not by
-  // which section it sits in. Memoized on `entries` and the sort mode alone so typing a
-  // commit message never re-derives it.
-  const { listed, stagedCount, modifiedCount, conflictCount, allStaged, discardable } =
-    useMemo(() => {
-      const conflicts = entries.filter((e) => e.conflict);
-      const others = entries.filter((e) => !e.conflict);
-      const stageable = others; // conflicts are resolved one at a time, never in bulk
-      return {
-        listed: sortChanges(entries, changesSort),
-        stagedCount: entries.filter(hasStagedPart).length,
-        // What a commit with nothing staged would pick up itself (`-a`): tracked files with
-        // working-tree changes. Untracked files are excluded, exactly as `-a` excludes them.
-        modifiedCount: others.filter((e) => !e.untracked && e.worktree !== " ").length,
-        conflictCount: conflicts.length,
-        allStaged:
-          stageable.length > 0 && stageable.every((e) => hasStagedPart(e) && !hasUnstagedPart(e)),
-        // What "Discard All" acts on: modified tracked files only (see `isDiscardable`).
-        discardable: entries.filter(isDiscardable).length,
-      };
-    }, [entries, changesSort]);
-  const sync = divergence(branch);
+  // The changed files as drawn -- grouped (Conflicts, Staged, Unstaged) or as one list, sorted
+  // by the chosen mode and filtered by the filter box -- and the counts the commit button and
+  // bulk actions use, which always cover every file, filtered or not. Memoized on `entries`,
+  // the sort and the filter alone, so typing a commit message never re-derives them.
+  const groups = useMemo(
+    () => groupChanges(entries, changesSort, filter, relativePathOf(activeRepo?.root ?? "")),
+    [entries, changesSort, filter, activeRepo?.root],
+  );
+  const { stagedCount, modifiedCount, conflictCount, allStaged, discardable } = useMemo(() => {
+    const others = entries.filter((e) => !e.conflict);
+    return {
+      stagedCount: entries.filter(hasStagedPart).length,
+      // What a commit with nothing staged would pick up itself (`-a`): tracked files with
+      // working-tree changes. Untracked files are excluded, exactly as `-a` excludes them.
+      modifiedCount: others.filter((e) => !e.untracked && e.worktree !== " ").length,
+      conflictCount: entries.length - others.length,
+      allStaged: others.length > 0 && others.every((e) => hasStagedPart(e) && !hasUnstagedPart(e)),
+      // What "Discard All" acts on: modified tracked files only (see `isDiscardable`).
+      discardable: entries.filter(isDiscardable).length,
+    };
+  }, [entries]);
 
   const toggleSection = (name: keyof SectionVisibility) =>
     setSectionVisible((prev) => ({ ...prev, [name]: !prev[name] }));
@@ -694,126 +707,223 @@ export function SourceControlPanel({
     return rel === undefined ? path : rel === "." ? "" : rel;
   };
 
-  // "View as Tree": the same flat `listed` entries, grouped into folders (single-child chains
-  // compacted, matching the Explorer's own convention -- see `fileTree.ts`). Bulk actions
-  // (Stage All, Discard All, ...) are unaffected: they always act on `entries` directly,
-  // regardless of how the list happens to be drawn right now.
-  const treeRows = useMemo(
-    () =>
-      changesViewAsTree
-        ? flattenVisible(
-            // `listed` is already in the user's chosen order with conflicts first; the tree
-            // groups it without reordering the files inside each folder.
-            buildFileTree(listed, (e) => relativePath(e.path), { preserveFileOrder: true }),
-            collapsedFolders,
-          )
-        : null,
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `relativePath` closes only over `activeRepo?.root`
-    [changesViewAsTree, listed, collapsedFolders, activeRepo?.root],
-  );
+  /** A file's letter in the group it is drawn in: a Staged row its staged change, an Unstaged
+   * row what is left in the working tree, the single list the merged letter. */
+  const groupLetter = (entry: GitEntry, group: ChangeGroup) => {
+    if (group === "staged") return entry.index;
+    if (group === "unstaged") return entry.untracked ? "U" : entry.worktree;
+    return statusLetter(entry);
+  };
 
-  // The row cap applies to whichever view is drawn. Tree mode used to ignore it entirely and
-  // render every row, so switching a large change set to View as Tree froze the panel for
-  // seconds -- the exact cost `ROWS_PER_PAGE` exists to bound. Folder rows count toward the
-  // cap too: they are the same ~22 DOM nodes as a file row.
-  const totalRowCount = changesViewAsTree ? (treeRows?.length ?? 0) : listed.length;
-  const shownRowCount = rowLimits.Changes ?? ROWS_PER_PAGE;
+  const stageOne = (entry: GitEntry) => {
+    if (!activeRepo) return;
+    if (
+      entry.conflict &&
+      !window.confirm("Stage this file as resolved? Review and remove conflict markers first.")
+    )
+      return;
+    void guarded("stage", () => activeRepo.store.repository.stage(entry.path));
+  };
+  const unstageOne = (entry: GitEntry) => {
+    if (!activeRepo) return;
+    void guarded("unstage", () => activeRepo.store.repository.unstage(entry.path));
+  };
 
-  /** One changed-file row -- shared between the flat list and the tree view, `depth` only
-   * changing its indentation. */
-  const renderFileRow = (entry: GitEntry, depth = 0) => {
+  /** Adds an untracked file to the repository's `.gitignore` (created if missing), through the
+   * same write path as Discard, so it is undoable and never overwrites a changed file. */
+  const ignoreFile = async (entry: GitEntry) => {
+    if (!activeRepo) return;
+    const file = `${activeRepo.root.replace(/\/+$/, "")}/.gitignore`;
+    const line = gitignoreLine(relativePath(entry.path));
+    try {
+      let before: string | null = null;
+      try {
+        before = await native("read_file_content", { path: file });
+      } catch {
+        before = null;
+      }
+      if (before === null) {
+        await native("create_file_with_content", { path: file, content: withIgnored("", line) });
+      } else {
+        const outcome = await apply([{ path: file, before, after: withIgnored(before, line) }]);
+        if (outcome.errors.length) throw new Error(outcome.errors.join(" "));
+      }
+      await callbacks.current.onChanged();
+      await activeRepo.store.refresh(["entries"], { silent: true });
+      activeRepo.store.setNotice(`Added ${line} to .gitignore.`);
+    } catch (error) {
+      activeRepo.store.setNotice(String(error));
+    }
+  };
+
+  const copy = (text: string) =>
+    void navigator.clipboard
+      .writeText(text)
+      .catch(() => activeRepo?.store.setNotice("The clipboard is not available."));
+
+  const [rowMenu, setRowMenu] = useState<{
+    x: number;
+    y: number;
+    entry: GitEntry;
+    group: ChangeGroup;
+  } | null>(null);
+
+  /** Arrow keys move between the rows of the changes list, as in the Explorer. */
+  const moveFocus = (from: HTMLElement, delta: 1 | -1) => {
+    const list = from.closest("[data-changes-list]");
+    if (!list) return;
+    const rows = [...list.querySelectorAll<HTMLElement>("[data-change-row]")];
+    const next = rows[rows.indexOf(from) + delta];
+    next?.focus();
+  };
+
+  /** One changed file, in the group it is drawn in -- shared by the grouped lists, the single
+   * list and the tree view (`depth` only indents it). */
+  const renderFileRow = (entry: GitEntry, depth: number, group: ChangeGroup) => {
     const relative = relativePath(entry.path);
     const parts = relative.split(/[/\\]/);
     const fileName = parts.pop() || relative;
     const dirPath = changesViewAsTree ? "" : parts.join("/"); // the tree already shows the folder
-    const status = getStatusInfo(entry);
+    const letter = groupLetter(entry, group);
+    const color = letterColor[letter] ?? "text-ink-2";
     const staged = hasStagedPart(entry);
     const partial = staged && hasUnstagedPart(entry);
-    const checked = staged && !partial;
+    // In a group the checkbox is the group's own direction; in the single list it says how much
+    // of the file is staged.
+    const checked = group === "staged" || (group === "all" && staged && !partial);
+    const mixed = group === "all" && partial;
+    const stagedDiff = opensStagedDiff(entry, group);
     const isActiveDiff = activeDiffPath === entry.path;
+    const toggle = () =>
+      group === "staged"
+        ? unstageOne(entry)
+        : group === "all"
+          ? toggleStage(entry)
+          : stageOne(entry);
+    const canDiscard = group !== "staged" && isDiscardable(entry);
 
     return (
       <div
-        key={entry.path}
+        key={`${group}:${entry.path}`}
         role="button"
         tabIndex={0}
-        aria-label={`Open diff for ${entry.path}`}
-        style={{ paddingLeft: `${8 + depth * 14}px` }}
-        className={`flex items-center gap-1.5 pr-2.5 h-[22px] hover:bg-surface-hover group/row transition-colors cursor-pointer ${
+        data-change-row
+        aria-label={
+          group === "staged" ? `Open staged diff for ${entry.path}` : `Open diff for ${entry.path}`
+        }
+        style={{ paddingLeft: `${10 + depth * 14}px` }}
+        className={`group/row flex h-[22px] cursor-pointer items-center gap-1.5 pr-2 outline-none transition-colors hover:bg-surface-hover focus-visible:bg-surface-hover focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-accent/60 ${
           isActiveDiff ? "bg-accent/15" : ""
         }`}
-        onClick={() => void openEntry(entry)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            void openEntry(entry);
+        onClick={() => void showDiff(entry, stagedDiff)}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          setRowMenu({ x: event.clientX, y: event.clientY, entry, group });
+        }}
+        onKeyDown={(event) => {
+          if (event.target !== event.currentTarget) return;
+          if (event.key === "Enter") {
+            event.preventDefault();
+            void showDiff(entry, stagedDiff);
+          } else if (event.key === " ") {
+            event.preventDefault();
+            if (!busy && !loading) toggle();
+          } else if (event.key === "Delete" && canDiscard) {
+            event.preventDefault();
+            void discard(entry);
+          } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            moveFocus(event.currentTarget, event.key === "ArrowDown" ? 1 : -1);
+          } else if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+            event.preventDefault();
+            const box = event.currentTarget.getBoundingClientRect();
+            setRowMenu({ x: box.left + 24, y: box.bottom, entry, group });
           }
         }}
       >
         <button
           role="checkbox"
-          aria-checked={checked ? true : partial ? "mixed" : false}
-          aria-label={`Stage ${entry.path}`}
+          aria-checked={checked ? true : mixed ? "mixed" : false}
+          aria-label={group === "staged" ? `Unstage ${entry.path}` : `Stage ${entry.path}`}
           title={checked ? `Unstage ${fileName}` : `Stage ${fileName}`}
+          tabIndex={-1}
           disabled={busy || loading}
-          onClick={(e) => {
-            e.stopPropagation();
-            toggleStage(entry);
+          onClick={(event) => {
+            event.stopPropagation();
+            toggle();
           }}
           className={`flex size-3.5 shrink-0 items-center justify-center rounded-[3px] border transition-colors disabled:opacity-40 ${
-            staged
-              ? "bg-accent border-accent text-white"
+            checked || mixed
+              ? "border-accent bg-accent text-white"
               : "border-border-strong text-transparent hover:border-ink-3"
           }`}
         >
-          {checked ? <CheckIcon size={10} /> : partial ? <MinusIcon size={10} /> : null}
+          {checked ? <CheckIcon size={10} /> : mixed ? <MinusIcon size={10} /> : null}
         </button>
 
         <FileIcon name={fileName} isDir={false} className="size-3.5 shrink-0" />
 
-        <div className="flex items-baseline min-w-0 flex-1 truncate">
+        <div className="flex min-w-0 flex-1 items-baseline truncate">
           <span
-            className={`text-xs truncate ${
-              status.letter === "D" ? "line-through text-ink-3" : "text-ink"
+            className={`truncate text-xs ${
+              letter === "D"
+                ? "text-ink-3 line-through"
+                : entry.conflict
+                  ? "text-yellow"
+                  : "text-ink"
             }`}
             title={entry.originalPath ? `${entry.originalPath} → ${entry.path}` : entry.path}
           >
             {fileName}
           </span>
-          {dirPath && <span className="text-ink-3 text-[10.5px] ml-1.5 truncate">{dirPath}</span>}
+          {dirPath && <span className="ml-1.5 truncate text-[10.5px] text-ink-3">{dirPath}</span>}
         </div>
 
         <div
-          className="flex items-center gap-0.5 opacity-0 group-hover/row:opacity-100 focus-within:opacity-100 transition-opacity shrink-0"
-          onClick={(e) => e.stopPropagation()}
+          className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover/row:opacity-100"
+          onClick={(event) => event.stopPropagation()}
         >
           <button
             disabled={busy}
             title="Open Diff"
             aria-label="Open Diff"
-            onClick={() => void openEntry(entry)}
-            className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
+            tabIndex={-1}
+            onClick={() => void showDiff(entry, stagedDiff)}
+            className="rounded p-0.5 text-ink-3 transition-colors hover:bg-border-strong hover:text-ink"
           >
             <DiffIcon size={12} />
           </button>
-          {partial && (
+          {onOpenFile && letter !== "D" && (
+            <button
+              title="Open File"
+              aria-label={`Open file ${entry.path}`}
+              tabIndex={-1}
+              onClick={() => onOpenFile(entry.path)}
+              className="rounded p-0.5 text-ink-3 transition-colors hover:bg-border-strong hover:text-ink"
+            >
+              <FileIcon name={fileName} isDir={false} className="size-3 grayscale" />
+            </button>
+          )}
+          {group === "all" && partial && (
             <button
               disabled={busy}
               title="Open staged changes"
               aria-label={`Open staged diff for ${entry.path}`}
+              tabIndex={-1}
               onClick={() => void showDiff(entry, true)}
-              className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
+              className="rounded p-0.5 text-ink-3 transition-colors hover:bg-border-strong hover:text-ink"
             >
               <CheckIcon size={12} />
             </button>
           )}
-          {entry.worktree === "M" && !entry.conflict && (
+          {canDiscard && entry.worktree === "M" && (
             <button
               disabled={busy || loading}
               aria-label={`Discard ${entry.path}`}
               title={`Discard changes in ${fileName}`}
+              tabIndex={-1}
               onClick={() => void discard(entry)}
-              className="p-0.5 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors"
+              className="rounded p-0.5 text-ink-3 transition-colors hover:bg-red/15 hover:text-red"
             >
               <UndoIcon size={12} />
             </button>
@@ -826,6 +936,7 @@ export function SourceControlPanel({
                 disabled={busy || loading}
                 aria-label={`Accept current change for ${entry.path}`}
                 title={`Resolve ${fileName} by keeping this branch's version`}
+                tabIndex={-1}
                 onClick={() => void acceptConflictSide(entry, "ours")}
                 className="rounded px-1 text-[10px] text-ink-3 hover:bg-border-strong hover:text-ink"
               >
@@ -835,6 +946,7 @@ export function SourceControlPanel({
                 disabled={busy || loading}
                 aria-label={`Accept incoming change for ${entry.path}`}
                 title={`Resolve ${fileName} by taking the incoming version`}
+                tabIndex={-1}
                 onClick={() => void acceptConflictSide(entry, "theirs")}
                 className="rounded px-1 text-[10px] text-ink-3 hover:bg-border-strong hover:text-ink"
               >
@@ -845,11 +957,178 @@ export function SourceControlPanel({
         </div>
 
         <span
-          title={`Status: ${status.letter}`}
-          className={`w-3 text-center text-[11px] font-semibold shrink-0 ${status.color}`}
+          title={`Status: ${letter}`}
+          className={`w-3 shrink-0 text-center font-mono text-[11px] font-semibold ${color}`}
         >
-          {status.letter}
+          {letter}
         </span>
+      </div>
+    );
+  };
+
+  /** The rows of one list, as a tree or flat, capped at `ROWS_PER_PAGE` with "Show more". */
+  const renderRows = (list: readonly GitEntry[], group: ChangeGroup) => {
+    const limit = rowLimits[group] ?? ROWS_PER_PAGE;
+    // Folders fold per group: the same folder can be open under Unstaged and closed under Staged.
+    const prefix = `${group}:`;
+    const collapsedHere = new Set(
+      [...collapsedFolders]
+        .filter((key) => key.startsWith(prefix))
+        .map((key) => key.slice(prefix.length)),
+    );
+    const rows = changesViewAsTree
+      ? flattenVisible(
+          buildFileTree(list, (entry) => relativePath(entry.path), { preserveFileOrder: true }),
+          collapsedHere,
+        )
+      : null;
+    const total = rows ? rows.length : list.length;
+    const drawn = rows
+      ? rows
+          .slice(0, limit)
+          .map((row) =>
+            row.node.kind === "folder"
+              ? renderFolderRow(row.node, row.depth, row.expanded, group)
+              : renderFileRow(row.node.item, row.depth, group),
+          )
+      : list.slice(0, limit).map((entry) => renderFileRow(entry, 0, group));
+    return (
+      <>
+        {drawn}
+        {total > limit && (
+          <button
+            onClick={() =>
+              setRowLimits((prev) => ({
+                ...prev,
+                [group]: (prev[group] ?? ROWS_PER_PAGE) + ROWS_PER_PAGE,
+              }))
+            }
+            className="w-full py-1.5 text-[11px] text-ink-2 hover:bg-surface-hover hover:text-ink"
+          >
+            Show {Math.min(ROWS_PER_PAGE, total - limit)} more of {total - limit} remaining
+          </button>
+        )}
+      </>
+    );
+  };
+
+  /** A folder of the tree view, with actions on every file below it in this group. */
+  const renderFolderRow = (
+    node: TreeFolder<GitEntry>,
+    depth: number,
+    expanded: boolean,
+    group: ChangeGroup,
+  ) => {
+    const files = collectFiles([node]);
+    const discardableHere = group === "staged" ? [] : files.filter(isDiscardable);
+    const key = `${group}:${node.path}`;
+    return (
+      <div
+        key={`folder:${key}`}
+        role="button"
+        tabIndex={0}
+        data-change-row
+        aria-expanded={expanded}
+        aria-label={`${expanded ? "Collapse" : "Expand"} ${node.name}`}
+        style={{ paddingLeft: `${10 + depth * 14}px` }}
+        className="group/row flex h-[22px] cursor-pointer items-center gap-1.5 pr-2 text-ink-2 outline-none transition-colors hover:bg-surface-hover focus-visible:bg-surface-hover focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-accent/60"
+        onClick={() => toggleFolder(key)}
+        onKeyDown={(event) => {
+          if (event.target !== event.currentTarget) return;
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            toggleFolder(key);
+          } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            moveFocus(event.currentTarget, event.key === "ArrowDown" ? 1 : -1);
+          }
+        }}
+      >
+        <ChevronIcon isExpanded={expanded} className="size-3 shrink-0" />
+        <FileIcon name={node.name} isDir className="size-3.5 shrink-0" />
+        <span className="truncate text-xs">{node.name}</span>
+        {/* Folder-level actions act on every file below the folder, collapsed ones included --
+            the same bulk handlers the group header uses, so the behaviour cannot drift. */}
+        <div className="ml-auto flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover/row:opacity-100">
+          {group !== "staged" && (
+            <IconAction
+              label={`Stage folder ${node.name}`}
+              title={`Stage ${files.length} file${files.length === 1 ? "" : "s"} in ${node.name}`}
+              disabled={busy}
+              onClick={() => void stageAll(files)}
+            >
+              <PlusIcon size={11} />
+            </IconAction>
+          )}
+          {group !== "unstaged" && (
+            <IconAction
+              label={`Unstage folder ${node.name}`}
+              title={`Unstage ${files.length} file${files.length === 1 ? "" : "s"} in ${node.name}`}
+              disabled={busy}
+              onClick={() => void unstageAll(files)}
+            >
+              <MinusIcon size={11} />
+            </IconAction>
+          )}
+          {group !== "staged" && (
+            <IconAction
+              label={`Discard folder ${node.name}`}
+              title={
+                discardableHere.length
+                  ? `Discard changes in ${discardableHere.length} file${discardableHere.length === 1 ? "" : "s"} in ${node.name}`
+                  : `Nothing in ${node.name} can be discarded`
+              }
+              danger
+              disabled={busy || discardableHere.length === 0}
+              onClick={() => void discardAll(discardableHere)}
+            >
+              <UndoIcon size={11} />
+            </IconAction>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  /** One group of the grouped view: its header (fold, count, bulk actions) and its rows. */
+  const renderGroup = (
+    group: Exclude<ChangeGroup, "all">,
+    title: string,
+    list: readonly GitEntry[],
+    actions: ReactNode,
+  ) => {
+    if (list.length === 0) return null;
+    const collapsed = collapsedGroups.has(group);
+    return (
+      <div key={group} role="group" aria-label={`${title} group`}>
+        <div className="group/grp flex h-6 items-center gap-1 bg-panel pl-1.5 pr-1">
+          <button
+            aria-expanded={!collapsed}
+            onClick={() =>
+              setCollapsedGroups((prev) => {
+                const next = new Set(prev);
+                if (next.has(group)) next.delete(group);
+                else next.add(group);
+                return next;
+              })
+            }
+            className="flex min-w-0 flex-1 items-center gap-1 self-stretch text-left"
+          >
+            <ChevronIcon isExpanded={!collapsed} className="size-3 shrink-0 text-ink-3" />
+            <span
+              className={`truncate text-[11.5px] font-medium ${group === "conflicts" ? "text-yellow" : "text-ink"}`}
+            >
+              {title}
+            </span>
+            <span className="shrink-0 rounded-full bg-border-strong px-1.5 font-mono text-[10px] leading-4 text-ink-2">
+              {list.length}
+            </span>
+          </button>
+          <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover/grp:opacity-100">
+            {actions}
+          </div>
+        </div>
+        {!collapsed && renderRows(list, group)}
       </div>
     );
   };
@@ -935,113 +1214,106 @@ export function SourceControlPanel({
       )}
 
       <div className={`flex-1 min-h-0 flex-col ${showInit ? "hidden" : "flex"}`}>
-        {sectionVisible.repositories && (
-          <RepositoriesSection
-            repos={registrySnapshot.repos}
-            repositories={registrySnapshot.repositories}
-            activeRepoId={registrySnapshot.activeRepoId}
+        {activeRepo && !unusable && snapshot && (
+          <BranchBar
+            entry={activeRepo}
+            branch={branch}
+            branches={branches}
+            remotes={remotes}
             dirty={dirty}
-            hasMessage={hasMessage}
-            getMessage={getMessage}
-            collapsed={sectionCollapsed.repositories}
-            onToggleCollapse={() => toggleCollapsed("repositories")}
-            onSelect={selectRepository}
-            onSelectWorktree={(path) => void selectWorktree(path)}
-            onRemove={removeRepository}
-            onAdd={() => void addRepository()}
-            onCommitted={() => commitBoxRef.current?.clear()}
-            onOpenBranches={() => setBranchesOpen(true)}
-            onDialog={onDialog}
+            busy={busy || loading}
+            open={branchesOpen}
+            onToggle={setBranchesOpen}
+            guarded={guarded}
+            onDeleteBranch={(name) => void deleteBranch(name)}
           />
         )}
 
         {sectionVisible.changes && (
           <section aria-label="Changes panel" className="flex min-h-0 flex-1 flex-col text-xs">
-            <div
-              onClick={() => toggleCollapsed("changes")}
-              className="flex items-center gap-1.5 px-2 h-7 cursor-pointer hover:bg-surface-hover transition-colors"
-            >
-              <ChevronIcon isExpanded={!sectionCollapsed.changes} className="size-3" />
-              <span className="font-semibold text-[12px] text-ink">Changes</span>
-              {branch.detached && (
-                <span
-                  title="HEAD is not on a branch. Commits made now belong to no branch until you switch to or create one."
-                  className="rounded bg-yellow/15 px-1.5 text-[10px] leading-4 text-yellow"
-                >
-                  Detached HEAD
-                </span>
-              )}
-              {stale && (
-                <span
-                  title="The last refresh failed, so this shows the last state Git reported. It updates after the next successful refresh."
-                  className="rounded bg-yellow/15 px-1.5 text-[10px] leading-4 text-yellow"
-                >
-                  Out of date
-                </span>
-              )}
-              <div className="flex-1" />
-              {activeRepo && !unusable && (
-                <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
-                  {stagedCount > 0 && (
-                    <button
-                      disabled={busy || loading || !hasMessage || conflictCount > 0}
-                      title={hasMessage ? "Commit staged changes" : "Enter a commit message first"}
-                      aria-label="Commit staged changes"
-                      onClick={() => commitBoxRef.current?.commit()}
-                      className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"
+            <SectionHeader
+              title="Changes"
+              count={entries.length}
+              countLabel={`${entries.length} changed files`}
+              collapsed={sectionCollapsed.changes}
+              onToggle={() => toggleCollapsed("changes")}
+              badges={
+                <>
+                  {branch.detached && (
+                    <span
+                      title="HEAD is not on a branch. Commits made now belong to no branch until you switch to or create one."
+                      className="shrink-0 rounded bg-yellow/15 px-1.5 text-[10px] normal-case leading-4 tracking-normal text-yellow"
                     >
-                      <CheckIcon size={13} />
-                    </button>
+                      Detached HEAD
+                    </span>
                   )}
-                  <button
-                    disabled={busy || loading}
-                    onClick={() => void activeRepo?.store.refresh()}
-                    title="Refresh Status"
-                    aria-label="Refresh Status"
-                    className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-30"
-                  >
-                    <RefreshIcon size={13} className={loading || busy ? "animate-spin" : ""} />
-                  </button>
-                  <button
-                    onClick={() => setBranchesOpen(!branchesOpen)}
-                    title="Branches and remotes"
-                    aria-label="Branches and remotes"
-                    className={`p-1 rounded transition-colors ${
-                      branchesOpen
-                        ? "text-accent-hover bg-accent/15"
-                        : "text-ink-3 hover:text-ink hover:bg-border-strong"
-                    }`}
-                  >
-                    <GitBranchIcon size={12} />
-                  </button>
-                  <GitMenu
-                    icon={<MoreIcon size={14} />}
-                    label="Changes actions"
-                    buttonClassName="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong"
-                    items={buildGitCommandMenu({
-                      entry: activeRepo,
-                      dirty,
-                      hasMessage,
-                      getMessage,
-                      onCommitted: () => commitBoxRef.current?.clear(),
-                      onDialog,
-                      onDiff,
-                      onDiscardAll: () => void discardAll(entries),
-                      includeViewOptions: true,
-                      changesSort,
-                      onSortChanges: setChangesSort,
-                      changesViewAsTree,
-                      onToggleViewAsTree: () => setChangesViewAsTree((v) => !v),
-                      onClone: cloneRepository,
-                      onShowOutput,
-                    })}
-                  />
-                </div>
-              )}
-            </div>
+                  {stale && (
+                    <span
+                      title="The last refresh failed, so this shows the last state Git reported. It updates after the next successful refresh."
+                      className="shrink-0 rounded bg-yellow/15 px-1.5 text-[10px] normal-case leading-4 tracking-normal text-yellow"
+                    >
+                      Out of date
+                    </span>
+                  )}
+                </>
+              }
+              actions={
+                activeRepo && !unusable ? (
+                  <>
+                    <IconAction
+                      label={grouped ? "Show as One List" : "Group by Staged"}
+                      title={
+                        grouped
+                          ? "Show every file once, with a checkbox for its staging"
+                          : "Group into Staged, Unstaged and Conflicts"
+                      }
+                      active={grouped}
+                      onClick={() => setGrouped((value) => !value)}
+                    >
+                      <GroupIcon />
+                    </IconAction>
+                    <IconAction
+                      label={changesViewAsTree ? "View as List" : "View as Tree"}
+                      onClick={() => setChangesViewAsTree((value) => !value)}
+                    >
+                      {changesViewAsTree ? <ListIcon /> : <TreeIcon />}
+                    </IconAction>
+                    <IconAction
+                      label="Refresh Status"
+                      disabled={busy || loading}
+                      onClick={() => void activeRepo.store.refresh()}
+                    >
+                      <RefreshIcon size={13} className={loading || busy ? "animate-spin" : ""} />
+                    </IconAction>
+                    <GitMenu
+                      icon={<MoreIcon size={14} />}
+                      label="Changes actions"
+                      buttonClassName="rounded p-1 text-ink-3 hover:bg-border-strong hover:text-ink"
+                      items={buildGitCommandMenu({
+                        entry: activeRepo,
+                        dirty,
+                        hasMessage,
+                        getMessage,
+                        onCommitted: () => commitBoxRef.current?.clear(),
+                        onDialog,
+                        onDiff,
+                        onDiscardAll: () => void discardAll(entries),
+                        includeViewOptions: true,
+                        changesSort,
+                        onSortChanges: setChangesSort,
+                        changesViewAsTree,
+                        onToggleViewAsTree: () => setChangesViewAsTree((v) => !v),
+                        onClone: cloneRepository,
+                        onShowOutput,
+                      })}
+                    />
+                  </>
+                ) : undefined
+              }
+            />
 
             {!sectionCollapsed.changes && (
-              <div className="shrink-0 max-h-[60%] overflow-y-auto p-3 pt-1 space-y-2.5">
+              <div className="max-h-[60%] shrink-0 space-y-2.5 overflow-y-auto px-2.5 pb-2.5 pt-1">
                 {activeRepo && unusable ? (
                   <div
                     role="alert"
@@ -1070,7 +1342,7 @@ export function SourceControlPanel({
                 ) : !activeRepo ? (
                   registrySnapshot.repos.length > 0 ? (
                     <div className="space-y-1">
-                      <p className="text-ink-3 text-[11px]">Choose a repository:</p>
+                      <p className="text-[11px] text-ink-3">Choose a repository:</p>
                       {registrySnapshot.repos.map((entry) => (
                         <button
                           key={entry.repoId}
@@ -1086,7 +1358,7 @@ export function SourceControlPanel({
                       ))}
                     </div>
                   ) : (
-                    <p className="text-ink-3 text-[11px]">
+                    <p className="text-[11px] text-ink-3">
                       {!workspace
                         ? "Open a workspace, or add a repository folder, to use Source Control."
                         : shownError
@@ -1099,13 +1371,13 @@ export function SourceControlPanel({
                     {operationInProgress && (
                       <div
                         role="alert"
-                        className="rounded border border-amber-500/30 bg-amber-500/10 p-2 space-y-1.5"
+                        className="space-y-1.5 rounded border border-yellow/30 bg-yellow/10 p-2"
                       >
-                        <p className="text-amber-300 font-medium text-[11px] flex items-center gap-1.5">
+                        <p className="flex items-center gap-1.5 text-[11px] font-medium text-yellow">
                           <AlertCircleIcon size={13} />
                           {OPERATION_LABEL[operationInProgress]} in progress
                         </p>
-                        <p className="text-amber-200/80 text-[11px]">
+                        <p className="text-[11px] text-ink-2">
                           {conflictCount > 0
                             ? `Resolve ${conflictCount} conflicted file${conflictCount === 1 ? "" : "s"}, stage each one, then continue.`
                             : "No conflicts remain. Continue when ready."}
@@ -1116,20 +1388,20 @@ export function SourceControlPanel({
                             onClick={() =>
                               void guarded("abort", () => activeRepo.store.repository.abort())
                             }
-                            className="flex-1 py-1 rounded bg-surface-hover hover:bg-surface-hover text-[11px] text-ink disabled:opacity-40 transition-colors"
+                            className="flex-1 rounded bg-surface-hover py-1 text-[11px] text-ink transition-colors hover:bg-border-strong disabled:opacity-40"
                           >
                             Abort
                           </button>
                           {/* Merge has no commit sequence to advance past -- Git itself has no
-                              `merge --skip`, so this is only ever offered for the three
-                              operations that genuinely process one. */}
+                              `merge --skip`, so this is only offered for the three operations
+                              that genuinely process one. */}
                           {operationInProgress !== "merge" && (
                             <button
                               disabled={busy || loading || dirty}
                               onClick={() =>
                                 void guarded("skip", () => activeRepo.store.repository.skip())
                               }
-                              className="flex-1 py-1 rounded bg-surface-hover hover:bg-surface-hover text-[11px] text-ink disabled:opacity-40 transition-colors"
+                              className="flex-1 rounded bg-surface-hover py-1 text-[11px] text-ink transition-colors hover:bg-border-strong disabled:opacity-40"
                             >
                               Skip
                             </button>
@@ -1141,7 +1413,7 @@ export function SourceControlPanel({
                                 activeRepo.store.repository.continueOperation(),
                               )
                             }
-                            className="flex-1 py-1 rounded bg-accent hover:bg-accent-hover text-[11px] text-white disabled:opacity-40 transition-colors"
+                            className="flex-1 rounded bg-accent py-1 text-[11px] text-white transition-colors hover:bg-accent-hover disabled:opacity-40"
                           >
                             Continue
                           </button>
@@ -1149,8 +1421,8 @@ export function SourceControlPanel({
                       </div>
                     )}
 
-                    <fieldset disabled={busy || loading} className="space-y-2 disabled:opacity-60">
-                      <CommitBox
+                    <fieldset disabled={busy || loading} className="disabled:opacity-60">
+                      <CommitComposer
                         ref={commitBoxRef}
                         draftKey={activeRepo.root}
                         branchName={branch.detached ? "detached HEAD" : branch.name}
@@ -1179,204 +1451,19 @@ export function SourceControlPanel({
                         busy={busy}
                         loading={loading}
                         onChange={onMessageChange}
-                        onCommit={(message) =>
+                        onCommit={(message, options) =>
                           guarded("commit", () =>
                             // Nothing staged means "commit every tracked change", exactly as
-                            // the dropdown's own Commit item does.
+                            // the dropdown's own Commit item does; an amend takes only what is
+                            // staged (possibly nothing: a new message).
                             activeRepo.store.repository.commit(message, {
-                              all: stagedCount === 0,
+                              all: stagedCount === 0 && !options.amend,
+                              amend: options.amend,
+                              signoff: options.signoff,
                             }),
                           )
                         }
                       />
-
-                      {branchesOpen && (
-                        <div className="space-y-2 pt-1 border-t border-border">
-                          <select
-                            aria-label="Switch branch"
-                            className="w-full rounded border border-border-strong bg-surface px-2 py-1 text-xs text-ink-2 focus:border-accent focus:outline-none"
-                            value={branches.includes(branch.name) ? branch.name : ""}
-                            disabled={dirty}
-                            onChange={(e) =>
-                              void guarded("switch", () =>
-                                activeRepo.store.repository.switchBranch(e.target.value),
-                              )
-                            }
-                          >
-                            <option value="" disabled>
-                              {branch.detached ? "Detached HEAD: choose a branch" : "Choose branch"}
-                            </option>
-                            {branches.map((name) => (
-                              <option key={name} value={name}>
-                                {name}
-                              </option>
-                            ))}
-                          </select>
-
-                          <div className="flex gap-1">
-                            <input
-                              aria-label="New branch name"
-                              placeholder="New branch name"
-                              className="flex-1 min-w-0 rounded border border-border-strong bg-surface px-2 py-1 text-xs text-ink placeholder:text-ink-3 focus:border-accent focus:outline-none"
-                              value={newBranch}
-                              onChange={(e) => setNewBranch(e.target.value)}
-                            />
-                            <button
-                              disabled={dirty || !newBranch.trim()}
-                              onClick={() =>
-                                void guarded("branch", () =>
-                                  activeRepo.store.repository.createBranch(newBranch),
-                                ).then((ok) => ok && setNewBranch(""))
-                              }
-                              className="px-2 py-1 rounded bg-surface-hover hover:bg-border-strong text-[11px] text-ink disabled:opacity-40 transition-colors shrink-0"
-                            >
-                              Create
-                            </button>
-                          </div>
-
-                          {/* The checked-out branch is excluded: Git always refuses to delete
-                              it, so offering the button was a guaranteed dead end. The
-                              command menu's Delete Branch… already filtered it out. */}
-                          {branches.some((name) => name !== branch.name) && (
-                            <ul aria-label="Delete a branch" className="space-y-0.5">
-                              {branches
-                                .filter((name) => name !== branch.name)
-                                .map((name) => (
-                                  <li
-                                    key={name}
-                                    className="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-surface-hover"
-                                  >
-                                    <span className="flex-1 min-w-0 truncate text-[11px] text-ink-2 font-mono">
-                                      {name}
-                                    </span>
-                                    <button
-                                      aria-label={`Delete ${name}`}
-                                      title={`Delete ${name}`}
-                                      onClick={() => void deleteBranch(name)}
-                                      className="p-0.5 rounded text-ink-3 hover:text-red-400 hover:bg-red-950/40 transition-colors shrink-0"
-                                    >
-                                      <TrashIcon size={11} />
-                                    </button>
-                                  </li>
-                                ))}
-                            </ul>
-                          )}
-
-                          {sync === "diverged" && (
-                            <div className="rounded border border-border bg-surface p-2 space-y-1.5">
-                              <p className="text-ink-2 text-[11px]">
-                                Diverged: {branch.ahead} local and {branch.behind} remote commits.
-                              </p>
-                              <p className="text-ink-3 text-[10.5px]">
-                                Neither choice stashes your work — save or commit anything you want
-                                to keep first.
-                              </p>
-                              <div className="flex gap-1.5">
-                                <button
-                                  disabled={dirty}
-                                  onClick={() =>
-                                    void guarded("pullRebase", () =>
-                                      activeRepo.store.repository.pullRebase(),
-                                    )
-                                  }
-                                  className="flex-1 py-1 rounded bg-surface-hover hover:bg-surface-hover text-[11px] text-ink-2 disabled:opacity-40 transition-colors"
-                                >
-                                  Rebase
-                                </button>
-                                <button
-                                  disabled={dirty}
-                                  onClick={() =>
-                                    void guarded("pullMerge", () =>
-                                      activeRepo.store.repository.pullMerge(),
-                                    )
-                                  }
-                                  className="flex-1 py-1 rounded bg-surface-hover hover:bg-surface-hover text-[11px] text-ink-2 disabled:opacity-40 transition-colors"
-                                >
-                                  Merge
-                                </button>
-                              </div>
-                            </div>
-                          )}
-
-                          <div className="flex gap-1.5 pt-0.5">
-                            <button
-                              onClick={() =>
-                                void guarded("fetch", () => activeRepo.store.repository.fetch())
-                              }
-                              className="flex-1 py-1 rounded bg-surface-hover hover:bg-surface-hover text-[11px] text-ink-2 disabled:opacity-40 transition-colors"
-                            >
-                              Fetch
-                            </button>
-                            {branch.upstream && (
-                              <button
-                                disabled={dirty || sync === "diverged"}
-                                title={
-                                  sync === "diverged"
-                                    ? "Fast-forward pull is unavailable; choose Rebase or Merge instead."
-                                    : undefined
-                                }
-                                onClick={() =>
-                                  void guarded("pull", () => activeRepo.store.repository.pull())
-                                }
-                                className="flex-1 py-1 rounded bg-surface-hover hover:bg-surface-hover text-[11px] text-ink-2 disabled:opacity-40 transition-colors"
-                              >
-                                Pull
-                              </button>
-                            )}
-                            {branch.upstream && (
-                              <button
-                                onClick={() =>
-                                  void guarded("push", () => activeRepo.store.repository.push())
-                                }
-                                className="flex-1 py-1 rounded bg-surface-hover hover:bg-surface-hover text-[11px] text-ink-2 disabled:opacity-40 transition-colors"
-                              >
-                                Push
-                              </button>
-                            )}
-                          </div>
-
-                          {branch.detached && (
-                            <p className="text-ink-3 text-[11px]">
-                              HEAD is detached, so there is no branch to publish. Switch to a
-                              branch, or create one here first.
-                            </p>
-                          )}
-                          {!branch.upstream &&
-                            !branch.detached &&
-                            (remotes.length === 0 ? (
-                              <p className="text-ink-3 text-[11px]">
-                                No remote is configured. Add one with `git remote add` to publish
-                                this branch.
-                              </p>
-                            ) : (
-                              <div className="flex gap-1">
-                                <select
-                                  aria-label="Remote"
-                                  className="flex-1 min-w-0 rounded border border-border-strong bg-surface px-2 py-1 text-xs text-ink-2 focus:border-accent focus:outline-none"
-                                  value={chosenRemote}
-                                  onChange={(e) => setChosenRemote(e.target.value)}
-                                >
-                                  {remotes.map((name) => (
-                                    <option key={name} value={name}>
-                                      {name}
-                                    </option>
-                                  ))}
-                                </select>
-                                <button
-                                  disabled={!chosenRemote}
-                                  onClick={() =>
-                                    void guarded("publish", () =>
-                                      activeRepo.store.repository.publish(chosenRemote),
-                                    )
-                                  }
-                                  className="px-2 py-1 rounded bg-surface-hover hover:bg-border-strong text-[11px] text-ink disabled:opacity-40 transition-colors shrink-0"
-                                >
-                                  Publish branch
-                                </button>
-                              </div>
-                            ))}
-                        </div>
-                      )}
                     </fieldset>
                   </>
                 )}
@@ -1391,7 +1478,7 @@ export function SourceControlPanel({
                   <p
                     role="status"
                     aria-live="polite"
-                    className={`flex-1 text-[11px] break-words leading-tight ${
+                    className={`flex-1 break-words text-[11px] leading-tight ${
                       cancelled ? "text-ink-3" : "text-ink-2"
                     }`}
                   >
@@ -1431,7 +1518,7 @@ export function SourceControlPanel({
                         })
                         .catch((e) => activeRepo?.store.setNotice(String(e)));
                     }}
-                    className="w-full rounded bg-border-strong hover:bg-surface-hover py-1 text-[11px] text-ink transition-colors flex items-center justify-center gap-1.5"
+                    className="flex w-full items-center justify-center gap-1.5 rounded bg-border-strong py-1 text-[11px] text-ink transition-colors hover:bg-surface-hover"
                   >
                     <UndoIcon size={12} />
                     <span>Undo last discard</span>
@@ -1442,188 +1529,151 @@ export function SourceControlPanel({
 
             {!sectionCollapsed.changes && activeRepo && !unusable && (
               <>
+                {(entries.length > FILTER_FROM || filter) && (
+                  <div className="shrink-0 px-2.5 pb-1.5">
+                    <input
+                      aria-label="Filter changes"
+                      placeholder={`Filter ${entries.length} changed files`}
+                      value={filter}
+                      onChange={(event) => setFilter(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Escape") setFilter("");
+                      }}
+                      className="w-full rounded border border-border-strong bg-surface px-2 py-1 text-xs text-ink placeholder:text-ink-3 focus:border-accent focus:outline-none"
+                    />
+                  </div>
+                )}
                 <div
-                  role="button"
-                  tabIndex={0}
-                  aria-expanded={!changesGroupCollapsed}
-                  aria-label="Changes group"
-                  onClick={() => setChangesGroupCollapsed((c) => !c)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      setChangesGroupCollapsed((c) => !c);
-                    }
-                  }}
-                  className="flex h-6 shrink-0 cursor-pointer items-center gap-1.5 bg-surface px-2 hover:bg-surface-hover"
+                  role="list"
+                  aria-label="Changed files"
+                  data-changes-list
+                  className="min-h-[44px] flex-1 overflow-y-auto pb-1"
                 >
-                  <ChevronIcon isExpanded={!changesGroupCollapsed} className="size-3" />
-                  <span className="text-[12px] text-ink">Changes</span>
-                  <div className="flex-1" />
-                  <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
-                    {entries.length > 0 && (
-                      <>
-                        <button
-                          disabled={busy || loading || discardable === 0}
-                          title={
-                            discardable === 0
-                              ? "Nothing to discard: Discard All restores modified tracked files only"
-                              : `Discard changes in ${discardable} modified file${discardable === 1 ? "" : "s"}. Untracked, deleted, staged-only and conflicted files are not affected.`
-                          }
-                          aria-label="Discard All Changes"
-                          onClick={() => void discardAll(entries)}
-                          className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"
+                  {entries.length === 0 && !loading && (
+                    // One row tall, like a single file: a big centred empty state made everything
+                    // below it (the Graph) jump ~100 px the moment the last file was committed.
+                    <p className="flex h-[22px] items-center gap-1.5 px-3 text-[11px] text-ink-3">
+                      <CheckIcon size={12} className="shrink-0" />
+                      Working tree clean
+                    </p>
+                  )}
+                  {entries.length > 0 && groups.all.length === 0 && (
+                    <p className="flex h-[22px] items-center px-3 text-[11px] text-ink-3">
+                      No changed file matches “{filter}”.
+                    </p>
+                  )}
+                  {grouped ? (
+                    <>
+                      {renderGroup("conflicts", "Conflicts", groups.conflicts, null)}
+                      {renderGroup(
+                        "staged",
+                        "Staged",
+                        groups.staged,
+                        <IconAction
+                          label="Unstage All Changes"
+                          disabled={busy || loading}
+                          onClick={() => void unstageAll(groups.staged)}
                         >
-                          <UndoIcon size={12} />
-                        </button>
-                        {allStaged ? (
-                          <button
-                            disabled={busy || loading}
-                            title="Unstage All Changes"
-                            aria-label="Unstage All Changes"
-                            onClick={() => void unstageAll(entries.filter(hasStagedPart))}
-                            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"
-                          >
-                            <MinusIcon size={12} />
-                          </button>
-                        ) : (
-                          <button
-                            disabled={busy || loading}
-                            title="Stage All Changes"
-                            aria-label="Stage All Changes"
-                            onClick={() =>
-                              void stageAll(
-                                entries.filter((e) => !e.conflict && hasUnstagedPart(e)),
-                              )
+                          <MinusIcon size={12} />
+                        </IconAction>,
+                      )}
+                      {renderGroup(
+                        "unstaged",
+                        "Unstaged",
+                        groups.unstaged,
+                        <>
+                          <IconAction
+                            label="Discard All Changes"
+                            title={
+                              discardable === 0
+                                ? "Nothing to discard: Discard All restores modified tracked files only"
+                                : `Discard changes in ${discardable} modified file${discardable === 1 ? "" : "s"}. Untracked, deleted, staged-only and conflicted files are not affected.`
                             }
-                            className="p-1 rounded text-ink-3 hover:text-ink hover:bg-border-strong transition-colors disabled:opacity-40"
+                            danger
+                            disabled={busy || loading || discardable === 0}
+                            onClick={() => void discardAll(entries)}
+                          >
+                            <UndoIcon size={12} />
+                          </IconAction>
+                          <IconAction
+                            label="Stage All Changes"
+                            disabled={busy || loading}
+                            onClick={() => void stageAll(groups.unstaged)}
                           >
                             <PlusIcon size={12} />
-                          </button>
-                        )}
-                      </>
-                    )}
-                  </div>
-                  {entries.length > 0 && (
-                    <span
-                      aria-label={`${entries.length} changed files`}
-                      className="rounded-full bg-border-strong px-1.5 font-mono text-[10px] leading-4 text-ink-2"
-                    >
-                      {entries.length}
-                    </span>
+                          </IconAction>
+                        </>,
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      {entries.length > 0 && (
+                        <div className="flex h-6 items-center justify-end gap-0.5 px-1">
+                          <IconAction
+                            label="Discard All Changes"
+                            title={
+                              discardable === 0
+                                ? "Nothing to discard: Discard All restores modified tracked files only"
+                                : `Discard changes in ${discardable} modified file${discardable === 1 ? "" : "s"}. Untracked, deleted, staged-only and conflicted files are not affected.`
+                            }
+                            danger
+                            disabled={busy || loading || discardable === 0}
+                            onClick={() => void discardAll(entries)}
+                          >
+                            <UndoIcon size={12} />
+                          </IconAction>
+                          {allStaged ? (
+                            <IconAction
+                              label="Unstage All Changes"
+                              disabled={busy || loading}
+                              onClick={() => void unstageAll(entries.filter(hasStagedPart))}
+                            >
+                              <MinusIcon size={12} />
+                            </IconAction>
+                          ) : (
+                            <IconAction
+                              label="Stage All Changes"
+                              disabled={busy || loading}
+                              onClick={() =>
+                                void stageAll(
+                                  entries.filter((e) => !e.conflict && hasUnstagedPart(e)),
+                                )
+                              }
+                            >
+                              <PlusIcon size={12} />
+                            </IconAction>
+                          )}
+                        </div>
+                      )}
+                      {renderRows(groups.all, "all")}
+                    </>
                   )}
                 </div>
-                {!changesGroupCollapsed && (
-                  <div
-                    role="list"
-                    aria-label="Changed files"
-                    className="min-h-[44px] flex-1 overflow-y-auto pb-1"
-                  >
-                    {entries.length === 0 && !loading && (
-                      // One row tall, like a single file: a big centred empty state made everything
-                      // below it (the Graph) jump ~100 px the moment the last file was committed,
-                      // and a click aimed at the Graph toolbar then landed elsewhere.
-                      <p className="flex h-[22px] items-center gap-1.5 px-3 text-[11px] text-ink-3">
-                        <CheckIcon size={12} className="shrink-0" />
-                        Working tree clean
-                      </p>
+                {rowMenu && (
+                  <ContextMenu
+                    x={rowMenu.x}
+                    y={rowMenu.y}
+                    label="File actions"
+                    onClose={() => setRowMenu(null)}
+                    onError={(error) => activeRepo.store.setNotice(String(error))}
+                    items={buildChangeMenu(
+                      rowMenu.entry,
+                      rowMenu.group,
+                      {
+                        openChanges: (staged) => void showDiff(rowMenu.entry, staged),
+                        openFile: onOpenFile ? () => onOpenFile(rowMenu.entry.path) : undefined,
+                        stage: () => stageOne(rowMenu.entry),
+                        unstage: () => unstageOne(rowMenu.entry),
+                        discard: () => void discard(rowMenu.entry),
+                        acceptSide: (side) => void acceptConflictSide(rowMenu.entry, side),
+                        ignore: () => void ignoreFile(rowMenu.entry),
+                        reveal: onReveal ? () => onReveal(rowMenu.entry.path) : undefined,
+                        copyPath: () => copy(rowMenu.entry.path),
+                        copyRelativePath: () => copy(relativePath(rowMenu.entry.path)),
+                      },
+                      busy || loading,
                     )}
-
-                    {changesViewAsTree
-                      ? treeRows!.slice(0, shownRowCount).map((row) =>
-                          row.node.kind === "folder" ? (
-                            <div
-                              key={`folder:${row.node.path}`}
-                              role="button"
-                              tabIndex={0}
-                              aria-expanded={row.expanded}
-                              aria-label={`${row.expanded ? "Collapse" : "Expand"} ${row.node.name}`}
-                              style={{ paddingLeft: `${8 + row.depth * 14}px` }}
-                              className="flex items-center gap-1.5 pr-2.5 h-[22px] hover:bg-surface-hover group/row transition-colors cursor-pointer text-ink-2"
-                              onClick={() => toggleFolder(row.node.path)}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter" || e.key === " ") {
-                                  e.preventDefault();
-                                  toggleFolder(row.node.path);
-                                }
-                              }}
-                            >
-                              <ChevronIcon isExpanded={row.expanded} className="size-3 shrink-0" />
-                              <FileIcon name={row.node.name} isDir className="size-3.5 shrink-0" />
-                              <span className="text-xs truncate">{row.node.name}</span>
-                              {/* Folder-level actions, acting on every file below the folder
-                                  including collapsed ones -- the same bulk handlers the
-                                  section header uses, so the behaviour cannot drift. */}
-                              <div className="ml-auto flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover/row:opacity-100 focus-within:opacity-100">
-                                {(() => {
-                                  const files = collectFiles([row.node]);
-                                  const discardable = files.filter(isDiscardable);
-                                  return (
-                                    <>
-                                      <button
-                                        title={`Stage ${files.length} file${files.length === 1 ? "" : "s"} in ${row.node.name}`}
-                                        aria-label={`Stage folder ${row.node.name}`}
-                                        disabled={busy}
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          void stageAll(files);
-                                        }}
-                                        className="rounded p-0.5 text-ink-3 hover:bg-surface-hover hover:text-ink disabled:opacity-40"
-                                      >
-                                        <PlusIcon size={11} />
-                                      </button>
-                                      <button
-                                        title={`Unstage ${files.length} file${files.length === 1 ? "" : "s"} in ${row.node.name}`}
-                                        aria-label={`Unstage folder ${row.node.name}`}
-                                        disabled={busy}
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          void unstageAll(files);
-                                        }}
-                                        className="rounded p-0.5 text-ink-3 hover:bg-surface-hover hover:text-ink disabled:opacity-40"
-                                      >
-                                        <MinusIcon size={11} />
-                                      </button>
-                                      <button
-                                        title={
-                                          discardable.length
-                                            ? `Discard changes in ${discardable.length} file${discardable.length === 1 ? "" : "s"} in ${row.node.name}`
-                                            : `Nothing in ${row.node.name} can be discarded`
-                                        }
-                                        aria-label={`Discard folder ${row.node.name}`}
-                                        disabled={busy || discardable.length === 0}
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          void discardAll(discardable);
-                                        }}
-                                        className="rounded p-0.5 text-ink-3 hover:bg-surface-hover hover:text-red-400 disabled:opacity-40"
-                                      >
-                                        <UndoIcon size={11} />
-                                      </button>
-                                    </>
-                                  );
-                                })()}
-                              </div>
-                            </div>
-                          ) : (
-                            renderFileRow(row.node.item, row.depth)
-                          ),
-                        )
-                      : listed.slice(0, shownRowCount).map((entry) => renderFileRow(entry))}
-                    {totalRowCount > shownRowCount && (
-                      <button
-                        onClick={() =>
-                          setRowLimits((prev) => ({
-                            ...prev,
-                            Changes: (prev.Changes ?? ROWS_PER_PAGE) + ROWS_PER_PAGE,
-                          }))
-                        }
-                        className="w-full py-1.5 text-[11px] text-ink-2 hover:bg-surface-hover hover:text-ink"
-                      >
-                        Show {Math.min(ROWS_PER_PAGE, totalRowCount - shownRowCount)} more of{" "}
-                        {totalRowCount - shownRowCount} remaining
-                      </button>
-                    )}
-                  </div>
+                  />
                 )}
               </>
             )}
@@ -1649,6 +1699,27 @@ export function SourceControlPanel({
             dirty={dirty}
             collapsed={sectionCollapsed.stashes}
             onToggleCollapse={() => toggleCollapsed("stashes")}
+            onDialog={onDialog}
+          />
+        )}
+
+        {sectionVisible.repositories && (
+          <RepositoriesSection
+            repos={registrySnapshot.repos}
+            repositories={registrySnapshot.repositories}
+            activeRepoId={registrySnapshot.activeRepoId}
+            dirty={dirty}
+            hasMessage={hasMessage}
+            getMessage={getMessage}
+            collapsed={sectionCollapsed.repositories}
+            onToggleCollapse={() => toggleCollapsed("repositories")}
+            onSelect={selectRepository}
+            onSelectWorktree={(path) => void selectWorktree(path)}
+            onRemove={removeRepository}
+            onAdd={() => void addRepository()}
+            onCommitted={() => commitBoxRef.current?.clear()}
+            onOpenBranches={() => setBranchesOpen(true)}
+            onDialog={onDialog}
           />
         )}
       </div>

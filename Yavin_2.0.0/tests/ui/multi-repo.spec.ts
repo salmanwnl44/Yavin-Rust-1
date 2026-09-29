@@ -151,7 +151,8 @@ test("the workspace repository is tracked and shown without adding anything", as
     workspace: "/work",
     repos: { "/work": repo("main", " M a.ts\0") },
   });
-  await expect(region.getByText("main")).toBeVisible();
+  // Its branch is in the branch bar, and its row in the Repositories section.
+  await expect(region.getByRole("button", { name: "Branches and remotes" })).toContainText("main");
   // The Repositories section always lists tracked repos, even just the one.
   await expect(region.getByRole("group", { name: "work" })).toBeVisible();
 });
@@ -498,9 +499,14 @@ test("switching rapidly back and forth between two just-refreshed worktrees does
     .getByRole("group", { name: "work", exact: true })
     .click({ position: { x: 5, y: 5 } });
   await region.getByTitle("Branches and remotes").click();
-  await expect(region.getByLabel("Switch branch")).toHaveValue("main"); // confirms the switch actually landed
+  // The checked-out branch is the selected one in the branch list: the switch actually landed.
+  await expect(
+    region.getByLabel("Switch branch").getByRole("option", { selected: true }),
+  ).toHaveText("main");
   await region.getByRole("group", { name: "work-feature" }).click({ position: { x: 5, y: 5 } });
-  await expect(region.getByLabel("Switch branch")).toHaveValue("feature");
+  await expect(
+    region.getByLabel("Switch branch").getByRole("option", { selected: true }),
+  ).toHaveText("feature");
 
   const workAfter = await statusCallsFor("/work");
   const featureAfter = await statusCallsFor("/work-feature");

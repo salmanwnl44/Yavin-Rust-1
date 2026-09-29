@@ -330,7 +330,7 @@ test("the commit detail's file list can be viewed as a tree", async ({ page }) =
     numstat: { c1: ["1\t0\tsrc/a.ts", "1\t0\tsrc/b.ts", "1\t0\tREADME.md"] },
   });
   await graph.getByText("Refactor").click();
-  const detail = page.getByRole("complementary").filter({ hasText: "Commit" });
+  const detail = page.getByRole("complementary", { name: "Commit details" });
   await expect(detail.getByText("src/a.ts")).toBeVisible();
 
   await detail.getByRole("button", { name: "Tree" }).click();

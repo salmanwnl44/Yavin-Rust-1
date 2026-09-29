@@ -2,8 +2,9 @@ import type { RepoEntry } from "../../services/git/registry";
 import { guardedAffecting } from "../../services/git/sync";
 import { useRepoSnapshot } from "../../services/git/hooks";
 import type { StashEntry } from "../../services/git/parsers/stash";
-import { ChevronIcon } from "../ui/FileIcons";
-import { ArrowDownIcon, TrashIcon, UndoIcon } from "../ui/Icons";
+import type { DialogRequest } from "../ui/AppDialog";
+import { ArrowDownIcon, PlusIcon, TrashIcon, UndoIcon } from "../ui/Icons";
+import { IconAction, SectionHeader } from "./SectionHeader";
 
 export function StashesSection({
   entry,
@@ -11,16 +12,20 @@ export function StashesSection({
   dirty,
   collapsed,
   onToggleCollapse,
+  onDialog,
 }: {
   entry: RepoEntry | null;
   stashes: StashEntry[];
   dirty: boolean;
   collapsed: boolean;
   onToggleCollapse: () => void;
+  /** Asks for the new stash's message; without it, New Stash is not offered. */
+  onDialog?: (request: DialogRequest) => void;
 }) {
   // Read before the early return: hooks cannot be called conditionally.
   const snapshot = useRepoSnapshot(entry?.store);
   const busy = snapshot?.busy ?? false;
+  const changed = snapshot?.entries.length ?? 0;
   if (!entry) return null;
 
   const run = (kind: string, op: () => Promise<string>) =>
@@ -31,20 +36,49 @@ export function StashesSection({
     run("stashDrop", () => entry.store.repository.stashDrop(index));
   };
 
+  /** Stashes the working tree: first what to include, then an optional message. */
+  const newStash = () =>
+    onDialog?.({
+      title: "New stash",
+      options: [
+        { value: "tracked", label: "Tracked changes" },
+        { value: "untracked", label: "Tracked changes and untracked files" },
+      ],
+      submit: (choice) =>
+        onDialog({
+          title: "Stash message (optional)",
+          input: "",
+          confirmLabel: "Stash",
+          submit: (message) =>
+            run("stash", () =>
+              entry.store.repository.stash({
+                message: message || undefined,
+                untracked: choice === "untracked",
+              }),
+            ),
+        }),
+    });
+
   return (
     <section aria-label="Stashes" className="text-xs flex flex-col min-h-0 border-b border-border">
-      <div
-        onClick={onToggleCollapse}
-        className="flex items-center gap-1.5 px-2.5 py-1.5 cursor-pointer hover:bg-surface-hover transition-colors shrink-0"
-      >
-        <ChevronIcon isExpanded={!collapsed} className="size-3" />
-        <span className="font-semibold text-[11px] uppercase tracking-wider text-ink-2">
-          Stashes
-        </span>
-        {stashes.length > 0 && (
-          <span className="text-ink-3 text-[10px] font-mono">{stashes.length}</span>
-        )}
-      </div>
+      <SectionHeader
+        title="Stashes"
+        count={stashes.length}
+        collapsed={collapsed}
+        onToggle={onToggleCollapse}
+        actions={
+          onDialog ? (
+            <IconAction
+              label="New Stash"
+              title={changed ? "Stash the working tree's changes" : "Nothing to stash"}
+              disabled={busy || changed === 0}
+              onClick={newStash}
+            >
+              <PlusIcon size={12} />
+            </IconAction>
+          ) : undefined
+        }
+      />
 
       {!collapsed && (
         <div className="overflow-y-auto max-h-[200px] pb-1">

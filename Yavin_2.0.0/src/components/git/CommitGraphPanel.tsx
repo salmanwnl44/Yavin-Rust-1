@@ -175,7 +175,10 @@ function CommitDetail({
   );
 
   return (
-    <aside className="w-[320px] shrink-0 border-l border-[#141414] bg-black flex flex-col h-full">
+    <aside
+      aria-label="Commit details"
+      className="w-[320px] shrink-0 border-l border-[#141414] bg-black flex flex-col h-full"
+    >
       <div className="flex h-9 items-center justify-between px-3 border-b border-[#141414] shrink-0">
         <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
           Commit

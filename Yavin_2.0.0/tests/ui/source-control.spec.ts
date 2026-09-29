@@ -219,6 +219,15 @@ async function update(page: Page, changes: Partial<Scenario>) {
   await page.getByTitle("Refresh Status").click();
 }
 
+/** The Commit button, whatever it currently says it will do. */
+const COMMIT_BUTTON = /^(Commit( all \d+| \d+ staged)?|Amend last commit)$/;
+
+/** The single list (every file once, a checkbox for its staging), instead of the default groups. */
+async function oneList(region: Locator) {
+  await region.getByRole("button", { name: "Show as One List" }).click();
+  await expect(region.getByRole("button", { name: "Group by Staged" })).toBeVisible();
+}
+
 test("a diverged branch offers rebase and merge instead of a fast-forward pull", async ({
   page,
 }) => {
@@ -255,7 +264,7 @@ async function showRepositories(page: Page, region: ReturnType<Page["getByRole"]
 test("the sync pill asks on a divergence rather than choosing a side", async ({ page }) => {
   const region = await panel(page, { branchInfo: diverged });
   await showRepositories(page, region);
-  await region.getByTitle(/Sync changes/).click();
+  await region.getByRole("button", { name: "Sync Changes" }).click();
 
   await expect(region.getByRole("status")).toContainText(/diverged.*Choose Rebase or Merge/s);
   // Nothing was run on the user's behalf.
@@ -269,7 +278,7 @@ test("the sync pill asks on a divergence rather than choosing a side", async ({ 
 test("a branch behind its upstream still fast-forwards on sync", async ({ page }) => {
   const region = await panel(page, { branchInfo: behind });
   await showRepositories(page, region);
-  await region.getByTitle(/Sync changes/).click();
+  await region.getByRole("button", { name: "Sync Changes" }).click();
   await expect.poll(() => gitCalls(page, "pull")).toBe(1);
 });
 
@@ -724,7 +733,7 @@ test("committing re-fetches status, branch and operation state, still skipping b
   };
 
   await region.getByLabel("Commit message").fill("a commit");
-  await region.getByRole("button", { name: /^Commit( \d+)?$/ }).click();
+  await region.getByRole("button", { name: COMMIT_BUTTON }).click();
   await expect.poll(() => gitCalls(page, "commit")).toBe(1);
 
   await expect.poll(() => gitCalls(page, "status")).toBe(before.status + 1);
@@ -748,7 +757,7 @@ test("committing resets the commit graph", async ({ page }) => {
   const before = await logCalls();
 
   await region.getByLabel("Commit message").fill("a commit");
-  await region.getByRole("button", { name: /^Commit( \d+)?$/ }).click();
+  await region.getByRole("button", { name: COMMIT_BUTTON }).click();
   await expect.poll(() => gitCalls(page, "commit")).toBe(1);
 
   await expect.poll(logCalls).toBeGreaterThan(before);
@@ -784,7 +793,7 @@ test("the Commit dropdown refuses to commit while a conflict is unresolved, like
 }) => {
   const region = await panel(page, { status: "M  a.ts\0UU b.ts\0" });
   await region.getByLabel("Commit message").fill("blocked");
-  await expect(region.getByRole("button", { name: /^Commit( \d+)?$/ })).toBeDisabled();
+  await expect(region.getByRole("button", { name: COMMIT_BUTTON })).toBeDisabled();
   await region.getByRole("button", { name: "Commit actions" }).click();
   await page.getByRole("menuitem", { name: /^Commit ›/ }).click();
   await expect(page.getByRole("menuitem", { name: "Commit Staged", exact: true })).toBeDisabled();
@@ -900,6 +909,7 @@ test("Sort Changes reorders the list by name, path and status; Path is the defau
   page,
 }) => {
   const region = await panel(page, { status: MIXED_STATUS });
+  await oneList(region);
   // Path is the default -- no menu interaction needed to see it.
   expect(await shownOrder(region)).toEqual([
     "clash.ts", // a conflict is never sorted out of sight
@@ -938,6 +948,7 @@ test("the chosen sort survives a refresh and a reload, and re-applies when the f
   page,
 }) => {
   const region = await panel(page, { status: MIXED_STATUS });
+  await oneList(region);
   await chooseSort(page, region, "Name");
 
   await region.getByTitle("Refresh Status").click();
@@ -980,6 +991,7 @@ test("View as Tree/View as List toggles, and the top-level item names the mode y
   page,
 }) => {
   const region = await panel(page, { status: MIXED_STATUS });
+  await oneList(region);
   await region.getByRole("button", { name: "Changes actions" }).click();
   // Starts in list mode: the quick-toggle item offers to switch to tree.
   await expect(page.getByRole("menuitem", { name: "View as Tree", exact: true })).toBeVisible();
@@ -1195,7 +1207,7 @@ test("typing a commit message does not lose the draft or the Commit button state
 }) => {
   const region = await panel(page, { status: "M  a.ts\0" });
   const box = region.getByLabel("Commit message");
-  const commit = region.getByRole("button", { name: /^Commit( \d+)?$/ });
+  const commit = region.getByRole("button", { name: COMMIT_BUTTON });
   await expect(commit).toBeDisabled();
   await box.fill("first line");
   await expect(commit).toBeEnabled();
@@ -1216,7 +1228,7 @@ test("with nothing staged the Commit button commits every tracked change, like i
   // first") while the dropdown item beside it, also labelled Commit, committed with `-a`.
   // Two controls with the same name disagreeing about whether the action existed at all.
   const region = await panel(page, { status: " M a.ts\0 M b.ts\0" });
-  const commitAll = region.getByRole("button", { name: /^Commit All/ });
+  const commitAll = region.getByRole("button", { name: /^Commit all/ });
   await expect(commitAll).toBeDisabled(); // no message yet
   await region.getByLabel("Commit message").fill("commit everything");
   await expect(commitAll).toBeEnabled();
@@ -1249,6 +1261,7 @@ test("every changed file appears once in one list, with a checkbox for its stagi
   const region = await panel(page, {
     status: "MM a.ts\0 M b.ts\0?? c.ts\0M  d.ts\0 D e.ts\0",
   });
+  await oneList(region);
   const list = region.getByRole("list", { name: "Changed files" });
   await expect(list.getByRole("button", { name: /^Open diff for/ })).toHaveCount(5);
   // The old Staged Changes / Changes sections are gone.
@@ -1273,13 +1286,14 @@ test("every changed file appears once in one list, with a checkbox for its stagi
   // The header count is the number of files, and the Commit button counts only staged ones.
   await expect(region.getByLabel("5 changed files")).toBeVisible();
   await region.getByLabel("Commit message").fill("msg");
-  await expect(region.getByRole("button", { name: "Commit 2" })).toBeEnabled();
+  await expect(region.getByRole("button", { name: "Commit 2 staged" })).toBeEnabled();
 });
 
 test("the row checkbox stages an unstaged or partly staged file and unstages a fully staged one", async ({
   page,
 }) => {
   const region = await panel(page, { status: " M b.ts\0M  d.ts\0MM a.ts\0" });
+  await oneList(region);
   const box = (name: string) =>
     region.getByRole("list", { name: "Changed files" }).getByRole("checkbox", {
       name: `Stage /work/${name}`,
@@ -1338,4 +1352,211 @@ test("the Graph toolbar's network buttons are disabled while an operation runs, 
   await expect(fetch).toBeEnabled();
   await expect(pull).toBeEnabled();
   await expect(push).toBeEnabled();
+});
+
+// --- The redesigned panel -------------------------------------------------------------------
+
+const lastGitArgs = (page: Page, first: string) =>
+  page.evaluate(
+    (name) =>
+      (window as unknown as { __calls: { command: string; args: { args?: string[] } }[] }).__calls
+        .filter((call) => call.command === "git_exec" && call.args.args?.[0] === name)
+        .map((call) => call.args.args!)
+        .pop() ?? [],
+    first,
+  );
+
+test("changes are grouped into Staged and Unstaged; a partly staged file is in both", async ({
+  page,
+}) => {
+  // a: staged then edited again; b: only edited; c: untracked; d: fully staged.
+  const region = await panel(page, { status: "MM a.ts\0 M b.ts\0?? c.ts\0M  d.ts\0" });
+  const group = (name: string) => region.getByRole("group", { name: `${name} group` });
+  await expect(group("Staged").getByRole("button", { name: /^Open staged diff for/ })).toHaveCount(
+    2,
+  );
+  await expect(group("Unstaged").getByRole("button", { name: /^Open diff for/ })).toHaveCount(3);
+  await expect(region.getByRole("group", { name: "Conflicts group" })).toHaveCount(0);
+  // Each row's letter is its own group's half: the index for Staged, the working tree otherwise.
+  const letter = (groupName: string, row: string) =>
+    group(groupName)
+      .getByRole("button", { name: row })
+      .getByTitle(/^Status: /);
+  await expect(letter("Staged", "Open staged diff for /work/a.ts")).toHaveText("M");
+  await expect(letter("Unstaged", "Open diff for /work/c.ts")).toHaveText("U");
+
+  // A group's checkbox works in its own direction.
+  await group("Staged").getByRole("checkbox", { name: "Unstage /work/a.ts" }).click();
+  await expect.poll(() => gitCalls(page, "unstage")).toBe(1);
+  await group("Unstaged").getByRole("checkbox", { name: "Stage /work/b.ts" }).click();
+  await expect.poll(() => gitCalls(page, "stage")).toBe(1);
+
+  // A Staged row opens the staged change.
+  await group("Staged").getByRole("button", { name: "Open staged diff for /work/d.ts" }).click();
+  await expect.poll(async () => (await lastGitArgs(page, "diff")).includes("--cached")).toBe(true);
+
+  // Folding a group hides its rows.
+  await group("Staged")
+    .getByRole("button", { name: /^Staged/ })
+    .click();
+  await expect(group("Staged").getByRole("button", { name: /^Open staged diff/ })).toHaveCount(0);
+});
+
+test("a conflict has a group of its own, resolved by taking a side", async ({ page }) => {
+  const region = await panel(page, { status: "UU x.ts\0 M y.ts\0", state: "merge" });
+  const conflicts = region.getByRole("group", { name: "Conflicts group" });
+  await expect(conflicts.getByRole("button", { name: "Open diff for /work/x.ts" })).toBeVisible();
+  await expect(conflicts.getByLabel("Accept current change for /work/x.ts")).toBeAttached();
+  // Never in Staged or Unstaged: a conflict is resolved one file at a time.
+  await expect(region.getByRole("group", { name: "Unstaged group" }).getByText("x.ts")).toHaveCount(
+    0,
+  );
+});
+
+test("a long change list can be filtered by path", async ({ page }) => {
+  let status = "";
+  for (let i = 0; i < 25; i++) status += ` M src/file${i}.ts\0`;
+  status += " M docs/readme.md\0";
+  const region = await panel(page, { status });
+  const rows = region.getByRole("button", { name: /^Open diff for/ });
+  await expect(rows).toHaveCount(26);
+  const filter = region.getByLabel("Filter changes");
+  await filter.fill("file1");
+  // file1 and file10..file19.
+  await expect(rows).toHaveCount(11);
+  await filter.fill("src readme");
+  await expect(rows).toHaveCount(0);
+  await expect(region.getByText(/No changed file matches/)).toBeVisible();
+  await filter.press("Escape");
+  await expect(rows).toHaveCount(26);
+  // The counts, and what the commit takes, are always every file.
+  await expect(region.getByLabel("26 changed files")).toBeVisible();
+});
+
+test("a changed file's right-click menu offers what applies to it", async ({ page }) => {
+  const region = await panel(page, { status: " M a.ts\0?? notes.log\0" });
+  await region.getByRole("button", { name: "Open diff for /work/a.ts" }).click({ button: "right" });
+  const menu = page.getByRole("menu", { name: "File actions" });
+  await expect(menu.getByRole("menuitem", { name: "Stage", exact: true })).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: "Discard Changes" })).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: "Add to .gitignore" })).toHaveCount(0);
+  await menu.getByRole("menuitem", { name: "Stage", exact: true }).click();
+  await expect.poll(() => gitCalls(page, "stage")).toBe(1);
+
+  // An untracked file can be ignored: the line goes into the repository's .gitignore, through
+  // the same guarded write as every other edit.
+  await region
+    .getByRole("button", { name: "Open diff for /work/notes.log" })
+    .click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Add to .gitignore" }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { __writes?: string[] }).__writes ?? []))
+    .toContain("/work/.gitignore");
+});
+
+test("the changes list works from the keyboard: arrows move, Space stages, Enter opens", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: " M a.ts\0 M b.ts\0" });
+  const first = region.getByRole("button", { name: "Open diff for /work/a.ts" });
+  const second = region.getByRole("button", { name: "Open diff for /work/b.ts" });
+  await first.focus();
+  await page.keyboard.press("ArrowDown");
+  await expect(second).toBeFocused();
+  await page.keyboard.press("ArrowUp");
+  await expect(first).toBeFocused();
+  await page.keyboard.press("Space");
+  await expect.poll(() => gitCalls(page, "stage")).toBe(1);
+  await page.keyboard.press("Enter");
+  await expect(page.locator("section[aria-label='Git diff editor']")).toBeVisible();
+});
+
+test("the Commit button says what it will do, and Amend and Sign off are one click away", async ({
+  page,
+}) => {
+  const region = await panel(page, { status: " M a.ts\0 M b.ts\0" });
+  await region.getByLabel("Commit message").fill("message");
+  // Nothing staged: every tracked change.
+  await expect(region.getByRole("button", { name: "Commit all 2" })).toBeEnabled();
+
+  await region.getByLabel("Amend").check();
+  await region.getByLabel("Sign off").check();
+  const amend = region.getByRole("button", { name: "Amend last commit" });
+  await expect(amend).toBeEnabled();
+  await amend.click();
+  await expect.poll(() => gitCalls(page, "commit")).toBe(1);
+  const args = await lastGitArgs(page, "commit");
+  expect(args).toContain("--amend");
+  expect(args).toContain("-s");
+  // An amend takes what is staged (here nothing: a new message), never `-a`.
+  expect(args).not.toContain("-a");
+});
+
+test("the branch bar lists, filters, switches to and deletes branches", async ({ page }) => {
+  const region = await panel(page, {
+    branchInfo: "# branch.oid abc\n# branch.head main\n",
+    branches: "refs/heads/main\nrefs/heads/feature/login\nrefs/heads/fix/crash\n",
+  });
+  const bar = region.getByRole("button", { name: "Branches and remotes" });
+  await expect(bar).toContainText("main");
+  await bar.click();
+  const list = region.getByRole("listbox", { name: "Switch branch" });
+  await expect(list.getByRole("option")).toHaveCount(3);
+  await expect(list.getByRole("option", { selected: true })).toHaveText("main");
+  await region.getByLabel("Filter branches").fill("fea");
+  await expect(list.getByRole("option")).toHaveText(["feature/login"]);
+  await list.getByRole("option", { name: "feature/login" }).click();
+  await expect.poll(() => gitCalls(page, "switch")).toBe(1);
+  expect(await lastGitArgs(page, "switch")).toContain("feature/login");
+
+  await region.getByLabel("Filter branches").fill("");
+  await list.getByRole("button", { name: "Delete fix/crash" }).click();
+  await expect.poll(() => gitCalls(page, "deleteBranch")).toBe(1);
+  // The checked-out branch cannot be deleted, so it offers no button.
+  await expect(list.getByRole("button", { name: "Delete main" })).toHaveCount(0);
+});
+
+test("New Stash asks what to include, then for a message", async ({ page }) => {
+  const region = await panel(page, { status: " M a.ts\0?? b.ts\0" });
+  await region.getByLabel("Source Control view options").click();
+  await page.getByRole("menuitem", { name: "Stashes" }).click();
+  await region.getByRole("button", { name: "New Stash" }).click();
+  await page.getByRole("option", { name: "Tracked changes and untracked files" }).click();
+  await page.getByRole("textbox", { name: "Stash message (optional)" }).fill("wip");
+  await page.getByRole("button", { name: "Stash", exact: true }).click();
+  // The stash itself, not the refresh's `stash list` after it.
+  const pushed = () =>
+    page.evaluate(() =>
+      (window as unknown as { __calls: { command: string; args: { args?: string[] } }[] }).__calls
+        .map((call) => call.args.args ?? [])
+        .find((args) => args[0] === "stash" && args[1] === "push"),
+    );
+  await expect.poll(pushed).toEqual(["stash", "push", "-u", "-m", "wip"]);
+});
+
+test("a menu action that asks twice keeps its second question open (Push to…)", async ({
+  page,
+}) => {
+  // A dialog that opens another from its answer used to be cleared by the first one closing
+  // itself, so every two-step Git action stopped after its first question.
+  const region = await panel(page, {
+    branchInfo: "# branch.oid abc\n# branch.head main\n",
+    remotes: "origin\n",
+  });
+  await region.getByRole("button", { name: "Changes actions" }).click();
+  await page.getByRole("menuitem", { name: /^Pull, Push/ }).click();
+  await page.getByRole("menuitem", { name: "Push to…" }).click();
+  await page.getByRole("option", { name: "origin" }).click();
+  const branch = page.getByRole("textbox", { name: 'Push to "origin"' });
+  await expect(branch).toHaveValue("main");
+  await page.getByRole("button", { name: "Push", exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as unknown as { __calls: { command: string; args: { args?: string[] } }[] }).__calls
+          .map((call) => call.args.args ?? [])
+          .some((args) => args[0] === "push" && args.includes("origin")),
+      ),
+    )
+    .toBe(true);
 });

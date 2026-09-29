@@ -782,6 +782,39 @@ closing → closed    opening → active
 4. What a workspace remembers is stored under its own identity, never shared with another.
 5. The window is never left with one workspace's UI over another's services.
 
+## Source Control panel
+
+The panel (`components/layout/SourceControlPanel.tsx`) is a view of the workspace's Git registry; it holds no Git state of its own beyond view preferences. From the top:
+
+```text
+SOURCE CONTROL                                   ⋯   view options: which sections show
+⎇ main ↓1 ↑2                            ›  [Sync]    BranchBar
+  (open: filter · branch list · create · Fetch/Pull/Push · diverged Rebase/Merge · publish)
+▾ CHANGES 6                        [▤][🌲][⟳][⋯]    group · list/tree · refresh · Changes actions
+  Message (Ctrl+Enter to commit on "main")           CommitComposer
+  [ ✓ Commit 3 staged            ][▾]  ☐ Amend ☐ Sign off
+  ⚠ Merge in progress …  Abort · Skip · Continue     (only while one is)
+  Filter changes                                     (more than 20 files)
+  ▾ Conflicts / ▾ Staged / ▾ Unstaged                grouped (default), or one list
+▸ GRAPH · ▸ STASHES (+ New Stash) · ▸ REPOSITORIES
+```
+
+| Piece                               | Owns                                                                                                     |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `components/git/BranchBar.tsx`      | the branch in view, incoming/outgoing, one Sync, the branch card (switch, create, delete, publish)       |
+| `components/git/CommitComposer.tsx` | the message (per-repository draft), what the button says it will commit, Amend and Sign off              |
+| `services/git/changeGroups.ts`      | which files are staged, unstaged, conflicted or discardable; grouping, filtering, which diff a row opens |
+| `services/git/changeMenu.ts`        | a file's right-click menu, by the group it was clicked in; the `.gitignore` line it adds                 |
+| `components/git/SectionHeader.tsx`  | the header every section shares (fold, count, actions shown on hover or focus)                           |
+
+**Changes.** Grouped by default: **Conflicts** (resolved one at a time, Ours/Theirs), **Staged** and **Unstaged**. A partly staged file is in both, each row showing its own half: its letter (the index's or the working tree's), the diff it opens (`--cached` or not), and the direction of its checkbox (`Unstage …` in Staged, `Stage …` in Unstaged). "Show as One List" gives every file once, the checkbox saying how much of it is staged (mixed when partly). Either view can be a tree, sorted by name, path or status; the filter matches every word typed against the repo-relative path. Counts, Stage All, Discard All and the commit always cover every file, filtered or not, drawn or not (rows are drawn 500 at a time).
+
+**Rows.** Click or Enter opens the diff; Space stages or unstages; Delete discards (with the same confirmation and recovery copy as the button); arrow keys move between rows; right-click, Shift+F10 or the context-menu key opens the file's menu -- Open Changes / Open File, Stage / Unstage, Discard, Accept Current or Incoming for a conflict, Add to .gitignore for an untracked file (appended through the guarded write, so it is undoable), Reveal in File Explorer, Copy Path, Copy Relative Path.
+
+**Commit.** The button says what it will do: "Commit 3 staged", "Commit all 5" (nothing staged: every tracked change, `-a`), or "Amend last commit" (what is staged, possibly nothing: a new message; never `-a`). Sign off adds `-s`. The dropdown keeps every commit variant.
+
+**Dialogs.** A dialog may open the next from its answer (pick a remote, then name the branch). Each request gets its own dialog element and clears only itself, so the first closing never takes the second with it.
+
 ## Explorer provider platform
 
 The Explorer is a projection of the filesystem, never a store of filesystem truth. `src/services/explorerProvider.ts` holds what has been listed; `src/services/explorerStore.ts` holds what the user did to the view; the existing tree view (`Sidebar`, `TreeRow`) renders the one and reads and writes the other.

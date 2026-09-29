@@ -238,12 +238,12 @@ export function RepositoriesSection({
   }, [repos, sort]);
 
   return (
-    <section aria-label="Repositories" className="text-xs shrink-0 border-b border-border">
+    <section aria-label="Repositories" className="text-xs shrink-0 border-t border-border">
       <div
         onClick={onToggleCollapse}
-        className="flex items-center gap-1.5 px-2.5 py-1.5 cursor-pointer hover:bg-surface-hover transition-colors group/header"
+        className="group/header flex h-7 cursor-pointer items-center gap-1 pl-1.5 pr-1 transition-colors hover:bg-surface-hover"
       >
-        <ChevronIcon isExpanded={!collapsed} className="size-3" />
+        <ChevronIcon isExpanded={!collapsed} className="size-3 text-ink-3" />
         <span className="font-semibold text-[11px] uppercase tracking-wider text-ink-2 flex-1">
           Repositories
         </span>

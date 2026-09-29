@@ -112,6 +112,8 @@ const documentIO: DocumentIO = {
 };
 
 const WELCOME_TAB: OpenTab = { id: "welcome", name: "Welcome", path: "welcome" };
+/** Numbers dialog requests, so each gets its own dialog element (see `dialogKey`). */
+let dialogCount = 0;
 
 /** What the session keeps of the Explorer. */
 interface ExplorerSessionState {
@@ -224,6 +226,20 @@ export default function App() {
     selected: false,
   });
   const [dialog, setDialog] = useState<DialogRequest | null>(null);
+  /**
+   * One dialog element per request. A dialog's `submit` may open the next one (pick a remote,
+   * then name the branch): that one must not be closed, or cleared, by the first as it closes
+   * itself -- which is what a shared element and an unconditional clear did.
+   */
+  const dialogKeys = useRef(new WeakMap<DialogRequest, number>());
+  const dialogKey = (request: DialogRequest) => {
+    let key = dialogKeys.current.get(request);
+    if (key === undefined) {
+      key = ++dialogCount;
+      dialogKeys.current.set(request, key);
+    }
+    return key;
+  };
   const [wordWrap, setWordWrap] = useState(false);
   const [zoom, setZoom] = useState(1);
   const [paletteMode, setPaletteMode] = useState<
@@ -2574,6 +2590,8 @@ export default function App() {
               showPanelView("output", "git");
             }}
             onDialog={setDialog}
+            onOpenFile={(path) => void handleOpenFile(path)}
+            onReveal={handleReveal}
           />
           <Sidebar
             key={`explorer:${workspacePath}`}
@@ -2768,7 +2786,13 @@ export default function App() {
             onClose={() => setTrustDialog(null)}
           />
         )}
-        {dialog && <AppDialog request={dialog} onClose={() => setDialog(null)} />}
+        {dialog && (
+          <AppDialog
+            key={dialogKey(dialog)}
+            request={dialog}
+            onClose={() => setDialog((current) => (current === dialog ? null : current))}
+          />
+        )}
         {/* Command Palette */}
         <CommandPalette
           commands={commands}

@@ -370,10 +370,10 @@ export function InlineGraphSection({
     <section ref={sectionRef} aria-label="Graph" className="text-xs flex flex-col min-h-0">
       <div
         onClick={onToggleCollapse}
-        className="flex items-center gap-1.5 px-2 h-7 cursor-pointer hover:bg-surface-hover transition-colors shrink-0 border-t border-border"
+        className="flex h-7 shrink-0 cursor-pointer items-center gap-1 border-t border-border pl-1.5 pr-1 transition-colors hover:bg-surface-hover"
       >
-        <ChevronIcon isExpanded={!collapsed} className="size-3" />
-        <span className="font-semibold text-[12px] text-ink">Graph</span>
+        <ChevronIcon isExpanded={!collapsed} className="size-3 text-ink-3" />
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-ink-2">Graph</span>
         {onDialog ? (
           <button
             title="Change which history is shown"
