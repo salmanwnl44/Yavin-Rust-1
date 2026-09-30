@@ -182,15 +182,39 @@ fn move_ref(
     )
 }
 
-/// Moves HEAD -- the ref it names, or HEAD itself when detached -- to `new`.
-fn move_head(repo: &mut Repository, new: ObjectId, reason: &str) -> Result<u64> {
-    match repo.refs().head.clone() {
-        Head::Symbolic(name) => move_ref(repo, &name, new, "commit", reason),
-        Head::Detached(_) => {
-            let revision = repo.refs().revision;
-            repo.update_refs(revision, &[], Some(Head::Detached(new)), "commit", reason)
-        }
+/// Moves HEAD -- the branch it is on, or HEAD itself when detached -- to `new`, in one atomic
+/// step with the index: the index follows HEAD when it had nothing staged (so it stays equal
+/// to HEAD), or when the commit was made from it (`from_index`). Staged changes are never
+/// dropped by a commit made from elsewhere (a checkpoint).
+fn move_head(repo: &mut Repository, new: ObjectId, reason: &str, from_index: bool) -> Result<u64> {
+    let revision = repo.refs().revision;
+    let index_name = RefName::new(crate::branches::INDEX_REF)?;
+    let index_ref = repo.refs().refs.get(&index_name).copied();
+    let old_head = repo.refs().head_commit();
+    let mut updates = Vec::new();
+    // A ref equal to the old HEAD, or none, means nothing was staged.
+    let nothing_staged = index_ref.is_none() || index_ref == old_head;
+    if index_ref.is_some() && (from_index || nothing_staged) {
+        // No index ref: the index is HEAD's tree, which is now the new commit's.
+        updates.push(RefUpdate {
+            name: index_name,
+            expected: index_ref,
+            new: None,
+        });
     }
+    let head = match repo.refs().head.clone() {
+        Head::Symbolic(name) => {
+            let expected = repo.refs().refs.get(&name).copied();
+            updates.push(RefUpdate {
+                name,
+                expected,
+                new: Some(new),
+            });
+            None
+        }
+        Head::Detached(_) => Some(Head::Detached(new)),
+    };
+    repo.update_refs(revision, &updates, head, "commit", reason)
 }
 
 /// Records a persisted snapshot as a checkpoint (`source` is `Checkpoint`, or `Recovery` for
@@ -247,7 +271,54 @@ pub fn commit_snapshot(
         Source::Human,
         request,
     )?;
-    let revision = move_head(repo, id, &summary(&request.message))?;
+    let revision = move_head(repo, id, &summary(&request.message), false)?;
+    Ok(Created {
+        commit: commit_info(id, &commit),
+        revision,
+    })
+}
+
+/// Makes a commit of the Local Index -- exactly what is staged, nothing from the working tree
+/// -- on top of HEAD, and moves HEAD (and the index, which now equals it) to it. Refused with
+/// `NothingToCommit` when the index is HEAD's tree (or empty, before the first commit).
+pub fn commit_index(repo: &mut Repository, request: &CommitRequest) -> Result<Created> {
+    validate_message(&request.message)?;
+    let index = crate::branches::index_state(repo)?;
+    let head = repo.refs().head_commit();
+    let head_root = match head {
+        Some(id) => Some(repo.read_commit(&id)?.root),
+        None => None,
+    };
+    let Some(root) = index.root else {
+        return Err(LgError::NothingToCommit);
+    };
+    if Some(root) == head_root {
+        return Err(LgError::NothingToCommit);
+    }
+    let empty = crate::object::Tree::default().id();
+    if head.is_none() && index.folders.values().all(|tree| *tree == empty) {
+        return Err(LgError::NothingToCommit);
+    }
+    let parents = head.into_iter().collect();
+    let commit = Commit {
+        root,
+        disk_root: None,
+        parents,
+        workspace: repo.meta().workspace.clone(),
+        author: request.author.clone(),
+        time_ms: request.time_ms,
+        tz_offset_min: request.tz_offset_min,
+        source: Source::Human,
+        meta: [("index".to_string(), "1".to_string())]
+            .into_iter()
+            .collect(),
+        meta_objects: BTreeMap::new(),
+        message: request.message.clone(),
+    };
+    let mut txn = repo.begin_write()?;
+    let id = txn.put_commit(&commit)?;
+    txn.commit()?;
+    let revision = move_head(repo, id, &summary(&request.message), true)?;
     Ok(Created {
         commit: commit_info(id, &commit),
         revision,
@@ -275,7 +346,7 @@ pub fn commit_checkpoint(
         Source::Human,
         request,
     )?;
-    let revision = move_head(repo, id, &summary(&request.message))?;
+    let revision = move_head(repo, id, &summary(&request.message), false)?;
     Ok(Created {
         commit: commit_info(id, &commit),
         revision,
@@ -285,6 +356,8 @@ pub fn commit_checkpoint(
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HeadInfo {
+    /// What `branches::resolve_head` says: on a branch, detached, or unborn.
+    pub state: crate::branches::HeadState,
     /// The ref HEAD names (`refs/heads/main`), or none when detached.
     pub symbolic: Option<String>,
     /// No commit yet.
@@ -300,6 +373,7 @@ pub fn head_info(repo: &Repository) -> Result<HeadInfo> {
         None => None,
     };
     Ok(HeadInfo {
+        state: crate::branches::resolve_head(repo),
         symbolic: match &refs.head {
             Head::Symbolic(name) => Some(name.as_str().into()),
             Head::Detached(_) => None,

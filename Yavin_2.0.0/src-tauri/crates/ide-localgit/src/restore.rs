@@ -131,6 +131,13 @@ pub enum RestoreConflict {
     },
     #[serde(rename_all = "camelCase")]
     TargetUnavailable { folder_id: String, path: String },
+    /// A switch (LG-04): something is staged, and the index is about to become the target's.
+    #[serde(rename_all = "camelCase")]
+    StagedChangeConflict { folder_id: String, path: String },
+    /// A switch (LG-04): a path the switch changes holds neither HEAD's content nor the
+    /// target's (a local change, or an untracked file in the way).
+    #[serde(rename_all = "camelCase")]
+    UnstagedChangeWouldBeOverwritten { folder_id: String, path: String },
     /// Found by the executor: a folder the restore would remove holds something snapshots
     /// leave out (`.git`, `node_modules`, `.env`, ...). It is never removed.
     #[serde(rename_all = "camelCase")]

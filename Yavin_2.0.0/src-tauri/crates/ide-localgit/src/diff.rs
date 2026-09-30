@@ -228,7 +228,7 @@ impl TreeLookup for Trees<'_> {
     }
 }
 
-fn is_binary(bytes: &[u8]) -> bool {
+pub(crate) fn is_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(8192)].contains(&0) || std::str::from_utf8(bytes).is_err()
 }
 
@@ -367,6 +367,83 @@ fn line_text(line: &[u8]) -> (String, bool) {
     (String::from_utf8_lossy(body).into_owned(), !has_newline)
 }
 
+/// Which lines of an edit script (`changed[i]`: line `i` is an addition or deletion) each hunk
+/// covers, as inclusive `(start, end)` positions: every change with `context` lines around it,
+/// changes close enough to share context in one hunk. `line_diff` and `apply_hunks` both use
+/// it, so a hunk number always means the same lines.
+fn hunk_ranges(changed: &[bool], context: usize) -> Vec<(usize, usize)> {
+    let positions: Vec<usize> = changed
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c)
+        .map(|(at, _)| at)
+        .collect();
+    let mut ranges = Vec::new();
+    let mut at = 0;
+    while at < positions.len() {
+        let start = positions[at].saturating_sub(context);
+        let mut end = positions[at];
+        at += 1;
+        while at < positions.len() && positions[at] <= end + 2 * context + 1 {
+            end = positions[at];
+            at += 1;
+        }
+        ranges.push((start, (end + context).min(changed.len() - 1)));
+    }
+    ranges
+}
+
+/// `old` with the chosen hunks of `line_diff(old, new, context)` applied (and the others
+/// not): every line kept exactly, line endings included. Applying every hunk gives `new`, and
+/// none gives `old`. Fails on a hunk number the diff does not have.
+pub fn apply_hunks(
+    old: &[u8],
+    new: &[u8],
+    selected: &[usize],
+    context: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    let (a, b) = (lines(old), lines(new));
+    let script = edit_script(&a, &b);
+    let changed: Vec<bool> = script.iter().map(|e| *e != Edit::Equal).collect();
+    let ranges = hunk_ranges(&changed, context);
+    if let Some(bad) = selected.iter().find(|h| **h >= ranges.len()) {
+        return Err(format!(
+            "there is no hunk {bad} (the diff has {})",
+            ranges.len()
+        ));
+    }
+    let chosen = |at: usize| {
+        ranges
+            .iter()
+            .enumerate()
+            .any(|(n, (start, end))| (*start..=*end).contains(&at) && selected.contains(&n))
+    };
+    let mut out = Vec::with_capacity(old.len().max(new.len()));
+    let (mut i, mut j) = (0usize, 0usize);
+    for (at, edit) in script.iter().enumerate() {
+        match edit {
+            Edit::Equal => {
+                out.extend_from_slice(a[i]);
+                i += 1;
+                j += 1;
+            }
+            Edit::Delete => {
+                if !chosen(at) {
+                    out.extend_from_slice(a[i]);
+                }
+                i += 1;
+            }
+            Edit::Insert => {
+                if chosen(at) {
+                    out.extend_from_slice(b[j]);
+                }
+                j += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The line diff of two texts, in hunks with `context` unchanged lines around each change.
 pub fn line_diff(old: &[u8], new: &[u8], context: usize) -> LineDiff {
     let (a, b) = (lines(old), lines(new));
@@ -412,23 +489,9 @@ pub fn line_diff(old: &[u8], new: &[u8], context: usize) -> LineDiff {
             }
         }
     }
-    let changed: Vec<usize> = all
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.kind != LineKind::Context)
-        .map(|(at, _)| at)
-        .collect();
+    let changed: Vec<bool> = all.iter().map(|l| l.kind != LineKind::Context).collect();
     let mut hunks = Vec::new();
-    let mut at = 0;
-    while at < changed.len() {
-        let start = changed[at].saturating_sub(context);
-        let mut end = changed[at];
-        at += 1;
-        while at < changed.len() && changed[at] <= end + 2 * context + 1 {
-            end = changed[at];
-            at += 1;
-        }
-        let end = (end + context).min(all.len() - 1);
+    for (start, end) in hunk_ranges(&changed, context) {
         let lines: Vec<DiffLine> = all[start..=end].to_vec();
         let old_lines = lines
             .iter()
@@ -769,6 +832,86 @@ mod tests {
             .map(|l| l.text.clone())
             .collect();
         assert_eq!(rebuilt, vec!["a", "c", "d", "x", "e", "f", "g"]);
+    }
+
+    #[test]
+    fn applying_hunks_gives_exactly_the_chosen_changes() {
+        let old: String = (1..=30)
+            .map(|i| {
+                format!(
+                    "{i}
+"
+                )
+            })
+            .collect();
+        let new = old
+            .replace(
+                "
+3
+", "
+three
+",
+            )
+            .replace(
+                "
+27
+",
+                "
+twenty-seven
+",
+            );
+        let (o, n) = (old.as_bytes(), new.as_bytes());
+        assert_eq!(line_diff(o, n, 3).hunks.len(), 2);
+        assert_eq!(apply_hunks(o, n, &[0, 1], 3).unwrap(), n);
+        assert_eq!(apply_hunks(o, n, &[], 3).unwrap(), o);
+        let first = String::from_utf8(apply_hunks(o, n, &[0], 3).unwrap()).unwrap();
+        assert!(
+            first.contains(
+                "
+three
+"
+            ) && first.contains(
+                "
+27
+"
+            )
+        );
+        let second = String::from_utf8(apply_hunks(o, n, &[1], 3).unwrap()).unwrap();
+        assert!(
+            second.contains(
+                "
+3
+"
+            ) && second.contains("twenty-seven")
+        );
+        assert!(apply_hunks(o, n, &[2], 3).is_err());
+        // Additions at the end of a file with no final newline, and a new file.
+        assert_eq!(
+            apply_hunks(
+                b"a",
+                b"a
+b
+",
+                &[0],
+                3
+            )
+            .unwrap(),
+            b"a
+b
+"
+        );
+        assert_eq!(
+            apply_hunks(
+                b"",
+                b"x
+",
+                &[0],
+                3
+            )
+            .unwrap(),
+            b"x
+"
+        );
     }
 
     #[test]

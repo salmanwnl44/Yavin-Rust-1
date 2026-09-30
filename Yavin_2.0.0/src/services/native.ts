@@ -6,7 +6,13 @@ import type { Session, WorkspaceSession } from "./session";
 import type { TrustState } from "./trust";
 import type {
   LocalGitBlobInfo,
+  LocalGitBranch,
   LocalGitCheckpointEntry,
+  LocalGitIndexInfo,
+  LocalGitPath,
+  LocalGitStageResult,
+  LocalGitSwitchResult,
+  LocalGitTag,
   LocalGitCommit,
   LocalGitCreated,
   LocalGitDiff,
@@ -187,13 +193,63 @@ interface Commands {
   localgit_commit: {
     args: {
       handle: string;
-      jobId: string;
       message: string;
       fromCheckpoint: string | null;
-      overlays: LocalGitOverlayRef[];
       by: LocalGitSignature;
     };
     result: LocalGitCreated;
+  };
+  localgit_index: { args: { handle: string }; result: LocalGitIndexInfo };
+  localgit_stage: {
+    args: {
+      handle: string;
+      jobId: string;
+      paths: LocalGitPath[];
+      all: boolean;
+      overlays: LocalGitOverlayRef[];
+    };
+    result: LocalGitStageResult;
+  };
+  localgit_unstage: {
+    args: { handle: string; paths: LocalGitPath[]; all: boolean };
+    result: LocalGitStageResult;
+  };
+  localgit_stage_hunks: {
+    args: {
+      handle: string;
+      jobId: string;
+      folderId: string | null;
+      path: string;
+      hunks: number[];
+      expectedIndex: string | null;
+      expectedWorking: string | null;
+      overlays: LocalGitOverlayRef[];
+    };
+    result: LocalGitStageResult;
+  };
+  localgit_branches: { args: { handle: string }; result: LocalGitBranch[] };
+  localgit_create_branch: {
+    args: { handle: string; name: string; start: string | null };
+    result: LocalGitBranch;
+  };
+  localgit_delete_branch: { args: { handle: string; name: string }; result: void };
+  localgit_tags: { args: { handle: string }; result: LocalGitTag[] };
+  localgit_get_tag: { args: { handle: string; name: string }; result: LocalGitTag };
+  localgit_create_tag: {
+    args: { handle: string; name: string; target: string | null };
+    result: LocalGitTag;
+  };
+  localgit_delete_tag: { args: { handle: string; name: string }; result: void };
+  localgit_switch: {
+    args: {
+      handle: string;
+      jobId: string;
+      branch: string | null;
+      commit: string | null;
+      dryRun: boolean;
+      overlays: LocalGitOverlayRef[];
+    };
+    result: LocalGitSwitchResult;
   };
   localgit_head: { args: { handle: string }; result: LocalGitHeadInfo };
   localgit_history: {

@@ -819,7 +819,7 @@ SOURCE CONTROL                                   ⋯   view options: which secti
 
 Local Git is Yavin's own history for a workspace -- checkpoints, local commits, branches and restore, eventually "Undo AI Run" -- that works with or without real Git. It is **not Git**: it never reads or writes `.git`, never runs `git`, never reads `.gitignore`, and nothing it stores ends up in the project. Real Git stays what the Source Control panel shows. Local Git never owns live document content either: DocumentService does, and Local Git only records snapshots of it.
 
-LG-01 is the storage layer: the object store, the repository lifecycle and crash-safe persistence. LG-02 adds snapshots of the workspace -- on disk, and with unsaved documents applied -- and status against Local HEAD ("Snapshots and status" below). LG-03 adds checkpoints, commits, history, diffs and restore ("History, diff and restore" below). Branches and everything that builds on them arrive in later phases (see "Not yet").
+LG-01 is the storage layer: the object store, the repository lifecycle and crash-safe persistence. LG-02 adds snapshots of the workspace -- on disk, and with unsaved documents applied -- and status against Local HEAD ("Snapshots and status" below). LG-03 adds checkpoints, commits, history, diffs and restore ("History, diff and restore" below). LG-04 adds the Local Index (staging), branches, tags and detached HEAD ("Staging, branches and tags" below). Reset, merge and everything that builds on them arrive in later phases (see "Not yet").
 
 ```text
 renderer                                    native (src-tauri)
@@ -1021,7 +1021,74 @@ A restore that fails partway (a disk error) reports how many operations were don
 
 History over 10,000 commits: the first page of 100 in 24.5 ms; all 10,000, in pages of 500, in 1.26 s (0.13 ms a commit, each read and re-hashed). The commit and HEAD move are dominated by the reflog's and `refs.json`'s syncs to disk.
 
-**Not yet** (later phases): staging, branches and tags (LG-04); reset, revert and stash (LG-05); merge and cherry-pick (LG-06); AI checkpoints and Undo AI Run (LG-07); any UI (LG-08); comparison with real Git, GC, compaction, compression and a recovery UI (LG-09).
+### Staging, branches and tags (LG-04)
+
+**Local Git staging is not the real Git index, and Local Git branch and tag operations never modify real Git.** Nothing here reads or writes `.git/index`, `.git/HEAD`, `.git/refs` or any Git configuration; tests fingerprint every file under `.git` across staging, commits, branches, tags and switches.
+
+```text
+HEAD ─(staged: HEAD↔index)─▶ Local Index ─(unstaged: index↔working)─▶ working tree ─▶ unsaved documents
+ refs/heads/<branch> (or detached)   refs/yavin/index                   LG-02 snapshot     DocumentService (read only)
+```
+
+**The Local Index** is the exact tree the next commit will have. It is a ref, `refs/yavin/index`, naming a commit whose root is the staged tree: HEAD's own commit when nothing is staged (no extra object), otherwise a small deterministic _index commit_ (source `automatic`, fixed author, time and message, parent HEAD), so the same staged tree always has the same id. No index ref means the index is HEAD's tree, empty before the first commit -- which is what every LG-01..03 store already has. Being a ref, every index change is LG-01's compare-and-swap with the reflog written first: the index is the old tree or the new one, never partly written, and a commit (branch + index) or a switch (HEAD + index) moves both in one step. Its trees point at the same immutable objects as everything else; nothing is copied.
+
+**Staging** (`index.rs`):
+
+| Operation     | Source                                                                                                       | What changes                                                                                                                                                  |
+| ------------- | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| stage paths   | an LG-02 snapshot (persisted, incremental when warm), unsaved documents included, LG-02's exclusions applied | the index entries at those paths: new content, a deletion (the entry removed -- never a zero-byte file), a whole directory                                    |
+| stage all     | the same snapshot                                                                                            | the index becomes the workspace's tree                                                                                                                        |
+| unstage paths | HEAD (nothing when unborn)                                                                                   | the index entries at those paths become HEAD's; no scan                                                                                                       |
+| unstage all   | HEAD                                                                                                         | the index becomes HEAD's tree (empty when unborn)                                                                                                             |
+| stage hunks   | the index-to-workspace line diff (LG-03's `line_diff`)                                                       | the file's index text with the chosen hunks applied (`diff::apply_hunks`, which numbers hunks exactly as the diff does, and keeps every byte and line ending) |
+
+Nothing is ever written to the working tree and no document is saved: a dirty document is staged from its bytes. Paths are grafted into the index's tree; folders on the way are made, and a folder a removal empties is pruned unless the source has it as an (empty) folder. A file over the storage limit is staged as it is recorded in snapshots and commits -- hashed, its size kept, content not stored -- and reported (`unstored`); it cannot be staged in parts (`contentUnavailableForStaging`). Partial staging is refused for binary files and deletions (`partialStagingUnsupported`), and when the file's diff is no longer the one the caller saw (`staleSelection`: the caller passes the index and working blob ids of its diff). Renames need nothing special: exact-content renames are paired by the status comparison, and staging both paths stages the rename.
+
+**Files over the storage limit (20 MiB) are staged and committed as metadata-only entries.** LG-02 snapshots and LG-03 commits already record such a file as its content hash and size, with its content not stored; staging does the same, and does not store it just to stage it. So a large file can be staged, unstaged and committed like any other -- status sees it added, modified, deleted or renamed by its hash -- but its historical content is unavailable: a diff reports it `notStored` and shows no text, and a restore or switch that would need it refuses (`historicalContentUnavailable`) rather than invent it. Staging part of such a file is refused (`contentUnavailableForStaging`). The large-file storage policy itself is unchanged.
+
+**Status** keeps LG-02's model and adds, per path, `staged` (HEAD against the index) and `unstaged` (the index against the workspace, unsaved documents included), their counts, the index root, and `index: "head" | "staged"`. HEAD=A, index=B, working=C gives `staged A→B` and `unstaged B→C`.
+
+**Commits come from the index** (`history::commit_index`): the commit's tree is exactly what is staged, never the working tree, and HEAD (the branch, or HEAD itself when detached) and the index move to it together. After a commit HEAD equals the index and the working tree may still differ. With nothing staged (the index is HEAD's tree, or empty before the first commit) it is refused: `NothingToCommit` -- there are no empty commits. Checkpoints still capture the workspace and never touch the index; a commit made from a checkpoint (LG-03) moves the index only if nothing was staged, so staged work is never dropped.
+
+**HEAD** is read in exactly one place, `branches::resolve_head`: `branch` (a name and its commit), `detached` (a commit), or `unborn` (a branch with no commit yet). History, commits, status, staging, branches, tags and switching all use it.
+
+**Branches** are `refs/heads/<name>` and **tags** `refs/tags/<name>` (lightweight: a ref to a commit). Names: 1-100 bytes of `/`-separated segments of ASCII letters, digits, `.`, `_`, `-`; a segment does not start with `.` or `-`, end with `.` or `.lock`, or hold `..`; not `HEAD`. So no spaces, control characters, backslashes or traversal, and nothing that could be read as a path -- refs live in `refs.json`, never as files. A name cannot be both a branch and a folder of branches (`a` and `a/b`), and names differing only in case are refused.
+
+- Creating one never moves HEAD (default start: HEAD's commit; `Unborn` before the first commit); an existing name is `AlreadyExists`, never replaced -- there is no forced tag or branch.
+- Deleting a branch is refused for the current one (`CurrentBranch`) and for one whose commits no other branch, tag or HEAD reaches (`NotMerged`); unreachable objects are GC's (LG-09). A missing tag is `NotFound`.
+- Listing gives each branch's commit, whether it is current, `merged` (in HEAD's history; null when the walk's bound was reached), and no upstream -- Local Git has no remotes.
+- A tag never moves when branches do.
+
+**Switching** (`switch.rs`) -- to a branch, or detached at a commit -- changes only what differs between HEAD and the target; local changes, untracked files and unsaved documents elsewhere are carried over. It is refused before anything changes, listing every reason: something is staged (`stagedChangeConflict` -- the index becomes the target's tree, and staged work is never dropped), a changing path holds neither HEAD's content nor the target's (`unstagedChangeWouldBeOverwritten`, which includes an untracked file in the way), a dirty document is on a changing path (`dirtyDocumentWouldBeOverwritten`/`Deleted`), or anything the restore planner refuses. Otherwise the disk goes to _desired_ = the current disk with the changed paths set to the target's, through LG-03's restore plan and executor -- one Module 03 operation recorded by Module 04, links never followed, nothing written through a link, verified by a Full snapshot -- and only then do HEAD and the index move, together, and only if the refs are still as the plan saw them (`StaleRevision` otherwise). A crash while the disk changes leaves HEAD where it was and the operation for recovery to settle; a switch run again finds already-switched paths holding the target's content and carries on. There is no forced switch. A detached HEAD's commits advance HEAD alone; the reflog records every move.
+
+**Known limitation: refs scale with `refs.json`.** Every ref update -- a stage, a commit, a branch or tag created or deleted, a switch -- rewrites the whole `refs.json` (LG-01's atomic replace), so its cost grows with the number of refs: about 15-20 ms with a handful, 54 ms with 10,000 branches. Reading and listing stay fast (10,000 branches listed in 8 ms). The format is unchanged in LG-04; a structure whose updates do not rewrite every ref is deferred to LG-09.
+
+**Isolation and concurrency.** Every operation goes through the workspace's handle; the switch checks, right before changing the disk, that its workspace is still the window's. Staging, unstaging, commits, branch and tag changes, switches, checkpoints and restores of a store are serialized: a second while one runs is `Busy`. A second Yavin process is read-only. A late answer is dropped by the window before any document is touched.
+
+**Performance** (release, idle development machine, `cargo test -p ide-localgit --release --test staging_scale -- --ignored --nocapture --test-threads=1`):
+
+|                                                | 10k files  | 100k files | Target                          |
+| ---------------------------------------------- | ---------- | ---------- | ------------------------------- |
+| stage one changed file (warm, incremental)     | 141 ms     | 133 ms     | < 150 ms                        |
+| stage 100 changed files                        | 284 ms     | 680 ms*    | proportional                    |
+| unstage one file                               | 82 ms      | 92 ms      | < 100 ms                        |
+| create a branch / a tag                        | 14 / 12 ms | 18 / 18 ms | < 50 ms                         |
+| switch plan, 10 paths (Full snapshot included) | 0.86 s     | 1.46 s     | proportional, plus the snapshot |
+| HEAD + index move after a switch               | 12 ms      | 16 ms      |                                 |
+| first stage all (every file stored)            | 3.3 s      | 20.7 s*    |                                 |
+
+Listing 10,001 branches: 8.1 ms; creating one more among them: 54 ms (`refs.json` is rewritten whole, so ref updates grow with the number of refs). The 10k column is after staging learned to read the engine's in-memory trees instead of the store; the 100k column (*) was measured before that change, which only affects staging whole folders or many paths, so those two figures are pessimistic. A later run while other programs saturated the machine (a disk scanner, a game client) was several times slower and is not used.
+
+**Load-sensitive tests (existing, unchanged).** Four tests from earlier modules bound real process timings, and failed during LG-04 validation only while other programs held the CPU at 100% (the whole `ide-workspace` suite then took 90.8 s instead of 6.9 s). On the otherwise idle machine they passed 10 of 10 alone and in three full-suite runs, far inside their bounds, which are correctness bounds and are kept:
+
+| Test                                                                                | Bound                                           | Idle        |
+| ----------------------------------------------------------------------------------- | ----------------------------------------------- | ----------- |
+| `lsp_process::a_real_server_process_exchanges_framed_messages_and_reports_its_exit` | a language server answers within 10 s           | 0.19-0.28 s |
+| `lsp_process::stopping_a_server_ends_it_and_a_broken_stream_ends_the_session`       | its exit is reported within 10 s                | 0.71-0.84 s |
+| `process::a_genuinely_running_process_is_actually_killed_on_cancellation`           | a cancelled process is stopped within 5 s       | 0.36-0.41 s |
+| `git::a_git_operation_cancelled_through_the_real_job_registry_is_actually_stopped`  | a cancelled Git operation is stopped within 5 s | 1.04-1.44 s |
+
+**Not yet** (later phases): reset, revert and stash (LG-05); merge and cherry-pick (LG-06); AI checkpoints and Undo AI Run (LG-07); any UI (LG-08); comparison with real Git, GC, compaction, compression, a recovery UI, and ref storage whose updates do not rewrite every ref (LG-09).
 
 **Invariants**
 
@@ -1039,6 +1106,11 @@ History over 10,000 commits: the first page of 100 in 24.5 ms; all 10,000, in pa
 12. A restore is planned completely, and refused on any conflict, before anything changes; unsaved documents are never overwritten or deleted unless the user chose to replace them.
 13. A restore changes the disk only as one recorded file operation, never through a link, never removing what snapshots leave out; it is verified, never assumed.
 14. Historical content that was never stored is never invented, read from disk in its place, or skipped silently.
+15. Local Git staging is not the real Git index; branch, tag and HEAD operations never modify real Git.
+16. The index is always a complete tree: HEAD's, or a published index commit's -- never partly written.
+17. A commit is exactly the index. Staging never changes the working tree or a document; unstaging never changes either.
+18. Creating a branch or a tag never moves HEAD; a tag never moves; nothing is replaced or deleted by force.
+19. A switch never overwrites or deletes staged work, local changes or unsaved documents; HEAD moves only after the disk is verified.
 
 ## Explorer provider platform
 

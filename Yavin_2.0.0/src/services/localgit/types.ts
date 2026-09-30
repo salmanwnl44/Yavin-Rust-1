@@ -194,6 +194,10 @@ export interface LocalGitStatusEntry {
   disk: LocalGitChange | null;
   /** Local HEAD against what the user has (disk plus unsaved documents). */
   effective: LocalGitChange | null;
+  /** Local HEAD against the index: staged (LG-04). */
+  staged: LocalGitChange | null;
+  /** The index against the workspace, unsaved documents included: not staged. */
+  unstaged: LocalGitChange | null;
   /** Set when the path has an unsaved document. */
   memory: {
     state: "differsFromDisk" | "equalsDisk" | "openDeletedOnDisk";
@@ -213,8 +217,9 @@ export interface LocalGitCounts {
 export interface LocalGitStatus {
   headCommit: string | null;
   headRoot: string | null;
-  /** `head` until staging exists (LG-04). */
-  index: "head";
+  /** `head` when nothing is staged (the index is HEAD's tree), `staged` otherwise. */
+  index: "head" | "staged";
+  indexRoot: string | null;
   diskRoot: string;
   effectiveRoot: string;
   entries: LocalGitStatusEntry[];
@@ -222,6 +227,8 @@ export interface LocalGitStatus {
   truncated: boolean;
   disk: LocalGitCounts;
   effective: LocalGitCounts;
+  staged: LocalGitCounts;
+  unstaged: LocalGitCounts;
   unsaved: number;
 }
 
@@ -291,7 +298,14 @@ export interface LocalGitCreated {
   revision: number;
 }
 
+/** Where HEAD is: on a branch, detached at a commit, or on a branch with no commit yet. */
+export type LocalGitHeadState =
+  | { kind: "branch"; name: string; refName: string; commit: string }
+  | { kind: "detached"; commit: string }
+  | { kind: "unborn"; name: string; refName: string };
+
 export interface LocalGitHeadInfo {
+  state: LocalGitHeadState;
   symbolic: string | null;
   unborn: boolean;
   commit: LocalGitCommitInfo | null;
@@ -408,6 +422,8 @@ export type LocalGitRestoreConflict =
   | { kind: "caseOnlyRename"; folderId: string; path: string; onDisk: string }
   | { kind: "targetUnavailable"; folderId: string; path: string }
   | { kind: "wouldRemoveUntracked"; folderId: string; path: string; entry: string }
+  | { kind: "stagedChangeConflict"; folderId: string; path: string }
+  | { kind: "unstagedChangeWouldBeOverwritten"; folderId: string; path: string }
   | { kind: "diskChangedSinceSnapshot"; folderId: string; path: string }
   | { kind: "linkNotRestorable"; folderId: string; path: string; reason: string };
 
@@ -441,4 +457,67 @@ export interface LocalGitRestoreResult {
     diskRoot: string;
     snapshotSequence: number;
   } | null;
+}
+
+// --- The Local Index, branches, tags and switching (LG-04) ----------------------------------
+
+export interface LocalGitIndexInfo {
+  /** The commit the index ref names (HEAD's own when nothing is staged); null when empty. */
+  commit: string | null;
+  root: string | null;
+  /** Nothing is staged. */
+  equalsHead: boolean;
+  revision: number;
+}
+
+export interface LocalGitStageResult {
+  index: LocalGitIndexInfo;
+  changed: string[];
+  unchanged: string[];
+  /** Files staged hashed but not stored (over the storage limit). */
+  unstored: string[];
+  snapshot: LocalGitSnapshot | null;
+}
+
+/** A path in one of the workspace's folders (`folderId` null: its only folder). */
+export interface LocalGitPath {
+  folderId?: string | null;
+  path: string;
+}
+
+export interface LocalGitBranch {
+  name: string;
+  refName: string;
+  commit: string;
+  current: boolean;
+  /** Whether HEAD's history contains it; null when that could not be decided cheaply. */
+  merged: boolean | null;
+  /** Always null: Local Git has no remotes. */
+  upstream: null;
+}
+
+export interface LocalGitTag {
+  name: string;
+  refName: string;
+  commit: string;
+}
+
+export interface LocalGitSwitchPlan {
+  branch: string | null;
+  commit: string;
+  from: string | null;
+  revision: number;
+  sameCommit: boolean;
+  restore: LocalGitRestorePlan;
+}
+
+export interface LocalGitSwitchResult {
+  status: "planned" | "refused" | "completed" | "failed" | "verificationFailed";
+  plan: LocalGitSwitchPlan;
+  conflicts: LocalGitRestoreConflict[];
+  operation: number | null;
+  applied: number;
+  error: string | null;
+  verification: LocalGitRestoreResult["verification"];
+  head: LocalGitHeadState;
 }

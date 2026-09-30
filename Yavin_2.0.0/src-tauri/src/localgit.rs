@@ -1210,47 +1210,29 @@ pub fn localgit_checkpoint(
     local_git.finish_job(&handle, &job_id, result)
 }
 
-/// Makes a commit on top of HEAD and moves HEAD to it: of the workspace as it is now (a Full
-/// persisted snapshot, unsaved documents included), or of a checkpoint (`fromCheckpoint`: its
-/// roots as they are, nothing scanned).
-#[allow(clippy::too_many_arguments)]
+/// Makes a commit on top of HEAD of exactly what is staged (the Local Index), and moves HEAD
+/// -- and the index, which now equals it -- to it; `NothingToCommit` when nothing is staged.
+/// With `fromCheckpoint`, of a checkpoint's roots as they are instead (nothing scanned; the
+/// index follows only if nothing was staged).
 #[tauri::command(async)]
 pub fn localgit_commit(
-    app: AppHandle,
     local_git: State<'_, LocalGit>,
     handle: String,
-    job_id: String,
     message: String,
     from_checkpoint: Option<String>,
-    overlays: Vec<OverlayRef>,
     by: Signature,
 ) -> Result<Created, String> {
     history::validate_message(&message).map_err(fail)?;
     let from_checkpoint = parse_opt(from_checkpoint)?;
-    let (store, request) = prepare(&local_git, &handle, "full", true, &overlays, &[])?;
+    let store = local_git.handle_store(&handle)?;
     let _only = exclusive(&store)?;
-    let cancel = local_git.start_job(&handle, &job_id, false)?;
-    let progress = progress_to(&app, &handle, &job_id);
-    let control = Control {
-        cancel: &cancel,
-        progress: &progress,
-    };
     let request_by = commit_request(message, by);
-    let result = match from_checkpoint {
-        Some(checkpoint) => store
-            .repo
-            .lock()
-            .map_err(|e| LgError::Io(e.to_string()))
-            .and_then(|mut repo| history::commit_checkpoint(&mut repo, checkpoint, &request_by)),
-        None => store
-            .engine
-            .snapshot(&store.repo, &request, &control)
-            .and_then(|snapshot| {
-                let mut repo = store.repo.lock().map_err(|e| LgError::Io(e.to_string()))?;
-                history::commit_snapshot(&mut repo, &snapshot, &request_by)
-            }),
-    };
-    local_git.finish_job(&handle, &job_id, result)
+    let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+    match from_checkpoint {
+        Some(checkpoint) => history::commit_checkpoint(&mut repo, checkpoint, &request_by),
+        None => history::commit_index(&mut repo, &request_by),
+    }
+    .map_err(fail)
 }
 
 #[tauri::command(async)]
@@ -1597,4 +1579,370 @@ mod lg03_tests {
         let late = local_git.finish_changed("lg-a", "restore-2", Ok("completed"));
         assert!(late.unwrap_err().starts_with("HandleClosed:"));
     }
+}
+
+// --- The Local Index, branches, tags and switching (LG-04) ------------------------------------
+
+use ide_localgit::branches::{self, BranchInfo, HeadState, TagInfo};
+use ide_localgit::index::{self as local_index, IndexInfo, StagePath, StageResult};
+use ide_localgit::switch::{SwitchPlan, SwitchTarget};
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathArg {
+    folder_id: Option<String>,
+    path: String,
+}
+
+fn stage_paths(paths: Vec<PathArg>) -> Result<Vec<StagePath>, String> {
+    paths
+        .into_iter()
+        .map(|p| {
+            Ok(StagePath {
+                folder: p
+                    .folder_id
+                    .as_deref()
+                    .map(FolderId::new)
+                    .transpose()
+                    .map_err(fail)?,
+                path: p.path,
+            })
+        })
+        .collect()
+}
+
+#[tauri::command(async)]
+pub fn localgit_index(local_git: State<'_, LocalGit>, handle: String) -> Result<IndexInfo, String> {
+    local_git.with(&handle, |repo| local_index::index_info(repo))
+}
+
+/// Stages paths as the workspace has them (unsaved documents included; nothing is saved).
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_stage(
+    app: AppHandle,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    paths: Vec<PathArg>,
+    all: bool,
+    overlays: Vec<OverlayRef>,
+) -> Result<StageResult, String> {
+    let paths = stage_paths(paths)?;
+    let (store, request) = prepare(&local_git, &handle, "auto", true, &overlays, &[])?;
+    let _only = exclusive(&store)?;
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let control = Control {
+        cancel: &cancel,
+        progress: &progress,
+    };
+    let result = if all {
+        local_index::stage_all(&store.engine, &store.repo, &request, &control)
+    } else {
+        local_index::stage(&store.engine, &store.repo, &request, &control, &paths)
+    };
+    local_git.finish_job(&handle, &job_id, result)
+}
+
+/// Unstages paths (their index entries become HEAD's), or everything. Nothing on disk and no
+/// document changes.
+#[tauri::command(async)]
+pub fn localgit_unstage(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    paths: Vec<PathArg>,
+    all: bool,
+) -> Result<StageResult, String> {
+    let paths = stage_paths(paths)?;
+    let store = local_git.handle_store(&handle)?;
+    let _only = exclusive(&store)?;
+    let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+    let folders = store.engine.folders();
+    if all {
+        local_index::unstage_all(&mut repo, folders)
+    } else {
+        local_index::unstage(&mut repo, folders, &paths)
+    }
+    .map_err(fail)
+}
+
+/// Stages chosen hunks of one file's index-to-workspace diff. `expectedIndex` and
+/// `expectedWorking` are the blob ids that diff was made from.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_stage_hunks(
+    app: AppHandle,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    folder_id: Option<String>,
+    path: String,
+    hunks: Vec<usize>,
+    expected_index: Option<String>,
+    expected_working: Option<String>,
+    overlays: Vec<OverlayRef>,
+) -> Result<StageResult, String> {
+    let folder = folder_id
+        .as_deref()
+        .map(FolderId::new)
+        .transpose()
+        .map_err(fail)?;
+    let expected = (parse_opt(expected_index)?, parse_opt(expected_working)?);
+    let (store, request) = prepare(&local_git, &handle, "auto", true, &overlays, &[])?;
+    let _only = exclusive(&store)?;
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let result = local_index::stage_hunks(
+        &store.engine,
+        &store.repo,
+        &request,
+        &Control {
+            cancel: &cancel,
+            progress: &progress,
+        },
+        folder,
+        &path,
+        &hunks,
+        expected,
+    );
+    local_git.finish_job(&handle, &job_id, result)
+}
+
+#[tauri::command(async)]
+pub fn localgit_branches(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+) -> Result<Vec<BranchInfo>, String> {
+    local_git.with(&handle, |repo| Ok(branches::list_branches(repo)))
+}
+
+/// A new branch at `start` (HEAD's commit by default). HEAD does not move.
+#[tauri::command(async)]
+pub fn localgit_create_branch(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    name: String,
+    start: Option<String>,
+) -> Result<BranchInfo, String> {
+    let start = parse_opt(start)?;
+    let store = local_git.handle_store(&handle)?;
+    let _only = exclusive(&store)?;
+    let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+    branches::create_branch(&mut repo, &name, start).map_err(fail)
+}
+
+/// Deletes a branch: never the current one, never one whose commits nothing else reaches.
+#[tauri::command(async)]
+pub fn localgit_delete_branch(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    name: String,
+) -> Result<(), String> {
+    let store = local_git.handle_store(&handle)?;
+    let _only = exclusive(&store)?;
+    let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+    branches::delete_branch(&mut repo, &name).map_err(fail)
+}
+
+#[tauri::command(async)]
+pub fn localgit_tags(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+) -> Result<Vec<TagInfo>, String> {
+    local_git.with(&handle, |repo| Ok(branches::list_tags(repo)))
+}
+
+#[tauri::command(async)]
+pub fn localgit_get_tag(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    name: String,
+) -> Result<TagInfo, String> {
+    local_git.with(&handle, |repo| branches::get_tag(repo, &name))
+}
+
+/// A lightweight tag at `target` (HEAD's commit by default); never replaces one.
+#[tauri::command(async)]
+pub fn localgit_create_tag(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    name: String,
+    target: Option<String>,
+) -> Result<TagInfo, String> {
+    let target = parse_opt(target)?;
+    let store = local_git.handle_store(&handle)?;
+    let _only = exclusive(&store)?;
+    let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+    branches::create_tag(&mut repo, &name, target).map_err(fail)
+}
+
+#[tauri::command(async)]
+pub fn localgit_delete_tag(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    name: String,
+) -> Result<(), String> {
+    let store = local_git.handle_store(&handle)?;
+    let _only = exclusive(&store)?;
+    let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+    branches::delete_tag(&mut repo, &name).map_err(fail)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchResult {
+    /// `planned` (dry run), `refused`, `completed`, `failed`, `verificationFailed`.
+    status: &'static str,
+    plan: SwitchPlan,
+    conflicts: Vec<RestoreConflict>,
+    operation: Option<u64>,
+    applied: usize,
+    error: Option<String>,
+    verification: Option<Verification>,
+    /// Where HEAD is afterwards.
+    head: HeadState,
+}
+
+/// Switches to a branch (`branch`), or detaches HEAD at a commit (`commit`). Refused -- with
+/// every conflict, before anything changes -- when staged work, local changes or unsaved
+/// documents would be lost. The disk changes as one recorded file operation, is verified,
+/// and only then do HEAD and the index move, together. Documents are the window's to
+/// reconcile after. There is no forced switch.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_switch(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    watch: State<'_, crate::Watch>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    branch: Option<String>,
+    commit: Option<String>,
+    dry_run: bool,
+    overlays: Vec<OverlayRef>,
+) -> Result<SwitchResult, String> {
+    let target = match (branch, parse_opt(commit)?) {
+        (Some(name), None) => SwitchTarget::Branch(name),
+        (None, Some(id)) => SwitchTarget::Commit(id),
+        _ => return Err("InvalidFormat: name a branch or a commit, not both".into()),
+    };
+    let (store, request) = prepare(&local_git, &handle, "full", true, &overlays, &[])?;
+    let guard = if dry_run {
+        None
+    } else {
+        Some(exclusive(&store)?)
+    };
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let control = Control {
+        cancel: &cancel,
+        progress: &progress,
+    };
+    let plan = match store
+        .engine
+        .plan_switch(&store.repo, &request, &control, &target)
+    {
+        Ok((_, plan)) => plan,
+        Err(error) => return local_git.finish_job(&handle, &job_id, Err(error)),
+    };
+    let head_now = |store: &Store| -> Result<HeadState, String> {
+        let repo = store.repo.lock().map_err(|e| e.to_string())?;
+        Ok(branches::resolve_head(&repo))
+    };
+    let mut result = SwitchResult {
+        status: "completed",
+        conflicts: plan.restore.conflicts.clone(),
+        plan,
+        operation: None,
+        applied: 0,
+        error: None,
+        verification: None,
+        head: head_now(&store)?,
+    };
+    if !result.conflicts.is_empty() {
+        result.status = "refused";
+        return local_git.finish_job(&handle, &job_id, Ok(result));
+    }
+    if dry_run {
+        result.status = "planned";
+        return local_git.finish_job(&handle, &job_id, Ok(result));
+    }
+    // The last point to cancel, and the last check this is still the window's workspace.
+    if cancel.load(Ordering::SeqCst) {
+        return local_git.finish_job(&handle, &job_id, Err(LgError::Cancelled));
+    }
+    let workspace_id = {
+        let inner = local_git.inner.lock().map_err(|e| e.to_string())?;
+        inner
+            .handles
+            .get(&handle)
+            .ok_or(CLOSED)?
+            .workspace_id
+            .clone()
+    };
+    if !workspace_is_open(&workspace, &workspace_id) {
+        return Err("NotInWorkspace: the workspace was left before the switch began".into());
+    }
+    if !result.plan.restore.operations.is_empty() {
+        let scratch = std::env::temp_dir().join("yavin-localgit-link-probe");
+        match crate::localgit_restore::execute(
+            &watch,
+            &store.repo,
+            &store.engine,
+            &result.plan.restore,
+            &scratch,
+        ) {
+            crate::localgit_restore::Outcome::Refused(conflicts) => {
+                result.status = "refused";
+                result.conflicts = conflicts;
+            }
+            crate::localgit_restore::Outcome::Failed {
+                operation,
+                applied,
+                error,
+            } => {
+                result.status = "failed";
+                result.operation = operation;
+                result.applied = applied;
+                result.error = Some(error);
+            }
+            crate::localgit_restore::Outcome::Done { operation, applied } => {
+                result.operation = Some(operation);
+                result.applied = applied;
+                let settled = AtomicBool::new(false);
+                match store.engine.verify_restore(
+                    &store.repo,
+                    &Control {
+                        cancel: &settled,
+                        progress: &progress,
+                    },
+                    &result.plan.restore,
+                ) {
+                    Ok((_, verification)) => {
+                        if !verification.matches {
+                            result.status = "verificationFailed";
+                        }
+                        result.verification = Some(verification);
+                    }
+                    Err(error) => {
+                        result.status = "verificationFailed";
+                        result.error = Some(fail(error));
+                    }
+                }
+            }
+        }
+    }
+    // HEAD and the index move only once the disk is verified where it should be.
+    if result.status == "completed" {
+        let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+        if let Err(error) = ide_localgit::switch::finish(&mut repo, &result.plan) {
+            result.status = "failed";
+            result.error = Some(fail(error));
+        }
+    }
+    result.head = head_now(&store)?;
+    drop(guard);
+    local_git.finish_changed(&handle, &job_id, Ok(result))
 }

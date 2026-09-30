@@ -8,7 +8,13 @@
 //!   `equalsDisk`, or `openDeletedOnDisk` when the file is gone but the document is open and
 //!   dirty), and whether it equals HEAD.
 //!
-//! The index is HEAD: staging arrives with LG-04, and until then there is nothing between them.
+//! Since LG-04 there are also the Local Index's two comparisons, per path:
+//!
+//! - **staged**: HEAD against the index -- what the next commit would change;
+//! - **unstaged**: the index against the workspace as the user has it (unsaved documents
+//!   included) -- what is not staged.
+//!
+//! (With nothing staged the index is HEAD's tree, and `unstaged` equals `effective`.)
 //!
 //! A change is `added`, `modified` (content, executable bit or link kind), `deleted`,
 //! `typeChanged` (file, directory and link turned into one another; a directory's own files
@@ -28,11 +34,14 @@ use crate::snapshot::{FolderRoot, ObjectIdText, Snapshot};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-/// HEAD as status reads it.
+/// HEAD (and the index) as status reads them.
 pub struct Head {
     pub commit: Option<ObjectId>,
     pub root: Option<ObjectId>,
     pub trees: BTreeMap<FolderId, ObjectId>,
+    /// The index's root and folders (see `branches::index_state`).
+    pub index_root: Option<ObjectId>,
+    pub index_trees: BTreeMap<FolderId, ObjectId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
@@ -146,6 +155,10 @@ pub struct StatusEntry {
     pub effective: Option<Change>,
     /// Set when the path has an unsaved document.
     pub memory: Option<Memory>,
+    /// HEAD against the index: staged.
+    pub staged: Option<Change>,
+    /// The index against the workspace (unsaved documents included): not staged.
+    pub unstaged: Option<Change>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize)]
@@ -175,8 +188,9 @@ impl Counts {
 pub struct Status {
     pub head_commit: Option<ObjectIdText>,
     pub head_root: Option<ObjectIdText>,
-    /// What the index is: `head` until staging exists (LG-04).
+    /// `head` when nothing is staged (the index is HEAD's tree), `staged` otherwise.
     pub index: &'static str,
+    pub index_root: Option<ObjectIdText>,
     pub disk_root: ObjectIdText,
     pub effective_root: ObjectIdText,
     /// Sorted by folder, then path; at most the limit asked for.
@@ -186,6 +200,8 @@ pub struct Status {
     pub truncated: bool,
     pub disk: Counts,
     pub effective: Counts,
+    pub staged: Counts,
+    pub unstaged: Counts,
     /// Unsaved documents taking part.
     pub unsaved: usize,
 }
@@ -471,7 +487,21 @@ fn slot<'a>(
             disk: None,
             effective: None,
             memory: None,
+            staged: None,
+            unstaged: None,
         })
+}
+
+/// A lookup that also knows the empty tree (which may never have been stored).
+struct EmptyAware<'a>(&'a dyn TreeLookup);
+
+impl TreeLookup for EmptyAware<'_> {
+    fn tree(&self, id: &ObjectId) -> Option<Tree> {
+        if *id == Tree::default().id() {
+            return Some(Tree::default());
+        }
+        self.0.tree(id)
+    }
 }
 
 /// Status of `snapshot` against `head`. `lookup` must have the snapshot's trees.
@@ -485,6 +515,8 @@ pub fn compute(
     let mut entries: BTreeMap<(String, String), StatusEntry> = BTreeMap::new();
     let mut disk_counts = Counts::default();
     let mut effective_counts = Counts::default();
+    let mut staged_counts = Counts::default();
+    let mut unstaged_counts = Counts::default();
     for folder in folders {
         let folder_id = folder.folder_id.as_str().to_string();
         let Some(this) = snapshot.folders.iter().find(|f| f.folder_id == folder_id) else {
@@ -498,6 +530,29 @@ pub fn compute(
         for leaf in changes(lookup, head_tree, this.effective_tree.0)? {
             effective_counts.add(leaf.kind);
             slot(&mut entries, &folder_id, &leaf.path).effective = Some(to_change(&leaf));
+        }
+        // The index: missing folders are empty, and no index is HEAD's tree.
+        let index_tree = head
+            .index_trees
+            .get(&folder.folder_id)
+            .copied()
+            .or(if head.index_root.is_none() {
+                head_tree
+            } else {
+                None
+            })
+            .unwrap_or_else(|| Tree::default().id());
+        let head_or_empty = head_tree.unwrap_or_else(|| Tree::default().id());
+        let empty_aware = EmptyAware(lookup);
+        if index_tree != head_or_empty {
+            for leaf in changes(&empty_aware, Some(head_or_empty), index_tree)? {
+                staged_counts.add(leaf.kind);
+                slot(&mut entries, &folder_id, &leaf.path).staged = Some(to_change(&leaf));
+            }
+        }
+        for leaf in changes(&empty_aware, Some(index_tree), this.effective_tree.0)? {
+            unstaged_counts.add(leaf.kind);
+            slot(&mut entries, &folder_id, &leaf.path).unstaged = Some(to_change(&leaf));
         }
         for overlay in snapshot
             .overlays
@@ -525,10 +580,12 @@ pub fn compute(
     }
     let total = entries.len();
     let entries: Vec<StatusEntry> = entries.into_values().take(limit).collect();
+    let staged = head.index_root.is_some() && head.index_root != head.root;
     Ok(Status {
         head_commit: head.commit.map(ObjectIdText),
         head_root: head.root.map(ObjectIdText),
-        index: "head",
+        index: if staged { "staged" } else { "head" },
+        index_root: head.index_root.map(ObjectIdText),
         disk_root: snapshot.disk_root,
         effective_root: snapshot.effective_root,
         truncated: entries.len() < total,
@@ -536,6 +593,8 @@ pub fn compute(
         entries,
         disk: disk_counts,
         effective: effective_counts,
+        staged: staged_counts,
+        unstaged: unstaged_counts,
         unsaved: snapshot.overlays.len(),
     })
 }

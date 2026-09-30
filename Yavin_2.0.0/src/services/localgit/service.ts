@@ -1,7 +1,14 @@
 import type { OverlaySource, ReconcileOutcome } from "./overlays.ts";
 import type {
   LocalGitBlobInfo,
+  LocalGitBranch,
   LocalGitCheckpointEntry,
+  LocalGitIndexInfo,
+  LocalGitPath,
+  LocalGitRestorePlan,
+  LocalGitStageResult,
+  LocalGitSwitchResult,
+  LocalGitTag,
   LocalGitCommit,
   LocalGitCreated,
   LocalGitDiff,
@@ -75,6 +82,13 @@ function signature(identity: LocalGitIdentity, now = new Date()): LocalGitSignat
     tzOffsetMin: -now.getTimezoneOffset(),
   };
 }
+
+/** A switch, with how the window's documents ended up after it. */
+export type LocalGitSwitchOutcome = LocalGitSwitchResult & {
+  documents: ReconcileOutcome | null;
+  /** The disk verified, HEAD and the index moved, and the documents reconciled. */
+  succeeded: boolean;
+};
 
 /** A restore, with how the window's documents ended up after it. */
 export type LocalGitRestoreOutcome = LocalGitRestoreResult & {
@@ -216,6 +230,43 @@ export function createLocalGitService(
 
   const nextJob = () => `job-${++jobs}`;
 
+  const normalPath = (p: LocalGitPath) => ({ folderId: p.folderId ?? null, path: p.path });
+
+  /**
+   * After the disk changed (a restore or a switch): the window's documents brought in line
+   * through DocumentService (`OverlaySource.reconcileRestore`). `applied` limits it to the
+   * operations that were done, when the change stopped partway.
+   */
+  async function reconcile(plan: LocalGitRestorePlan, applied: number | null) {
+    const opened = await opening;
+    const root = (folder: string) =>
+      opened.folders.find((f) => f.folderId === folder)?.path ?? null;
+    const absolute = (folder: string, rel: string) => {
+      const base = root(folder);
+      return base === null ? null : `${base.replace(/[\\/]+$/, "")}/${rel}`;
+    };
+    const done = applied === null ? plan.operations : plan.operations.slice(0, applied);
+    const changes = done.flatMap((op) => {
+      const path = absolute(op.folderId, op.path);
+      if (path === null || op.kind === "createDirectory" || op.kind === "removeDirectory")
+        return [];
+      const removed = op.kind === "removeFile" || op.kind === "removeLink";
+      const kind: "created" | "modified" | "deleted" = removed
+        ? "deleted"
+        : op.expected.kind === "absent"
+          ? "created"
+          : "modified";
+      return [{ kind, path }];
+    });
+    const replace = plan.documents.flatMap((doc) => {
+      const path = absolute(doc.folderId, doc.path);
+      return path === null ? [] : [{ path, action: doc.action }];
+    });
+    const documents = await source!.reconcileRestore!({ changes, replace });
+    if (!live()) throw new LocalGitClosedError();
+    return documents;
+  }
+
   return {
     /** Resolves once the store is open (writer or read-only), with what it found on opening. */
     ready: opening,
@@ -288,20 +339,12 @@ export function createLocalGitService(
      * A commit on top of HEAD, which moves to it: of the workspace now (unsaved documents
      * included), or of a checkpoint already taken (`fromCheckpoint`: nothing is scanned).
      */
-    commit(
-      message: string,
-      options: { fromCheckpoint?: string } = {},
-      jobId: string = nextJob(),
-    ): Promise<LocalGitCreated> {
-      return withOverlays(false, (refs) =>
-        call<LocalGitCreated>("localgit_commit", {
-          jobId,
-          message,
-          fromCheckpoint: options.fromCheckpoint ?? null,
-          overlays: refs.overlays,
-          by: signature(identity()),
-        }),
-      );
+    commit(message: string, options: { fromCheckpoint?: string } = {}): Promise<LocalGitCreated> {
+      return call<LocalGitCreated>("localgit_commit", {
+        message,
+        fromCheckpoint: options.fromCheckpoint ?? null,
+        by: signature(identity()),
+      });
     },
 
     head: () => call<LocalGitHeadInfo>("localgit_head"),
@@ -371,40 +414,112 @@ export function createLocalGitService(
         result.status === "verificationFailed";
       if (!changed || !source?.reconcileRestore)
         return { ...result, documents: null, succeeded: result.status === "completed" };
-      const opened = await opening;
-      const root = (folder: string) =>
-        opened.folders.find((f) => f.folderId === folder)?.path ?? null;
-      const absolute = (folder: string, rel: string) => {
-        const base = root(folder);
-        return base === null ? null : `${base.replace(/[\\/]+$/, "")}/${rel}`;
-      };
-      const done =
-        result.status === "failed"
-          ? result.plan.operations.slice(0, result.applied)
-          : result.plan.operations;
-      const changes = done.flatMap((op) => {
-        const path = absolute(op.folderId, op.path);
-        if (path === null || op.kind === "createDirectory" || op.kind === "removeDirectory")
-          return [];
-        const removed = op.kind === "removeFile" || op.kind === "removeLink";
-        const kind: "created" | "modified" | "deleted" = removed
-          ? "deleted"
-          : op.expected.kind === "absent"
-            ? "created"
-            : "modified";
-        return [{ kind, path }];
-      });
-      const replace = result.plan.documents.flatMap((doc) => {
-        const path = absolute(doc.folderId, doc.path);
-        return path === null ? [] : [{ path, action: doc.action }];
-      });
-      const documents = await source.reconcileRestore({ changes, replace });
-      if (!live()) throw new LocalGitClosedError();
+      const documents = await reconcile(
+        result.plan,
+        result.status === "failed" ? result.applied : null,
+      );
       return {
         ...result,
         documents,
         succeeded: result.status === "completed" && documents.ok,
       };
+    },
+
+    /** The Local Index: what the next commit will have. */
+    index: () => call<LocalGitIndexInfo>("localgit_index"),
+
+    /** Stages paths as the workspace has them (unsaved documents included; nothing is saved). */
+    stage(paths: LocalGitPath[], jobId: string = nextJob()) {
+      return withOverlays(false, (refs) =>
+        call<LocalGitStageResult>("localgit_stage", {
+          jobId,
+          paths: paths.map(normalPath),
+          all: false,
+          overlays: refs.overlays,
+        }),
+      );
+    },
+    stageAll(jobId: string = nextJob()) {
+      return withOverlays(false, (refs) =>
+        call<LocalGitStageResult>("localgit_stage", {
+          jobId,
+          paths: [],
+          all: true,
+          overlays: refs.overlays,
+        }),
+      );
+    },
+    /** Unstages paths: their index entries become HEAD's. Nothing on disk changes. */
+    unstage: (paths: LocalGitPath[]) =>
+      call<LocalGitStageResult>("localgit_unstage", {
+        paths: paths.map(normalPath),
+        all: false,
+      }),
+    unstageAll: () => call<LocalGitStageResult>("localgit_unstage", { paths: [], all: true }),
+    /**
+     * Stages chosen hunks of one file's index-to-workspace diff (`diffWorkspace` from the
+     * index); `expected` are that diff's blob ids, so a stale selection is refused.
+     */
+    stageHunks(
+      file: LocalGitPath,
+      hunks: number[],
+      expected: { index: string | null; working: string | null },
+      jobId: string = nextJob(),
+    ) {
+      return withOverlays(false, (refs) =>
+        call<LocalGitStageResult>("localgit_stage_hunks", {
+          jobId,
+          folderId: file.folderId ?? null,
+          path: file.path,
+          hunks,
+          expectedIndex: expected.index,
+          expectedWorking: expected.working,
+          overlays: refs.overlays,
+        }),
+      );
+    },
+
+    branches: () => call<LocalGitBranch[]>("localgit_branches"),
+    /** A new branch at `start` (HEAD's commit by default); HEAD does not move. */
+    createBranch: (name: string, start: string | null = null) =>
+      call<LocalGitBranch>("localgit_create_branch", { name, start }),
+    deleteBranch: (name: string) => call<void>("localgit_delete_branch", { name }),
+    tags: () => call<LocalGitTag[]>("localgit_tags"),
+    tag: (name: string) => call<LocalGitTag>("localgit_get_tag", { name }),
+    createTag: (name: string, target: string | null = null) =>
+      call<LocalGitTag>("localgit_create_tag", { name, target }),
+    deleteTag: (name: string) => call<void>("localgit_delete_tag", { name }),
+
+    /**
+     * Switches to a branch, or detaches HEAD at a commit. Refused, untouched, when staged
+     * work, local changes or unsaved documents would be lost; there is no forced switch.
+     */
+    async switchTo(
+      target: { branch: string } | { commit: string },
+      options: { dryRun?: boolean } = {},
+      jobId: string = nextJob(),
+    ): Promise<LocalGitSwitchOutcome> {
+      const result = await withOverlays(false, (refs) =>
+        call<LocalGitSwitchResult>("localgit_switch", {
+          jobId,
+          branch: "branch" in target ? target.branch : null,
+          commit: "commit" in target ? target.commit : null,
+          dryRun: options.dryRun ?? false,
+          overlays: refs.overlays,
+        }),
+      );
+      const changed =
+        (result.status === "completed" ||
+          result.status === "failed" ||
+          result.status === "verificationFailed") &&
+        result.plan.restore.operations.length > 0;
+      if (!changed || !source?.reconcileRestore)
+        return { ...result, documents: null, succeeded: result.status === "completed" };
+      const documents = await reconcile(
+        result.plan.restore,
+        result.status === "failed" ? result.applied : null,
+      );
+      return { ...result, documents, succeeded: result.status === "completed" && documents.ok };
     },
 
     /** Stops a snapshot or status of this service (it rejects with code `Cancelled`). */

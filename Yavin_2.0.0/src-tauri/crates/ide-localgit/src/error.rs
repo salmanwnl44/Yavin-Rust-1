@@ -62,6 +62,24 @@ pub enum LgError {
     },
     /// The caller cancelled the operation (a newer status superseded it, or its handle closed).
     Cancelled,
+    /// A branch or tag of that name exists already (never replaced).
+    AlreadyExists(String),
+    /// No branch, tag or path of that name.
+    NotFound(String),
+    /// A commit was asked for, and the index holds nothing HEAD does not.
+    NothingToCommit,
+    /// The branch HEAD is on cannot be deleted.
+    CurrentBranch(String),
+    /// Deleting the branch would leave commits no other ref reaches.
+    NotMerged(String),
+    /// There is no commit yet (HEAD is unborn) to start from.
+    Unborn,
+    /// A file whose content was not stored cannot be staged piece by piece.
+    ContentUnavailableForStaging(String),
+    /// Partial staging was asked for a diff that is no longer the one the caller saw.
+    StaleSelection(String),
+    /// Partial staging cannot be represented safely for this file (binary, not text).
+    PartialStagingUnsupported(String),
     Io(String),
 }
 
@@ -84,6 +102,15 @@ impl LgError {
             LgError::ContentUnavailable(_) => "ContentUnavailable",
             LgError::WrongKind { .. } => "WrongKind",
             LgError::Cancelled => "Cancelled",
+            LgError::AlreadyExists(_) => "AlreadyExists",
+            LgError::NotFound(_) => "NotFound",
+            LgError::NothingToCommit => "NothingToCommit",
+            LgError::CurrentBranch(_) => "CurrentBranch",
+            LgError::NotMerged(_) => "NotMerged",
+            LgError::Unborn => "Unborn",
+            LgError::ContentUnavailableForStaging(_) => "ContentUnavailableForStaging",
+            LgError::StaleSelection(_) => "StaleSelection",
+            LgError::PartialStagingUnsupported(_) => "PartialStagingUnsupported",
             LgError::Io(_) => "Io",
         }
     }
@@ -144,6 +171,28 @@ impl fmt::Display for LgError {
                 found,
             } => write!(f, "{id} is a {found}, not a {expected}"),
             LgError::Cancelled => write!(f, "The operation was cancelled"),
+            LgError::AlreadyExists(name) => write!(f, "{name} already exists"),
+            LgError::NotFound(name) => write!(f, "{name} does not exist"),
+            LgError::NothingToCommit => write!(f, "Nothing is staged: there is nothing to commit"),
+            LgError::CurrentBranch(name) => {
+                write!(f, "{name} is the current branch and cannot be deleted")
+            }
+            LgError::NotMerged(name) => write!(
+                f,
+                "{name} has commits no other branch or tag reaches; it was not deleted"
+            ),
+            LgError::Unborn => write!(f, "There is no commit yet"),
+            LgError::ContentUnavailableForStaging(path) => write!(
+                f,
+                "{path} is over the storage limit: its content was not stored, so it cannot be staged in parts"
+            ),
+            LgError::StaleSelection(path) => write!(
+                f,
+                "{path} changed since its diff was shown; show it again before staging part of it"
+            ),
+            LgError::PartialStagingUnsupported(path) => {
+                write!(f, "{path} cannot be staged in parts (it is not text)")
+            }
             LgError::Io(detail) => write!(f, "{detail}"),
         }
     }

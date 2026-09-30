@@ -485,10 +485,13 @@ impl SnapshotEngine {
                 Some(root) => repo.read_root(&root)?.folders,
                 None => BTreeMap::new(),
             };
+            let index = crate::branches::index_state(&repo)?;
             crate::status::Head {
                 commit,
                 root,
                 trees,
+                index_root: index.root,
+                index_trees: index.folders,
             }
         };
         let status = crate::status::compute(&self.folders, &lookup, &head, &snapshot, limit)?;
@@ -671,6 +674,32 @@ impl SnapshotEngine {
         };
         let verification = crate::restore::verify(&trees, &snapshot, &target_folders, scope)?;
         Ok((snapshot, verification))
+    }
+
+    /// Plans switching branches (or detaching HEAD) from the workspace as a fresh Full,
+    /// persisted snapshot (with the unsaved documents) sees it. See `switch.rs`.
+    pub fn plan_switch(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        target: &crate::switch::SwitchTarget,
+    ) -> Result<(Snapshot, crate::switch::SwitchPlan)> {
+        let mut state = self.state.lock().unwrap();
+        let mut request = request.clone();
+        request.mode = RequestedMode::Full;
+        request.persist = true;
+        request.allow_incremental_persist = false;
+        let snapshot = self.snapshot_in(&mut state, repo, &request, control)?;
+        let mut repo = repo.lock().unwrap();
+        let memory = MemoryTrees(&state.trees);
+        let plan = crate::switch::plan(&memory, &mut repo, &self.folders, &snapshot, target)?;
+        Ok((snapshot, plan))
+    }
+
+    /// A copy of the trees the last snapshot produced (staging reads them without the store).
+    pub(crate) fn memory_trees(&self) -> HashMap<ObjectId, Tree> {
+        self.state.lock().unwrap().trees.clone()
     }
 
     /// Where the workspace's folders are, for the layer that carries out a restore.

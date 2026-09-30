@@ -550,3 +550,7 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[path = "localgit_restore_git_tests.rs"]
 mod git_tests;
+
+#[cfg(test)]
+#[path = "localgit_switch_tests.rs"]
+mod switch_tests;

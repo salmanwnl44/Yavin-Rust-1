@@ -397,7 +397,8 @@ test("a commit and a checkpoint carry who and when, with the offset east of UTC"
   const commit = native.calls.find((c) => c.command === "localgit_commit")!;
   assert.equal(commit.args.message, "message");
   assert.equal(commit.args.fromCheckpoint, "k1");
-  assert.deepEqual(commit.args.overlays, [{ key: "a.ts", version: 3 }]);
+  // A commit takes exactly what is staged (the Local Index): no unsaved documents are sent.
+  assert.equal(commit.args.overlays, undefined);
   const by = commit.args.by as { name: string; id: string; timeMs: number; tzOffsetMin: number };
   assert.equal(by.name, "Ada");
   assert.equal(by.tzOffsetMin, -new Date().getTimezoneOffset());
@@ -587,6 +588,160 @@ test("a restore answering after its workspace was left is dropped; no document i
   // A -> B while A's restore is in flight.
   active = false;
   await native.answer("localgit_restore", restoreResult("completed", [op("writeFile", "a.txt")]));
+  assert.ok((await late) instanceof LocalGitClosedError);
+  assert.equal(reconciles, 0);
+});
+
+// --- The Local Index, branches, tags and switching (LG-04) ---------------------------------
+
+test("staging sends the paths and the unsaved documents; unstaging sends only paths", async () => {
+  const native = scriptedNative({
+    localgit_stage: () => ({ index: {}, changed: [], unchanged: [], unstored: [], snapshot: null }),
+    localgit_unstage: () => ({
+      index: {},
+      changed: [],
+      unchanged: [],
+      unstored: [],
+      snapshot: null,
+    }),
+    localgit_stage_hunks: () => ({
+      index: {},
+      changed: [],
+      unchanged: [],
+      unstored: [],
+      snapshot: null,
+    }),
+  });
+  const service = createLocalGitService(["/work"], { isActive: () => true }, native.invoke);
+  service.attachOverlays(overlaySource([{ key: "a.ts", version: 3, text: "A" }]).source);
+  await service.stage([{ path: "src/a.ts" }, { folderId: "f-1", path: "b.ts" }]);
+  await service.stageAll();
+  await service.unstage([{ path: "src/a.ts" }]);
+  await service.unstageAll();
+  await service.stageHunks({ path: "f.txt" }, [0, 2], { index: "i1", working: "w1" });
+  const args = (command: string) =>
+    native.calls.filter((c) => c.command === command).map((c) => c.args);
+  const staged = args("localgit_stage");
+  assert.deepEqual(staged[0].paths, [
+    { folderId: null, path: "src/a.ts" },
+    { folderId: "f-1", path: "b.ts" },
+  ]);
+  assert.equal(staged[0].all, false);
+  assert.deepEqual(staged[0].overlays, [{ key: "a.ts", version: 3 }]);
+  assert.equal(staged[1].all, true);
+  assert.deepEqual(args("localgit_unstage"), [
+    { handle: "lg-7", paths: [{ folderId: null, path: "src/a.ts" }], all: false },
+    { handle: "lg-7", paths: [], all: true },
+  ]);
+  const hunks = args("localgit_stage_hunks")[0];
+  assert.deepEqual(hunks.hunks, [0, 2]);
+  assert.equal(hunks.expectedIndex, "i1");
+  assert.equal(hunks.expectedWorking, "w1");
+  assert.deepEqual(hunks.overlays, [{ key: "a.ts", version: 3 }]);
+});
+
+test("branches and tags are asked for by name, with HEAD's commit by default", async () => {
+  const native = scriptedNative({});
+  const service = createLocalGitService(["/work"], { isActive: () => true }, native.invoke);
+  await service.createBranch("feature/x");
+  await service.createBranch("from-there", "c1");
+  await service.deleteBranch("feature/x");
+  await service.createTag("v1");
+  await service.tag("v1");
+  await service.deleteTag("v1");
+  const got = native.calls
+    .filter((c) => c.command !== "localgit_open")
+    .map((c) => [c.command, c.args]);
+  assert.deepEqual(got, [
+    ["localgit_create_branch", { handle: "lg-7", name: "feature/x", start: null }],
+    ["localgit_create_branch", { handle: "lg-7", name: "from-there", start: "c1" }],
+    ["localgit_delete_branch", { handle: "lg-7", name: "feature/x" }],
+    ["localgit_create_tag", { handle: "lg-7", name: "v1", target: null }],
+    ["localgit_get_tag", { handle: "lg-7", name: "v1" }],
+    ["localgit_delete_tag", { handle: "lg-7", name: "v1" }],
+  ]);
+});
+
+function switchResult(status: string, operations: unknown[]) {
+  const restored = restoreResult(status, operations);
+  return {
+    status,
+    plan: {
+      branch: "feature",
+      commit: "c2",
+      from: "c1",
+      revision: 4,
+      sameCommit: false,
+      restore: { ...restored.plan, documents: [] },
+    },
+    conflicts: [],
+    operation: 3,
+    applied: operations.length,
+    error: null,
+    verification: null,
+    head: { kind: "branch", name: "feature", refName: "refs/heads/feature", commit: "c2" },
+  };
+}
+
+test("a completed switch reconciles the documents it changed; a refused one touches none", async () => {
+  const reconciled: unknown[] = [];
+  const native = scriptedNative({
+    localgit_switch: (args) =>
+      args.dryRun
+        ? switchResult("planned", [op("writeFile", "a.txt")])
+        : args.branch === "blocked"
+          ? switchResult("refused", [])
+          : switchResult("completed", [op("writeFile", "a.txt"), op("removeFile", "b.txt")]),
+  });
+  const service = createLocalGitService(["/work"], { isActive: () => true }, native.invoke);
+  service.attachOverlays({
+    ...overlaySource([]).source,
+    reconcileRestore: async (paths) => {
+      reconciled.push(paths);
+      return { ok: true, reloaded: [], closed: [], failed: [] };
+    },
+  });
+  const done = await service.switchTo({ branch: "feature" });
+  assert.equal(done.succeeded, true);
+  assert.deepEqual(reconciled, [
+    {
+      changes: [
+        { kind: "modified", path: "C:/Work/Project/a.txt" },
+        { kind: "deleted", path: "C:/Work/Project/b.txt" },
+      ],
+      replace: [],
+    },
+  ]);
+  const planned = await service.switchTo({ commit: "c9" }, { dryRun: true });
+  assert.equal(planned.succeeded, false);
+  const refused = await service.switchTo({ branch: "blocked" });
+  assert.equal(refused.succeeded, false);
+  assert.equal(reconciled.length, 1);
+  const calls = native.calls.filter((c) => c.command === "localgit_switch").map((c) => c.args);
+  assert.equal(calls[1].commit, "c9");
+  assert.equal(calls[1].branch, null);
+});
+
+test("a switch answering after its workspace was left is dropped before any document", async () => {
+  const native = fakeNative();
+  let active = true;
+  let reconciles = 0;
+  const service = createLocalGitService(["/a"], { isActive: () => active }, native.invoke);
+  service.attachOverlays({
+    ...overlaySource([]).source,
+    reconcileRestore: async () => {
+      reconciles++;
+      return { ok: true, reloaded: [], closed: [], failed: [] };
+    },
+  });
+  await native.answer("localgit_open");
+  const late = service.switchTo({ branch: "feature" }).then(
+    () => "delivered",
+    (error: unknown) => error,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  active = false;
+  await native.answer("localgit_switch", switchResult("completed", [op("writeFile", "a.txt")]));
   assert.ok((await late) instanceof LocalGitClosedError);
   assert.equal(reconciles, 0);
 });
