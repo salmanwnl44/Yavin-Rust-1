@@ -1885,54 +1885,14 @@ pub fn localgit_switch(
     if !workspace_is_open(&workspace, &workspace_id) {
         return Err("NotInWorkspace: the workspace was left before the switch began".into());
     }
-    if !result.plan.restore.operations.is_empty() {
-        let scratch = std::env::temp_dir().join("yavin-localgit-link-probe");
-        match crate::localgit_restore::execute(
-            &watch,
-            &store.repo,
-            &store.engine,
-            &result.plan.restore,
-            &scratch,
-        ) {
-            crate::localgit_restore::Outcome::Refused(conflicts) => {
-                result.status = "refused";
-                result.conflicts = conflicts;
-            }
-            crate::localgit_restore::Outcome::Failed {
-                operation,
-                applied,
-                error,
-            } => {
-                result.status = "failed";
-                result.operation = operation;
-                result.applied = applied;
-                result.error = Some(error);
-            }
-            crate::localgit_restore::Outcome::Done { operation, applied } => {
-                result.operation = Some(operation);
-                result.applied = applied;
-                let settled = AtomicBool::new(false);
-                match store.engine.verify_restore(
-                    &store.repo,
-                    &Control {
-                        cancel: &settled,
-                        progress: &progress,
-                    },
-                    &result.plan.restore,
-                ) {
-                    Ok((_, verification)) => {
-                        if !verification.matches {
-                            result.status = "verificationFailed";
-                        }
-                        result.verification = Some(verification);
-                    }
-                    Err(error) => {
-                        result.status = "verificationFailed";
-                        result.error = Some(fail(error));
-                    }
-                }
-            }
-        }
+    let carried = carry_out(&watch, &store, &result.plan.restore, &progress);
+    result.status = carried.status;
+    result.operation = carried.operation;
+    result.applied = carried.applied;
+    result.error = carried.error;
+    result.verification = carried.verification;
+    if !carried.conflicts.is_empty() {
+        result.conflicts = carried.conflicts;
     }
     // HEAD and the index move only once the disk is verified where it should be.
     if result.status == "completed" {
@@ -1945,4 +1905,759 @@ pub fn localgit_switch(
     result.head = head_now(&store)?;
     drop(guard);
     local_git.finish_changed(&handle, &job_id, Ok(result))
+}
+
+// --- Reset, revert and stash (LG-05) ----------------------------------------------------------
+
+use ide_localgit::reset::{self, HardResetPlan, ResetDone, ResetMode, ResetPolicy, ResetTarget};
+use ide_localgit::revert::RevertResult;
+use ide_localgit::stash::{self, StashApplyPlan, StashInfo, StashList, StashPushPlan};
+
+/// How a planned change of the disk went.
+struct Carried {
+    /// `completed`, `refused`, `failed` or `verificationFailed`.
+    status: &'static str,
+    conflicts: Vec<RestoreConflict>,
+    operation: Option<u64>,
+    applied: usize,
+    error: Option<String>,
+    verification: Option<Verification>,
+}
+
+/// Carries out a restore plan (switch, hard reset, stash): the last checks, one Module 03
+/// operation recorded by Module 04, then a Full snapshot to verify it. A plan with nothing to
+/// do on disk is simply complete.
+fn carry_out(
+    watch: &crate::Watch,
+    store: &Store,
+    plan: &RestorePlan,
+    progress: &(dyn Fn(&Progress) + Sync),
+) -> Carried {
+    let mut carried = Carried {
+        status: "completed",
+        conflicts: Vec::new(),
+        operation: None,
+        applied: 0,
+        error: None,
+        verification: None,
+    };
+    if plan.operations.is_empty() {
+        return carried;
+    }
+    let scratch = std::env::temp_dir().join("yavin-localgit-link-probe");
+    match crate::localgit_restore::execute(watch, &store.repo, &store.engine, plan, &scratch) {
+        crate::localgit_restore::Outcome::Refused(conflicts) => {
+            carried.status = "refused";
+            carried.conflicts = conflicts;
+        }
+        crate::localgit_restore::Outcome::Failed {
+            operation,
+            applied,
+            error,
+        } => {
+            carried.status = "failed";
+            carried.operation = operation;
+            carried.applied = applied;
+            carried.error = Some(error);
+        }
+        crate::localgit_restore::Outcome::Done { operation, applied } => {
+            carried.operation = Some(operation);
+            carried.applied = applied;
+            let settled = AtomicBool::new(false);
+            match store.engine.verify_restore(
+                &store.repo,
+                &Control {
+                    cancel: &settled,
+                    progress,
+                },
+                plan,
+            ) {
+                Ok((_, verification)) => {
+                    if !verification.matches {
+                        carried.status = "verificationFailed";
+                    }
+                    carried.verification = Some(verification);
+                }
+                Err(error) => {
+                    carried.status = "verificationFailed";
+                    carried.error = Some(fail(error));
+                }
+            }
+        }
+    }
+    carried
+}
+
+/// The last point an operation that changes the disk can stop: cancelled, or its workspace no
+/// longer the window's.
+fn before_changing(
+    local_git: &LocalGit,
+    workspace: &Workspace,
+    handle: &str,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(fail(LgError::Cancelled));
+    }
+    let workspace_id = {
+        let inner = local_git.inner.lock().map_err(|e| e.to_string())?;
+        inner
+            .handles
+            .get(handle)
+            .ok_or(CLOSED)?
+            .workspace_id
+            .clone()
+    };
+    if !workspace_is_open(workspace, &workspace_id) {
+        return Err("NotInWorkspace: the workspace was left before the change began".into());
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetArg {
+    /// `commit`, `branch` or `tag`.
+    kind: String,
+    value: String,
+}
+
+fn reset_target(target: TargetArg) -> Result<ResetTarget, String> {
+    match target.kind.as_str() {
+        "commit" => Ok(ResetTarget::Commit(parse_id(&target.value)?)),
+        "branch" => Ok(ResetTarget::Branch(target.value)),
+        "tag" => Ok(ResetTarget::Tag(target.value)),
+        other => Err(format!("InvalidFormat: unknown target kind {other:?}")),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetResult {
+    /// `planned` (a hard reset's dry run), `refused`, `completed`, `failed`, `verificationFailed`.
+    status: &'static str,
+    mode: ResetMode,
+    done: Option<ResetDone>,
+    /// A hard reset's plan.
+    plan: Option<HardResetPlan>,
+    conflicts: Vec<RestoreConflict>,
+    operation: Option<u64>,
+    applied: usize,
+    error: Option<String>,
+    verification: Option<Verification>,
+    head: HeadState,
+}
+
+/// Resets HEAD (its branch, or HEAD itself) to a target: `soft` (the index and working tree
+/// kept), `mixed` (the index too), or `hard` (the working tree too -- refused, with every
+/// conflict, when local work would be lost, unless `policy` is `allowDestructive`).
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_reset(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    watch: State<'_, crate::Watch>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    target: TargetArg,
+    mode: String,
+    policy: String,
+    dry_run: bool,
+    overlays: Vec<OverlayRef>,
+) -> Result<ResetResult, String> {
+    let target = reset_target(target)?;
+    let policy = match policy.as_str() {
+        "refuseIfDirty" => ResetPolicy::RefuseIfDirty,
+        "allowDestructive" => ResetPolicy::AllowDestructive,
+        other => return Err(format!("InvalidFormat: unknown reset policy {other:?}")),
+    };
+    let (store, request) = prepare(&local_git, &handle, "full", true, &overlays, &[])?;
+    let _only = if dry_run {
+        None
+    } else {
+        Some(exclusive(&store)?)
+    };
+    let head_now = |store: &Store| -> Result<HeadState, String> {
+        Ok(branches::resolve_head(
+            &*store.repo.lock().map_err(|e| e.to_string())?,
+        ))
+    };
+    let simple =
+        |mode: ResetMode, done: Result<ResetDone, LgError>| -> Result<ResetResult, String> {
+            let done = done.map_err(fail)?;
+            Ok(ResetResult {
+                status: "completed",
+                mode,
+                head: done.head.clone(),
+                done: Some(done),
+                plan: None,
+                conflicts: Vec::new(),
+                operation: None,
+                applied: 0,
+                error: None,
+                verification: None,
+            })
+        };
+    match mode.as_str() {
+        "soft" if !dry_run => {
+            let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+            return simple(
+                ResetMode::Soft,
+                reset::reset_soft(&mut repo, store.engine.folders(), &target),
+            );
+        }
+        "mixed" if !dry_run => {
+            let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+            return simple(ResetMode::Mixed, reset::reset_mixed(&mut repo, &target));
+        }
+        "hard" => {}
+        _ => {
+            return Err(format!(
+                "InvalidFormat: unknown reset mode {mode:?} (dry runs are for hard resets)"
+            ))
+        }
+    }
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let control = Control {
+        cancel: &cancel,
+        progress: &progress,
+    };
+    let plan = match store
+        .engine
+        .plan_reset_hard(&store.repo, &request, &control, &target, policy)
+    {
+        Ok((_, plan)) => plan,
+        Err(error) => return local_git.finish_job(&handle, &job_id, Err(error)),
+    };
+    let mut result = ResetResult {
+        status: "completed",
+        mode: ResetMode::Hard,
+        done: None,
+        conflicts: plan.restore.conflicts.clone(),
+        plan: Some(plan),
+        operation: None,
+        applied: 0,
+        error: None,
+        verification: None,
+        head: head_now(&store)?,
+    };
+    if !result.conflicts.is_empty() || dry_run {
+        result.status = if result.conflicts.is_empty() {
+            "planned"
+        } else {
+            "refused"
+        };
+        return local_git.finish_job(&handle, &job_id, Ok(result));
+    }
+    before_changing(&local_git, &workspace, &handle, &cancel)?;
+    let plan = result.plan.clone().expect("a hard reset has a plan");
+    let carried = carry_out(&watch, &store, &plan.restore, &progress);
+    result.status = carried.status;
+    result.conflicts = carried.conflicts;
+    result.operation = carried.operation;
+    result.applied = carried.applied;
+    result.error = carried.error;
+    result.verification = carried.verification;
+    if result.status == "completed" {
+        let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+        match reset::finish_hard(&mut repo, &plan) {
+            Ok(done) => result.done = Some(done),
+            Err(error) => {
+                result.status = "failed";
+                result.error = Some(fail(error));
+            }
+        }
+    }
+    result.head = head_now(&store)?;
+    local_git.finish_changed(&handle, &job_id, Ok(result))
+}
+
+/// Reverts a commit: a new commit, made from the index, that undoes it (refused, with every
+/// conflict, when it would take a merge or lose local work). The working tree is not touched.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_revert(
+    app: AppHandle,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    commit: String,
+    message: Option<String>,
+    overlays: Vec<OverlayRef>,
+    by: Signature,
+) -> Result<RevertResult, String> {
+    let commit = parse_id(&commit)?;
+    let (store, request) = prepare(&local_git, &handle, "full", false, &overlays, &[])?;
+    let _only = exclusive(&store)?;
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let request_by = commit_request(String::new(), by);
+    let result = store
+        .engine
+        .revert(
+            &store.repo,
+            &request,
+            &Control {
+                cancel: &cancel,
+                progress: &progress,
+            },
+            commit,
+            message,
+            &request_by,
+        )
+        .map(|(_, result)| result);
+    local_git.finish_job(&handle, &job_id, result)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StashPushResult {
+    /// `refused`, `completed` (stashed and cleaned), `failed` (stashed; cleaning stopped
+    /// partway), `verificationFailed` (stashed; the disk did not verify).
+    status: &'static str,
+    /// The stash, once it is durable.
+    stash: Option<StashInfo>,
+    plan: StashPushPlan,
+    conflicts: Vec<RestoreConflict>,
+    operation: Option<u64>,
+    applied: usize,
+    error: Option<String>,
+    verification: Option<Verification>,
+}
+
+/// Stashes the workspace's changes (staged and unstaged apart, unsaved documents included,
+/// untracked files when asked): the stash is made durable first, and only then is the
+/// workspace cleaned back to HEAD.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_stash_push(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    watch: State<'_, crate::Watch>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    message: Option<String>,
+    include_untracked: bool,
+    overlays: Vec<OverlayRef>,
+    by: Signature,
+) -> Result<StashPushResult, String> {
+    let (store, request) = prepare(&local_git, &handle, "full", true, &overlays, &[])?;
+    let _only = exclusive(&store)?;
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let control = Control {
+        cancel: &cancel,
+        progress: &progress,
+    };
+    let plan = match store.engine.plan_stash_push(
+        &store.repo,
+        &request,
+        &control,
+        message,
+        include_untracked,
+    ) {
+        Ok((_, plan)) => plan,
+        Err(error) => return local_git.finish_job(&handle, &job_id, Err(error)),
+    };
+    let mut result = StashPushResult {
+        status: "completed",
+        stash: None,
+        conflicts: plan.restore.conflicts.clone(),
+        plan,
+        operation: None,
+        applied: 0,
+        error: None,
+        verification: None,
+    };
+    if !result.conflicts.is_empty() {
+        result.status = "refused";
+        return local_git.finish_job(&handle, &job_id, Ok(result));
+    }
+    before_changing(&local_git, &workspace, &handle, &cancel)?;
+    let result = finish_stash_push(
+        &watch,
+        &store,
+        result,
+        &commit_request(String::new(), by),
+        &progress,
+    )?;
+    local_git.finish_changed(&handle, &job_id, Ok(result))
+}
+
+/// A stash push once planned without conflicts: the stash made durable first, then the
+/// workspace cleaned. If the executor's last checks refuse the cleaning -- nothing was touched --
+/// the just-made stash is dropped again, so the workspace (which still has every change) and the
+/// stash list are exactly as before. If cleaning fails partway, or the disk does not verify, the
+/// stash stays: it holds everything that was there.
+fn finish_stash_push(
+    watch: &crate::Watch,
+    store: &Store,
+    mut result: StashPushResult,
+    by: &CommitRequest,
+    progress: &(dyn Fn(&Progress) + Sync),
+) -> Result<StashPushResult, String> {
+    // Durable first: if this fails, nothing in the workspace has changed.
+    let stash = {
+        let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+        stash::record(&mut repo, &result.plan, by).map_err(fail)?
+    };
+    let carried = carry_out(watch, store, &result.plan.restore, progress);
+    result.status = carried.status;
+    result.conflicts = carried.conflicts;
+    result.operation = carried.operation;
+    result.applied = carried.applied;
+    result.error = carried.error;
+    result.verification = carried.verification;
+    let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+    match result.status {
+        "completed" => {
+            if let Err(error) = stash::finish_push(&mut repo) {
+                result.status = "failed";
+                result.error = Some(fail(error));
+            }
+            result.stash = Some(stash);
+        }
+        // The last checks refused before anything changed: the workspace still has every
+        // change, so the stash is taken back rather than left as a duplicate.
+        "refused" => {
+            stash::drop_stash(&mut repo, &stash.id).map_err(fail)?;
+        }
+        // Partly cleaned, or not verified: the stash stays -- it holds what was there.
+        _ => result.stash = Some(stash),
+    }
+    Ok(result)
+}
+
+#[tauri::command(async)]
+pub fn localgit_stash_list(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    limit: usize,
+) -> Result<StashList, String> {
+    local_git.with(&handle, |repo| stash::list(repo, limit))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StashApplyResult {
+    /// `refused`, `completed`, `failed`, `verificationFailed`.
+    status: &'static str,
+    plan: StashApplyPlan,
+    conflicts: Vec<RestoreConflict>,
+    operation: Option<u64>,
+    applied: usize,
+    error: Option<String>,
+    verification: Option<Verification>,
+    /// Whether the stash is still there (always, unless a pop completed).
+    kept: bool,
+}
+
+/// Applies a stash (`pop`: and removes it, only once everything succeeded). Refused, with every
+/// conflict, before anything changes.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_stash_apply(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    watch: State<'_, crate::Watch>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    id: String,
+    pop: bool,
+    overlays: Vec<OverlayRef>,
+) -> Result<StashApplyResult, String> {
+    let (store, request) = prepare(&local_git, &handle, "full", true, &overlays, &[])?;
+    let _only = exclusive(&store)?;
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let control = Control {
+        cancel: &cancel,
+        progress: &progress,
+    };
+    let plan = match store
+        .engine
+        .plan_stash_apply(&store.repo, &request, &control, &id, pop)
+    {
+        Ok((_, plan)) => plan,
+        Err(error) => return local_git.finish_job(&handle, &job_id, Err(error)),
+    };
+    let mut result = StashApplyResult {
+        status: "completed",
+        conflicts: plan.restore.conflicts.clone(),
+        plan,
+        operation: None,
+        applied: 0,
+        error: None,
+        verification: None,
+        kept: true,
+    };
+    if !result.conflicts.is_empty() {
+        result.status = "refused";
+        return local_git.finish_job(&handle, &job_id, Ok(result));
+    }
+    before_changing(&local_git, &workspace, &handle, &cancel)?;
+    let carried = carry_out(&watch, &store, &result.plan.restore, &progress);
+    result.status = carried.status;
+    result.conflicts = carried.conflicts;
+    result.operation = carried.operation;
+    result.applied = carried.applied;
+    result.error = carried.error;
+    result.verification = carried.verification;
+    if result.status == "completed" {
+        let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+        match stash::finish_apply(&mut repo, &result.plan) {
+            Ok(()) => result.kept = !result.plan.pop,
+            Err(error) => {
+                result.status = "failed";
+                result.error = Some(fail(error));
+            }
+        }
+    }
+    local_git.finish_changed(&handle, &job_id, Ok(result))
+}
+
+/// Removes a stash (its ref; the objects stay until GC).
+#[tauri::command(async)]
+pub fn localgit_stash_drop(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    id: String,
+) -> Result<(), String> {
+    let store = local_git.handle_store(&handle)?;
+    let _only = exclusive(&store)?;
+    let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+    stash::drop_stash(&mut repo, &id).map_err(fail)
+}
+
+#[cfg(test)]
+mod lg05_push_tests {
+    use super::*;
+    use ide_localgit::branches::index_state;
+    use ide_localgit::index::{stage, stage_all, StagePath};
+    use ide_workspace::recovery::IntentLog;
+
+    fn put(path: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn listing(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(at) = stack.pop() {
+            for entry in std::fs::read_dir(&at).unwrap().flatten() {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if path.is_dir() {
+                    out.push((format!("{rel}/"), Vec::new()));
+                    stack.push(path);
+                } else {
+                    out.push((rel, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn by() -> CommitRequest {
+        CommitRequest {
+            message: "base".into(),
+            author: Author {
+                name: "T".into(),
+                id: "t".into(),
+            },
+            time_ms: 0,
+            tz_offset_min: 0,
+        }
+    }
+
+    /// The exact path `localgit_stash_push` takes when the executor's final checks refuse the
+    /// cleaning: the stash was made durable, nothing in the workspace was touched, and the stash
+    /// is dropped again -- HEAD, the index, the working tree and every document's text exactly as
+    /// before, nothing lost, nothing left behind.
+    #[test]
+    fn a_stash_whose_final_cleanup_is_refused_is_dropped_and_the_workspace_is_untouched() {
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "yavin-localgit-lg05-push-refused-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let spec = WorkspaceSpec::from_paths(&[&project]).unwrap();
+        let repo = Repository::open(&dir.join("base"), &spec, OpenOptions::default()).unwrap();
+        let record = repo.meta().folders[0].clone();
+        let engine = SnapshotEngine::new(
+            vec![FolderRoot {
+                folder_id: FolderId::new(&record.folder_id).unwrap(),
+                path: project.clone(),
+                resource_id: record.resource_id,
+            }],
+            repo.meta().max_blob_bytes,
+        );
+        let store = Store {
+            repo: Arc::new(Mutex::new(repo)),
+            engine: Arc::new(engine),
+            mutating: Arc::new(Mutex::new(())),
+        };
+        let watch = crate::Watch::default();
+        watch
+            .intents
+            .set(Ok(IntentLog::open(&dir.join("recovery")).unwrap()))
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        let control = Control {
+            cancel: &cancel,
+            progress: &|_| {},
+        };
+
+        // (a) A committed base, then staged and unstaged work, an untracked file, and an
+        // unsaved document.
+        put(&project.join("foo.txt"), "A");
+        put(&project.join("bar.txt"), "bar");
+        put(&project.join("doc.txt"), "doc on disk");
+        stage_all(
+            &store.engine,
+            &store.repo,
+            &SnapshotRequest::default(),
+            &control,
+        )
+        .unwrap();
+        history::commit_index(&mut store.repo.lock().unwrap(), &by()).unwrap();
+        put(&project.join("foo.txt"), "B (staged)");
+        stage(
+            &store.engine,
+            &store.repo,
+            &SnapshotRequest::default(),
+            &control,
+            &[StagePath {
+                folder: None,
+                path: "foo.txt".into(),
+            }],
+        )
+        .unwrap();
+        put(&project.join("foo.txt"), "C (unstaged)");
+        put(&project.join("bar.txt"), "bar, changed");
+        put(&project.join("untracked.txt"), "mine");
+        let unsaved = OverlayInput {
+            path: ide_workspace::file_tree::clean_path_str(project.join("doc.txt")),
+            bytes: Arc::new(b"unsaved text".to_vec()),
+            encoding: "utf8".into(),
+            line_ending: "lf".into(),
+            version: 7,
+        };
+        let request = SnapshotRequest {
+            overlays: vec![unsaved],
+            ..Default::default()
+        };
+        let (plan, stashes_before) = {
+            let (_, plan) = store
+                .engine
+                .plan_stash_push(&store.repo, &request, &control, None, true)
+                .unwrap();
+            let repo = store.repo.lock().unwrap();
+            (plan, stash::list(&repo, 100).unwrap().total)
+        };
+        assert!(
+            plan.restore.conflicts.is_empty(),
+            "{:?}",
+            plan.restore.conflicts
+        );
+        assert_eq!(plan.counts.staged, 1);
+        assert!(
+            plan.restore.operations.len() >= 3,
+            "foo, bar and the untracked file to clean"
+        );
+        assert_eq!(
+            plan.restore.documents.len(),
+            1,
+            "the unsaved document was to be replaced"
+        );
+
+        // (b) Between the plan and the cleaning, another program writes a file the cleaning
+        // would change: the executor's final checks must refuse, before touching anything.
+        put(
+            &project.join("bar.txt"),
+            "bar, changed again by someone else",
+        );
+        let head_before = branches::resolve_head(&store.repo.lock().unwrap());
+        let index_before = index_state(&store.repo.lock().unwrap()).unwrap().root;
+        let disk_before = listing(&project);
+
+        let result = StashPushResult {
+            status: "completed",
+            stash: None,
+            conflicts: Vec::new(),
+            plan,
+            operation: None,
+            applied: 0,
+            error: None,
+            verification: None,
+        };
+        let result = finish_stash_push(&watch, &store, result, &by(), &|_| {}).unwrap();
+
+        // (c) The push failed, and says why.
+        assert_eq!(result.status, "refused");
+        assert!(result.stash.is_none());
+        assert!(result
+            .conflicts
+            .iter()
+            .any(|c| matches!(c, RestoreConflict::DiskChangedSinceSnapshot { path, .. } if path == "bar.txt")));
+        assert_eq!(result.applied, 0, "(h) no operation was carried out");
+        let repo = store.repo.lock().unwrap();
+        // (d) No stash remains -- it was made durable, and then dropped.
+        assert_eq!(stash::list(&repo, 100).unwrap().total, stashes_before);
+        let reflog: Vec<String> = repo
+            .reflog()
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| match r {
+                ReflogRecord::Update { op, reason, .. } if op == "stash" => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reflog.len(), 2, "pushed, then dropped: {reflog:?}");
+        assert!(reflog[0].starts_with("push ") && reflog[1].starts_with("drop "));
+        // (e) HEAD and (f) the index are unchanged.
+        assert_eq!(branches::resolve_head(&repo), head_before);
+        assert_eq!(index_state(&repo).unwrap().root, index_before);
+        assert!(repo.verify(true).is_empty());
+        drop(repo);
+        // (g, h, i) The working tree is exactly as it was -- the staged, the unstaged and the
+        // untracked work all there, nothing half cleaned -- and the unsaved document was never
+        // written (its text lives only in the editor, untouched).
+        assert_eq!(listing(&project), disk_before);
+        assert_eq!(
+            std::fs::read(project.join("foo.txt")).unwrap(),
+            b"C (unstaged)"
+        );
+        assert_eq!(
+            std::fs::read(project.join("untracked.txt")).unwrap(),
+            b"mine"
+        );
+        assert_eq!(
+            std::fs::read(project.join("doc.txt")).unwrap(),
+            b"doc on disk"
+        );
+        // No file operation was even recorded for recovery.
+        let records = std::fs::read_dir(dir.join("recovery").join("instances"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|i| std::fs::read_dir(i.path()).into_iter().flatten().flatten())
+            .filter(|f| f.file_name().to_string_lossy().starts_with("op-"))
+            .count();
+        assert_eq!(records, 0);
+        drop(watch);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

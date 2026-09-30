@@ -60,7 +60,7 @@ pub struct SwitchPlan {
 }
 
 /// A tree lookup that also knows the empty tree.
-struct Trees<'a>(&'a dyn TreeLookup);
+pub(crate) struct Trees<'a>(pub(crate) &'a dyn TreeLookup);
 
 impl TreeLookup for Trees<'_> {
     fn tree(&self, id: &ObjectId) -> Option<Tree> {
@@ -71,7 +71,7 @@ impl TreeLookup for Trees<'_> {
     }
 }
 
-fn same(a: &Option<TreeEntry>, b: &Option<TreeEntry>) -> bool {
+pub(crate) fn same(a: &Option<TreeEntry>, b: &Option<TreeEntry>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(a), Some(b)) => a.id == b.id && a.kind == b.kind,
@@ -80,10 +80,14 @@ fn same(a: &Option<TreeEntry>, b: &Option<TreeEntry>) -> bool {
 }
 
 /// A path that differs, with its entry before and after.
-type PathChange = (String, Option<TreeEntry>, Option<TreeEntry>);
+pub(crate) type PathChange = (String, Option<TreeEntry>, Option<TreeEntry>);
 
 /// The paths that differ between two trees, a rename being its two paths.
-fn differing(lookup: &dyn TreeLookup, from: ObjectId, to: ObjectId) -> Result<Vec<PathChange>> {
+pub(crate) fn differing(
+    lookup: &dyn TreeLookup,
+    from: ObjectId,
+    to: ObjectId,
+) -> Result<Vec<PathChange>> {
     let mut out = Vec::new();
     for leaf in changes(lookup, Some(from), to)? {
         if leaf.kind == ChangeKind::Renamed {
@@ -295,9 +299,9 @@ pub fn plan(
 }
 
 /// Trees just written (the desired tree) come from the store; the rest as the caller has them.
-struct MemoryAndStore<'a> {
-    repo: &'a Repository,
-    lookup: &'a dyn TreeLookup,
+pub(crate) struct MemoryAndStore<'a> {
+    pub(crate) repo: &'a Repository,
+    pub(crate) lookup: &'a dyn TreeLookup,
 }
 
 impl TreeLookup for MemoryAndStore<'_> {

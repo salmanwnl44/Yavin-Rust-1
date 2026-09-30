@@ -697,6 +697,110 @@ impl SnapshotEngine {
         Ok((snapshot, plan))
     }
 
+    /// Takes a Full snapshot (persisted when `persist`) with the request's unsaved documents,
+    /// then runs `plan` with the store and the snapshot's trees -- under the engine's lock, so
+    /// no other snapshot can run between them.
+    fn with_full_snapshot<T>(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        persist: bool,
+        plan: impl FnOnce(&dyn TreeLookup, &mut Repository, &[FolderRoot], &Snapshot) -> Result<T>,
+    ) -> Result<(Snapshot, T)> {
+        let mut state = self.state.lock().unwrap();
+        let mut request = request.clone();
+        request.mode = RequestedMode::Full;
+        request.persist = persist;
+        request.allow_incremental_persist = false;
+        let snapshot = self.snapshot_in(&mut state, repo, &request, control)?;
+        let mut repo = repo.lock().unwrap();
+        let memory = MemoryTrees(&state.trees);
+        let planned = plan(&memory, &mut repo, &self.folders, &snapshot)?;
+        Ok((snapshot, planned))
+    }
+
+    /// Plans a hard reset (see `reset.rs`).
+    pub fn plan_reset_hard(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        target: &crate::reset::ResetTarget,
+        policy: crate::reset::ResetPolicy,
+    ) -> Result<(Snapshot, crate::reset::HardResetPlan)> {
+        self.with_full_snapshot(
+            repo,
+            request,
+            control,
+            true,
+            |lookup, repo, folders, snapshot| {
+                crate::reset::plan_hard(lookup, repo, folders, snapshot, target, policy)
+            },
+        )
+    }
+
+    /// Reverts a commit (see `revert.rs`): a new commit made from the index.
+    pub fn revert(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        target: ObjectId,
+        message: Option<String>,
+        by: &crate::history::CommitRequest,
+    ) -> Result<(Snapshot, crate::revert::RevertResult)> {
+        self.with_full_snapshot(
+            repo,
+            request,
+            control,
+            false,
+            |lookup, repo, folders, snapshot| {
+                crate::revert::revert(lookup, repo, folders, snapshot, target, message, by)
+            },
+        )
+    }
+
+    /// Plans a stash (see `stash.rs`).
+    pub fn plan_stash_push(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        message: Option<String>,
+        include_untracked: bool,
+    ) -> Result<(Snapshot, crate::stash::StashPushPlan)> {
+        self.with_full_snapshot(
+            repo,
+            request,
+            control,
+            true,
+            |lookup, repo, folders, snapshot| {
+                crate::stash::plan_push(lookup, repo, folders, snapshot, message, include_untracked)
+            },
+        )
+    }
+
+    /// Plans applying (or popping) a stash (see `stash.rs`).
+    pub fn plan_stash_apply(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        id: &str,
+        pop: bool,
+    ) -> Result<(Snapshot, crate::stash::StashApplyPlan)> {
+        self.with_full_snapshot(
+            repo,
+            request,
+            control,
+            true,
+            |lookup, repo, folders, snapshot| {
+                crate::stash::plan_apply(lookup, repo, folders, snapshot, id, pop)
+            },
+        )
+    }
+
     /// A copy of the trees the last snapshot produced (staging reads them without the store).
     pub(crate) fn memory_trees(&self) -> HashMap<ObjectId, Tree> {
         self.state.lock().unwrap().trees.clone()

@@ -554,3 +554,7 @@ mod git_tests;
 #[cfg(test)]
 #[path = "localgit_switch_tests.rs"]
 mod switch_tests;
+
+#[cfg(test)]
+#[path = "localgit_lg05_tests.rs"]
+mod lg05_tests;

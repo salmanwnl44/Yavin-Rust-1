@@ -25,12 +25,16 @@ pub mod odb;
 pub mod reflog;
 pub mod refs;
 pub mod repository;
+pub mod reset;
 pub mod restore;
+pub mod revert;
 pub mod scan;
 pub mod segment;
 pub mod snapshot;
+pub mod stash;
 pub mod status;
 pub mod switch;
+pub mod transition;
 pub mod workspace;
 
 pub use error::{LgError, Result};

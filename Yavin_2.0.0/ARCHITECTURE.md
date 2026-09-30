@@ -819,7 +819,7 @@ SOURCE CONTROL                                   ⋯   view options: which secti
 
 Local Git is Yavin's own history for a workspace -- checkpoints, local commits, branches and restore, eventually "Undo AI Run" -- that works with or without real Git. It is **not Git**: it never reads or writes `.git`, never runs `git`, never reads `.gitignore`, and nothing it stores ends up in the project. Real Git stays what the Source Control panel shows. Local Git never owns live document content either: DocumentService does, and Local Git only records snapshots of it.
 
-LG-01 is the storage layer: the object store, the repository lifecycle and crash-safe persistence. LG-02 adds snapshots of the workspace -- on disk, and with unsaved documents applied -- and status against Local HEAD ("Snapshots and status" below). LG-03 adds checkpoints, commits, history, diffs and restore ("History, diff and restore" below). LG-04 adds the Local Index (staging), branches, tags and detached HEAD ("Staging, branches and tags" below). Reset, merge and everything that builds on them arrive in later phases (see "Not yet").
+LG-01 is the storage layer: the object store, the repository lifecycle and crash-safe persistence. LG-02 adds snapshots of the workspace -- on disk, and with unsaved documents applied -- and status against Local HEAD ("Snapshots and status" below). LG-03 adds checkpoints, commits, history, diffs and restore ("History, diff and restore" below). LG-04 adds the Local Index (staging), branches, tags and detached HEAD ("Staging, branches and tags" below). LG-05 adds reset, revert and stash ("Reset, revert and stash" below). Merge and everything that builds on it arrive in later phases (see "Not yet").
 
 ```text
 renderer                                    native (src-tauri)
@@ -1088,7 +1088,38 @@ Listing 10,001 branches: 8.1 ms; creating one more among them: 54 ms (`refs.json
 | `process::a_genuinely_running_process_is_actually_killed_on_cancellation`           | a cancelled process is stopped within 5 s       | 0.36-0.41 s |
 | `git::a_git_operation_cancelled_through_the_real_job_registry_is_actually_stopped`  | a cancelled Git operation is stopped within 5 s | 1.04-1.44 s |
 
-**Not yet** (later phases): reset, revert and stash (LG-05); merge and cherry-pick (LG-06); AI checkpoints and Undo AI Run (LG-07); any UI (LG-08); comparison with real Git, GC, compaction, compression, a recovery UI, and ref storage whose updates do not rewrite every ref (LG-09).
+### Reset, revert and stash (LG-05)
+
+**Reset never silently destroys user changes. Stash is not a real Git stash and never touches `.git`. Revert creates new Local Git history; it never rewrites existing commits.** Nothing here runs `git` or reads its index, configuration, stash or refs; a real-Git test fingerprints `.git` across every operation below.
+
+Every operation that changes the disk -- a hard reset, cleaning after a stash, applying a stash -- goes through one path (`transition.rs`): the current disk with a set of paths changed, planned by LG-03's restore planner, carried out by its executor as one Module 03 operation recorded by Module 04 (links never followed, nothing written through one), verified by a Full snapshot, and only then the refs moved. There is no second restore engine. Documents are reconciled afterwards through DocumentService's public API (the same `reconcileRestore` as restore and switch). Every mutation holds the store's mutation lock (`Busy` for a second one); a second Yavin process is read-only; a late answer from a workspace left is refused and dropped before any document is touched.
+
+**Reset** (`reset.rs`) moves HEAD -- its branch, or HEAD itself when detached -- to a target (a commit, a branch's commit, or a tag's; no revision syntax).
+
+| Mode  | HEAD   | Index                                                                      | Working tree                                | Disk changes  |
+| ----- | ------ | -------------------------------------------------------------------------- | ------------------------------------------- | ------------- |
+| soft  | target | unchanged (made explicit, since an index without its own ref follows HEAD) | unchanged                                   | none          |
+| mixed | target | target's tree                                                              | unchanged (its differences become unstaged) | none          |
+| hard  | target | target's tree                                                              | target's tree                               | yes, verified |
+
+Soft and mixed are one atomic ref update each. A hard reset is planned from a Full snapshot and refused, with every conflict before anything changes, when it would destroy staged changes (`stagedChangeConflict`), local changes to tracked files or an untracked file where the target has one (`unstagedChangeWouldBeOverwritten`), or unsaved documents (`dirtyDocumentWouldBeOverwritten`/`Deleted`) -- unless the caller passes `allowDestructive`, the explicit, typed choice to lose exactly those. Untracked files the target does not have are never touched. A reset never stashes or checkpoints anything on its own. Every move is in the reflog (op `reset`, old and new values, time; the store is the workspace's); a crash leaves the old refs or the new ones, and a crash while a hard reset changes the disk leaves HEAD where it was and the operation for recovery to settle.
+
+**Revert** (`revert.rs`) undoes commit T (against its first parent P; the empty state for a root commit) with a new commit on top of HEAD whose tree is HEAD's with every path T changed set back to P's entry. It works on the Local Index: nothing may be staged, the new commit is made from the result, and HEAD and the index move together in one step. The working tree is not touched -- its files keep what they had, so the undone difference shows as unstaged until restored. There is no merging (LG-06): a path is reverted only when HEAD still has exactly what T left there. Refused, with every reason, before anything changes: `stagedChangesPresent`, `changedSince` (a later commit changed the path; `binary` says whether it is a binary file), `workingTreeChanged`, `dirtyDocument`, and `historicalContentUnavailable` (P's content was never stored -- never reconstructed from disk or real Git). Its message defaults to `Revert "<summary>"` and a line naming T; a custom one is validated like any commit message.
+
+**Stash** (`stash.rs`) is one commit object (source `automatic`) under its own ref, `refs/yavin/stash/<id>` (ids sort by time) -- never on a branch's history. Its root is the working tree as it was, unsaved documents included; `metaobj index` is the index's root; its parent is the base (HEAD when made); `meta` records the branch, whether untracked files are in it, and how many staged, unstaged and untracked paths it holds. Staged (base -> index) and unstaged (index -> working tree) changes are kept apart and come back apart: HEAD=A, index=B, working=C stashes and returns to exactly index B and working C. Untracked files are included only with `includeUntracked` (default off: they stay where they are); excluded paths, `.git` and proposed documents never are. Nothing is copied: the stash is made of the same objects as everything else.
+
+- **Push**: plan from a Full snapshot (`NothingToStash` when there is nothing), then the stash's commit and ref, durably -- and only then is the workspace cleaned: the stashed paths back to HEAD's content (documents on them lose their unsaved text, which is in the stash), verified, and the index set to HEAD. If the stash cannot be made durable, nothing in the workspace changes; if the executor's last checks refuse the cleaning (nothing was touched), the stash is removed again; if cleaning fails partway, the stash stays -- it holds everything that was there.
+- **Apply** puts the staged changes back into the index and the working tree's on disk. Refused, with every conflict before anything changes, when something is staged, when HEAD no longer has at a stashed path what the stash was made on (`stashBaseChanged` -- that would need a merge), when a stashed path holds local changes or an unsaved document, or when an untracked file it brings back is in the way (`untrackedFileCollision`). The stash is never modified.
+- **Pop** is apply, and the stash's ref is removed in the same atomic step that sets the index -- after the disk was verified. A pop that fails, or crashes, leaves the stash.
+- **List** is newest first, from the refs and the listed stashes' commits only (never the workspace), with the total. **Drop** removes the ref; objects stay for LG-09's GC.
+
+Branch switching never stashes on its own: the workflow is explicit -- stash, switch, work, switch back, pop.
+
+**Large files**: files over the storage limit are in a stash, a reset or a revert as they are everywhere -- hash and size only. A hard reset, a stash cleaning or an apply that would need their content refuses (`historicalContentUnavailable`, or `currentContentNotStored` when a large file would be replaced); a revert that would need it refuses the same way.
+
+**Performance** (release, 10,000 files, `cargo test -p ide-localgit --release --test lg05_scale -- --ignored --nocapture --test-threads=1`): soft reset 12.7 ms, mixed reset 12.3 ms (targets 50 and 100 ms); revert of a 10-path commit 596 ms and a 10-path stash plan 671 ms, both including the Full snapshot they need; recording a stash 38.5 ms; listing 100 of 10,000 stashes 40.5 ms (target 50 ms); dropping one of 10,000 60.6 ms -- over the 50 ms target because every ref update rewrites the whole `refs.json` (the known limitation above, deferred to LG-09).
+
+**Not yet** (later phases): merge, cherry-pick and rebase (LG-06); AI checkpoints and Undo AI Run (LG-07); any UI (LG-08); comparison with real Git, GC, compaction, compression, a recovery UI, and ref storage whose updates do not rewrite every ref (LG-09).
 
 **Invariants**
 
@@ -1111,6 +1142,9 @@ Listing 10,001 branches: 8.1 ms; creating one more among them: 54 ms (`refs.json
 17. A commit is exactly the index. Staging never changes the working tree or a document; unstaging never changes either.
 18. Creating a branch or a tag never moves HEAD; a tag never moves; nothing is replaced or deleted by force.
 19. A switch never overwrites or deletes staged work, local changes or unsaved documents; HEAD moves only after the disk is verified.
+20. Reset never silently destroys user changes: a hard reset refuses unless explicitly `allowDestructive`, and never touches untracked files the target does not have.
+21. Revert creates new Local Git history; it never rewrites or moves existing commits.
+22. Stash is not a real Git stash and never touches `.git`. A stash is durable before the workspace is cleaned, and a pop removes it only with its successful application.
 
 ## Explorer provider platform
 

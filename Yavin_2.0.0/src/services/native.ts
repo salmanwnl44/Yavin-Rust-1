@@ -7,6 +7,11 @@ import type { TrustState } from "./trust";
 import type {
   LocalGitBlobInfo,
   LocalGitBranch,
+  LocalGitResetResult,
+  LocalGitRevertResult,
+  LocalGitStashApplyResult,
+  LocalGitStashList,
+  LocalGitStashPushResult,
   LocalGitCheckpointEntry,
   LocalGitIndexInfo,
   LocalGitPath,
@@ -240,6 +245,52 @@ interface Commands {
     result: LocalGitTag;
   };
   localgit_delete_tag: { args: { handle: string; name: string }; result: void };
+  localgit_reset: {
+    args: {
+      handle: string;
+      jobId: string;
+      target: { kind: "commit" | "branch" | "tag"; value: string };
+      mode: "soft" | "mixed" | "hard";
+      policy: "refuseIfDirty" | "allowDestructive";
+      dryRun: boolean;
+      overlays: LocalGitOverlayRef[];
+    };
+    result: LocalGitResetResult;
+  };
+  localgit_revert: {
+    args: {
+      handle: string;
+      jobId: string;
+      commit: string;
+      message: string | null;
+      overlays: LocalGitOverlayRef[];
+      by: LocalGitSignature;
+    };
+    result: LocalGitRevertResult;
+  };
+  localgit_stash_push: {
+    args: {
+      handle: string;
+      jobId: string;
+      message: string | null;
+      includeUntracked: boolean;
+      overlays: LocalGitOverlayRef[];
+      by: LocalGitSignature;
+    };
+    result: LocalGitStashPushResult;
+  };
+  localgit_stash_list: { args: { handle: string; limit: number }; result: LocalGitStashList };
+  localgit_stash_apply: {
+    args: {
+      handle: string;
+      jobId: string;
+      id: string;
+      pop: boolean;
+      overlays: LocalGitOverlayRef[];
+    };
+    result: LocalGitStashApplyResult;
+  };
+  localgit_stash_drop: { args: { handle: string; id: string }; result: void };
   localgit_switch: {
     args: {
       handle: string;

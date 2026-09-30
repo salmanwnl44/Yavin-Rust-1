@@ -2,6 +2,14 @@ import type { OverlaySource, ReconcileOutcome } from "./overlays.ts";
 import type {
   LocalGitBlobInfo,
   LocalGitBranch,
+  LocalGitResetMode,
+  LocalGitResetPolicy,
+  LocalGitResetResult,
+  LocalGitRevertResult,
+  LocalGitStashApplyResult,
+  LocalGitStashList,
+  LocalGitStashPushResult,
+  LocalGitTarget,
   LocalGitCheckpointEntry,
   LocalGitIndexInfo,
   LocalGitPath,
@@ -82,6 +90,13 @@ function signature(identity: LocalGitIdentity, now = new Date()): LocalGitSignat
     tzOffsetMin: -now.getTimezoneOffset(),
   };
 }
+
+/** An operation that may have changed the disk, with how the documents ended up after it. */
+export type WithDocuments<T> = T & {
+  documents: ReconcileOutcome | null;
+  /** Everything held: the disk verified, the refs moved, the documents reconciled. */
+  succeeded: boolean;
+};
 
 /** A switch, with how the window's documents ended up after it. */
 export type LocalGitSwitchOutcome = LocalGitSwitchResult & {
@@ -231,6 +246,35 @@ export function createLocalGitService(
   const nextJob = () => `job-${++jobs}`;
 
   const normalPath = (p: LocalGitPath) => ({ folderId: p.folderId ?? null, path: p.path });
+
+  /** Reconciles the documents after an operation that may have changed the disk. */
+  async function afterDisk<T extends { status: string; applied: number }>(
+    result: T,
+    plan: LocalGitRestorePlan | null,
+  ): Promise<WithDocuments<T>> {
+    const changed =
+      plan !== null &&
+      plan.operations.length + plan.documents.length > 0 &&
+      (result.status === "completed" ||
+        result.status === "failed" ||
+        result.status === "verificationFailed");
+    if (!changed || !source?.reconcileRestore)
+      return { ...result, documents: null, succeeded: result.status === "completed" };
+    const documents = await reconcile(plan!, result.status === "failed" ? result.applied : null);
+    return { ...result, documents, succeeded: result.status === "completed" && documents.ok };
+  }
+
+  async function applyStash(id: string, pop: boolean, jobId: string) {
+    const result = await withOverlays(false, (refs) =>
+      call<LocalGitStashApplyResult>("localgit_stash_apply", {
+        jobId,
+        id,
+        pop,
+        overlays: refs.overlays,
+      }),
+    );
+    return afterDisk(result, result.plan.restore);
+  }
 
   /**
    * After the disk changed (a restore or a switch): the window's documents brought in line
@@ -489,6 +533,75 @@ export function createLocalGitService(
     createTag: (name: string, target: string | null = null) =>
       call<LocalGitTag>("localgit_create_tag", { name, target }),
     deleteTag: (name: string) => call<void>("localgit_delete_tag", { name }),
+
+    /**
+     * Resets HEAD (its branch, or HEAD itself when detached) to a target. `soft` keeps the
+     * index and the working tree; `mixed` keeps the working tree; `hard` changes all three and
+     * is refused, with every conflict, when local work would be lost -- unless `policy` is
+     * `allowDestructive`, the caller's explicit choice.
+     */
+    async reset(
+      target: LocalGitTarget,
+      mode: LocalGitResetMode,
+      options: { policy?: LocalGitResetPolicy; dryRun?: boolean } = {},
+      jobId: string = nextJob(),
+    ): Promise<WithDocuments<LocalGitResetResult>> {
+      const [kind, value] =
+        "commit" in target
+          ? (["commit", target.commit] as const)
+          : "branch" in target
+            ? (["branch", target.branch] as const)
+            : (["tag", target.tag] as const);
+      const result = await withOverlays(false, (refs) =>
+        call<LocalGitResetResult>("localgit_reset", {
+          jobId,
+          target: { kind, value },
+          mode,
+          policy: options.policy ?? "refuseIfDirty",
+          dryRun: options.dryRun ?? false,
+          overlays: refs.overlays,
+        }),
+      );
+      return afterDisk(result, result.plan?.restore ?? null);
+    },
+
+    /** A new commit that undoes `commit`, made from the index; the working tree is untouched. */
+    revert(commit: string, options: { message?: string } = {}, jobId: string = nextJob()) {
+      return withOverlays(false, (refs) =>
+        call<LocalGitRevertResult>("localgit_revert", {
+          jobId,
+          commit,
+          message: options.message ?? null,
+          overlays: refs.overlays,
+          by: signature(identity()),
+        }),
+      );
+    },
+
+    /**
+     * Puts the workspace's changes aside -- staged and unstaged apart, unsaved documents
+     * included, untracked files only when asked -- and cleans the workspace back to HEAD.
+     */
+    async stashPush(
+      options: { message?: string; includeUntracked?: boolean } = {},
+      jobId: string = nextJob(),
+    ): Promise<WithDocuments<LocalGitStashPushResult>> {
+      const result = await withOverlays(false, (refs) =>
+        call<LocalGitStashPushResult>("localgit_stash_push", {
+          jobId,
+          message: options.message ?? null,
+          includeUntracked: options.includeUntracked ?? false,
+          overlays: refs.overlays,
+          by: signature(identity()),
+        }),
+      );
+      return afterDisk(result, result.plan.restore);
+    },
+    stashList: (limit = 100) => call<LocalGitStashList>("localgit_stash_list", { limit }),
+    stashApply: (id: string, jobId: string = nextJob()) => applyStash(id, false, jobId),
+    /** Applies the stash and removes it -- only once everything succeeded. */
+    stashPop: (id: string, jobId: string = nextJob()) => applyStash(id, true, jobId),
+    stashDrop: (id: string) => call<void>("localgit_stash_drop", { id }),
 
     /**
      * Switches to a branch, or detaches HEAD at a commit. Refused, untouched, when staged

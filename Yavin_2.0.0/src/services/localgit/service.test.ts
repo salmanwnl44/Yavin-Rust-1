@@ -745,3 +745,142 @@ test("a switch answering after its workspace was left is dropped before any docu
   assert.ok((await late) instanceof LocalGitClosedError);
   assert.equal(reconciles, 0);
 });
+
+// --- Reset, revert and stash (LG-05) -------------------------------------------------------
+
+function diskResult(status: string, operations: unknown[]) {
+  return restoreResult(status, operations).plan;
+}
+
+test("reset sends a typed target and policy; only a hard reset that changed the disk reconciles", async () => {
+  const reconciled: unknown[] = [];
+  const native = scriptedNative({
+    localgit_reset: (args) =>
+      args.mode === "hard"
+        ? {
+            status: "completed",
+            mode: "hard",
+            done: null,
+            plan: { restore: diskResult("completed", [op("writeFile", "a.txt")]) },
+            conflicts: [],
+            operation: 1,
+            applied: 1,
+            error: null,
+            verification: null,
+            head: { kind: "detached", commit: "c1" },
+          }
+        : { status: "completed", mode: args.mode, done: {}, plan: null, applied: 0, head: {} },
+  });
+  const service = createLocalGitService(["/work"], { isActive: () => true }, native.invoke);
+  service.attachOverlays({
+    ...overlaySource([]).source,
+    reconcileRestore: async (paths) => {
+      reconciled.push(paths);
+      return { ok: true, reloaded: [], closed: [], failed: [] };
+    },
+  });
+  const soft = await service.reset({ commit: "c1" }, "soft");
+  await service.reset({ tag: "v1" }, "mixed");
+  const hard = await service.reset({ branch: "main" }, "hard", { policy: "allowDestructive" });
+  assert.equal(soft.succeeded, true);
+  assert.equal(soft.documents, null);
+  assert.equal(hard.succeeded, true);
+  assert.equal(reconciled.length, 1, "only the hard reset changed the disk");
+  const calls = native.calls.filter((c) => c.command === "localgit_reset").map((c) => c.args);
+  assert.deepEqual(calls[0].target, { kind: "commit", value: "c1" });
+  assert.equal(calls[0].policy, "refuseIfDirty", "never destructive by default");
+  assert.deepEqual(calls[1].target, { kind: "tag", value: "v1" });
+  assert.deepEqual(calls[2].target, { kind: "branch", value: "main" });
+  assert.equal(calls[2].policy, "allowDestructive");
+});
+
+test("revert and the stash commands send what they are given", async () => {
+  const native = scriptedNative({
+    localgit_revert: () => ({
+      commit: null,
+      reverted: "c2",
+      conflicts: [],
+      paths: [],
+      revision: null,
+    }),
+    localgit_stash_push: () => ({
+      status: "completed",
+      stash: { id: "s1" },
+      plan: { restore: diskResult("completed", [op("writeFile", "a.txt")]) },
+      conflicts: [],
+      operation: 1,
+      applied: 1,
+      error: null,
+      verification: null,
+    }),
+    localgit_stash_apply: (args) => ({
+      status: args.pop ? "failed" : "completed",
+      plan: { restore: diskResult("completed", [op("writeFile", "a.txt")]) },
+      conflicts: [],
+      operation: 2,
+      applied: 0,
+      error: args.pop ? "disk full" : null,
+      verification: null,
+      kept: true,
+    }),
+  });
+  const service = createLocalGitService(["/work"], { isActive: () => true }, native.invoke);
+  service.attachOverlays({
+    ...overlaySource([{ key: "a.ts", version: 1, text: "A" }]).source,
+    reconcileRestore: async () => ({ ok: true, reloaded: [], closed: [], failed: [] }),
+  });
+  await service.revert("c2", { message: "Undo it" });
+  const pushed = await service.stashPush({ includeUntracked: true });
+  await service.stashList(5);
+  const applied = await service.stashApply("s1");
+  const popped = await service.stashPop("s1");
+  await service.stashDrop("s1");
+  assert.equal(pushed.succeeded, true);
+  assert.equal(applied.succeeded, true);
+  assert.equal(popped.succeeded, false, "a failed pop is never a success");
+  assert.equal(popped.kept, true);
+  const args = (command: string) =>
+    native.calls.filter((c) => c.command === command).map((c) => c.args);
+  assert.equal(args("localgit_revert")[0].message, "Undo it");
+  assert.deepEqual(args("localgit_revert")[0].overlays, [{ key: "a.ts", version: 1 }]);
+  assert.equal(args("localgit_stash_push")[0].includeUntracked, true);
+  assert.deepEqual(args("localgit_stash_list"), [{ handle: "lg-7", limit: 5 }]);
+  assert.deepEqual(
+    args("localgit_stash_apply").map((a) => a.pop),
+    [false, true],
+  );
+  assert.deepEqual(args("localgit_stash_drop"), [{ handle: "lg-7", id: "s1" }]);
+});
+
+test("a stash answering after its workspace was left is dropped before any document", async () => {
+  const native = fakeNative();
+  let active = true;
+  let reconciles = 0;
+  const service = createLocalGitService(["/a"], { isActive: () => active }, native.invoke);
+  service.attachOverlays({
+    ...overlaySource([]).source,
+    reconcileRestore: async () => {
+      reconciles++;
+      return { ok: true, reloaded: [], closed: [], failed: [] };
+    },
+  });
+  await native.answer("localgit_open");
+  const late = service.stashPush().then(
+    () => "delivered",
+    (error: unknown) => error,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  active = false;
+  await native.answer("localgit_stash_push", {
+    status: "completed",
+    stash: { id: "s1" },
+    plan: { restore: diskResult("completed", [op("writeFile", "a.txt")]) },
+    conflicts: [],
+    operation: 1,
+    applied: 1,
+    error: null,
+    verification: null,
+  });
+  assert.ok((await late) instanceof LocalGitClosedError);
+  assert.equal(reconciles, 0);
+});

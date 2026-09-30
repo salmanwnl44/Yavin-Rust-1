@@ -38,9 +38,10 @@ use localgit::{
     localgit_create_tag, localgit_delete_branch, localgit_delete_tag, localgit_diff_commits,
     localgit_diff_workspace, localgit_get_tag, localgit_head, localgit_history, localgit_index,
     localgit_info, localgit_open, localgit_put_overlays, localgit_read_blob, localgit_read_commit,
-    localgit_read_tree, localgit_reflog, localgit_refs, localgit_restore, localgit_snapshot,
-    localgit_stage, localgit_stage_hunks, localgit_status, localgit_switch, localgit_tags,
-    localgit_tree, localgit_unstage, localgit_verify, LocalGit,
+    localgit_read_tree, localgit_reflog, localgit_refs, localgit_reset, localgit_restore,
+    localgit_revert, localgit_snapshot, localgit_stage, localgit_stage_hunks, localgit_stash_apply,
+    localgit_stash_drop, localgit_stash_list, localgit_stash_push, localgit_status,
+    localgit_switch, localgit_tags, localgit_tree, localgit_unstage, localgit_verify, LocalGit,
 };
 use lsp::{lsp_send, lsp_servers, lsp_start, lsp_stop, lsp_stop_all, LspSessions};
 use ports::{list_listening_ports, stop_listening_process};
@@ -699,6 +700,12 @@ pub fn run() {
             localgit_create_tag,
             localgit_delete_tag,
             localgit_switch,
+            localgit_reset,
+            localgit_revert,
+            localgit_stash_push,
+            localgit_stash_list,
+            localgit_stash_apply,
+            localgit_stash_drop,
             recovery_report,
             recovery_dismiss,
             get_default_workspace,

@@ -424,6 +424,8 @@ export type LocalGitRestoreConflict =
   | { kind: "wouldRemoveUntracked"; folderId: string; path: string; entry: string }
   | { kind: "stagedChangeConflict"; folderId: string; path: string }
   | { kind: "unstagedChangeWouldBeOverwritten"; folderId: string; path: string }
+  | { kind: "stashBaseChanged"; folderId: string; path: string }
+  | { kind: "untrackedFileCollision"; folderId: string; path: string }
   | { kind: "diskChangedSinceSnapshot"; folderId: string; path: string }
   | { kind: "linkNotRestorable"; folderId: string; path: string; reason: string };
 
@@ -520,4 +522,114 @@ export interface LocalGitSwitchResult {
   error: string | null;
   verification: LocalGitRestoreResult["verification"];
   head: LocalGitHeadState;
+}
+
+// --- Reset, revert and stash (LG-05) ------------------------------------------------------
+
+/** What a reset or a switch aims at: a commit, a branch's commit, or a tag's. */
+export type LocalGitTarget = { commit: string } | { branch: string } | { tag: string };
+
+export type LocalGitResetMode = "soft" | "mixed" | "hard";
+/** Whether a hard reset may destroy local work: never unless explicitly `allowDestructive`. */
+export type LocalGitResetPolicy = "refuseIfDirty" | "allowDestructive";
+
+export interface LocalGitResetDone {
+  mode: LocalGitResetMode;
+  from: string | null;
+  to: string;
+  revision: number;
+  head: LocalGitHeadState;
+}
+
+export interface LocalGitResetResult {
+  status: "planned" | "refused" | "completed" | "failed" | "verificationFailed";
+  mode: LocalGitResetMode;
+  done: LocalGitResetDone | null;
+  plan: {
+    from: string | null;
+    to: string;
+    policy: LocalGitResetPolicy;
+    revision: number;
+    restore: LocalGitRestorePlan;
+  } | null;
+  conflicts: LocalGitRestoreConflict[];
+  operation: number | null;
+  applied: number;
+  error: string | null;
+  verification: LocalGitRestoreResult["verification"];
+  head: LocalGitHeadState;
+}
+
+export type LocalGitRevertConflict =
+  | { kind: "stagedChangesPresent"; folderId: string; path: string }
+  | { kind: "changedSince"; folderId: string; path: string; binary: boolean }
+  | { kind: "workingTreeChanged"; folderId: string; path: string }
+  | { kind: "dirtyDocument"; folderId: string; path: string }
+  | { kind: "historicalContentUnavailable"; folderId: string; path: string };
+
+export interface LocalGitRevertResult {
+  /** The new commit; null when refused. */
+  commit: LocalGitCommitInfo | null;
+  reverted: string;
+  conflicts: LocalGitRevertConflict[];
+  paths: string[];
+  revision: number | null;
+}
+
+export interface LocalGitStash {
+  id: string;
+  refName: string;
+  commit: string;
+  shortId: string;
+  message: string;
+  timeMs: number;
+  base: string | null;
+  branch: string | null;
+  hasUntracked: boolean;
+  counts: { staged: number; unstaged: number; untracked: number };
+}
+
+export interface LocalGitStashList {
+  items: LocalGitStash[];
+  total: number;
+}
+
+export interface LocalGitStashPushResult {
+  status: "refused" | "completed" | "failed" | "verificationFailed";
+  /** The stash, once durable (kept even when cleaning the workspace failed). */
+  stash: LocalGitStash | null;
+  plan: {
+    base: string | null;
+    branch: string | null;
+    indexRoot: string;
+    workRoot: string;
+    includeUntracked: boolean;
+    counts: LocalGitStash["counts"];
+    message: string;
+    revision: number;
+    restore: LocalGitRestorePlan;
+  };
+  conflicts: LocalGitRestoreConflict[];
+  operation: number | null;
+  applied: number;
+  error: string | null;
+  verification: LocalGitRestoreResult["verification"];
+}
+
+export interface LocalGitStashApplyResult {
+  status: "refused" | "completed" | "failed" | "verificationFailed";
+  plan: {
+    stash: LocalGitStash;
+    pop: boolean;
+    revision: number;
+    indexFolders: Record<string, string>;
+    restore: LocalGitRestorePlan;
+  };
+  conflicts: LocalGitRestoreConflict[];
+  operation: number | null;
+  applied: number;
+  error: string | null;
+  verification: LocalGitRestoreResult["verification"];
+  /** Whether the stash is still there (always, unless a pop completed). */
+  kept: boolean;
 }

@@ -68,6 +68,8 @@ pub enum LgError {
     NotFound(String),
     /// A commit was asked for, and the index holds nothing HEAD does not.
     NothingToCommit,
+    /// A stash was asked for, and there is nothing to put aside.
+    NothingToStash,
     /// The branch HEAD is on cannot be deleted.
     CurrentBranch(String),
     /// Deleting the branch would leave commits no other ref reaches.
@@ -105,6 +107,7 @@ impl LgError {
             LgError::AlreadyExists(_) => "AlreadyExists",
             LgError::NotFound(_) => "NotFound",
             LgError::NothingToCommit => "NothingToCommit",
+            LgError::NothingToStash => "NothingToStash",
             LgError::CurrentBranch(_) => "CurrentBranch",
             LgError::NotMerged(_) => "NotMerged",
             LgError::Unborn => "Unborn",
@@ -174,6 +177,7 @@ impl fmt::Display for LgError {
             LgError::AlreadyExists(name) => write!(f, "{name} already exists"),
             LgError::NotFound(name) => write!(f, "{name} does not exist"),
             LgError::NothingToCommit => write!(f, "Nothing is staged: there is nothing to commit"),
+            LgError::NothingToStash => write!(f, "There are no changes to stash"),
             LgError::CurrentBranch(name) => {
                 write!(f, "{name} is the current branch and cannot be deleted")
             }

@@ -138,6 +138,14 @@ pub enum RestoreConflict {
     /// target's (a local change, or an untracked file in the way).
     #[serde(rename_all = "camelCase")]
     UnstagedChangeWouldBeOverwritten { folder_id: String, path: String },
+    /// A stash (LG-05): HEAD no longer has, at a path the stash changes, what the stash was
+    /// made on; applying it would mean merging, which stash does not do.
+    #[serde(rename_all = "camelCase")]
+    StashBaseChanged { folder_id: String, path: String },
+    /// A stash (LG-05): an untracked file the stash would bring back is already there, with
+    /// other content.
+    #[serde(rename_all = "camelCase")]
+    UntrackedFileCollision { folder_id: String, path: String },
     /// Found by the executor: a folder the restore would remove holds something snapshots
     /// leave out (`.git`, `node_modules`, `.env`, ...). It is never removed.
     #[serde(rename_all = "camelCase")]
