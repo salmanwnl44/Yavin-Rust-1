@@ -82,6 +82,22 @@ pub enum LgError {
     StaleSelection(String),
     /// Partial staging cannot be represented safely for this file (binary, not text).
     PartialStagingUnsupported(String),
+    /// A merge or cherry-pick is in progress (LG-06): HEAD and the index change only through
+    /// its resolve, continue and abort until it ends.
+    OperationInProgress(String),
+    /// Continue, abort or resolve was asked for, and no merge or cherry-pick is in progress.
+    NoOperation,
+    /// Continue was asked for while conflicts are unresolved (how many).
+    UnresolvedConflicts(usize),
+    /// The two histories have no commit in common.
+    UnrelatedHistories,
+    /// Cherry-picking a commit with several parents (which parent's change is meant?).
+    CherryPickMerge(String),
+    /// A resolution's content still holds conflict markers.
+    ConflictMarkers(String),
+    /// Marking a path resolved as it is on disk, while a document on it has unsaved changes
+    /// (which would be left out).
+    UnsavedDocument(String),
     Io(String),
 }
 
@@ -114,6 +130,13 @@ impl LgError {
             LgError::ContentUnavailableForStaging(_) => "ContentUnavailableForStaging",
             LgError::StaleSelection(_) => "StaleSelection",
             LgError::PartialStagingUnsupported(_) => "PartialStagingUnsupported",
+            LgError::OperationInProgress(_) => "OperationInProgress",
+            LgError::NoOperation => "NoOperation",
+            LgError::UnresolvedConflicts(_) => "UnresolvedConflicts",
+            LgError::UnrelatedHistories => "UnrelatedHistories",
+            LgError::CherryPickMerge(_) => "CherryPickMerge",
+            LgError::ConflictMarkers(_) => "ConflictMarkers",
+            LgError::UnsavedDocument(_) => "UnsavedDocument",
             LgError::Io(_) => "Io",
         }
     }
@@ -197,6 +220,29 @@ impl fmt::Display for LgError {
             LgError::PartialStagingUnsupported(path) => {
                 write!(f, "{path} cannot be staged in parts (it is not text)")
             }
+            LgError::OperationInProgress(kind) => write!(
+                f,
+                "A {kind} is in progress: resolve its conflicts and continue it, or abort it, first"
+            ),
+            LgError::NoOperation => write!(f, "No merge or cherry-pick is in progress"),
+            LgError::UnresolvedConflicts(n) => {
+                write!(f, "{n} conflict(s) are not resolved yet")
+            }
+            LgError::UnrelatedHistories => {
+                write!(f, "The two histories have no commit in common; they were not merged")
+            }
+            LgError::CherryPickMerge(id) => write!(
+                f,
+                "{id} is a merge commit (several parents); it cannot be cherry-picked"
+            ),
+            LgError::ConflictMarkers(path) => write!(
+                f,
+                "{path} still holds conflict markers; edit them out before resolving it"
+            ),
+            LgError::UnsavedDocument(path) => write!(
+                f,
+                "{path} has unsaved changes: save it, or resolve it with the document's text"
+            ),
             LgError::Io(detail) => write!(f, "{detail}"),
         }
     }

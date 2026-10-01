@@ -2433,6 +2433,534 @@ pub fn localgit_stash_drop(
     stash::drop_stash(&mut repo, &id).map_err(fail)
 }
 
+// --- Merge and cherry-pick (LG-06) -------------------------------------------------------------
+
+use ide_localgit::merge::{
+    self, OperationPlan, OperationRequest, Outcome, ResolveChoice, ResolvePlan,
+};
+use ide_localgit::operation::{self as operation_state, OperationState, Phase};
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationResult {
+    /// `planned` (a dry run), `refused`, `completed`, `failed` (the disk change stopped partway;
+    /// the operation stays in progress), `verificationFailed`.
+    status: &'static str,
+    /// What the step came to: `upToDate`, `fastForward`, `merged`, `conflicted`, `resolved`,
+    /// `continued`, `aborted`.
+    outcome: Option<&'static str>,
+    /// A merge's or cherry-pick's plan.
+    plan: Option<OperationPlan>,
+    /// A resolution's plan.
+    resolve: Option<ResolvePlan>,
+    /// The disk change carried out (or planned), for the window's documents.
+    restore: Option<RestorePlan>,
+    conflicts: Vec<RestoreConflict>,
+    operation: Option<u64>,
+    applied: usize,
+    error: Option<String>,
+    verification: Option<Verification>,
+    /// The commit made, when the operation completed.
+    commit: Option<history::CommitInfo>,
+    /// The merge or cherry-pick still in progress afterwards (none: none is).
+    state: Option<OperationState>,
+    head: HeadState,
+}
+
+impl OperationResult {
+    fn new(store: &Store) -> Result<OperationResult, String> {
+        let repo = store.repo.lock().map_err(|e| e.to_string())?;
+        Ok(OperationResult {
+            status: "completed",
+            outcome: None,
+            plan: None,
+            resolve: None,
+            restore: None,
+            conflicts: Vec::new(),
+            operation: None,
+            applied: 0,
+            error: None,
+            verification: None,
+            commit: None,
+            state: operation_state::current(&repo)
+                .map_err(fail)?
+                .map(|(_, state)| state),
+            head: branches::resolve_head(&repo),
+        })
+    }
+
+    /// The disk change's outcome.
+    fn carried(&mut self, carried: Carried) {
+        self.status = carried.status;
+        self.operation = carried.operation;
+        self.applied = carried.applied;
+        self.error = carried.error;
+        self.verification = carried.verification;
+        if !carried.conflicts.is_empty() {
+            self.conflicts = carried.conflicts;
+        }
+    }
+
+    /// HEAD and the operation's state as they are now.
+    fn settle(&mut self, store: &Store) -> Result<(), String> {
+        let repo = store.repo.lock().map_err(|e| e.to_string())?;
+        self.head = branches::resolve_head(&repo);
+        self.state = operation_state::current(&repo)
+            .map_err(fail)?
+            .map(|(_, state)| state);
+        Ok(())
+    }
+
+    /// A step that completed or recorded conflicts (`merge::finish_apply`'s answer).
+    fn finished(&mut self, finished: Result<merge::Finished, LgError>, completed: &'static str) {
+        match finished {
+            Ok(done) => {
+                self.outcome = Some(if done.commit.is_some() {
+                    completed
+                } else {
+                    "conflicted"
+                });
+                self.commit = done.commit;
+            }
+            Err(error) => {
+                self.status = "failed";
+                self.error = Some(fail(error));
+            }
+        }
+    }
+}
+
+fn outcome_name(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::UpToDate => "upToDate",
+        Outcome::FastForward => "fastForward",
+        Outcome::Merged => "merged",
+        Outcome::Conflicted => "conflicted",
+    }
+}
+
+fn policy_arg(policy: &str) -> Result<ResetPolicy, String> {
+    match policy {
+        "refuseIfDirty" => Ok(ResetPolicy::RefuseIfDirty),
+        "allowDestructive" => Ok(ResetPolicy::AllowDestructive),
+        other => Err(format!("InvalidFormat: unknown policy {other:?}")),
+    }
+}
+
+/// A merge or a cherry-pick: planned from a Full snapshot (refused, with every reason, before
+/// anything changes), recorded, the disk changed as one recorded file operation and verified,
+/// and then either completed (HEAD and the index move, in one step) or stopped with conflicts.
+#[allow(clippy::too_many_arguments)]
+fn run_operation(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    watch: State<'_, crate::Watch>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    request: OperationRequest,
+    dry_run: bool,
+    overlays: Vec<OverlayRef>,
+    by: Signature,
+) -> Result<OperationResult, String> {
+    let (store, snapshot_request) = prepare(&local_git, &handle, "full", true, &overlays, &[])?;
+    let _only = if dry_run {
+        None
+    } else {
+        Some(exclusive(&store)?)
+    };
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let control = Control {
+        cancel: &cancel,
+        progress: &progress,
+    };
+    let by = commit_request(String::new(), by);
+    let plan =
+        match store
+            .engine
+            .plan_operation(&store.repo, &snapshot_request, &control, &request, &by)
+        {
+            Ok((_, plan)) => plan,
+            Err(error) => return local_git.finish_job(&handle, &job_id, Err(error)),
+        };
+    let mut result = OperationResult::new(&store)?;
+    result.outcome = Some(outcome_name(plan.outcome));
+    result.restore = plan.restore.clone();
+    result.conflicts = plan
+        .restore
+        .as_ref()
+        .map(|r| r.conflicts.clone())
+        .unwrap_or_default();
+    let up_to_date = plan.outcome == Outcome::UpToDate;
+    result.plan = Some(plan);
+    if up_to_date {
+        return local_git.finish_job(&handle, &job_id, Ok(result));
+    }
+    if !result.conflicts.is_empty() {
+        result.status = "refused";
+        return local_git.finish_job(&handle, &job_id, Ok(result));
+    }
+    if dry_run {
+        result.status = "planned";
+        return local_git.finish_job(&handle, &job_id, Ok(result));
+    }
+    before_changing(&local_git, &workspace, &handle, &cancel)?;
+    let result = carry_operation(&watch, &store, result, &progress)?;
+    local_git.finish_changed(&handle, &job_id, Ok(result))
+}
+
+/// A planned merge or cherry-pick with nothing in its way: recorded first (so a crash from here
+/// on leaves an explicit operation to continue or abort), the disk changed and verified, and
+/// then completed -- or stopped with its conflicts. If the executor's last checks refuse
+/// (nothing was touched), the record is withdrawn; if the disk change stops partway, it stays.
+fn carry_operation(
+    watch: &crate::Watch,
+    store: &Store,
+    mut result: OperationResult,
+    progress: &(dyn Fn(&Progress) + Sync),
+) -> Result<OperationResult, String> {
+    let plan = result.plan.clone().expect("an operation has a plan");
+    {
+        let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+        merge::begin(&mut repo, &plan).map_err(fail)?;
+    }
+    let restore = plan
+        .restore
+        .as_ref()
+        .expect("a plan that changes something");
+    let carried = carry_out(watch, store, restore, progress);
+    result.carried(carried);
+    {
+        let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+        match result.status {
+            "completed" => {
+                let completed = outcome_name(plan.outcome);
+                result.finished(merge::finish_apply(&mut repo), completed);
+            }
+            "refused" => {
+                merge::withdraw(&mut repo).map_err(fail)?;
+            }
+            _ => {}
+        }
+    }
+    result.settle(store)?;
+    Ok(result)
+}
+
+/// Merges a commit, branch or tag into HEAD (fast-forward when it can, a merge commit when
+/// conflict-free, stopped with conflicts otherwise).
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_merge(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    watch: State<'_, crate::Watch>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    target: TargetArg,
+    message: Option<String>,
+    dry_run: bool,
+    overlays: Vec<OverlayRef>,
+    by: Signature,
+) -> Result<OperationResult, String> {
+    let request = OperationRequest::Merge {
+        target: reset_target(target)?,
+        message,
+    };
+    run_operation(
+        app, workspace, watch, local_git, handle, job_id, request, dry_run, overlays, by,
+    )
+}
+
+/// Applies one commit's change to HEAD as a new commit (stopped with conflicts when it does
+/// not apply cleanly). The picked commit is never changed.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_cherry_pick(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    watch: State<'_, crate::Watch>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    commit: String,
+    dry_run: bool,
+    overlays: Vec<OverlayRef>,
+    by: Signature,
+) -> Result<OperationResult, String> {
+    let request = OperationRequest::CherryPick {
+        commit: parse_id(&commit)?,
+    };
+    run_operation(
+        app, workspace, watch, local_git, handle, job_id, request, dry_run, overlays, by,
+    )
+}
+
+/// The merge or cherry-pick in progress, with its conflicts (none: none is).
+#[tauri::command(async)]
+pub fn localgit_operation(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+) -> Result<Option<OperationState>, String> {
+    local_git.with(&handle, |repo| {
+        Ok(operation_state::current(repo)?.map(|(_, state)| state))
+    })
+}
+
+/// Resolves one conflict: `takeOurs`, `takeTheirs`, `delete` (these set the file on disk too
+/// -- refused, untouched, over the user's edits or unsaved text unless `policy` is
+/// `allowDestructive`), `manual` (the document's text, unsaved changes included) or
+/// `markResolved` (the file as it is on disk). Never completes the operation.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_resolve(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    watch: State<'_, crate::Watch>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    folder_id: Option<String>,
+    path: String,
+    resolution: String,
+    policy: String,
+    overlays: Vec<OverlayRef>,
+) -> Result<OperationResult, String> {
+    let choice = match resolution.as_str() {
+        "takeOurs" => ResolveChoice::TakeOurs,
+        "takeTheirs" => ResolveChoice::TakeTheirs,
+        "delete" => ResolveChoice::Delete,
+        "manual" => ResolveChoice::Manual,
+        "markResolved" => ResolveChoice::MarkResolved,
+        other => return Err(format!("InvalidFormat: unknown resolution {other:?}")),
+    };
+    let policy = policy_arg(&policy)?;
+    let folder = folder_id
+        .map(|f| FolderId::new(&f))
+        .transpose()
+        .map_err(fail)?;
+    let (store, snapshot_request) = prepare(&local_git, &handle, "full", true, &overlays, &[])?;
+    let _only = exclusive(&store)?;
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let control = Control {
+        cancel: &cancel,
+        progress: &progress,
+    };
+    let plan = match store.engine.plan_resolve(
+        &store.repo,
+        &snapshot_request,
+        &control,
+        folder,
+        &path,
+        choice,
+        policy,
+    ) {
+        Ok((_, plan)) => plan,
+        Err(error) => return local_git.finish_job(&handle, &job_id, Err(error)),
+    };
+    let mut result = OperationResult::new(&store)?;
+    result.restore = plan.restore.clone();
+    result.conflicts = plan
+        .restore
+        .as_ref()
+        .map(|r| r.conflicts.clone())
+        .unwrap_or_default();
+    result.resolve = Some(plan);
+    if !result.conflicts.is_empty() {
+        result.status = "refused";
+        return local_git.finish_job(&handle, &job_id, Ok(result));
+    }
+    before_changing(&local_git, &workspace, &handle, &cancel)?;
+    let result = carry_resolution(&watch, &store, result, &progress)?;
+    local_git.finish_changed(&handle, &job_id, Ok(result))
+}
+
+/// A resolution with nothing in its way: what it writes is recorded first, the disk changed and
+/// verified (when it writes anything), and then the index and the conflict move together.
+fn carry_resolution(
+    watch: &crate::Watch,
+    store: &Store,
+    mut result: OperationResult,
+    progress: &(dyn Fn(&Progress) + Sync),
+) -> Result<OperationResult, String> {
+    let plan = result.resolve.clone().expect("a resolution has a plan");
+    {
+        let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+        merge::record_resolve(&mut repo, &plan).map_err(fail)?;
+    }
+    if let Some(restore) = &plan.restore {
+        let carried = carry_out(watch, store, restore, progress);
+        result.carried(carried);
+    }
+    if result.status == "completed" {
+        let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+        match merge::finish_resolve(&mut repo, &plan) {
+            Ok(_) => result.outcome = Some("resolved"),
+            Err(error) => {
+                result.status = "failed";
+                result.error = Some(fail(error));
+            }
+        }
+    }
+    result.settle(store)?;
+    Ok(result)
+}
+
+/// Continues the operation in progress: after conflicts, once every one is resolved, the commit
+/// (a merge commit, or the cherry-pick's) is made from the index and HEAD moves; after a stop
+/// while the disk was changing, the disk is taken the rest of the way first.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_continue(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    watch: State<'_, crate::Watch>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    message: Option<String>,
+    overlays: Vec<OverlayRef>,
+    by: Signature,
+) -> Result<OperationResult, String> {
+    let (store, snapshot_request) = prepare(&local_git, &handle, "full", true, &overlays, &[])?;
+    let _only = exclusive(&store)?;
+    let mut result = OperationResult::new(&store)?;
+    let state = result
+        .state
+        .clone()
+        .ok_or_else(|| fail(LgError::NoOperation))?;
+    if state.phase == Phase::Conflicts {
+        let created = {
+            let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+            merge::finish_continue(&mut repo, message, &commit_request(String::new(), by))
+                .map_err(fail)?
+        };
+        result.commit = Some(created.commit);
+        result.outcome = Some("continued");
+        result.settle(&store)?;
+        return Ok(result);
+    }
+    // Stopped while the disk was changing: the rest of the way, then finished as it would have.
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let control = Control {
+        cancel: &cancel,
+        progress: &progress,
+    };
+    let restore = match store
+        .engine
+        .plan_resume(&store.repo, &snapshot_request, &control)
+    {
+        Ok((_, restore)) => restore,
+        Err(error) => return local_git.finish_job(&handle, &job_id, Err(error)),
+    };
+    result.conflicts = restore.conflicts.clone();
+    result.restore = Some(restore.clone());
+    if !result.conflicts.is_empty() {
+        result.status = "refused";
+        return local_git.finish_job(&handle, &job_id, Ok(result));
+    }
+    before_changing(&local_git, &workspace, &handle, &cancel)?;
+    let result = carry_resume(&watch, &store, result, &restore, &state, &progress)?;
+    local_git.finish_changed(&handle, &job_id, Ok(result))
+}
+
+/// The rest of an interrupted operation's disk change, verified, then finished as it would
+/// have been (completed, or stopped with its conflicts).
+fn carry_resume(
+    watch: &crate::Watch,
+    store: &Store,
+    mut result: OperationResult,
+    restore: &RestorePlan,
+    state: &OperationState,
+    progress: &(dyn Fn(&Progress) + Sync),
+) -> Result<OperationResult, String> {
+    let carried = carry_out(watch, store, restore, progress);
+    result.carried(carried);
+    if result.status == "completed" {
+        let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+        let completed = if state.fast_forward {
+            "fastForward"
+        } else {
+            "merged"
+        };
+        result.finished(merge::finish_apply(&mut repo), completed);
+    }
+    result.settle(store)?;
+    Ok(result)
+}
+
+/// Aborts the operation in progress: every path it changed on disk goes back to what it held
+/// before (refused, untouched, over edits made since or unsaved text, unless `policy` is
+/// `allowDestructive`), verified, and then the index goes back and the state goes. HEAD never
+/// moved; nothing is committed.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_abort(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    watch: State<'_, crate::Watch>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    policy: String,
+    overlays: Vec<OverlayRef>,
+) -> Result<OperationResult, String> {
+    let policy = policy_arg(&policy)?;
+    let (store, snapshot_request) = prepare(&local_git, &handle, "full", true, &overlays, &[])?;
+    let _only = exclusive(&store)?;
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let control = Control {
+        cancel: &cancel,
+        progress: &progress,
+    };
+    let restore = match store
+        .engine
+        .plan_abort(&store.repo, &snapshot_request, &control, policy)
+    {
+        Ok((_, restore)) => restore,
+        Err(error) => return local_git.finish_job(&handle, &job_id, Err(error)),
+    };
+    let mut result = OperationResult::new(&store)?;
+    result.conflicts = restore.conflicts.clone();
+    result.restore = Some(restore.clone());
+    if !result.conflicts.is_empty() {
+        result.status = "refused";
+        return local_git.finish_job(&handle, &job_id, Ok(result));
+    }
+    before_changing(&local_git, &workspace, &handle, &cancel)?;
+    let result = carry_abort(&watch, &store, result, &restore, &progress)?;
+    local_git.finish_changed(&handle, &job_id, Ok(result))
+}
+
+/// An abort with nothing in its way: the disk back and verified, then the refs.
+fn carry_abort(
+    watch: &crate::Watch,
+    store: &Store,
+    mut result: OperationResult,
+    restore: &RestorePlan,
+    progress: &(dyn Fn(&Progress) + Sync),
+) -> Result<OperationResult, String> {
+    let carried = carry_out(watch, store, restore, progress);
+    result.carried(carried);
+    if result.status == "completed" {
+        let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+        match merge::finish_abort(&mut repo) {
+            Ok(_) => result.outcome = Some("aborted"),
+            Err(error) => {
+                result.status = "failed";
+                result.error = Some(fail(error));
+            }
+        }
+    }
+    result.settle(store)?;
+    Ok(result)
+}
+
 #[cfg(test)]
 mod lg05_push_tests {
     use super::*;
@@ -2657,6 +3185,206 @@ mod lg05_push_tests {
             .filter(|f| f.file_name().to_string_lossy().starts_with("op-"))
             .count();
         assert_eq!(records, 0);
+        drop(watch);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod lg06_isolation_tests {
+    use super::*;
+    use ide_localgit::branches::create_branch;
+    use ide_localgit::history::commit_index;
+    use ide_localgit::index::stage_all;
+    use ide_workspace::file_tree::WorkspaceManager;
+    use ide_workspace::recovery::IntentLog;
+
+    fn put(path: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn listing(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(at) = stack.pop() {
+            for entry in std::fs::read_dir(&at).unwrap().flatten() {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push((rel, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn by() -> CommitRequest {
+        CommitRequest {
+            message: "c".into(),
+            author: Author {
+                name: "T".into(),
+                id: "t".into(),
+            },
+            time_ms: 0,
+            tz_offset_min: 0,
+        }
+    }
+
+    fn quiet(cancel: &AtomicBool) -> Control<'_> {
+        Control {
+            cancel,
+            progress: &|_| {},
+        }
+    }
+
+    /// A workspace's store, as `localgit_open` keeps it.
+    fn store(dir: &std::path::Path, project: &std::path::Path) -> (Store, WorkspaceSpec) {
+        let spec = WorkspaceSpec::from_paths(&[project]).unwrap();
+        let repo = Repository::open(&dir.join("base"), &spec, OpenOptions::default()).unwrap();
+        let record = repo.meta().folders[0].clone();
+        let engine = SnapshotEngine::new(
+            vec![FolderRoot {
+                folder_id: FolderId::new(&record.folder_id).unwrap(),
+                path: project.to_path_buf(),
+                resource_id: record.resource_id,
+            }],
+            repo.meta().max_blob_bytes,
+        );
+        (
+            Store {
+                repo: Arc::new(Mutex::new(repo)),
+                engine: Arc::new(engine),
+                mutating: Arc::new(Mutex::new(())),
+            },
+            spec,
+        )
+    }
+
+    /// A new handle on `store`, as a new generation of its workspace gets.
+    fn open(local_git: &LocalGit, store: &Store, spec: &WorkspaceSpec) -> String {
+        let handle = new_handle();
+        let mut inner = local_git.inner.lock().unwrap();
+        inner.stores.insert(spec.key(), store.clone());
+        inner.handles.insert(
+            handle.clone(),
+            Handle {
+                key: spec.key(),
+                workspace_id: spec.workspace_id.clone(),
+                overlays: HashMap::new(),
+                untitled: HashMap::new(),
+                jobs: HashMap::new(),
+                status_job: None,
+            },
+        );
+        handle
+    }
+
+    fn window(project: &std::path::Path) -> Workspace {
+        Workspace(Mutex::new(Some(WorkspaceManager::new(project).unwrap())))
+    }
+
+    /// A → B while A's merge is planned: A's late step is refused before anything changes, B
+    /// is never touched; back in A (a new generation, a new handle), A's own merge runs --
+    /// and A's old handle stays refused.
+    #[test]
+    fn a_merge_planned_in_a_never_runs_once_b_is_open_and_a_again_is_a_new_generation() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("yavin-localgit-lg06-iso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (a_project, b_project) = (dir.join("a"), dir.join("b"));
+        put(&a_project.join("f.txt"), "one");
+        put(&b_project.join("f.txt"), "b's own");
+        let (a_store, a_spec) = store(&dir.join("a-store"), &a_project);
+        let (_b_store, b_spec) = store(&dir.join("b-store"), &b_project);
+        let cancel = AtomicBool::new(false);
+        // A: main at one, feature at two -- a fast-forward that changes f.txt.
+        let commit = |text: &str| {
+            put(&a_project.join("f.txt"), text);
+            stage_all(
+                &a_store.engine,
+                &a_store.repo,
+                &SnapshotRequest::default(),
+                &quiet(&cancel),
+            )
+            .unwrap();
+            commit_index(&mut a_store.repo.lock().unwrap(), &by())
+                .unwrap()
+                .commit
+                .id
+                .0
+        };
+        let one = commit("one");
+        commit("two");
+        create_branch(&mut a_store.repo.lock().unwrap(), "feature", None).unwrap();
+        reset::reset_mixed(&mut a_store.repo.lock().unwrap(), &ResetTarget::Commit(one)).unwrap();
+        put(&a_project.join("f.txt"), "one");
+        let local_git = LocalGit::default();
+        let old = open(&local_git, &a_store, &a_spec);
+        let request = OperationRequest::Merge {
+            target: ResetTarget::Branch("feature".into()),
+            message: None,
+        };
+        let (_, plan) = a_store
+            .engine
+            .plan_operation(
+                &a_store.repo,
+                &SnapshotRequest::default(),
+                &quiet(&cancel),
+                &request,
+                &by(),
+            )
+            .unwrap();
+        assert_eq!(plan.outcome, Outcome::FastForward);
+        let (a_before, b_before) = (listing(&a_project), listing(&b_project));
+
+        // The window moved to B: the last check before changing anything refuses A's step.
+        let b_open = window(&b_project);
+        let refused = before_changing(&local_git, &b_open, &old, &cancel);
+        assert!(refused.unwrap_err().starts_with("NotInWorkspace:"));
+        // B's handle revoked A's: the late answer is refused too.
+        local_git.revoke_except(Some(&b_spec.workspace_id));
+        assert!(before_changing(&local_git, &b_open, &old, &cancel)
+            .unwrap_err()
+            .starts_with("HandleClosed:"));
+        assert!(local_git
+            .finish_changed(&old, "job", Ok(()))
+            .unwrap_err()
+            .starts_with("HandleClosed:"));
+        assert_eq!(listing(&a_project), a_before, "A untouched");
+        assert_eq!(listing(&b_project), b_before, "B untouched");
+        assert!(operation_state::current(&a_store.repo.lock().unwrap())
+            .unwrap()
+            .is_none());
+
+        // A → B → A: the new generation's handle works; the old one never again.
+        let a_open = window(&a_project);
+        let new = open(&local_git, &a_store, &a_spec);
+        assert_ne!(new, old);
+        before_changing(&local_git, &a_open, &new, &cancel).unwrap();
+        assert!(before_changing(&local_git, &a_open, &old, &cancel).is_err());
+        let watch = crate::Watch::default();
+        watch
+            .intents
+            .set(Ok(IntentLog::open(&dir.join("recovery")).unwrap()))
+            .unwrap();
+        let mut result = OperationResult::new(&a_store).unwrap();
+        result.restore = plan.restore.clone();
+        result.plan = Some(plan);
+        let result = carry_operation(&watch, &a_store, result, &|_| {}).unwrap();
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.outcome, Some("fastForward"));
+        assert_eq!(std::fs::read(a_project.join("f.txt")).unwrap(), b"two");
+        assert_eq!(listing(&b_project), b_before, "B still untouched");
         drop(watch);
         let _ = std::fs::remove_dir_all(&dir);
     }

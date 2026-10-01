@@ -371,6 +371,7 @@ pub fn stage(
     control: &Control,
     paths: &[StagePath],
 ) -> Result<StageResult> {
+    crate::operation::ensure_idle(&repo.lock().unwrap())?;
     let snapshot = staging_snapshot(engine, repo, request, control)?;
     let source = effective_folders(&snapshot)?;
     let mut repo = repo.lock().unwrap();
@@ -426,6 +427,7 @@ pub fn unstage(
     folders: &[FolderRoot],
     paths: &[StagePath],
 ) -> Result<StageResult> {
+    crate::operation::ensure_idle(repo)?;
     let source = head_folders(repo)?;
     let (changed, unchanged, unstored) =
         set_paths(repo, folders, &source, paths, "unstage", Default::default())?;
@@ -464,6 +466,7 @@ pub fn stage_hunks(
     hunks: &[usize],
     expected: (Option<ObjectId>, Option<ObjectId>),
 ) -> Result<StageResult> {
+    crate::operation::ensure_idle(&repo.lock().unwrap())?;
     let snapshot = staging_snapshot(engine, repo, request, control)?;
     let source = effective_folders(&snapshot)?;
     let mut repo = repo.lock().unwrap();

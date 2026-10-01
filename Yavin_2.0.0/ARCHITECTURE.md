@@ -1119,7 +1119,95 @@ Branch switching never stashes on its own: the workflow is explicit -- stash, sw
 
 **Performance** (release, 10,000 files, `cargo test -p ide-localgit --release --test lg05_scale -- --ignored --nocapture --test-threads=1`): soft reset 12.7 ms, mixed reset 12.3 ms (targets 50 and 100 ms); revert of a 10-path commit 596 ms and a 10-path stash plan 671 ms, both including the Full snapshot they need; recording a stash 38.5 ms; listing 100 of 10,000 stashes 40.5 ms (target 50 ms); dropping one of 10,000 60.6 ms -- over the 50 ms target because every ref update rewrites the whole `refs.json` (the known limitation above, deferred to LG-09).
 
-**Not yet** (later phases): merge, cherry-pick and rebase (LG-06); AI checkpoints and Undo AI Run (LG-07); any UI (LG-08); comparison with real Git, GC, compaction, compression, a recovery UI, and ref storage whose updates do not rewrite every ref (LG-09).
+**Not yet** (later phases): merge and cherry-pick (LG-06, below; rebase is not planned); AI checkpoints and Undo AI Run (LG-07); any UI (LG-08); comparison with real Git, GC, compaction, compression, a recovery UI, and ref storage whose updates do not rewrite every ref (LG-09).
+
+### Merge and cherry-pick (LG-06)
+
+**A merge never overwrites what it cannot account for, and never completes by itself. Conflicts are explicit, durable records -- never inferred from a file's content -- and are resolved only by an explicit choice.** Nothing here runs `git` or reads `.git`; a real-Git test fingerprints `.git`, the real index, HEAD, branches and `git status` across a conflicted merge, its resolution and continue, a cherry-pick and an abort. Rebase is not part of Local Git.
+
+**Merge** (`merge.rs`) of a target T (a commit, a branch's commit or a tag's) into HEAD H:
+
+| Case                                             | Result                                                                                                                                                     |
+| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| T is H or an ancestor of it                      | _up to date_: no disk, index, ref or reflog change at all                                                                                                  |
+| H is an ancestor of T, or there is no commit yet | _fast-forward_: the disk goes to T on the paths that differ, then HEAD (its branch, or HEAD itself when detached) and the index move to T; no merge commit |
+| otherwise                                        | a _three-way merge_ of BASE, OURS (H) and THEIRS (T): conflict-free, a merge commit with parents H then T; with conflicts, stopped for resolution          |
+| no common ancestor                               | refused (`UnrelatedHistories`)                                                                                                                             |
+
+The **merge base** is the best common ancestor: the common ancestors nearest to T that no other common ancestor reaches. With several (criss-cross histories) the one nearest to T is used and the plan says how many others there were (`otherBases`); there is no recursive merge of bases.
+
+**The tree merge** goes folder by folder, and down a tree only where both sides changed something -- equal subtrees are taken whole, so a merge costs what differs, not what exists. For each path: equal sides are taken; a side equal to BASE takes the other; otherwise both changed it:
+
+| Both sides                                                                          | Result                                                                                                                                                                                                                                                                                                                                                      |
+| ----------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| text files                                                                          | line-merged on LG-03's Myers diff (`merge3.rs`): changes that overlap or touch (no unchanged base line between) conflict, others combine; the same change on both sides is taken once. Conflicting: `modifyModify`, or `addAdd` with no base; the working file gets `<<<<<<< HEAD (<branch>)` / `=======` / `>>>>>>> <target>` markers in ours' line ending |
+| binary (a NUL in the first 8 KiB, or not UTF-8), not stored, missing, or over 8 MiB | a conflict with no markers (`binary`, or `unavailable`: `notStored`, `missing`, `tooLarge`); the working file keeps ours                                                                                                                                                                                                                                    |
+| ours deleted, theirs changed                                                        | `deleteModify`: the working tree gets theirs, to look at                                                                                                                                                                                                                                                                                                    |
+| ours changed, theirs deleted                                                        | `modifyDelete`: ours is kept                                                                                                                                                                                                                                                                                                                                |
+| a folder against a file or link                                                     | `directoryFile`: ours kept                                                                                                                                                                                                                                                                                                                                  |
+| a file against a link                                                               | `typeChange`: ours kept                                                                                                                                                                                                                                                                                                                                     |
+| both folders (or one deleted)                                                       | merged inside, path by path                                                                                                                                                                                                                                                                                                                                 |
+
+Executable bits merge three-way. An **exact rename** on one side (LG-02's rename pairing: the same content at a new path) with a change on the other side carries the change to the new path; other rename combinations are merged path by path (a file renamed to two different names on the two sides ends up under both -- nothing is lost, and it is not reported as a conflict).
+
+**Cherry-pick** of commit C is the same merge with BASE = C's parent (the empty state for a root commit), OURS = HEAD and THEIRS = C: C's change, applied to HEAD. Conflict-free, it makes a _new_ commit on HEAD -- never C itself -- with C's message plus `(cherry picked from Local Git commit <id>)`, C's author, the picker's time, and `meta cherry-pick <C>` and `committer`. C is never changed. A merge commit is refused (`CherryPickMerge`); a change already in HEAD is `NothingToCommit`. One commit at a time: there is no sequence of picks (`OperationRequest` is where one would be added).
+
+**Safety** is LG-04's switch's and LG-05's, checked from a Full, persisted snapshot with the unsaved documents, before anything changes -- every reason at once, as `RestoreConflict`s:
+
+- anything staged (`stagedChangeConflict`);
+- a path the merge changes on disk holding neither HEAD's entry nor the result: a local change (`unstagedChangeWouldBeOverwritten`) or an untracked file in the way (`untrackedFileCollision`);
+- a document with unsaved changes on such a path (`dirtyDocumentWouldBeOverwritten`/`Deleted`) -- never saved, never replaced;
+- two names in one folder of the result that differ only in letter case, on a case-insensitive disk (`caseOnlyRename`);
+- everything the restore planner refuses: content that was never stored (`historicalContentUnavailable`), unreadable paths, a large file that would be replaced, and, at the last moment, the executor's own checks (links on the way, a disk changed since the plan).
+
+Unrelated local work -- other changed files, untracked files, unsaved documents elsewhere -- is carried over untouched.
+
+**The operation's state** (`operation.rs`) is durable: an object (a commit with source `automatic`, on no branch) whose `metaobj state` blob is the `OperationState` as JSON (versioned; a newer version is refused, never guessed at), and whose other `metaobj`s name every commit and root it refers to, so they stay reachable. The ref `refs/yavin/operation` names it. It records the kind (merge or cherry-pick), the phase, the branch and commit HEAD was at, THEIRS and BASE, the index ref and disk root before, the index and working-tree roots of the result, the commit to finish with (when conflict-free), the message, every **touched** path (what it held before, and everything the operation wrote there since), and every **conflict**: path, kind, base/ours/theirs entries, markers/binary/unavailable, and its **resolution** -- `unresolved`, `takeOurs`, `takeTheirs`, `deleted`, `manual` or `resolved` -- with the entry it resolved to. Every change of the state moves that ref in the same compare-and-swap as what changes with it.
+
+```text
+plan (Full snapshot) --refused--> nothing changed
+  | begin: state recorded, phase applying            (ref step)
+  v
+disk changed: one Module 03 operation, Module 04 intent, verified
+  |-- executor refused before touching anything --> state withdrawn
+  |-- stopped partway / not verified --> state stays: applying (continue or abort)
+  v
+finish_apply (one ref step)
+  |-- conflict-free: HEAD (branch, or detached HEAD) + index + state removed  -> done
+  '-- conflicts: index = clean results + ours at conflicted paths, state phase conflicts
+        |
+   resolve (each: state records what it will write -> disk -> index + resolution, one step)
+        |
+   continue: all resolved, index holds every resolution, content present and free of
+             markers -> commit from the index; HEAD + index + state removed, one step
+   abort:    touched paths back to what they held -> verified -> index back + state
+             removed, one step; HEAD never moved
+```
+
+**The index** during conflicts is LG-04's one index: every clean result staged, and ours at each conflicted path until it is resolved. The state -- not the index, not the file -- says what is unresolved; writing or saving a file resolves nothing. While an operation is in progress, HEAD and the index change only through it: commits, staging and unstaging, switching, resets, reverts, stash push and apply, and another merge or cherry-pick are refused (`OperationInProgress`); checkpoints and file restores, which move neither, are not.
+
+**Resolving** (one conflict at a time; re-resolving is allowed until continue):
+
+- `takeOurs`, `takeTheirs`, `delete` set the index **and the file on disk** (through the restore machinery, recorded first). Refused, untouched, when the file holds something the operation did not write there -- the user's edits -- or a document on it has unsaved changes, unless `policy` is `allowDestructive` (the explicit choice; unsaved documents are then replaced through DocumentService).
+- `manual` stages the document's current text -- unsaved changes included, the disk untouched -- and `markResolved` the file as it is on disk (refused with `UnsavedDocument` while a document on it has unsaved changes, which would be left out). Both are refused while the content still holds conflict markers (`ConflictMarkers`) or is not stored.
+
+**Continue** requires the state, every conflict resolved (`UnresolvedConflicts`), HEAD still where the operation began, the index holding every resolution, and every resolution's content present. It makes the merge commit (parents HEAD then THEIRS; the default message `Merge branch '<name>'`, or the caller's) or the cherry-pick's commit from the index, and moves HEAD, clears the index ref and removes the state in one step: until that step, the state stays, and continue can be retried. Continue after a stop while the disk was changing (phase `applying`) first takes the disk the rest of the way -- each touched path must hold what it held before or what the operation wrote, never anything else -- and then finishes as it would have.
+
+**Abort** takes every touched path back to what it held before (each must hold that, or something the operation wrote; otherwise it is refused unless `allowDestructive`), verifies the disk, then sets the index back to what it was and removes the state in one step. It never creates a commit or moves HEAD, and never touches anything the operation did not.
+
+**Crashes.** A crash before the state is recorded changes nothing. After it -- before the disk changes, partway through (Module 04 settles the file operation as completed, not applied, or partial -- never replayed), or after the disk changed but before the refs moved -- the store reopens with the operation in phase `applying` and HEAD where it was: nothing completes by itself, and continue or abort settles it, each accepting any mix of before and after on the touched paths. The ref steps themselves are LG-01's: old or new, never half. A crash during an abort's disk change leaves the state; aborting again finishes it. Tested at every boundary for merge and cherry-pick, both continued and aborted.
+
+**Documents.** Merges read unsaved documents (they refuse over them) and never write them; the disk changes are reconciled afterwards through DocumentService's public API (`reconcileRestore`), as for restore, switch and reset -- conflict files written into open, clean documents reload them. A document is replaced only on the explicit `allowDestructive` of a resolve or an abort.
+
+**Workspaces and processes.** Each step holds the store's mutation lock (`Busy` for a second); a second Yavin process has the store read-only and cannot record, resolve, continue or abort (`ReadOnly`, before anything changes). A step checks, right before the disk changes, that its handle is still open and its workspace still the window's (`NotInWorkspace`, `HandleClosed`): a merge planned in workspace A is refused once B is open, never touches B, and A's old handle stays refused when A is opened again as a new generation.
+
+**API** (native commands, typed in `services/localgit/types.ts`, on the service for LG-08's UI): `localgit_merge` (target, message, dry run), `localgit_cherry_pick` (commit, dry run), `localgit_operation` (the state, with every conflict), `localgit_resolve` (path, resolution, policy), `localgit_continue` (message), `localgit_abort` (policy). Each answers an `OperationResult`: status (`planned`, `refused`, `completed`, `failed`, `verificationFailed`), outcome (`upToDate`, `fastForward`, `merged`, `conflicted`, `resolved`, `continued`, `aborted`), the plan (clean paths, conflicts, safety refusals), the disk change for the documents, the commit made, the state still in progress, and HEAD.
+
+**Performance**: (release, `cargo test -p ide-localgit --release --test lg06_scale -- --ignored --nocapture --test-threads=1`; every plan includes the Full snapshot it needs, and 10 paths change on each side) 10,000 files: fast-forward plan 541 ms; clean merge plan 495 ms, record and finish 69 ms; a 10-conflict merge plan 492 ms, record and finish 98 ms; abort plan 433 ms, finish 21 ms; one resolve (snapshot included) 590 ms; continue 65 ms; cherry-pick plan 484 ms, record and finish 64 ms; peak working set 28.5 MB. 100,000 files: fast-forward plan 1.14 s; clean merge plan 1.04 s, record and finish 50 ms; conflicted merge plan 1.08 s, record and finish 77 ms; abort plan 1.04 s, finish 12 ms; one resolve 1.18 s; continue 58 ms; cherry-pick plan 949 ms, record and finish 57 ms; peak working set 89.9 MB. The tree merge itself costs what differs; the snapshot dominates. Each resolve takes a Full snapshot of its own.
+
+**Known limitations**: one merge base when there are several (no recursive merge); rename detection is exact-content only, and rename/rename to two names is not reported as a conflict; no line merge for binary or non-UTF-8 text or files over 8 MiB (a conflict instead); no `ours`/`theirs` strategies or whitespace options; cherry-pick is one commit at a time and refuses merge commits; no rebase. `refs.json` is rewritten on every ref step (LG-01's layout; LG-09).
+
+**Not yet** (later phases): AI checkpoints and Undo AI Run (LG-07); any UI (LG-08); comparison with real Git, GC, compaction, compression, a recovery UI, and ref storage whose updates do not rewrite every ref (LG-09).
 
 **Invariants**
 
@@ -1145,6 +1233,9 @@ Branch switching never stashes on its own: the workflow is explicit -- stash, sw
 20. Reset never silently destroys user changes: a hard reset refuses unless explicitly `allowDestructive`, and never touches untracked files the target does not have.
 21. Revert creates new Local Git history; it never rewrites or moves existing commits.
 22. Stash is not a real Git stash and never touches `.git`. A stash is durable before the workspace is cleaned, and a pop removes it only with its successful application.
+23. A merge or cherry-pick never overwrites staged work, local changes, untracked files or unsaved documents, and never writes content Local Git does not have; it is refused before anything changes.
+24. A merge's or cherry-pick's state is durable and explicit: conflicts are resolved only by an explicit choice, and an interrupted operation is continued or aborted by the user -- never completed by itself. HEAD moves only when it completes.
+25. A cherry-pick makes a new commit and never changes the picked one; a merge never rewrites either parent.
 
 ## Explorer provider platform
 

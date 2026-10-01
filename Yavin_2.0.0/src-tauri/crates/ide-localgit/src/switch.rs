@@ -111,6 +111,7 @@ pub fn plan(
     snapshot: &Snapshot,
     target: &SwitchTarget,
 ) -> Result<SwitchPlan> {
+    crate::operation::ensure_idle(repo)?;
     let (branch, commit) = match target {
         SwitchTarget::Branch(name) => {
             let short = ShortName::new(name)?;

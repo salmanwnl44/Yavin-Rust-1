@@ -104,6 +104,7 @@ pub fn revert(
     message: Option<String>,
     request: &CommitRequest,
 ) -> Result<RevertResult> {
+    crate::operation::ensure_idle(repo)?;
     require_commit(repo, &target)?;
     let reverted = repo.read_commit(&target)?;
     let message = message.unwrap_or_else(|| default_message(target, &reverted));

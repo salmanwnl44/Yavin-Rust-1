@@ -7,6 +7,8 @@ import type { TrustState } from "./trust";
 import type {
   LocalGitBlobInfo,
   LocalGitBranch,
+  LocalGitOperationResult,
+  LocalGitOperationState,
   LocalGitResetResult,
   LocalGitRevertResult,
   LocalGitStashApplyResult,
@@ -291,6 +293,61 @@ interface Commands {
     result: LocalGitStashApplyResult;
   };
   localgit_stash_drop: { args: { handle: string; id: string }; result: void };
+  localgit_merge: {
+    args: {
+      handle: string;
+      jobId: string;
+      target: { kind: "commit" | "branch" | "tag"; value: string };
+      message: string | null;
+      dryRun: boolean;
+      overlays: LocalGitOverlayRef[];
+      by: LocalGitSignature;
+    };
+    result: LocalGitOperationResult;
+  };
+  localgit_cherry_pick: {
+    args: {
+      handle: string;
+      jobId: string;
+      commit: string;
+      dryRun: boolean;
+      overlays: LocalGitOverlayRef[];
+      by: LocalGitSignature;
+    };
+    result: LocalGitOperationResult;
+  };
+  localgit_operation: { args: { handle: string }; result: LocalGitOperationState | null };
+  localgit_resolve: {
+    args: {
+      handle: string;
+      jobId: string;
+      folderId: string | null;
+      path: string;
+      resolution: "takeOurs" | "takeTheirs" | "delete" | "manual" | "markResolved";
+      policy: "refuseIfDirty" | "allowDestructive";
+      overlays: LocalGitOverlayRef[];
+    };
+    result: LocalGitOperationResult;
+  };
+  localgit_continue: {
+    args: {
+      handle: string;
+      jobId: string;
+      message: string | null;
+      overlays: LocalGitOverlayRef[];
+      by: LocalGitSignature;
+    };
+    result: LocalGitOperationResult;
+  };
+  localgit_abort: {
+    args: {
+      handle: string;
+      jobId: string;
+      policy: "refuseIfDirty" | "allowDestructive";
+      overlays: LocalGitOverlayRef[];
+    };
+    result: LocalGitOperationResult;
+  };
   localgit_switch: {
     args: {
       handle: string;

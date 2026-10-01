@@ -129,6 +129,7 @@ pub fn reset_soft(
     folders: &[FolderRoot],
     target: &ResetTarget,
 ) -> Result<ResetDone> {
+    crate::operation::ensure_idle(repo)?;
     let to = resolve_target(repo, target)?;
     let from = repo.refs().head_commit();
     let index_name = RefName::new(INDEX_REF)?;
@@ -214,6 +215,7 @@ fn head_and_index(repo: &Repository, to: ObjectId) -> Result<(Vec<RefUpdate>, Op
 /// Mixed: HEAD moves and the index becomes the target's tree; the working tree is not touched
 /// (what differs from it is now unstaged).
 pub fn reset_mixed(repo: &mut Repository, target: &ResetTarget) -> Result<ResetDone> {
+    crate::operation::ensure_idle(repo)?;
     let to = resolve_target(repo, target)?;
     let from = repo.refs().head_commit();
     let (updates, head) = head_and_index(repo, to)?;
@@ -256,6 +258,7 @@ pub fn plan_hard(
     target: &ResetTarget,
     policy: ResetPolicy,
 ) -> Result<HardResetPlan> {
+    crate::operation::ensure_idle(repo)?;
     let to = resolve_target(repo, target)?;
     let from = repo.refs().head_commit();
     let revision = repo.refs().revision;

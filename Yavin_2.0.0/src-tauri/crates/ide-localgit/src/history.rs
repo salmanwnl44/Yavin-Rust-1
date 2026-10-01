@@ -258,6 +258,7 @@ pub fn commit_snapshot(
     snapshot: &Snapshot,
     request: &CommitRequest,
 ) -> Result<Created> {
+    crate::operation::ensure_idle(repo)?;
     if !snapshot.persisted {
         return Err(LgError::InvalidFormat(
             "a commit needs a persisted snapshot".into(),
@@ -282,6 +283,7 @@ pub fn commit_snapshot(
 /// -- on top of HEAD, and moves HEAD (and the index, which now equals it) to it. Refused with
 /// `NothingToCommit` when the index is HEAD's tree (or empty, before the first commit).
 pub fn commit_index(repo: &mut Repository, request: &CommitRequest) -> Result<Created> {
+    crate::operation::ensure_idle(repo)?;
     validate_message(&request.message)?;
     let index = crate::branches::index_state(repo)?;
     let head = repo.refs().head_commit();
@@ -332,6 +334,7 @@ pub fn commit_checkpoint(
     checkpoint: ObjectId,
     request: &CommitRequest,
 ) -> Result<Created> {
+    crate::operation::ensure_idle(repo)?;
     let from = repo.read_commit(&checkpoint)?;
     if !matches!(from.source, Source::Checkpoint | Source::Recovery) {
         return Err(LgError::InvalidFormat(format!(

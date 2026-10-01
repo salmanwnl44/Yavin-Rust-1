@@ -234,7 +234,7 @@ pub(crate) fn is_binary(bytes: &[u8]) -> bool {
 
 /// Lines of `bytes`, each with its line ending (so `a\n` and `a` differ, and so do `a\r\n`
 /// and `a\n`).
-fn lines(bytes: &[u8]) -> Vec<&[u8]> {
+pub(crate) fn lines(bytes: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut start = 0;
     for (at, byte) in bytes.iter().enumerate() {
@@ -250,7 +250,7 @@ fn lines(bytes: &[u8]) -> Vec<&[u8]> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Edit {
+pub(crate) enum Edit {
     Equal,
     Delete,
     Insert,
@@ -262,7 +262,7 @@ const MAX_EDIT_DISTANCE: usize = 4000;
 
 /// Myers' O(ND) shortest edit script between `a` and `b`, after trimming their common start
 /// and end. Beyond `MAX_EDIT_DISTANCE` the middle is reported as deleted then inserted.
-fn edit_script(a: &[&[u8]], b: &[&[u8]]) -> Vec<Edit> {
+pub(crate) fn edit_script(a: &[&[u8]], b: &[&[u8]]) -> Vec<Edit> {
     let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
     let suffix = a[prefix..]
         .iter()

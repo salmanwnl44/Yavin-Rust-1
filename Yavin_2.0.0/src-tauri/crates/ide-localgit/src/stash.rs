@@ -178,6 +178,7 @@ pub fn plan_push(
     message: Option<String>,
     include_untracked: bool,
 ) -> Result<StashPushPlan> {
+    crate::operation::ensure_idle(repo)?;
     let head = resolve_head(repo);
     let base = head.commit();
     let branch = match &head {
@@ -454,6 +455,7 @@ pub fn plan_apply(
     id: &str,
     pop: bool,
 ) -> Result<StashApplyPlan> {
+    crate::operation::ensure_idle(repo)?;
     let stash = get(repo, id)?;
     let commit = repo.read_commit(&stash.commit.0)?;
     let base = commit.parents.first().copied();

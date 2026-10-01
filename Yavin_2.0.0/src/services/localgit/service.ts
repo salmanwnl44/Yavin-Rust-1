@@ -2,6 +2,9 @@ import type { OverlaySource, ReconcileOutcome } from "./overlays.ts";
 import type {
   LocalGitBlobInfo,
   LocalGitBranch,
+  LocalGitOperationResult,
+  LocalGitOperationState,
+  LocalGitResolveChoice,
   LocalGitResetMode,
   LocalGitResetPolicy,
   LocalGitResetResult,
@@ -246,6 +249,13 @@ export function createLocalGitService(
   const nextJob = () => `job-${++jobs}`;
 
   const normalPath = (p: LocalGitPath) => ({ folderId: p.folderId ?? null, path: p.path });
+
+  const targetArg = (target: LocalGitTarget) =>
+    "commit" in target
+      ? { kind: "commit" as const, value: target.commit }
+      : "branch" in target
+        ? { kind: "branch" as const, value: target.branch }
+        : { kind: "tag" as const, value: target.tag };
 
   /** Reconciles the documents after an operation that may have changed the disk. */
   async function afterDisk<T extends { status: string; applied: number }>(
@@ -633,6 +643,109 @@ export function createLocalGitService(
         result.status === "failed" ? result.applied : null,
       );
       return { ...result, documents, succeeded: result.status === "completed" && documents.ok };
+    },
+
+    /**
+     * Merges a commit, branch or tag into HEAD: a fast-forward when it can be, a merge commit
+     * when conflict-free, and otherwise stopped with conflicts to resolve (`operation()`), then
+     * continue or abort. Refused, untouched, when staged work, local changes, untracked files or
+     * unsaved documents are in the way.
+     */
+    async merge(
+      target: LocalGitTarget,
+      options: { message?: string; dryRun?: boolean } = {},
+      jobId: string = nextJob(),
+    ): Promise<WithDocuments<LocalGitOperationResult>> {
+      const result = await withOverlays(false, (refs) =>
+        call<LocalGitOperationResult>("localgit_merge", {
+          jobId,
+          target: targetArg(target),
+          message: options.message ?? null,
+          dryRun: options.dryRun ?? false,
+          overlays: refs.overlays,
+          by: signature(identity()),
+        }),
+      );
+      return afterDisk(result, result.restore);
+    },
+
+    /** Applies one commit's change to HEAD as a new commit; the commit itself is untouched. */
+    async cherryPick(
+      commit: string,
+      options: { dryRun?: boolean } = {},
+      jobId: string = nextJob(),
+    ): Promise<WithDocuments<LocalGitOperationResult>> {
+      const result = await withOverlays(false, (refs) =>
+        call<LocalGitOperationResult>("localgit_cherry_pick", {
+          jobId,
+          commit,
+          dryRun: options.dryRun ?? false,
+          overlays: refs.overlays,
+          by: signature(identity()),
+        }),
+      );
+      return afterDisk(result, result.restore);
+    },
+
+    /** The merge or cherry-pick in progress, with its conflicts (null: none). */
+    operation: () => call<LocalGitOperationState | null>("localgit_operation"),
+
+    /**
+     * Resolves one conflict. `takeOurs`, `takeTheirs` and `delete` also set the file on disk --
+     * refused over edits or unsaved text unless `policy` is `allowDestructive`; `manual` takes
+     * the document's current text (unsaved changes included); `markResolved` the file as it is.
+     */
+    async resolve(
+      path: LocalGitPath,
+      choice: LocalGitResolveChoice,
+      options: { policy?: LocalGitResetPolicy } = {},
+      jobId: string = nextJob(),
+    ): Promise<WithDocuments<LocalGitOperationResult>> {
+      const result = await withOverlays(false, (refs) =>
+        call<LocalGitOperationResult>("localgit_resolve", {
+          jobId,
+          folderId: path.folderId ?? null,
+          path: path.path,
+          resolution: choice,
+          policy: options.policy ?? "refuseIfDirty",
+          overlays: refs.overlays,
+        }),
+      );
+      return afterDisk(result, result.restore);
+    },
+
+    /**
+     * Continues the operation in progress: once every conflict is resolved, its commit is made
+     * and HEAD moves; after a stop while the disk was changing, the disk is finished first.
+     */
+    async continueOperation(
+      options: { message?: string } = {},
+      jobId: string = nextJob(),
+    ): Promise<WithDocuments<LocalGitOperationResult>> {
+      const result = await withOverlays(false, (refs) =>
+        call<LocalGitOperationResult>("localgit_continue", {
+          jobId,
+          message: options.message ?? null,
+          overlays: refs.overlays,
+          by: signature(identity()),
+        }),
+      );
+      return afterDisk(result, result.restore);
+    },
+
+    /** Aborts the operation in progress: the disk and the index back as they were. */
+    async abortOperation(
+      options: { policy?: LocalGitResetPolicy } = {},
+      jobId: string = nextJob(),
+    ): Promise<WithDocuments<LocalGitOperationResult>> {
+      const result = await withOverlays(false, (refs) =>
+        call<LocalGitOperationResult>("localgit_abort", {
+          jobId,
+          policy: options.policy ?? "refuseIfDirty",
+          overlays: refs.overlays,
+        }),
+      );
+      return afterDisk(result, result.restore);
     },
 
     /** Stops a snapshot or status of this service (it rejects with code `Cancelled`). */

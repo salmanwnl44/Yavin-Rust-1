@@ -633,3 +633,124 @@ export interface LocalGitStashApplyResult {
   /** Whether the stash is still there (always, unless a pop completed). */
   kept: boolean;
 }
+
+// --- Merge and cherry-pick (LG-06) -------------------------------------------------------
+
+export type LocalGitOperationKind = "merge" | "cherryPick";
+
+export type LocalGitConflictKind =
+  | "addAdd"
+  | "modifyModify"
+  /** Ours deleted what theirs changed. */
+  | "deleteModify"
+  /** Ours changed what theirs deleted. */
+  | "modifyDelete"
+  | "typeChange"
+  | "directoryFile";
+
+export type LocalGitResolution =
+  "unresolved" | "resolved" | "deleted" | "takeOurs" | "takeTheirs" | "manual";
+
+/** How a conflict is resolved: take a side, delete, the document's text, or the file as is. */
+export type LocalGitResolveChoice =
+  "takeOurs" | "takeTheirs" | "delete" | "manual" | "markResolved";
+
+/** A tree entry, as the operation's state records it. */
+export interface LocalGitEntryState {
+  kind: "file" | "directory" | "link";
+  id: string;
+  executable: boolean;
+  /** False for a file over the storage limit: hashed, not stored. */
+  stored: boolean;
+  size: number | null;
+  link: "file" | "directory" | "junction" | null;
+}
+
+export interface LocalGitConflict {
+  folderId: string;
+  path: string;
+  kind: LocalGitConflictKind;
+  base: LocalGitEntryState | null;
+  ours: LocalGitEntryState | null;
+  theirs: LocalGitEntryState | null;
+  /** Text on both sides: the working file has conflict markers. */
+  markers: boolean;
+  binary: boolean;
+  unavailable: "notStored" | "missing" | "tooLarge" | null;
+  resolution: LocalGitResolution;
+  /** What the index holds once resolved (null: deleted). */
+  resolved: LocalGitEntryState | null;
+}
+
+/** The merge or cherry-pick in progress, as recorded durably. */
+export interface LocalGitOperationState {
+  version: number;
+  kind: LocalGitOperationKind;
+  /** `applying`: stopped while the disk changed -- continue or abort it. */
+  phase: "applying" | "conflicts";
+  branch: string | null;
+  head: string | null;
+  theirs: string;
+  base: string | null;
+  label: string;
+  fastForward: boolean;
+  indexBefore: string | null;
+  diskBefore: string;
+  resultIndex: string;
+  resultWork: string;
+  commit: string | null;
+  message: string;
+  touched: {
+    folderId: string;
+    path: string;
+    before: LocalGitEntryState | null;
+    written: (LocalGitEntryState | null)[];
+  }[];
+  conflicts: LocalGitConflict[];
+}
+
+export type LocalGitOperationOutcome =
+  "upToDate" | "fastForward" | "merged" | "conflicted" | "resolved" | "continued" | "aborted";
+
+export interface LocalGitOperationPlan {
+  kind: LocalGitOperationKind;
+  outcome: "upToDate" | "fastForward" | "merged" | "conflicted";
+  branch: string | null;
+  head: string | null;
+  theirs: string;
+  base: string | null;
+  otherBases: number;
+  label: string;
+  /** Paths the merge changes in the index, cleanly (`folderId:path`). */
+  merged: string[];
+  conflicts: LocalGitConflict[];
+  revision: number;
+  restore: LocalGitRestorePlan | null;
+}
+
+export interface LocalGitResolvePlan {
+  folderId: string;
+  path: string;
+  choice: LocalGitResolveChoice;
+  entry: LocalGitEntryState | null;
+  restore: LocalGitRestorePlan | null;
+}
+
+/** The answer of every merge, cherry-pick, resolve, continue and abort. */
+export interface LocalGitOperationResult {
+  status: "planned" | "refused" | "completed" | "failed" | "verificationFailed";
+  outcome: LocalGitOperationOutcome | null;
+  plan: LocalGitOperationPlan | null;
+  resolve: LocalGitResolvePlan | null;
+  /** The disk change carried out (or planned). */
+  restore: LocalGitRestorePlan | null;
+  conflicts: LocalGitRestoreConflict[];
+  operation: number | null;
+  applied: number;
+  error: string | null;
+  verification: LocalGitRestoreResult["verification"];
+  commit: LocalGitCommitInfo | null;
+  /** The merge or cherry-pick still in progress afterwards (null: none). */
+  state: LocalGitOperationState | null;
+  head: LocalGitHeadState;
+}

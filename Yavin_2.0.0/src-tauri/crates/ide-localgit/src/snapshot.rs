@@ -801,6 +801,88 @@ impl SnapshotEngine {
         )
     }
 
+    /// Plans a merge or a cherry-pick (see `merge.rs`).
+    pub fn plan_operation(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        operation: &crate::merge::OperationRequest,
+        by: &crate::history::CommitRequest,
+    ) -> Result<(Snapshot, crate::merge::OperationPlan)> {
+        self.with_full_snapshot(
+            repo,
+            request,
+            control,
+            true,
+            |lookup, repo, folders, snapshot| {
+                crate::merge::plan(lookup, repo, folders, snapshot, operation, by)
+            },
+        )
+    }
+
+    /// Plans resolving one conflict of the operation in progress (see `merge.rs`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_resolve(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        folder: Option<FolderId>,
+        path: &str,
+        choice: crate::merge::ResolveChoice,
+        policy: crate::reset::ResetPolicy,
+    ) -> Result<(Snapshot, crate::merge::ResolvePlan)> {
+        self.with_full_snapshot(
+            repo,
+            request,
+            control,
+            true,
+            |lookup, repo, folders, snapshot| {
+                crate::merge::plan_resolve(
+                    lookup, repo, folders, snapshot, folder, path, choice, policy,
+                )
+            },
+        )
+    }
+
+    /// Plans aborting the operation in progress: the disk back as it was (see `merge.rs`).
+    pub fn plan_abort(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        policy: crate::reset::ResetPolicy,
+    ) -> Result<(Snapshot, crate::restore::RestorePlan)> {
+        self.with_full_snapshot(
+            repo,
+            request,
+            control,
+            true,
+            |lookup, repo, folders, snapshot| {
+                crate::merge::plan_abort(lookup, repo, folders, snapshot, policy)
+            },
+        )
+    }
+
+    /// Plans taking an interrupted operation's disk change the rest of the way (see `merge.rs`).
+    pub fn plan_resume(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+    ) -> Result<(Snapshot, crate::restore::RestorePlan)> {
+        self.with_full_snapshot(
+            repo,
+            request,
+            control,
+            true,
+            |lookup, repo, folders, snapshot| {
+                crate::merge::plan_resume(lookup, repo, folders, snapshot)
+            },
+        )
+    }
+
     /// A copy of the trees the last snapshot produced (staging reads them without the store).
     pub(crate) fn memory_trees(&self) -> HashMap<ObjectId, Tree> {
         self.state.lock().unwrap().trees.clone()

@@ -884,3 +884,117 @@ test("a stash answering after its workspace was left is dropped before any docum
   assert.ok((await late) instanceof LocalGitClosedError);
   assert.equal(reconciles, 0);
 });
+
+// --- Merge and cherry-pick (LG-06) -------------------------------------------------------
+
+function operationResult(status: string, outcome: string | null, operations: unknown[]) {
+  return {
+    status,
+    outcome,
+    plan: null,
+    resolve: null,
+    restore: operations.length ? diskResult("completed", operations) : null,
+    conflicts: [],
+    operation: operations.length ? 1 : null,
+    applied: operations.length,
+    error: null,
+    verification: null,
+    commit: null,
+    state: null,
+    head: { kind: "branch", name: "main", refName: "refs/heads/main", commit: "c1" },
+  };
+}
+
+test("merge and cherry-pick send a typed target; a disk change, conflicted or not, reconciles", async () => {
+  const reconciled: unknown[] = [];
+  const native = scriptedNative({
+    localgit_merge: (args) =>
+      args.dryRun
+        ? operationResult("planned", "merged", [op("writeFile", "a.txt")])
+        : operationResult("completed", "conflicted", [op("writeFile", "a.txt")]),
+    localgit_cherry_pick: () => operationResult("refused", "merged", []),
+  });
+  const service = createLocalGitService(["/work"], { isActive: () => true }, native.invoke);
+  service.attachOverlays({
+    ...overlaySource([]).source,
+    reconcileRestore: async (paths) => {
+      reconciled.push(paths);
+      return { ok: true, reloaded: [], closed: [], failed: [] };
+    },
+  });
+  const merged = await service.merge({ branch: "feature" });
+  assert.equal(merged.outcome, "conflicted");
+  assert.equal(merged.succeeded, true, "the step completed; its conflicts wait");
+  assert.equal(reconciled.length, 1, "the conflict files written are reconciled");
+  const planned = await service.merge({ tag: "v1" }, { dryRun: true, message: "Merge v1" });
+  assert.equal(planned.documents, null);
+  const refused = await service.cherryPick("c9");
+  assert.equal(refused.succeeded, false);
+  assert.equal(reconciled.length, 1, "nothing planned or refused touches a document");
+  const calls = native.calls.filter((c) => c.command === "localgit_merge").map((c) => c.args);
+  assert.deepEqual(calls[0].target, { kind: "branch", value: "feature" });
+  assert.equal(calls[0].message, null);
+  assert.deepEqual(calls[1].target, { kind: "tag", value: "v1" });
+  assert.equal(calls[1].message, "Merge v1");
+  assert.equal(calls[1].dryRun, true);
+  const pick = native.calls.find((c) => c.command === "localgit_cherry_pick")!.args;
+  assert.equal(pick.commit, "c9");
+  assert.equal(pick.dryRun, false);
+});
+
+test("resolve, continue and abort are never destructive unless asked", async () => {
+  const native = scriptedNative({
+    localgit_operation: () => null,
+    localgit_resolve: () => operationResult("completed", "resolved", []),
+    localgit_continue: () => operationResult("completed", "continued", []),
+    localgit_abort: () => operationResult("refused", null, []),
+  });
+  const service = createLocalGitService(["/work"], { isActive: () => true }, native.invoke);
+  assert.equal(await service.operation(), null);
+  await service.resolve({ path: "a.txt" }, "takeTheirs");
+  await service.resolve({ folderId: "f-1", path: "b.txt" }, "delete", {
+    policy: "allowDestructive",
+  });
+  const continued = await service.continueOperation({ message: "Merged by hand" });
+  assert.equal(continued.outcome, "continued");
+  const aborted = await service.abortOperation();
+  assert.equal(aborted.succeeded, false);
+  const args = (command: string) =>
+    native.calls.filter((c) => c.command === command).map((c) => c.args);
+  const [first, second] = args("localgit_resolve");
+  assert.equal(first.folderId, null);
+  assert.equal(first.path, "a.txt");
+  assert.equal(first.resolution, "takeTheirs");
+  assert.equal(first.policy, "refuseIfDirty");
+  assert.equal(second.folderId, "f-1");
+  assert.equal(second.policy, "allowDestructive");
+  assert.equal(args("localgit_continue")[0].message, "Merged by hand");
+  assert.equal(args("localgit_abort")[0].policy, "refuseIfDirty");
+});
+
+test("a merge answering after its workspace was left is dropped before any document", async () => {
+  const native = fakeNative();
+  let active = true;
+  let reconciles = 0;
+  const service = createLocalGitService(["/a"], { isActive: () => active }, native.invoke);
+  service.attachOverlays({
+    ...overlaySource([]).source,
+    reconcileRestore: async () => {
+      reconciles++;
+      return { ok: true, reloaded: [], closed: [], failed: [] };
+    },
+  });
+  await native.answer("localgit_open");
+  const late = service.merge({ branch: "feature" }).then(
+    () => "delivered",
+    (error: unknown) => error,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  active = false;
+  await native.answer(
+    "localgit_merge",
+    operationResult("completed", "merged", [op("writeFile", "a.txt")]),
+  );
+  assert.ok((await late) instanceof LocalGitClosedError);
+  assert.equal(reconciles, 0);
+});
