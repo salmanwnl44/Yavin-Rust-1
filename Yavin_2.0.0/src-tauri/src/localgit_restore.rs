@@ -562,3 +562,7 @@ mod lg05_tests;
 #[cfg(test)]
 #[path = "localgit_lg06_tests.rs"]
 mod lg06_tests;
+
+#[cfg(test)]
+#[path = "localgit_lg07_tests.rs"]
+mod lg07_tests;

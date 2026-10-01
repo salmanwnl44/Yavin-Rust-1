@@ -11,6 +11,7 @@
 //! `exclude`, `status`). Commits made by people, branches and everything that builds on them
 //! come in later phases on top of these APIs.
 
+pub mod ai;
 pub mod branches;
 pub mod diff;
 pub mod error;

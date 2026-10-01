@@ -754,3 +754,108 @@ export interface LocalGitOperationResult {
   state: LocalGitOperationState | null;
   head: LocalGitHeadState;
 }
+
+// --- AI runs (LG-07) ------------------------------------------------------------------------
+
+/** What Local Git has recorded about an AI run; the run itself is the AI layer's. */
+export type LocalGitAiRunStatus =
+  | "checkpointed"
+  | "running"
+  | "changesDetected"
+  | "validated"
+  | "committed"
+  | "cancelled"
+  | "failed"
+  | "undone";
+
+export interface LocalGitAiChange {
+  folderId: string;
+  path: string;
+  /** At the checkpoint (null: absent). */
+  before: LocalGitEntryState | null;
+  /** After the AI's change (null: deleted). */
+  after: LocalGitEntryState | null;
+}
+
+export interface LocalGitAiRun {
+  version: number;
+  agentRunId: string;
+  taskId: string | null;
+  changeSetId: string | null;
+  changeSetRevision: string | null;
+  workspace: string;
+  /** The checkpoint commit. */
+  checkpoint: string;
+  head: string | null;
+  branch: string | null;
+  index: string | null;
+  reason: string;
+  /** Only as the AI layer gave it; never inferred. */
+  model: string | null;
+  startedMs: number;
+  finishedMs: number | null;
+  status: LocalGitAiRunStatus;
+  validation: { passed: boolean; reference: string | null } | null;
+  note: string | null;
+  changes: LocalGitAiChange[];
+  /** Changed since the checkpoint, not by the AI (`folderId:path`). */
+  unattributed: string[];
+  /** The AI commit. */
+  commit: string | null;
+  undo: { folderId: string; path: string; entry: LocalGitEntryState | null }[] | null;
+  undoneMs: number | null;
+  /** Checkpointed or running, and not this process's: it stopped without saying how it ended. */
+  interrupted: boolean;
+  undoAvailable: boolean;
+}
+
+export type LocalGitAiRefusal =
+  | { kind: "headMoved"; expected: string | null; found: string | null }
+  | { kind: "staleChangeSet"; expected: string; found: string }
+  | { kind: "operationInProgress" }
+  | { kind: "nothingToCommit" }
+  | { kind: "nothingToUndo" }
+  | { kind: "humanChangedAiPath"; folderId: string; path: string }
+  | { kind: "preexistingHumanChange"; folderId: string; path: string }
+  | { kind: "stagedOnAiPath"; folderId: string; path: string }
+  | { kind: "undoConflict"; folderId: string; path: string }
+  | { kind: "dirtyDocument"; folderId: string; path: string }
+  | { kind: "historyMovedOn"; commit: string };
+
+export interface LocalGitAiCommitResult {
+  /** Every reason the commit was not made (empty: it was). */
+  refusals: LocalGitAiRefusal[];
+  commit: LocalGitCommitInfo | null;
+  record: Omit<LocalGitAiRun, "interrupted" | "undoAvailable">;
+  revision: number | null;
+}
+
+export interface LocalGitAiUndoResult {
+  status: "planned" | "refused" | "completed" | "failed" | "verificationFailed";
+  plan: {
+    agentRunId: string;
+    refusals: LocalGitAiRefusal[];
+    /** Paths whose later human edits a three-way inverse keeps (`folderId:path`). */
+    merged: string[];
+    restore: LocalGitRestorePlan;
+    movesHead: boolean;
+  };
+  refusals: LocalGitAiRefusal[];
+  conflicts: LocalGitRestoreConflict[];
+  operation: number | null;
+  applied: number;
+  error: string | null;
+  verification: LocalGitRestoreResult["verification"];
+  run: LocalGitAiRun | null;
+  head: LocalGitHeadState;
+}
+
+/** A path the AI changed, as the AI layer reports it. */
+export interface LocalGitAiPath {
+  folderId?: string | null;
+  path: string;
+  /** The blob the AI wrote, when known: a workspace holding anything else is refused. */
+  expected?: string | null;
+  /** The AI deleted the path. */
+  deleted?: boolean;
+}

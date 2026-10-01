@@ -98,6 +98,12 @@ pub enum LgError {
     /// Marking a path resolved as it is on disk, while a document on it has unsaved changes
     /// (which would be left out).
     UnsavedDocument(String),
+    /// An AI run is not in a state that allows what was asked (LG-07).
+    AiRunState(String),
+    /// An AI run already belongs to another ChangeSet.
+    ChangeSetMismatch(String),
+    /// What the AI changed cannot be told apart from what others changed.
+    AttributionAmbiguous(String),
     Io(String),
 }
 
@@ -137,6 +143,9 @@ impl LgError {
             LgError::CherryPickMerge(_) => "CherryPickMerge",
             LgError::ConflictMarkers(_) => "ConflictMarkers",
             LgError::UnsavedDocument(_) => "UnsavedDocument",
+            LgError::AiRunState(_) => "AiRunState",
+            LgError::ChangeSetMismatch(_) => "ChangeSetMismatch",
+            LgError::AttributionAmbiguous(_) => "AttributionAmbiguous",
             LgError::Io(_) => "Io",
         }
     }
@@ -242,6 +251,12 @@ impl fmt::Display for LgError {
             LgError::UnsavedDocument(path) => write!(
                 f,
                 "{path} has unsaved changes: save it, or resolve it with the document's text"
+            ),
+            LgError::AiRunState(detail) => write!(f, "{detail}"),
+            LgError::ChangeSetMismatch(detail) => write!(f, "{detail}"),
+            LgError::AttributionAmbiguous(detail) => write!(
+                f,
+                "{detail}: the AI's change cannot be told apart from others, so it was not recorded"
             ),
             LgError::Io(detail) => write!(f, "{detail}"),
         }

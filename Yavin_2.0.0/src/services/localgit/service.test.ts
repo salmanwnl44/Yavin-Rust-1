@@ -998,3 +998,120 @@ test("a merge answering after its workspace was left is dropped before any docum
   assert.ok((await late) instanceof LocalGitClosedError);
   assert.equal(reconciles, 0);
 });
+
+// --- AI runs (LG-07) -------------------------------------------------------------------------
+
+test("AI runs send the AI layer's ids and what it reports, never more", async () => {
+  const native = scriptedNative({
+    localgit_ai_checkpoint: () => ({ agentRunId: "run-1", status: "checkpointed" }),
+    localgit_ai_report: (args) => ({ agentRunId: args.agentRunId, status: args.event }),
+    localgit_ai_associate: () => ({ agentRunId: "run-1", changeSetId: "cs-1" }),
+    localgit_ai_record_changes: () => ({ agentRunId: "run-1", status: "changesDetected" }),
+    localgit_ai_commit: () => ({ refusals: [{ kind: "headMoved" }], commit: null }),
+    localgit_ai_runs: () => ({ items: [], total: 0 }),
+  });
+  const service = createLocalGitService(["/work"], { isActive: () => true }, native.invoke);
+  await service.ai.checkpoint({ agentRunId: "run-1", taskId: "t-1", reason: "refactor" });
+  await service.ai.started("run-1");
+  await service.ai.associateChangeSet("run-1", "cs-1", "rev-1");
+  await service.ai.recordChanges("run-1", [
+    { path: "a.ts", expected: "b1" },
+    { folderId: "f-1", path: "gone.ts", deleted: true },
+  ]);
+  await service.ai.validated("run-1", true, "ci-7");
+  await service.ai.cancelled("run-1", "stopped by the user");
+  const refused = await service.ai.commit("run-1", { changeSetRevision: "rev-1" });
+  assert.equal(refused.commit, null);
+  assert.equal(refused.refusals[0].kind, "headMoved");
+  await service.ai.history(10);
+  const args = (command: string) =>
+    native.calls.filter((c) => c.command === command).map((c) => c.args);
+  const checkpoint = args("localgit_ai_checkpoint")[0];
+  assert.equal(checkpoint.taskId, "t-1");
+  assert.equal(checkpoint.changeSetId, null);
+  assert.equal(checkpoint.model, null, "never invented");
+  assert.deepEqual(
+    args("localgit_ai_report").map((a) => [a.event, a.passed, a.reference, a.note]),
+    [
+      ["started", null, null, null],
+      ["validated", true, "ci-7", null],
+      ["cancelled", null, null, "stopped by the user"],
+    ],
+  );
+  assert.equal(args("localgit_ai_associate")[0].revision, "rev-1");
+  assert.deepEqual(args("localgit_ai_record_changes")[0].paths, [
+    { folderId: null, path: "a.ts", expected: "b1", deleted: false },
+    { folderId: "f-1", path: "gone.ts", expected: null, deleted: true },
+  ]);
+  assert.equal(args("localgit_ai_commit")[0].changeSetRevision, "rev-1");
+  assert.equal(args("localgit_ai_runs")[0].limit, 10);
+});
+
+function undoResult(status: string, operations: unknown[]) {
+  return {
+    status,
+    plan: {
+      agentRunId: "run-1",
+      refusals: [],
+      merged: [],
+      restore: diskResult("completed", operations),
+      movesHead: false,
+    },
+    refusals: [],
+    conflicts: [],
+    operation: operations.length ? 1 : null,
+    applied: operations.length,
+    error: null,
+    verification: null,
+    run: null,
+    head: { kind: "detached", commit: "c1" },
+  };
+}
+
+test("an undo reconciles the documents it changed; a dry run or refusal touches none", async () => {
+  const reconciled: unknown[] = [];
+  const native = scriptedNative({
+    localgit_ai_undo: (args) =>
+      args.dryRun
+        ? undoResult("planned", [op("writeFile", "a.txt")])
+        : undoResult("completed", [op("writeFile", "a.txt")]),
+  });
+  const service = createLocalGitService(["/work"], { isActive: () => true }, native.invoke);
+  service.attachOverlays({
+    ...overlaySource([]).source,
+    reconcileRestore: async (paths) => {
+      reconciled.push(paths);
+      return { ok: true, reloaded: [], closed: [], failed: [] };
+    },
+  });
+  const planned = await service.ai.undo("run-1", { dryRun: true });
+  assert.equal(planned.documents, null);
+  assert.equal(reconciled.length, 0);
+  const done = await service.ai.undo("run-1");
+  assert.equal(done.succeeded, true);
+  assert.equal(reconciled.length, 1);
+});
+
+test("an AI undo answering after its workspace was left is dropped before any document", async () => {
+  const native = fakeNative();
+  let active = true;
+  let reconciles = 0;
+  const service = createLocalGitService(["/a"], { isActive: () => active }, native.invoke);
+  service.attachOverlays({
+    ...overlaySource([]).source,
+    reconcileRestore: async () => {
+      reconciles++;
+      return { ok: true, reloaded: [], closed: [], failed: [] };
+    },
+  });
+  await native.answer("localgit_open");
+  const late = service.ai.undo("run-1").then(
+    () => "delivered",
+    (error: unknown) => error,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  active = false;
+  await native.answer("localgit_ai_undo", undoResult("completed", [op("writeFile", "a.txt")]));
+  assert.ok((await late) instanceof LocalGitClosedError);
+  assert.equal(reconciles, 0);
+});

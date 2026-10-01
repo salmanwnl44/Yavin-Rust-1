@@ -2,6 +2,10 @@ import type { OverlaySource, ReconcileOutcome } from "./overlays.ts";
 import type {
   LocalGitBlobInfo,
   LocalGitBranch,
+  LocalGitAiCommitResult,
+  LocalGitAiPath,
+  LocalGitAiRun,
+  LocalGitAiUndoResult,
   LocalGitOperationResult,
   LocalGitOperationState,
   LocalGitResolveChoice,
@@ -249,6 +253,19 @@ export function createLocalGitService(
   const nextJob = () => `job-${++jobs}`;
 
   const normalPath = (p: LocalGitPath) => ({ folderId: p.folderId ?? null, path: p.path });
+
+  const report = (
+    agentRunId: string,
+    event: "started" | "validated" | "failed" | "cancelled",
+    detail: { passed?: boolean; reference?: string; note?: string } = {},
+  ) =>
+    call<LocalGitAiRun>("localgit_ai_report", {
+      agentRunId,
+      event,
+      passed: detail.passed ?? null,
+      reference: detail.reference ?? null,
+      note: detail.note ?? null,
+    });
 
   const targetArg = (target: LocalGitTarget) =>
     "commit" in target
@@ -746,6 +763,109 @@ export function createLocalGitService(
         }),
       );
       return afterDisk(result, result.restore);
+    },
+
+    /**
+     * AI runs (LG-07). The AI layer runs the AI and owns its lifecycle and ChangeSets; Local Git
+     * records what it is told, by the AI layer's ids, and owns the checkpoint, the attribution,
+     * the AI commit and the undo.
+     */
+    ai: {
+      /**
+       * The checkpoint of a run that has not changed anything yet: the workspace as the user has
+       * it, unsaved documents included. HEAD and the index do not move. If this rejects, the AI
+       * must not begin.
+       */
+      checkpoint(
+        run: {
+          agentRunId: string;
+          taskId?: string;
+          changeSetId?: string;
+          changeSetRevision?: string;
+          reason: string;
+          model?: string;
+        },
+        jobId: string = nextJob(),
+      ) {
+        return withOverlays(false, (refs) =>
+          call<LocalGitAiRun>("localgit_ai_checkpoint", {
+            jobId,
+            agentRunId: run.agentRunId,
+            taskId: run.taskId ?? null,
+            changeSetId: run.changeSetId ?? null,
+            changeSetRevision: run.changeSetRevision ?? null,
+            reason: run.reason,
+            model: run.model ?? null,
+            overlays: refs.overlays,
+            by: signature(identity()),
+          }),
+        );
+      },
+      run: (agentRunId: string) => call<LocalGitAiRun>("localgit_ai_run", { agentRunId }),
+      /** Newest first, with what became of each run. */
+      history: (limit = 100) =>
+        call<{ items: LocalGitAiRun[]; total: number }>("localgit_ai_runs", { limit }),
+      started: (agentRunId: string) => report(agentRunId, "started"),
+      validated: (agentRunId: string, passed: boolean, reference?: string) =>
+        report(agentRunId, "validated", { passed, reference }),
+      /** Recorded only: the run's changes stay, for the user to keep or undo. */
+      failed: (agentRunId: string, note?: string) => report(agentRunId, "failed", { note }),
+      cancelled: (agentRunId: string, note?: string) => report(agentRunId, "cancelled", { note }),
+      associateChangeSet: (agentRunId: string, changeSetId: string, revision?: string) =>
+        call<LocalGitAiRun>("localgit_ai_associate", {
+          agentRunId,
+          changeSetId,
+          revision: revision ?? null,
+        }),
+      /** The paths the AI changed; everything else changed since is recorded as not the AI's. */
+      recordChanges(agentRunId: string, paths: LocalGitAiPath[], jobId: string = nextJob()) {
+        return withOverlays(false, (refs) =>
+          call<LocalGitAiRun>("localgit_ai_record_changes", {
+            jobId,
+            agentRunId,
+            paths: paths.map((p) => ({
+              folderId: p.folderId ?? null,
+              path: p.path,
+              expected: p.expected ?? null,
+              deleted: p.deleted ?? false,
+            })),
+            overlays: refs.overlays,
+          }),
+        );
+      },
+      /** Exactly the AI's changes on HEAD -- or every reason not, with nothing changed. */
+      commit(
+        agentRunId: string,
+        options: { message?: string; changeSetRevision?: string } = {},
+        jobId: string = nextJob(),
+      ) {
+        return withOverlays(false, (refs) =>
+          call<LocalGitAiCommitResult>("localgit_ai_commit", {
+            jobId,
+            agentRunId,
+            message: options.message ?? null,
+            changeSetRevision: options.changeSetRevision ?? null,
+            overlays: refs.overlays,
+            by: signature(identity()),
+          }),
+        );
+      },
+      /** Takes out exactly the AI's changes; never a reset. `dryRun` says whether it can. */
+      async undo(
+        agentRunId: string,
+        options: { dryRun?: boolean } = {},
+        jobId: string = nextJob(),
+      ): Promise<WithDocuments<LocalGitAiUndoResult>> {
+        const result = await withOverlays(false, (refs) =>
+          call<LocalGitAiUndoResult>("localgit_ai_undo", {
+            jobId,
+            agentRunId,
+            dryRun: options.dryRun ?? false,
+            overlays: refs.overlays,
+          }),
+        );
+        return afterDisk(result, result.plan.restore);
+      },
     },
 
     /** Stops a snapshot or status of this service (it rejects with code `Cancelled`). */

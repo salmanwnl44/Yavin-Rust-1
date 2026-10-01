@@ -40,6 +40,8 @@ pub struct LocalGit {
     inner: Mutex<Inner>,
     /// The workspace watcher's last status (generation, healthy, root), for stores opened later.
     watcher: Mutex<Option<(u64, bool, String)>>,
+    /// AI runs checkpointed by this process and not yet ended (store key, run id).
+    ai_live: Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -2961,6 +2963,460 @@ fn carry_abort(
     Ok(result)
 }
 
+// --- AI runs (LG-07) ---------------------------------------------------------------------------
+
+use ide_localgit::ai::{
+    self, AiCommitResult, AiRefusal, AiRunRecord, AiRunStatus, AiUndoPlan, CheckpointRequest,
+    ReportedPath, RunEvent, Validation,
+};
+
+/// A run's record, and what only this process can say about it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiRunView {
+    #[serde(flatten)]
+    record: AiRunRecord,
+    /// Checkpointed or running, and not started by this Yavin process (it stopped, or crashed,
+    /// without the run saying how it ended): explicit, never assumed to have succeeded.
+    interrupted: bool,
+    /// Whether an undo can be attempted (the undo itself checks everything again).
+    undo_available: bool,
+}
+
+fn live_key(handle_key: &str, agent_run_id: &str) -> String {
+    format!("{handle_key}\0{agent_run_id}")
+}
+
+impl LocalGit {
+    fn store_key(&self, handle: &str) -> Result<String, String> {
+        let inner = self.inner.lock().map_err(|e| e.to_string())?;
+        Ok(inner.handles.get(handle).ok_or(CLOSED)?.key.clone())
+    }
+
+    fn set_live(&self, handle: &str, agent_run_id: &str, live: bool) -> Result<(), String> {
+        let key = live_key(&self.store_key(handle)?, agent_run_id);
+        let mut runs = self.ai_live.lock().map_err(|e| e.to_string())?;
+        if live {
+            runs.insert(key);
+        } else {
+            runs.remove(&key);
+        }
+        Ok(())
+    }
+
+    fn ai_view(
+        &self,
+        handle: &str,
+        repo: &Repository,
+        record: AiRunRecord,
+    ) -> Result<AiRunView, String> {
+        let live = self
+            .ai_live
+            .lock()
+            .map_err(|e| e.to_string())?
+            .contains(&live_key(&self.store_key(handle)?, &record.agent_run_id));
+        let interrupted = !live
+            && matches!(
+                record.status,
+                AiRunStatus::Checkpointed | AiRunStatus::Running | AiRunStatus::ChangesDetected
+            );
+        let head = branches::resolve_head(repo).commit().map(|h| h.to_hex());
+        let undo_available = record.status != AiRunStatus::Undone
+            && !record.changes.is_empty()
+            && (record.commit.is_none() || record.commit == head);
+        Ok(AiRunView {
+            record,
+            interrupted,
+            undo_available,
+        })
+    }
+}
+
+/// The checks of a step that changes Local Git state for an AI run: its handle still open and
+/// its workspace still the window's.
+fn ai_step(local_git: &LocalGit, workspace: &Workspace, handle: &str) -> Result<Store, String> {
+    let store = local_git.handle_store(handle)?;
+    before_changing(local_git, workspace, handle, &AtomicBool::new(false))?;
+    Ok(store)
+}
+
+/// Records the AI checkpoint of a run that has not changed anything yet: the workspace as the
+/// user has it (unsaved documents included), durably, with the run's record. HEAD and the index
+/// do not move. An error means the AI must not begin.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_ai_checkpoint(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    agent_run_id: String,
+    task_id: Option<String>,
+    change_set_id: Option<String>,
+    change_set_revision: Option<String>,
+    reason: String,
+    model: Option<String>,
+    overlays: Vec<OverlayRef>,
+    by: Signature,
+) -> Result<AiRunView, String> {
+    let (store, request) = prepare(&local_git, &handle, "full", true, &overlays, &[])?;
+    let _only = exclusive(&store)?;
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    before_changing(&local_git, &workspace, &handle, &cancel)?;
+    let checkpoint = CheckpointRequest {
+        agent_run_id: agent_run_id.clone(),
+        task_id,
+        change_set_id,
+        change_set_revision,
+        reason,
+        model,
+    };
+    let record = store
+        .engine
+        .ai_checkpoint(
+            &store.repo,
+            &request,
+            &Control {
+                cancel: &cancel,
+                progress: &progress,
+            },
+            &checkpoint,
+            &commit_request(String::new(), by),
+        )
+        .map(|(_, record)| record);
+    let record = local_git.finish_job(&handle, &job_id, record)?;
+    local_git.set_live(&handle, &agent_run_id, true)?;
+    let repo = store.repo.lock().map_err(|e| e.to_string())?;
+    local_git.ai_view(&handle, &repo, record)
+}
+
+#[tauri::command(async)]
+pub fn localgit_ai_run(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    agent_run_id: String,
+) -> Result<AiRunView, String> {
+    let store = local_git.handle_store(&handle)?;
+    let repo = store.repo.lock().map_err(|e| e.to_string())?;
+    let record = ai::get_run(&repo, &agent_run_id).map_err(fail)?;
+    local_git.ai_view(&handle, &repo, record)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiRunsView {
+    /// Newest first.
+    items: Vec<AiRunView>,
+    total: usize,
+}
+
+/// The newest AI runs of this workspace, with what became of them.
+#[tauri::command(async)]
+pub fn localgit_ai_runs(
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    limit: usize,
+) -> Result<AiRunsView, String> {
+    let store = local_git.handle_store(&handle)?;
+    let repo = store.repo.lock().map_err(|e| e.to_string())?;
+    let list = ai::list_runs(&repo, limit).map_err(fail)?;
+    let items = list
+        .items
+        .into_iter()
+        .map(|record| local_git.ai_view(&handle, &repo, record))
+        .collect::<Result<_, _>>()?;
+    Ok(AiRunsView {
+        items,
+        total: list.total,
+    })
+}
+
+/// Records a step of a run's lifecycle, as the layer that runs the AI reports it: `started`,
+/// `validated` (with `passed` and a `reference`), `failed` or `cancelled` (with a `note`).
+/// Nothing on disk changes: a failed or cancelled run keeps its changes for the user to decide.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_ai_report(
+    workspace: State<'_, Workspace>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    agent_run_id: String,
+    event: String,
+    passed: Option<bool>,
+    reference: Option<String>,
+    note: Option<String>,
+) -> Result<AiRunView, String> {
+    let event = match event.as_str() {
+        "started" => RunEvent::Started,
+        "validated" => RunEvent::Validated(Validation {
+            passed: passed.ok_or("InvalidFormat: say whether validation passed")?,
+            reference,
+        }),
+        "failed" => RunEvent::Failed(note),
+        "cancelled" => RunEvent::Cancelled(note),
+        other => return Err(format!("InvalidFormat: unknown AI run event {other:?}")),
+    };
+    let ended = matches!(event, RunEvent::Failed(_) | RunEvent::Cancelled(_));
+    let store = ai_step(&local_git, &workspace, &handle)?;
+    let _only = exclusive(&store)?;
+    let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+    let record = ai::report(&mut repo, &agent_run_id, event).map_err(fail)?;
+    if ended {
+        local_git.set_live(&handle, &agent_run_id, false)?;
+    }
+    local_git.ai_view(&handle, &repo, record)
+}
+
+/// Associates a run with its ChangeSet (by id, with the ChangeSet's revision when known).
+#[tauri::command(async)]
+pub fn localgit_ai_associate(
+    workspace: State<'_, Workspace>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    agent_run_id: String,
+    change_set_id: String,
+    revision: Option<String>,
+) -> Result<AiRunView, String> {
+    let store = ai_step(&local_git, &workspace, &handle)?;
+    let _only = exclusive(&store)?;
+    let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+    let record = ai::associate(&mut repo, &agent_run_id, &change_set_id, revision).map_err(fail)?;
+    local_git.ai_view(&handle, &repo, record)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiPathArg {
+    folder_id: Option<String>,
+    path: String,
+    /// The blob the AI wrote there, when the caller knows it.
+    expected: Option<String>,
+    /// The AI deleted the path.
+    #[serde(default)]
+    deleted: bool,
+}
+
+/// Records the paths the AI changed, as the workspace holds them now (unsaved documents
+/// included); everything else changed since the checkpoint is recorded as not the AI's.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_ai_record_changes(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    agent_run_id: String,
+    paths: Vec<AiPathArg>,
+    overlays: Vec<OverlayRef>,
+) -> Result<AiRunView, String> {
+    let reported = paths
+        .into_iter()
+        .map(|p| {
+            Ok(ReportedPath {
+                folder: p
+                    .folder_id
+                    .map(|f| FolderId::new(&f))
+                    .transpose()
+                    .map_err(fail)?,
+                path: p.path,
+                expected: if p.deleted {
+                    Some(None)
+                } else {
+                    p.expected.map(|e| parse_id(&e).map(Some)).transpose()?
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let (store, request) = prepare(&local_git, &handle, "full", true, &overlays, &[])?;
+    let _only = exclusive(&store)?;
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    before_changing(&local_git, &workspace, &handle, &cancel)?;
+    let record = store
+        .engine
+        .ai_record_changes(
+            &store.repo,
+            &request,
+            &Control {
+                cancel: &cancel,
+                progress: &progress,
+            },
+            &agent_run_id,
+            &reported,
+        )
+        .map(|(_, record)| record);
+    let record = local_git.finish_job(&handle, &job_id, record)?;
+    let repo = store.repo.lock().map_err(|e| e.to_string())?;
+    local_git.ai_view(&handle, &repo, record)
+}
+
+/// Makes the AI commit: exactly the AI's changes on HEAD, nothing of anyone else's -- or every
+/// reason it cannot be made, with nothing changed. Staged work stays staged; the working tree
+/// is not touched.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_ai_commit(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    agent_run_id: String,
+    message: Option<String>,
+    change_set_revision: Option<String>,
+    overlays: Vec<OverlayRef>,
+    by: Signature,
+) -> Result<AiCommitResult, String> {
+    let (store, request) = prepare(&local_git, &handle, "full", true, &overlays, &[])?;
+    let _only = exclusive(&store)?;
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    before_changing(&local_git, &workspace, &handle, &cancel)?;
+    let result = store
+        .engine
+        .ai_commit(
+            &store.repo,
+            &request,
+            &Control {
+                cancel: &cancel,
+                progress: &progress,
+            },
+            &agent_run_id,
+            message,
+            change_set_revision,
+            &commit_request(String::new(), by),
+        )
+        .map(|(_, result)| result);
+    let result = local_git.finish_changed(&handle, &job_id, result.map_err(fail))?;
+    if result.commit.is_some() {
+        local_git.set_live(&handle, &agent_run_id, false)?;
+    }
+    Ok(result)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiUndoResult {
+    /// `planned` (a dry run), `refused`, `completed`, `failed`, `verificationFailed`.
+    status: &'static str,
+    plan: AiUndoPlan,
+    refusals: Vec<AiRefusal>,
+    /// The restore planner's and executor's refusals.
+    conflicts: Vec<RestoreConflict>,
+    operation: Option<u64>,
+    applied: usize,
+    error: Option<String>,
+    verification: Option<Verification>,
+    run: Option<AiRunView>,
+    head: HeadState,
+}
+
+/// Undoes an AI run: exactly its changes taken out (a human's later edit kept by a clean
+/// three-way inverse), the disk changed as one recorded file operation and verified -- or every
+/// reason it cannot be done, with nothing changed. Never a reset to the checkpoint.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+pub fn localgit_ai_undo(
+    app: AppHandle,
+    workspace: State<'_, Workspace>,
+    watch: State<'_, crate::Watch>,
+    local_git: State<'_, LocalGit>,
+    handle: String,
+    job_id: String,
+    agent_run_id: String,
+    dry_run: bool,
+    overlays: Vec<OverlayRef>,
+) -> Result<AiUndoResult, String> {
+    let (store, request) = prepare(&local_git, &handle, "full", true, &overlays, &[])?;
+    let _only = if dry_run {
+        None
+    } else {
+        Some(exclusive(&store)?)
+    };
+    let cancel = local_git.start_job(&handle, &job_id, false)?;
+    let progress = progress_to(&app, &handle, &job_id);
+    let plan = match store.engine.ai_plan_undo(
+        &store.repo,
+        &request,
+        &Control {
+            cancel: &cancel,
+            progress: &progress,
+        },
+        &agent_run_id,
+    ) {
+        Ok((_, plan)) => plan,
+        Err(error) => return local_git.finish_job(&handle, &job_id, Err(error)),
+    };
+    let head = {
+        let repo = store.repo.lock().map_err(|e| e.to_string())?;
+        branches::resolve_head(&repo)
+    };
+    let mut result = AiUndoResult {
+        status: "completed",
+        refusals: plan.refusals.clone(),
+        conflicts: plan.restore.conflicts.clone(),
+        plan,
+        operation: None,
+        applied: 0,
+        error: None,
+        verification: None,
+        run: None,
+        head,
+    };
+    if !result.refusals.is_empty() || !result.conflicts.is_empty() {
+        result.status = "refused";
+        return local_git.finish_job(&handle, &job_id, Ok(result));
+    }
+    if dry_run {
+        result.status = "planned";
+        return local_git.finish_job(&handle, &job_id, Ok(result));
+    }
+    before_changing(&local_git, &workspace, &handle, &cancel)?;
+    let result = carry_undo(&local_git, &handle, &watch, &store, result, &progress)?;
+    local_git.finish_changed(&handle, &job_id, Ok(result))
+}
+
+/// An undo with nothing in its way: recorded first, the disk changed and verified, then the
+/// run undone (and HEAD back, for a committed run) in one step.
+fn carry_undo(
+    local_git: &LocalGit,
+    handle: &str,
+    watch: &crate::Watch,
+    store: &Store,
+    mut result: AiUndoResult,
+    progress: &(dyn Fn(&Progress) + Sync),
+) -> Result<AiUndoResult, String> {
+    {
+        let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+        ai::begin_undo(&mut repo, &result.plan).map_err(fail)?;
+    }
+    let carried = carry_out(watch, store, &result.plan.restore, progress);
+    result.status = carried.status;
+    result.operation = carried.operation;
+    result.applied = carried.applied;
+    result.error = carried.error;
+    result.verification = carried.verification;
+    if !carried.conflicts.is_empty() {
+        result.conflicts = carried.conflicts;
+    }
+    let mut repo = store.repo.lock().map_err(|e| e.to_string())?;
+    if result.status == "completed" {
+        if let Err(error) = ai::finish_undo(&mut repo, &result.plan) {
+            result.status = "failed";
+            result.error = Some(fail(error));
+        } else {
+            local_git.set_live(handle, &result.plan.agent_run_id, false)?;
+        }
+    }
+    result.head = branches::resolve_head(&repo);
+    let record = ai::get_run(&repo, &result.plan.agent_run_id).map_err(fail)?;
+    result.run = Some(local_git.ai_view(handle, &repo, record)?);
+    Ok(result)
+}
+
 #[cfg(test)]
 mod lg05_push_tests {
     use super::*;
@@ -3386,6 +3842,147 @@ mod lg06_isolation_tests {
         assert_eq!(std::fs::read(a_project.join("f.txt")).unwrap(), b"two");
         assert_eq!(listing(&b_project), b_before, "B still untouched");
         drop(watch);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod lg07_isolation_tests {
+    use super::*;
+    use ide_workspace::file_tree::WorkspaceManager;
+
+    fn put(path: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn store(dir: &std::path::Path, project: &std::path::Path) -> (Store, WorkspaceSpec) {
+        let spec = WorkspaceSpec::from_paths(&[project]).unwrap();
+        let repo = Repository::open(&dir.join("base"), &spec, OpenOptions::default()).unwrap();
+        let record = repo.meta().folders[0].clone();
+        let engine = SnapshotEngine::new(
+            vec![FolderRoot {
+                folder_id: FolderId::new(&record.folder_id).unwrap(),
+                path: project.to_path_buf(),
+                resource_id: record.resource_id,
+            }],
+            repo.meta().max_blob_bytes,
+        );
+        (
+            Store {
+                repo: Arc::new(Mutex::new(repo)),
+                engine: Arc::new(engine),
+                mutating: Arc::new(Mutex::new(())),
+            },
+            spec,
+        )
+    }
+
+    fn open(local_git: &LocalGit, store: &Store, spec: &WorkspaceSpec) -> String {
+        let handle = new_handle();
+        let mut inner = local_git.inner.lock().unwrap();
+        inner.stores.insert(spec.key(), store.clone());
+        inner.handles.insert(
+            handle.clone(),
+            Handle {
+                key: spec.key(),
+                workspace_id: spec.workspace_id.clone(),
+                overlays: HashMap::new(),
+                untitled: HashMap::new(),
+                jobs: HashMap::new(),
+                status_job: None,
+            },
+        );
+        handle
+    }
+
+    fn window(project: &std::path::Path) -> Workspace {
+        Workspace(Mutex::new(Some(WorkspaceManager::new(project).unwrap())))
+    }
+
+    fn checkpoint(store: &Store, id: &str) -> AiRunRecord {
+        let cancel = AtomicBool::new(false);
+        store
+            .engine
+            .ai_checkpoint(
+                &store.repo,
+                &SnapshotRequest::default(),
+                &Control {
+                    cancel: &cancel,
+                    progress: &|_| {},
+                },
+                &CheckpointRequest {
+                    agent_run_id: id.into(),
+                    reason: "x".into(),
+                    ..Default::default()
+                },
+                &CommitRequest {
+                    message: String::new(),
+                    author: Author {
+                        name: "AI".into(),
+                        id: "ai".into(),
+                    },
+                    time_ms: 0,
+                    tz_offset_min: 0,
+                },
+            )
+            .unwrap()
+            .1
+    }
+
+    /// A's run, then B opens: A's late steps are refused and never reach B; B does not know
+    /// A's run. A again (a new generation, a new handle): the run is A's, unchanged, still
+    /// this process's.
+    #[test]
+    fn an_ai_run_in_a_is_refused_once_b_is_open_and_is_still_as_in_a_again() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("yavin-localgit-lg07-iso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (a_project, b_project) = (dir.join("a"), dir.join("b"));
+        put(&a_project.join("f.txt"), "a");
+        put(&b_project.join("f.txt"), "b");
+        let (a_store, a_spec) = store(&dir.join("a-store"), &a_project);
+        let (b_store, b_spec) = store(&dir.join("b-store"), &b_project);
+        let local_git = LocalGit::default();
+        let old = open(&local_git, &a_store, &a_spec);
+        let record = checkpoint(&a_store, "run-a");
+        local_git.set_live(&old, "run-a", true).unwrap();
+
+        let b_open = window(&b_project);
+        assert!(ai_step(&local_git, &b_open, &old)
+            .err()
+            .unwrap()
+            .starts_with("NotInWorkspace:"));
+        local_git.revoke_except(Some(&b_spec.workspace_id));
+        assert!(ai_step(&local_git, &b_open, &old)
+            .err()
+            .unwrap()
+            .starts_with("HandleClosed:"));
+        assert!(matches!(
+            ai::get_run(&b_store.repo.lock().unwrap(), "run-a"),
+            Err(LgError::NotFound(_))
+        ));
+        assert_eq!(std::fs::read(b_project.join("f.txt")).unwrap(), b"b");
+
+        let a_open = window(&a_project);
+        let new = open(&local_git, &a_store, &a_spec);
+        ai_step(&local_git, &a_open, &new).unwrap();
+        assert!(ai_step(&local_git, &a_open, &old).is_err());
+        let repo = a_store.repo.lock().unwrap();
+        let again = ai::get_run(&repo, "run-a").unwrap();
+        assert_eq!(again, record);
+        assert_eq!(again.workspace, repo.meta().workspace);
+        let view = local_git.ai_view(&new, &repo, again).unwrap();
+        assert!(!view.interrupted, "still this process's run");
+        // A run no live process started (as after a restart) is interrupted, not finished.
+        drop(repo);
+        let other = checkpoint(&a_store, "run-orphan");
+        let repo = a_store.repo.lock().unwrap();
+        let view = local_git.ai_view(&new, &repo, other).unwrap();
+        assert!(view.interrupted);
+        drop(repo);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

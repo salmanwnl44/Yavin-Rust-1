@@ -7,6 +7,9 @@ import type { TrustState } from "./trust";
 import type {
   LocalGitBlobInfo,
   LocalGitBranch,
+  LocalGitAiCommitResult,
+  LocalGitAiRun,
+  LocalGitAiUndoResult,
   LocalGitOperationResult,
   LocalGitOperationState,
   LocalGitResetResult,
@@ -338,6 +341,73 @@ interface Commands {
       by: LocalGitSignature;
     };
     result: LocalGitOperationResult;
+  };
+  localgit_ai_checkpoint: {
+    args: {
+      handle: string;
+      jobId: string;
+      agentRunId: string;
+      taskId: string | null;
+      changeSetId: string | null;
+      changeSetRevision: string | null;
+      reason: string;
+      model: string | null;
+      overlays: LocalGitOverlayRef[];
+      by: LocalGitSignature;
+    };
+    result: LocalGitAiRun;
+  };
+  localgit_ai_run: { args: { handle: string; agentRunId: string }; result: LocalGitAiRun };
+  localgit_ai_runs: {
+    args: { handle: string; limit: number };
+    result: { items: LocalGitAiRun[]; total: number };
+  };
+  localgit_ai_report: {
+    args: {
+      handle: string;
+      agentRunId: string;
+      event: "started" | "validated" | "failed" | "cancelled";
+      passed: boolean | null;
+      reference: string | null;
+      note: string | null;
+    };
+    result: LocalGitAiRun;
+  };
+  localgit_ai_associate: {
+    args: { handle: string; agentRunId: string; changeSetId: string; revision: string | null };
+    result: LocalGitAiRun;
+  };
+  localgit_ai_record_changes: {
+    args: {
+      handle: string;
+      jobId: string;
+      agentRunId: string;
+      paths: { folderId: string | null; path: string; expected: string | null; deleted: boolean }[];
+      overlays: LocalGitOverlayRef[];
+    };
+    result: LocalGitAiRun;
+  };
+  localgit_ai_commit: {
+    args: {
+      handle: string;
+      jobId: string;
+      agentRunId: string;
+      message: string | null;
+      changeSetRevision: string | null;
+      overlays: LocalGitOverlayRef[];
+      by: LocalGitSignature;
+    };
+    result: LocalGitAiCommitResult;
+  };
+  localgit_ai_undo: {
+    args: {
+      handle: string;
+      jobId: string;
+      agentRunId: string;
+      dryRun: boolean;
+      overlays: LocalGitOverlayRef[];
+    };
+    result: LocalGitAiUndoResult;
   };
   localgit_abort: {
     args: {

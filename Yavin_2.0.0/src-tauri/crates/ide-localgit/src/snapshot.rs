@@ -883,6 +883,92 @@ impl SnapshotEngine {
         )
     }
 
+    /// Records an AI checkpoint (see `ai.rs`): a Full, persisted snapshot with the unsaved
+    /// documents, as a commit HEAD never moves to, and the run's record.
+    pub fn ai_checkpoint(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        checkpoint: &crate::ai::CheckpointRequest,
+        by: &crate::history::CommitRequest,
+    ) -> Result<(Snapshot, crate::ai::AiRunRecord)> {
+        self.with_full_snapshot(repo, request, control, true, |_, repo, _, snapshot| {
+            crate::ai::checkpoint(repo, snapshot, checkpoint, by)
+        })
+    }
+
+    /// Records the paths an AI changed (see `ai.rs`).
+    pub fn ai_record_changes(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        agent_run_id: &str,
+        reported: &[crate::ai::ReportedPath],
+    ) -> Result<(Snapshot, crate::ai::AiRunRecord)> {
+        self.with_full_snapshot(
+            repo,
+            request,
+            control,
+            true,
+            |lookup, repo, folders, snapshot| {
+                crate::ai::record_changes(lookup, repo, folders, snapshot, agent_run_id, reported)
+            },
+        )
+    }
+
+    /// Makes an AI run's commit (see `ai.rs`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ai_commit(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        agent_run_id: &str,
+        message: Option<String>,
+        change_set_revision: Option<String>,
+        by: &crate::history::CommitRequest,
+    ) -> Result<(Snapshot, crate::ai::AiCommitResult)> {
+        self.with_full_snapshot(
+            repo,
+            request,
+            control,
+            true,
+            |lookup, repo, folders, snapshot| {
+                crate::ai::commit(
+                    lookup,
+                    repo,
+                    folders,
+                    snapshot,
+                    agent_run_id,
+                    message,
+                    change_set_revision,
+                    by,
+                )
+            },
+        )
+    }
+
+    /// Plans undoing an AI run (see `ai.rs`).
+    pub fn ai_plan_undo(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        agent_run_id: &str,
+    ) -> Result<(Snapshot, crate::ai::AiUndoPlan)> {
+        self.with_full_snapshot(
+            repo,
+            request,
+            control,
+            true,
+            |lookup, repo, folders, snapshot| {
+                crate::ai::plan_undo(lookup, repo, folders, snapshot, agent_run_id)
+            },
+        )
+    }
+
     /// A copy of the trees the last snapshot produced (staging reads them without the store).
     pub(crate) fn memory_trees(&self) -> HashMap<ObjectId, Tree> {
         self.state.lock().unwrap().trees.clone()

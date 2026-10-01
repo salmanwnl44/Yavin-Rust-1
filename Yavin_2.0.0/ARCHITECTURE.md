@@ -1207,7 +1207,78 @@ finish_apply (one ref step)
 
 **Known limitations**: one merge base when there are several (no recursive merge); rename detection is exact-content only, and rename/rename to two names is not reported as a conflict; no line merge for binary or non-UTF-8 text or files over 8 MiB (a conflict instead); no `ours`/`theirs` strategies or whitespace options; cherry-pick is one commit at a time and refuses merge commits; no rebase. `refs.json` is rewritten on every ref step (LG-01's layout; LG-09).
 
-**Not yet** (later phases): AI checkpoints and Undo AI Run (LG-07); any UI (LG-08); comparison with real Git, GC, compaction, compression, a recovery UI, and ref storage whose updates do not rewrite every ref (LG-09).
+**Not yet** (later phases): AI checkpoints and Undo AI Run (LG-07, below); any UI (LG-08); comparison with real Git, GC, compaction, compression, a recovery UI, and ref storage whose updates do not rewrite every ref (LG-09).
+
+### AI runs: checkpoints, provenance and Undo AI Run (LG-07)
+
+**An AI never commits a human's work, and undoing an AI run never takes a human's work with it. Ownership is recorded, never guessed: whenever it cannot be shown, Local Git refuses.**
+
+**Who owns what.** There is no AI Run Manager or ChangeSet module in Yavin yet (ChangeSets are Module 13). LG-07 is the Local Git side only, behind a contract those modules will use:
+
+| Owner                  | Owns                                                                                                                                                          |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| AI run layer (to come) | running the AI, its tools and cancellation; the run's id; telling Local Git what happened (started, the AI changed these paths, validated, failed, cancelled) |
+| ChangeSet (Module 13)  | the proposed changes and their review; its id and revision                                                                                                    |
+| DocumentService        | document content, dirty state, open and proposed documents                                                                                                    |
+| Local Git (`ai.rs`)    | the checkpoint, the run's provenance record, the attribution of changes, the AI commit, Undo AI Run                                                           |
+| Module 03 / Module 04  | the undo's file operation, and its recovery                                                                                                                   |
+
+Local Git stores **references**: the run's, task's and ChangeSet's ids (opaque strings, never interpreted), a ChangeSet revision, a model id only when the caller gives one -- never a copy of a ChangeSet, never an inferred provider.
+
+**The record.** One per run, under `refs/yavin/ai/r<hash of the run id>`: a commit (source `automatic`, on no branch) whose `metaobj run` blob is the `AiRunRecord` as versioned JSON, and whose `metaobj checkpoint` and `metaobj commit` keep those reachable. It holds the run, task and ChangeSet ids, the workspace, the checkpoint, HEAD and its branch and the index's root at the checkpoint, the reason, start and end times, the status, the validation (passed, and the caller's reference), a note, the **AI changes** (each path with its entry at the checkpoint and after the AI), the **unattributed** paths (changed since the checkpoint, not by the AI), the AI commit, and an undo under way. Every change is one compare-and-swap of the refs -- together with HEAD and the index, for an AI commit or the undo of one.
+
+**Lifecycle**, as the AI layer reports it -- Local Git never decides one:
+
+```text
+checkpoint -> checkpointed -> started -> running -> (changes recorded) -> changesDetected
+   -> validated -> committed            failed / cancelled (from any of the active states)
+   any state with changes -> undone
+```
+
+More changes after validation return the run to `changesDetected` and clear the validation. A run that was checkpointed or running and that no process in this Yavin started -- after a restart, or a crash -- is reported `interrupted`: never "succeeded", never rolled back, its changes left for the user.
+
+**AI checkpoint.** Before the AI's first change, from a Full, persisted snapshot with the window's unsaved documents: a commit with source `ai` whose root is the workspace as the user has it, disk root the disk, `metaobj overlays` the unsaved documents, `metaobj index` the index's root, HEAD its parent, and `meta` the run, task, ChangeSet, reason and (if given) model -- and the run's record, in one ref step. HEAD, branches, the index and `refs/yavin/checkpoint` never move. It is LG-03's checkpoint object with the AI's provenance, from LG-02's snapshot engine; there is no other snapshot mechanism. If it cannot be made durable -- a read-only store, a workspace left, a full disk -- the call fails and the AI must not begin. A run id is checkpointed once.
+
+**Attribution.** The AI owns exactly the paths the AI layer reports it changed (files or links; a folder is reported as its files). Each is recorded with its entry at the checkpoint (`before`; a path reported again keeps it) and as a fresh Full snapshot sees it (`after`). The caller may say what the AI wrote (a blob, or "deleted"): a workspace holding anything else is `AttributionAmbiguous`, and nothing is recorded. Everything else changed since the checkpoint is listed as unattributed. So a human's change before the run (in the checkpoint), during it on another path (unattributed), or after it on an AI path (`after` no longer matches) is never taken for the AI's.
+
+**AI commit.** A commit on HEAD (source `ai`; `meta` the run, task, ChangeSet and its revision, checkpoint, validation and its reference, model only when given; `metaobj checkpoint`; message `AI: <reason>` or the caller's) whose tree is **HEAD's tree with only the AI's paths set to `after`** -- never the working tree, never the index. Refused with every reason (`AiRefusal`), nothing changed, when:
+
+| Refusal                  | When                                                                                                                 |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| `headMoved`              | HEAD is not where it was at the checkpoint (no silent rebase)                                                        |
+| `staleChangeSet`         | the ChangeSet revision given is not the one recorded                                                                 |
+| `humanChangedAiPath`     | the workspace no longer holds the AI's content at an AI path                                                         |
+| `preexistingHumanChange` | at the checkpoint an AI path already held a human's change: committing the AI's content would commit the human's too |
+| `stagedOnAiPath`         | something is staged at an AI path                                                                                    |
+| `operationInProgress`    | a merge or cherry-pick is in progress                                                                                |
+| `nothingToCommit`        | the AI changed nothing HEAD does not have                                                                            |
+
+**The index** is preserved: it keeps every other entry -- a human's staged work stays staged -- and takes the commit's entries at the AI's paths; HEAD, the index and the record move in one step. Unstaged and untracked work and unsaved documents are untouched: the AI commit changes no file. A run is committed once; a crash leaves the commit made and recorded, or neither.
+
+**Undo AI Run** takes out exactly the AI's changes -- never a reset to the checkpoint. Per AI path, from a Full snapshot with the unsaved documents:
+
+| The path now holds                                                                             | Undo                                                                                                                                       |
+| ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| its checkpoint content (or what an interrupted undo wrote)                                     | nothing                                                                                                                                    |
+| the AI's content                                                                               | back to the checkpoint content (an AI-created file removed, an AI-deleted one restored)                                                    |
+| a human's later edit, all three text                                                           | the three-way inverse (`merge3`, base = the AI's content): the human's edit kept, the AI's taken out -- or `undoConflict` where they touch |
+| anything else (a human edited a file the AI created, recreated one it deleted, binary content) | `humanChangedAiPath`: refused                                                                                                              |
+| an unsaved document whose text is not the AI's                                                 | `dirtyDocument`: refused -- never overwritten or saved                                                                                     |
+| an unsaved document holding exactly the AI's text                                              | replaced through DocumentService (it is the AI's, not the user's)                                                                          |
+
+The disk changes through LG-03's restore machinery: planned (`transition.rs`; content never stored refuses as `historicalContentUnavailable`), the targets recorded in the run's record, carried out as one Module 03 operation recorded by Module 04, verified, and only then the run marked undone. Documents are reconciled through DocumentService's public API afterwards. Paths the AI did not change -- every human change elsewhere, staged or not -- are never touched, and the index is not changed for an uncommitted run. Undoing a **committed** run also moves HEAD back to the commit's parent (the AI's paths in the index with it, everything else staged kept), only while HEAD is still that commit (`historyMovedOn` otherwise: history moved on, and a revert is the way); the commit stays in the record. Cancelled, failed, partial and interrupted runs undo the same way -- after a restart too.
+
+**Crashes.** A checkpoint is there, durably with its record, or not at all. A crash during the AI's changes leaves the checkpoint, the record (running), and the partial changes, visible -- none rolled back. An AI commit is made with its record, or neither: committing again after a crash makes exactly one. An undo interrupted partway (Module 04 settles the file operation) leaves the run not undone, with its targets recorded; undoing again accepts any mix of before, AI and target on each path and finishes it. Ref steps are LG-01's: old or new, never completed by themselves.
+
+**Workspaces and processes.** Every step that changes Local Git state for a run checks its handle is open and its workspace still the window's (`NotInWorkspace`, `HandleClosed`): a run's late steps after a switch never reach the next workspace, a run belongs to the workspace (and store) it was checkpointed in, and another workspace does not know it. Each step holds the store's mutation lock (`Busy`); a second Yavin process has the store read-only and cannot checkpoint (so its AI must not begin), record or undo.
+
+**API** (native commands, typed in `services/localgit/types.ts`, on the service as `localGit.ai`): `localgit_ai_checkpoint`, `localgit_ai_run`, `localgit_ai_runs` (the AI history: newest first, each run with its task, checkpoint, ChangeSet, commit, status, validation, `interrupted` and `undoAvailable`), `localgit_ai_report` (`started`, `validated`, `failed`, `cancelled`), `localgit_ai_associate`, `localgit_ai_record_changes`, `localgit_ai_commit`, `localgit_ai_undo` (with a dry run). Paths are folder-relative and named by folder id, never absolute.
+
+**Performance**: (release, `cargo test -p ide-localgit --release --test lg07_scale -- --ignored --nocapture --test-threads=1`; 10 AI-changed paths) 10,000 files: AI checkpoint 484 ms (its Full snapshot; +1.7 KiB stored when the workspace's content is already in the store -- objects are shared, a checkpoint adds its commit and record); ChangeSet association 38 ms; recording the AI's paths 627 ms (Full snapshot); AI commit 493 ms; undo plan 458 ms, finish 35 ms; the AI history of 1,000 runs (50 listed) 259 ms, one run 0.3 ms; peak working set 24.8 MB. 100,000 files: checkpoint 1.09 s, association 36 ms, recording 1.08 s, AI commit 1.12 s, undo plan 1.12 s, finish 45 ms, history 270 ms; peak working set 85.1 MB. Metadata steps (lifecycle, association, history) never scan the workspace.
+
+**Known limitations**: attribution is only as good as what the AI layer reports (a path the AI changed and did not report is unattributed, and neither committed nor undone); recording changes, committing and undoing each take a Full snapshot; the three-way inverse is for text up to 8 MiB; an AI commit is refused, never rebased, when HEAD moved; undo of a committed run requires HEAD to still be its commit; the AI history reads every run record (fine for thousands; LG-09 may index it).
+
+**Not yet** (later phases): any UI (LG-08); comparison with real Git, GC and retention (including of AI checkpoints and records), compaction, compression, a recovery UI, and ref storage whose updates do not rewrite every ref (LG-09).
 
 **Invariants**
 
@@ -1236,6 +1307,9 @@ finish_apply (one ref step)
 23. A merge or cherry-pick never overwrites staged work, local changes, untracked files or unsaved documents, and never writes content Local Git does not have; it is refused before anything changes.
 24. A merge's or cherry-pick's state is durable and explicit: conflicts are resolved only by an explicit choice, and an interrupted operation is continued or aborted by the user -- never completed by itself. HEAD moves only when it completes.
 25. A cherry-pick makes a new commit and never changes the picked one; a merge never rewrites either parent.
+26. An AI checkpoint is durable before the AI changes anything, and never moves HEAD, a branch or the index; if it cannot be made, the AI does not begin.
+27. An AI commit holds exactly the AI's recorded changes, never a human's; staged human work stays staged. Ownership is never guessed: when it cannot be shown, the commit is refused.
+28. Undo AI Run takes out only the AI's changes, never a human's work or unsaved text -- never a reset to the checkpoint -- and is refused rather than guess.
 
 ## Explorer provider platform
 
