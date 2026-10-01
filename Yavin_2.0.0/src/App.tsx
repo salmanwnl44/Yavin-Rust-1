@@ -21,6 +21,7 @@ import React, {
 } from "react";
 import { TitleBar } from "./components/layout/TitleBar";
 import { ActivityBar } from "./components/layout/ActivityBar";
+import { LocalHistoryPanel } from "./components/localgit/LocalHistoryPanel"; // LG-08
 import { Sidebar } from "./components/layout/Sidebar";
 import { EditorArea } from "./components/layout/EditorArea";
 const TerminalPanel = lazy(() =>
@@ -2603,9 +2604,22 @@ export default function App() {
             onOpenFile={(path) => void handleOpenFile(path)}
             onReveal={handleReveal}
           />
+          {/* LG-08: Local History, from the workspace's Local Git service. */}
+          <LocalHistoryPanel
+            key={`history:${workspacePath}`}
+            service={workspace.services.localGit}
+            visible={isSidebarOpen && activeActivityTab === "history"}
+            onDiff={setDiff}
+            onChanged={reconcileWorkspace}
+          />
           <Sidebar
             key={`explorer:${workspacePath}`}
-            visible={isSidebarOpen && activeActivityTab !== "search" && activeActivityTab !== "git"}
+            visible={
+              isSidebarOpen &&
+              activeActivityTab !== "search" &&
+              activeActivityTab !== "git" &&
+              activeActivityTab !== "history" // LG-08
+            }
             activeTab={activeActivityTab}
             workspacePath={workspacePath}
             // Only once the window has taken the folder: the provider's tree arrives through a

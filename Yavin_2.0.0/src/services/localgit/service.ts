@@ -162,7 +162,10 @@ export function createLocalGitService(
   const live = () => !closed && lifecycle.isActive();
 
   const opening: Promise<LocalGitInfo> = (async () => {
-    if (!live()) throw new LocalGitClosedError();
+    // A workspace makes its services before it is active (WorkspaceManager marks it active once
+    // `create` returns), so nothing is checked before asking: whether the workspace is still the
+    // window's is checked when the answer comes, below.
+    if (closed) throw new LocalGitClosedError();
     let info: LocalGitInfo;
     try {
       info = (await invoke("localgit_open", { folders: [...folders] })) as LocalGitInfo;

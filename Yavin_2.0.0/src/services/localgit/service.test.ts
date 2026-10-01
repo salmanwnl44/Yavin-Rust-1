@@ -1115,3 +1115,15 @@ test("an AI undo answering after its workspace was left is dropped before any do
   assert.ok((await late) instanceof LocalGitClosedError);
   assert.equal(reconciles, 0);
 });
+
+test("a service made while its workspace is still opening opens once the workspace is active", async () => {
+  // WorkspaceManager calls `create` in state "opening" and marks the workspace active right
+  // after it returns: the service must not give up in between.
+  const native = fakeNative();
+  let active = false;
+  const service = createLocalGitService(["/a"], { isActive: () => active }, native.invoke);
+  active = true;
+  await native.answer("localgit_open");
+  const info = await service.ready;
+  assert.equal(info.handle, "lg-1");
+});

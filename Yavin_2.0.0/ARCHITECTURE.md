@@ -1280,6 +1280,48 @@ The disk changes through LG-03's restore machinery: planned (`transition.rs`; co
 
 **Not yet** (later phases): any UI (LG-08); comparison with real Git, GC and retention (including of AI checkpoints and records), compaction, compression, a recovery UI, and ref storage whose updates do not rewrite every ref (LG-09).
 
+### Local History UI (LG-08)
+
+**Local History presents Local Git; it owns nothing.** Every fact on screen comes from the workspace's Local Git service (`services/localgit/service.ts`, over the `localgit_*` commands) as the service gives it, and every change goes through it -- which plans it, refuses it with its reasons, carries it out, verifies it and reconciles the documents. The panel orders no history, computes no diff, judges no safety and attributes no AI change.
+
+```text
+LocalHistoryPanel (components/localgit)          presentation.ts (pure labels, no decisions)
+   │  head · history(cursor) · readCommit · diffCommits · diffWorkspace · restore(dryRun)
+   │  branches · tags · operation · ai.history · ai.undo(dryRun) · stashList · continue/abort
+   v
+LocalGit service (one per workspace, its generation's handle) ──> localgit_* ──> ide-localgit
+                                                         restore/undo ──> M03/M04 executor
+   after a disk change: DocumentService reconcile (service) · Explorer/Source Control refresh (window)
+```
+
+**Where it lives.** An activity-bar entry, _Local History_, beside Source Control (which shows real Git and is unchanged). The window mounts the panel with the workspace's service, keyed by the workspace (the only `App.tsx` change), so a workspace switch unmounts it with everything it held.
+
+**History.** The current HEAD (branch, detached, or no commit yet) and the history as Local Git orders it (newest first along first parents), a page of 100 at a time through the service's cursor -- the next page loads when the list is scrolled to its end, or on _Load older entries_; a history that ends early at an unreadable commit says so. The list is windowed: only the rows in view (and a few around) are in the DOM, however many are loaded. Each row shows the entry's kind, short id, summary, author, time, and the branches and tags at it. The kind comes from what is recorded -- `source` (`ai`, `checkpoint`, `recovery`, `automatic`) and the number of parents (a merge) -- never from a message or an id's shape. The filter narrows the loaded entries by message, id prefix, author or kind; it never scans the repository.
+
+**Entry details** (`localgit_read_commit`): message, full id, refs, author and source, date, parents (each opens), and the provenance its metadata records -- cherry-picked from, merged, and for AI work the agent run, task, ChangeSet and revision, AI checkpoint, validation and model -- each only if present, and ids shown as the opaque strings they are. Changed files come from the backend's diff (added, modified, deleted, renamed with both paths, type changed; unavailable and binary marked), against the entry's parent or against the workspace.
+
+**Diffs** open in the existing diff view in the editor area, read-only (no staging: it is not real Git): Local Git's own hunks, written as the unified text that view reads. Content Local Git does not have is never replaced by the file on disk: _"Historical content unavailable: the file was over Local Git's storage limit"_, a missing object, binary content, a file changed on disk since the snapshot, too large or over the diff budget -- each says so above the diff.
+
+**Restore** (a whole entry, or one file) always shows the backend's dry-run plan first: files changed, added and deleted, documents whose unsaved changes would be discarded, and every refusal as the backend gives it (unsaved documents, local changes, untracked files in the way, blocked paths, content not stored, case-only renames, …) -- a refused plan cannot be confirmed. Only _Restore_ in the confirmation runs it (`refuseIfDirty`; Local Git takes a checkpoint first); the outcome is shown as reported, and the window refreshes the Explorer and Source Control.
+
+**AI runs** (LG-07's records): status as recorded -- a run left checkpointed or running by a process that ended is _Interrupted_, never shown as done -- agent run, task, ChangeSet and revision, model (only if given), validation, note, the checkpoint and the AI commit (each opens in History), the AI's changes and the changes that were not the AI's. **Undo AI Run** is offered only when the backend says it is available; it shows the backend's dry run (what is taken out, whose later edits are kept, whether HEAD moves back for a committed run, and every refusal -- a person's edit on an AI file, overlapping edits, unsaved text, history moved on, a merge in progress, content not stored) and runs only on confirmation.
+
+**Stashes** (LG-05): message, branch, base, time and the staged, unstaged and untracked counts. **A merge or cherry-pick in progress** (LG-06) is shown above the views with its conflicts and their resolutions; _Continue_ waits for every conflict, _Abort_ asks the backend.
+
+**Errors** are shown by meaning, with the native message under _Details_: `Busy`, `ReadOnly` (the panel is marked read-only and offers no change), the workspace changed, an operation in progress, recovery required, damaged or missing objects, `NotFound`, and any other code by name. Empty states: no history yet, no AI runs, no stashes, no changes, no folder open.
+
+**Workspaces.** The panel holds the service of the workspace it was mounted for; switching workspaces unmounts it, and every answer of an earlier one is dropped -- by the service (a closed workspace's results are refused) and by the panel's own generation check. Nothing of workspace A is ever shown in B.
+
+**Keyboard and accessibility**: the history is a listbox (arrow keys move the selection, which opens its details); views are tabs; confirmations are modal dialogs that keep focus inside and close on Escape, returning focus; every control has a label, and kinds and states are written out, never shown by colour alone.
+
+**A fix found by integration.** The Local Git service checked that its workspace was active before opening -- but `WorkspaceManager` makes a workspace's services _before_ marking it active, so in the window the service never opened. It now opens at once and checks the workspace when the answer arrives (a store opened for a workspace already gone is handed straight back, as before); a test makes the service in the manager's own order.
+
+**Performance** (UI test with a scripted backend of 10,000 entries): first rows 30 ms after a refresh; nine more pages (1,000 entries loaded) 832 ms; 29 rows in the DOM; entry details 136 ms; a diff 140 ms.
+
+**Known limitations**: the filter covers loaded entries only (the backend has no search); conflicts are shown but resolved through the API, not yet in this panel; stashes, branches and tags are shown, not managed here (Source Control and the API do that); a diff of one file asks the backend for the entry's whole diff; the panel's own test covers a workspace's results being dropped through the service, not a full A → B → A switch in the window.
+
+**Not yet** (LG-09): comparison with real Git, promotion, GC and retention, compaction, compression, a recovery UI.
+
 **Invariants**
 
 1. Local Git never reads or writes the project's `.git`, never runs `git`, and never writes inside the project.
@@ -1310,6 +1352,7 @@ The disk changes through LG-03's restore machinery: planned (`transition.rs`; co
 26. An AI checkpoint is durable before the AI changes anything, and never moves HEAD, a branch or the index; if it cannot be made, the AI does not begin.
 27. An AI commit holds exactly the AI's recorded changes, never a human's; staged human work stays staged. Ownership is never guessed: when it cannot be shown, the commit is refused.
 28. Undo AI Run takes out only the AI's changes, never a human's work or unsaved text -- never a reset to the checkpoint -- and is refused rather than guess.
+29. Local History presents Local Git and owns nothing: every fact comes from the Local Git service, every change goes through it after its dry run is shown, and every refusal is shown as the backend gave it.
 
 ## Explorer provider platform
 
