@@ -969,6 +969,47 @@ impl SnapshotEngine {
         )
     }
 
+    /// Compares a Local commit with real Git's side (see `compare.rs`), from a Full snapshot of
+    /// the disk (not persisted; unsaved documents play no part).
+    pub fn compare_with_git(
+        &self,
+        repo: &Mutex<Repository>,
+        control: &Control,
+        local: Option<ObjectId>,
+        git: &BTreeMap<FolderId, crate::compare::GitSide>,
+        limit: usize,
+    ) -> Result<(Snapshot, crate::compare::Comparison)> {
+        self.with_full_snapshot(
+            repo,
+            &SnapshotRequest::default(),
+            control,
+            false,
+            |lookup, repo, folders, snapshot| {
+                crate::compare::compare(lookup, repo, folders, snapshot, local, git, limit)
+            },
+        )
+    }
+
+    /// Plans promoting a Local commit into the working tree (see `promote.rs`).
+    pub fn plan_promotion(
+        &self,
+        repo: &Mutex<Repository>,
+        request: &SnapshotRequest,
+        control: &Control,
+        local: ObjectId,
+        git: &BTreeMap<FolderId, crate::compare::GitSide>,
+    ) -> Result<(Snapshot, crate::promote::PromotionPlan)> {
+        self.with_full_snapshot(
+            repo,
+            request,
+            control,
+            true,
+            |lookup, repo, folders, snapshot| {
+                crate::promote::plan(lookup, repo, folders, snapshot, local, git)
+            },
+        )
+    }
+
     /// A copy of the trees the last snapshot produced (staging reads them without the store).
     pub(crate) fn memory_trees(&self) -> HashMap<ObjectId, Tree> {
         self.state.lock().unwrap().trees.clone()

@@ -23,7 +23,8 @@ export type LocalGitFinding =
   | { kind: "danglingRef"; name: string; id: string }
   | { kind: "corruptObject"; id: string; detail: string }
   | { kind: "missingObject"; id: string; from: string }
-  | { kind: "staleTempsRemoved"; count: number };
+  | { kind: "staleTempsRemoved"; count: number }
+  | { kind: "interruptedGc"; id: number; stage: string };
 
 export interface LocalGitInfo {
   /** Valid until the workspace is left or the service closes. */
@@ -427,7 +428,8 @@ export type LocalGitRestoreConflict =
   | { kind: "stashBaseChanged"; folderId: string; path: string }
   | { kind: "untrackedFileCollision"; folderId: string; path: string }
   | { kind: "diskChangedSinceSnapshot"; folderId: string; path: string }
-  | { kind: "linkNotRestorable"; folderId: string; path: string; reason: string };
+  | { kind: "linkNotRestorable"; folderId: string; path: string; reason: string }
+  | { kind: "realGitChanged"; folderId: string; path: string; staged: boolean };
 
 export interface LocalGitRestorePlan {
   commit: string;
@@ -858,4 +860,128 @@ export interface LocalGitAiPath {
   expected?: string | null;
   /** The AI deleted the path. */
   deleted?: boolean;
+}
+
+// --- Real Git comparison, promotion, GC and integrity (LG-09) --------------------------------
+
+export type LocalGitPathState =
+  "same" | "different" | "localOnly" | "gitOnly" | "unavailable" | "notInLocalGit";
+
+export interface LocalGitPathComparison {
+  folderId: string;
+  path: string;
+  state: LocalGitPathState;
+  local: LocalGitEntryState | null;
+  gitMode: string | null;
+  /** Real Git's blob id (SHA-1): a different object space from Local Git's. */
+  gitId: string | null;
+  gitStatus: "clean" | "staged" | "modified" | "untracked" | "notTracked";
+  diskMatchesLocal: boolean;
+}
+
+export interface LocalGitComparison {
+  localCommit: string | null;
+  localBranch: string | null;
+  gitRepository: boolean;
+  gitHead: string | null;
+  gitBranch: string | null;
+  /** Paths that are not the same (at most the limit asked for). */
+  entries: LocalGitPathComparison[];
+  counts: Partial<Record<LocalGitPathState, number>>;
+  truncated: boolean;
+  identical: boolean;
+  localStaged: string[];
+  gitStaged: string[];
+}
+
+export interface LocalGitPromotionPlan {
+  localCommit: string;
+  gitHead: string | null;
+  gitBranch: string | null;
+  gitFingerprints: Record<string, string>;
+  paths: { folderId: string; path: string; action: "create" | "modify" | "delete" }[];
+  refusals: LocalGitRestoreConflict[];
+  restore: LocalGitRestorePlan;
+}
+
+export interface LocalGitPromoteResult {
+  status: "planned" | "refused" | "completed" | "failed" | "verificationFailed";
+  plan: LocalGitPromotionPlan;
+  conflicts: LocalGitRestoreConflict[];
+  /** The Local Git checkpoint of the workspace taken before anything changed. */
+  checkpoint: LocalGitCommitInfo | null;
+  operation: number | null;
+  applied: number;
+  error: string | null;
+  verification: LocalGitRestoreResult["verification"];
+}
+
+/** What GC may let go. Nothing expires by default. */
+export interface LocalGitRetentionPolicy {
+  reflogMaxAgeDays: number | null;
+  reflogKeepRecent: number;
+  aiFinishedMaxAgeDays: number | null;
+}
+
+export interface LocalGitGcPlan {
+  revision: number;
+  reflogRecords: number;
+  policy: LocalGitRetentionPolicy;
+  objects: number;
+  reachable: number;
+  unreachable: number;
+  unreachableBytes: number;
+  segments: number;
+  segmentsToRewrite: number;
+  liveObjectsToCopy: number;
+  /** Live roots by kind (`branch`, `tag`, `stash`, `aiRun`, …) and the reflog's objects. */
+  protected: Record<string, number>;
+  expiredReflogEntries: number;
+  expiredAiRuns: string[];
+  /** Reachable and absent: GC refuses to run. */
+  missing: LocalGitFinding[];
+}
+
+export interface LocalGitGcJournal {
+  version: number;
+  id: number;
+  stage: "copying" | "retiring" | "done" | "rolledBack";
+  segments: string[];
+  newSegment: string | null;
+  quarantine: string;
+}
+
+export interface LocalGitGcOutcome {
+  objectsBefore: number;
+  objectsAfter: number;
+  bytesBefore: number;
+  bytesAfter: number;
+  segmentsRetired: number;
+  quarantine: string | null;
+  expiredAiRuns: string[];
+}
+
+export interface LocalGitStorageStats {
+  objects: number;
+  blobs: number;
+  trees: number;
+  roots: number;
+  commits: number;
+  segments: number;
+  storageBytes: number;
+  refs: number;
+  reflogRecords: number;
+  aiRuns: number;
+  stashes: number;
+  quarantineGcBytes: number;
+  quarantineOtherBytes: number;
+  lastGc: LocalGitGcJournal | null;
+}
+
+export interface LocalGitIntegrityReport {
+  ok: boolean;
+  findings: LocalGitFinding[];
+  records: string[];
+  interruptedGc: LocalGitGcJournal | null;
+  repair: { problem: string; suggestion: string }[];
 }

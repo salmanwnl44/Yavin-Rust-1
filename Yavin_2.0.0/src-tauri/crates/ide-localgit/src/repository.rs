@@ -409,6 +409,12 @@ impl Repository {
         };
         repository.reconcile_reflog(&quarantine)?;
         repository.findings.extend(repository.dangling_refs());
+        if let Some(journal) = crate::gc::interrupted(&repository.dir) {
+            repository.findings.push(Finding::InterruptedGc {
+                id: journal.id,
+                stage: format!("{:?}", journal.stage),
+            });
+        }
         Ok(repository)
     }
 
@@ -682,6 +688,75 @@ impl Repository {
             .ok_or_else(|| LgError::RecoveryRequired("refs.json disappeared".into()))?;
         self.odb = odb;
         self.refs = refs;
+        Ok(())
+    }
+
+    /// The store's own folder (GC keeps its journal and quarantine there).
+    pub(crate) fn store_dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub(crate) fn odb(&self) -> &ObjectDb {
+        &self.odb
+    }
+
+    pub(crate) fn is_writer(&self) -> bool {
+        self.mode == Mode::Writer
+    }
+
+    /// GC: writes `ids` (each read and re-hashed from where it is now) into one new segment,
+    /// published in `objects/` beside the old ones -- deliberately not deduplicated against
+    /// the store, whose copies are about to be retired. Nothing else changes. Returns the new
+    /// segment's name (none: nothing to copy).
+    pub(crate) fn copy_objects(&mut self, ids: &[ObjectId]) -> Result<Option<String>> {
+        self.require_writer()?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let mut writer = SegmentWriter::create(&self.dir.join("tmp"))?;
+        let copied = self.odb.read_each(ids, |_, kind, bytes| {
+            writer.put(kind, &bytes)?;
+            Ok(())
+        });
+        if let Err(error) = copied {
+            writer.abandon();
+            return Err(error);
+        }
+        let name = self.odb.next_segment_name();
+        let objects_dir = self.odb.objects_dir().to_path_buf();
+        let records = writer.finish(&objects_dir, &name)?;
+        self.odb.publish(objects_dir.join(&name), &records);
+        Ok(Some(name))
+    }
+
+    /// GC: moves segments (by name) from `objects/` into `into`, then re-indexes the store.
+    /// Nothing is deleted. A segment already moved (a retried step) is skipped.
+    pub(crate) fn move_segments(
+        &mut self,
+        names: &[String],
+        from: &Path,
+        into: &Path,
+    ) -> Result<()> {
+        self.require_writer()?;
+        fs::create_dir_all(into)?;
+        for name in names {
+            let source = from.join(name);
+            if source.exists() {
+                fs::rename(&source, into.join(name))?;
+            }
+        }
+        self.reload_objects()
+    }
+
+    /// Re-indexes the segments only.
+    pub(crate) fn reload_objects(&mut self) -> Result<()> {
+        let quarantine = self.dir.join("quarantine");
+        let writer = self.mode == Mode::Writer;
+        let (odb, _) = ObjectDb::load(
+            &self.dir.join("objects"),
+            writer.then_some(quarantine.as_path()),
+        )?;
+        self.odb = odb;
         Ok(())
     }
 

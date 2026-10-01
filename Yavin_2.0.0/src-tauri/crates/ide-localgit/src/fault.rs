@@ -25,6 +25,10 @@ pub enum FaultPoint {
     ReflogAppended,
     /// `refs.json` holds the update; the in-memory state does not yet.
     RefsWritten,
+    /// GC: the live objects are copied into a new segment; no old segment is retired yet.
+    GcCopied,
+    /// GC: the old segments are in quarantine; the journal does not say done yet.
+    GcRetired,
 }
 
 #[cfg(any(test, feature = "fault-injection"))]

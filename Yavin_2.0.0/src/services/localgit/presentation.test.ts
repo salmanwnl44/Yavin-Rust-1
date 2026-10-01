@@ -126,6 +126,7 @@ test("every refusal the backend can give has its own words", () => {
     { kind: "untrackedFileCollision", folderId: "f", path: "a" },
     { kind: "diskChangedSinceSnapshot", folderId: "f", path: "a" },
     { kind: "linkNotRestorable", folderId: "f", path: "a", reason: "no privilege" },
+    { kind: "realGitChanged", folderId: "f", path: "a", staged: true },
   ];
   const words = conflicts.map(describeRestoreConflict);
   assert.equal(new Set(words).size, words.length, "each is distinct");

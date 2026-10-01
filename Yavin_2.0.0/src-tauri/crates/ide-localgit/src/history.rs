@@ -475,12 +475,16 @@ pub fn checkpoints(repo: &Repository, limit: usize) -> Result<Vec<CheckpointEntr
                 reason,
                 ..
             } if name == CHECKPOINT_REF && !aborted.contains(revision) => {
-                ObjectId::from_hex(new).ok().map(|id| CheckpointEntry {
-                    id: ObjectIdText(id),
-                    revision: *revision,
-                    ms: *ms,
-                    reason: reason.clone(),
-                })
+                // A checkpoint whose objects retention let go (LG-09) is no longer listed.
+                ObjectId::from_hex(new)
+                    .ok()
+                    .filter(|id| repo.contains(id))
+                    .map(|id| CheckpointEntry {
+                        id: ObjectIdText(id),
+                        revision: *revision,
+                        ms: *ms,
+                        reason: reason.clone(),
+                    })
             }
             _ => None,
         })

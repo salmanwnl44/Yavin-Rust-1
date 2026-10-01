@@ -146,6 +146,14 @@ pub enum RestoreConflict {
     /// other content.
     #[serde(rename_all = "camelCase")]
     UntrackedFileCollision { folder_id: String, path: String },
+    /// Promotion (LG-09): real Git reports the path staged (`staged`) or modified -- the user's
+    /// work there is never overwritten.
+    #[serde(rename_all = "camelCase")]
+    RealGitChanged {
+        folder_id: String,
+        path: String,
+        staged: bool,
+    },
     /// Found by the executor: a folder the restore would remove holds something snapshots
     /// leave out (`.git`, `node_modules`, `.env`, ...). It is never removed.
     #[serde(rename_all = "camelCase")]

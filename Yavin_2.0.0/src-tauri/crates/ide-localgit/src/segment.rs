@@ -308,6 +308,15 @@ pub fn entry_info(path: &Path, offset: u64) -> Result<(ObjectKind, u64)> {
     Ok((kind, len))
 }
 
+/// `entry_info` through a file already open.
+pub(crate) fn entry_info_in(
+    path: &Path,
+    file: &mut File,
+    offset: u64,
+) -> Result<(ObjectKind, u64)> {
+    read_entry_header(path, file, offset)
+}
+
 fn read_entry_header(path: &Path, file: &mut File, offset: u64) -> Result<(ObjectKind, u64)> {
     file.seek(SeekFrom::Start(offset))?;
     let mut header = [0u8; ENTRY_HEADER_LEN as usize];
@@ -337,7 +346,18 @@ pub fn read_object(
     max_len: u64,
 ) -> Result<(ObjectKind, Vec<u8>)> {
     let mut file = File::open(path)?;
-    let (kind, len) = read_entry_header(path, &mut file, offset)?;
+    read_object_in(path, &mut file, offset, expected, max_len)
+}
+
+/// `read_object` through a file already open (many objects of one segment).
+pub(crate) fn read_object_in(
+    path: &Path,
+    file: &mut File,
+    offset: u64,
+    expected: &ObjectId,
+    max_len: u64,
+) -> Result<(ObjectKind, Vec<u8>)> {
+    let (kind, len) = read_entry_header(path, file, offset)?;
     if len > max_len {
         return Err(LgError::InvalidFormat(format!(
             "{expected} is {len} bytes, more than the {max_len} asked for"

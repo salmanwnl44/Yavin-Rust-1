@@ -222,6 +222,11 @@ fn run_ref(agent_run_id: &str) -> Result<RefName> {
     RefName::new(&format!("{AI_PREFIX}r{}", &hash[..24]))
 }
 
+/// The ref that names a run's record.
+pub fn run_ref_name(agent_run_id: &str) -> Result<RefName> {
+    run_ref(agent_run_id)
+}
+
 fn check_id(what: &str, id: &str) -> Result<()> {
     if id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
         return Err(LgError::InvalidName(format!("{what} {id:?}")));

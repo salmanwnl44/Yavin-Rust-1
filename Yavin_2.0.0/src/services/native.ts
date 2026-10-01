@@ -10,6 +10,14 @@ import type {
   LocalGitAiCommitResult,
   LocalGitAiRun,
   LocalGitAiUndoResult,
+  LocalGitComparison,
+  LocalGitGcJournal,
+  LocalGitGcOutcome,
+  LocalGitGcPlan,
+  LocalGitIntegrityReport,
+  LocalGitPromoteResult,
+  LocalGitRetentionPolicy,
+  LocalGitStorageStats,
   LocalGitOperationResult,
   LocalGitOperationState,
   LocalGitResetResult,
@@ -408,6 +416,39 @@ interface Commands {
       overlays: LocalGitOverlayRef[];
     };
     result: LocalGitAiUndoResult;
+  };
+  localgit_compare_git: {
+    args: { handle: string; jobId: string; commit: string | null; limit: number };
+    result: LocalGitComparison;
+  };
+  localgit_promote: {
+    args: {
+      handle: string;
+      jobId: string;
+      commit: string;
+      dryRun: boolean;
+      overlays: LocalGitOverlayRef[];
+      by: LocalGitSignature;
+    };
+    result: LocalGitPromoteResult;
+  };
+  localgit_gc_plan: {
+    args: { handle: string; policy: LocalGitRetentionPolicy };
+    result: LocalGitGcPlan;
+  };
+  localgit_gc_run: {
+    args: { handle: string; policy: LocalGitRetentionPolicy };
+    result: LocalGitGcOutcome;
+  };
+  localgit_gc_roll_back: { args: { handle: string }; result: LocalGitGcJournal | null };
+  localgit_gc_purge: {
+    args: { handle: string };
+    result: { folders: string[]; bytes: number };
+  };
+  localgit_storage: { args: { handle: string }; result: LocalGitStorageStats };
+  localgit_integrity: {
+    args: { handle: string; full: boolean };
+    result: LocalGitIntegrityReport;
   };
   localgit_abort: {
     args: {

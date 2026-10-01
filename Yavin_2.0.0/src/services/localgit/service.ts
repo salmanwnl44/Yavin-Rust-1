@@ -6,6 +6,14 @@ import type {
   LocalGitAiPath,
   LocalGitAiRun,
   LocalGitAiUndoResult,
+  LocalGitComparison,
+  LocalGitGcJournal,
+  LocalGitGcOutcome,
+  LocalGitGcPlan,
+  LocalGitIntegrityReport,
+  LocalGitPromoteResult,
+  LocalGitRetentionPolicy,
+  LocalGitStorageStats,
   LocalGitOperationResult,
   LocalGitOperationState,
   LocalGitResolveChoice,
@@ -144,6 +152,13 @@ export function asLocalGitError(error: unknown): LocalGitError {
   const match = /^([A-Za-z]+): (.*)$/s.exec(text);
   return match ? new LocalGitError(match[1], match[2]) : new LocalGitError("Unknown", text);
 }
+
+/** GC's default: nothing in the reflog or the AI history expires. */
+export const KEEP_EVERYTHING: LocalGitRetentionPolicy = {
+  reflogMaxAgeDays: null,
+  reflogKeepRecent: 20,
+  aiFinishedMaxAgeDays: null,
+};
 
 export function createLocalGitService(
   folders: readonly string[],
@@ -870,6 +885,51 @@ export function createLocalGitService(
         return afterDisk(result, result.plan.restore);
       },
     },
+
+    /**
+     * Local Git against real Git, by content (LG-09): read-only on both sides. `commit`
+     * defaults to Local HEAD.
+     */
+    compareWithGit: (
+      options: { commit?: string; limit?: number } = {},
+      jobId: string = nextJob(),
+    ) =>
+      call<LocalGitComparison>("localgit_compare_git", {
+        jobId,
+        commit: options.commit ?? null,
+        limit: options.limit ?? 2000,
+      }),
+
+    /**
+     * Brings a Local commit's content into the working tree real Git works in, for the user to
+     * stage and commit with real Git. Never stages, commits or pushes; `dryRun` plans only.
+     */
+    async promote(
+      commit: string,
+      options: { dryRun?: boolean } = {},
+      jobId: string = nextJob(),
+    ): Promise<WithDocuments<LocalGitPromoteResult>> {
+      const result = await withOverlays(false, (refs) =>
+        call<LocalGitPromoteResult>("localgit_promote", {
+          jobId,
+          commit,
+          dryRun: options.dryRun ?? false,
+          overlays: refs.overlays,
+          by: signature(identity()),
+        }),
+      );
+      return afterDisk(result, result.plan.restore);
+    },
+
+    /** Storage upkeep (LG-09). Nothing is deleted except by `gcPurge`. */
+    gcPlan: (policy: LocalGitRetentionPolicy = KEEP_EVERYTHING) =>
+      call<LocalGitGcPlan>("localgit_gc_plan", { policy }),
+    gcRun: (policy: LocalGitRetentionPolicy = KEEP_EVERYTHING) =>
+      call<LocalGitGcOutcome>("localgit_gc_run", { policy }),
+    gcRollBack: () => call<LocalGitGcJournal | null>("localgit_gc_roll_back"),
+    gcPurge: () => call<{ folders: string[]; bytes: number }>("localgit_gc_purge"),
+    storage: () => call<LocalGitStorageStats>("localgit_storage"),
+    integrity: (full = false) => call<LocalGitIntegrityReport>("localgit_integrity", { full }),
 
     /** Stops a snapshot or status of this service (it rejects with code `Cancelled`). */
     cancel: (jobId: string) => call<void>("localgit_cancel", { jobId }),

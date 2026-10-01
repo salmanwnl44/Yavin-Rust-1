@@ -32,6 +32,10 @@ use git::{
     git_probe_worktree, git_repo_state, git_unwatch_repo, git_watch_repo, GitJobs, GitWatches,
     NetworkLocks, Repos, StashLocks,
 };
+use localgit::lg09::{
+    localgit_compare_git, localgit_gc_plan, localgit_gc_purge, localgit_gc_roll_back,
+    localgit_gc_run, localgit_integrity, localgit_promote, localgit_storage,
+};
 use localgit::{
     localgit_abort, localgit_ai_associate, localgit_ai_checkpoint, localgit_ai_commit,
     localgit_ai_record_changes, localgit_ai_report, localgit_ai_run, localgit_ai_runs,
@@ -716,6 +720,14 @@ pub fn run() {
             localgit_resolve,
             localgit_continue,
             localgit_abort,
+            localgit_compare_git,
+            localgit_promote,
+            localgit_gc_plan,
+            localgit_gc_run,
+            localgit_gc_roll_back,
+            localgit_gc_purge,
+            localgit_storage,
+            localgit_integrity,
             localgit_ai_checkpoint,
             localgit_ai_run,
             localgit_ai_runs,

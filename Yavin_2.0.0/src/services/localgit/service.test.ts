@@ -1127,3 +1127,72 @@ test("a service made while its workspace is still opening opens once the workspa
   const info = await service.ready;
   assert.equal(info.handle, "lg-1");
 });
+
+// --- Real Git comparison, promotion and upkeep (LG-09) --------------------------------------
+
+test("comparison, promotion and GC send what they are given; GC keeps everything by default", async () => {
+  const reconciled: unknown[] = [];
+  const native = scriptedNative({
+    localgit_compare_git: () => ({ identical: true, entries: [] }),
+    localgit_promote: (args) => ({
+      status: args.dryRun ? "planned" : "completed",
+      plan: {
+        localCommit: "c1",
+        gitHead: "g1",
+        gitBranch: "main",
+        gitFingerprints: {},
+        paths: [],
+        refusals: [],
+        restore: diskResult("completed", [op("writeFile", "a.txt")]),
+      },
+      conflicts: [],
+      checkpoint: null,
+      operation: args.dryRun ? null : 1,
+      applied: args.dryRun ? 0 : 1,
+      error: null,
+      verification: null,
+    }),
+    localgit_gc_plan: () => ({ unreachable: 3 }),
+    localgit_gc_run: () => ({ segmentsRetired: 1 }),
+    localgit_gc_purge: () => ({ folders: ["gc-1"], bytes: 10 }),
+    localgit_integrity: () => ({ ok: true }),
+  });
+  const service = createLocalGitService(["/work"], { isActive: () => true }, native.invoke);
+  service.attachOverlays({
+    ...overlaySource([]).source,
+    reconcileRestore: async (paths) => {
+      reconciled.push(paths);
+      return { ok: true, reloaded: [], closed: [], failed: [] };
+    },
+  });
+  await service.compareWithGit();
+  await service.compareWithGit({ commit: "c7", limit: 10 });
+  const planned = await service.promote("c1", { dryRun: true });
+  assert.equal(planned.documents, null, "a dry run touches no document");
+  const promoted = await service.promote("c1");
+  assert.equal(promoted.succeeded, true);
+  assert.equal(reconciled.length, 1);
+  await service.gcPlan();
+  await service.gcRun({ reflogMaxAgeDays: 30, reflogKeepRecent: 5, aiFinishedMaxAgeDays: null });
+  await service.gcPurge();
+  await service.integrity(true);
+  const args = (command: string) =>
+    native.calls.filter((c) => c.command === command).map((c) => c.args);
+  assert.deepEqual(
+    args("localgit_compare_git").map((a) => [a.commit, a.limit]),
+    [
+      [null, 2000],
+      ["c7", 10],
+    ],
+  );
+  assert.deepEqual(args("localgit_gc_plan")[0].policy, {
+    reflogMaxAgeDays: null,
+    reflogKeepRecent: 20,
+    aiFinishedMaxAgeDays: null,
+  });
+  assert.equal(
+    (args("localgit_gc_run")[0].policy as { reflogMaxAgeDays: number }).reflogMaxAgeDays,
+    30,
+  );
+  assert.equal(args("localgit_integrity")[0].full, true);
+});

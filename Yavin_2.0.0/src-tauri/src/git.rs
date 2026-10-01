@@ -234,6 +234,17 @@ fn run(root: &Path, args: &[&str]) -> Result<ToolOutput, String> {
     run_command(root, args, None, Arc::new(AtomicBool::new(false)), false)
 }
 
+/// A read-only Git command for Local Git's comparison with real Git (LG-09): the same hardened
+/// runner, with optional locks off so that even `status` never writes the index.
+pub(crate) fn run_read_only(root: &Path, args: &[&str]) -> Result<ToolOutput, String> {
+    run_command(root, args, None, Arc::new(AtomicBool::new(false)), true)
+}
+
+/// The top level of the repository `path` is in -- none when it is in none (or Git is missing).
+pub(crate) fn toplevel_of(path: &Path) -> Option<PathBuf> {
+    discover_toplevel(path).ok()
+}
+
 /// `run` with a longer deadline than the shared default, for `clone` -- the one Git command
 /// here whose legitimate running time is measured in minutes rather than milliseconds.
 fn run_within(root: &Path, args: &[&str], timeout: Duration) -> Result<ToolOutput, String> {

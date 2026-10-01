@@ -170,6 +170,8 @@ export function describeRestoreConflict(conflict: LocalGitRestoreConflict): stri
       return `${path}: changed on disk since the plan was made`;
     case "linkNotRestorable":
       return `${path}: the link cannot be created (${conflict.reason})`;
+    case "realGitChanged":
+      return `${path}: real Git has ${conflict.staged ? "staged" : "unstaged"} changes here`;
     default:
       return `${path}: ${(conflict as { kind: string }).kind}`;
   }

@@ -42,6 +42,11 @@ pub enum Finding {
     /// Temporary files of an interrupted write were removed (they were never published).
     #[serde(rename_all = "camelCase")]
     StaleTempsRemoved { count: usize },
+    /// A garbage collection stopped partway (LG-09). The store is consistent -- every live
+    /// object is in an old or the new segment -- and nothing was deleted; it is rolled back
+    /// explicitly before another GC, never finished on its own.
+    #[serde(rename_all = "camelCase")]
+    InterruptedGc { id: u64, stage: String },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]

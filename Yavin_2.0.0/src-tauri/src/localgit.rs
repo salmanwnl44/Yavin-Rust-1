@@ -3417,6 +3417,10 @@ fn carry_undo(
     Ok(result)
 }
 
+/// Local Git and real Git, and upkeep (LG-09).
+#[path = "localgit_lg09.rs"]
+pub mod lg09;
+
 #[cfg(test)]
 mod lg05_push_tests {
     use super::*;

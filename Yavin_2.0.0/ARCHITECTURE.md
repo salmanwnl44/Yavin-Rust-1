@@ -1320,7 +1320,60 @@ LocalGit service (one per workspace, its generation's handle) ──> localgit_*
 
 **Known limitations**: the filter covers loaded entries only (the backend has no search); conflicts are shown but resolved through the API, not yet in this panel; stashes, branches and tags are shown, not managed here (Source Control and the API do that); a diff of one file asks the backend for the entry's whole diff; the panel's own test covers a workspace's results being dropped through the service, not a full A → B → A switch in the window.
 
-**Not yet** (LG-09): comparison with real Git, promotion, GC and retention, compaction, compression, a recovery UI.
+**Not yet**: a UI for comparison, promotion and GC (LG-09 provides the backend, below).
+
+### Real Git comparison, promotion, garbage collection and integrity (LG-09)
+
+**Local Git and real Git stay separate systems, joined only by an explicit, read-mostly bridge.** Real Git owns `.git`, its index, branches, commits and remotes; Local Git owns its store. Nothing in `ide-localgit` runs a process or touches `.git` -- its source-scan test still holds. Real Git is read by the app, through its one hardened Git runner (`git::run_read_only`, with `GIT_OPTIONAL_LOCKS=0` so even `status` never refreshes the index), with five read-only commands: `rev-parse`, `symbolic-ref`, `ls-tree`, `ls-files`, `status`. Local Git never stages, commits, pushes, resets, checks out or changes a branch in real Git.
+
+**Comparison** (`compare.rs`, `localgit_compare_git`) is by content. The two histories are separate object spaces (Local Git: SHA-256 over its own format; real Git: SHA-1 over its own), so ids are never matched: a Local commit's tree is compared with real Git's HEAD path by path. Exactly: Local content that the working tree holds unchanged, where real Git reports the path clean, is HEAD's without reading anything; otherwise the Local content's real Git blob id is computed (`gitblob.rs`, a SHA-1 checked against the standard vectors and `git hash-object`) and compared with the id real Git reports, mode included. Never timestamps.
+
+| State                   | Meaning                                                                                                     |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `same`                  | the same content and mode                                                                                   |
+| `different`             | in both, with different content or mode                                                                     |
+| `localOnly` / `gitOnly` | in one of them only                                                                                         |
+| `unavailable`           | Local Git never stored the content (over the storage limit), so it cannot be decided -- never assumed equal |
+| `notInLocalGit`         | real Git tracks it, Local Git's rules leave it out (`node_modules`, `.env`, `.yavinignore`)                 |
+
+Each path also carries real Git's status there (clean, staged, modified, untracked, not tracked) and whether the working tree holds the Local content. The result names both HEADs and branches, says whether the trees are identical, and lists each side's staged paths. A workspace folder inside a repository compares only its own paths; a folder in no repository says so; no Local history makes everything `gitOnly`.
+
+**Promotion** (`promote.rs`, `localgit_promote`) brings a Local commit's content into the working tree real Git works in -- the bridge in one direction, explicitly. It writes the working tree only, and only what differs from real Git's HEAD (create, modify, delete; paths Local Git leaves out are never touched), through LG-03's restore machinery: planned completely, refused with every reason before anything changes, carried out as one Module 03 operation recorded by Module 04 after a Local Git recovery checkpoint of the workspace, and verified. The result is ordinary working-tree changes for the user to review, stage and commit in Source Control: Local Git never stages, commits or pushes. Refused:
+
+- where real Git reports the path staged or modified (`realGitChanged`, saying which) -- the user's work there is never overwritten;
+- where an untracked or ignored file is in the way (`untrackedFileCollision`);
+- where a document with unsaved changes would be overwritten; where Local Git never stored the content (`historicalContentUnavailable`); and everything else the restore planner refuses;
+- when real Git changed since the plan: the plan records a fingerprint of real Git's state (HEAD, branch, the index's entries, status) and the app reads it again right before writing -- any difference refuses (`StaleRevision`), compare-and-apply.
+
+A promotion interrupted partway is Module 04's to settle on the next start (never replayed or undone by guessing); the recovery checkpoint holds the working tree as it was, restorable from Local History; real Git's HEAD and index are untouched throughout.
+
+**Garbage collection** (`gc.rs`, `localgit_gc_*`). _Roots_: every ref -- branches, tags, the index, the checkpoint ref, the merge or cherry-pick in progress, stashes, AI run records, and any ref kind added later, since all of `refs.json` is read -- a detached HEAD, and the objects the reflog names unless retention expires them. _Reachability_ follows commits to their roots, disk roots, parents and every `metaobj` (index roots, overlay sets, AI checkpoints and commits, operation states), roots to trees, trees to trees and blobs (files never stored are not looked for), over hash sets, once per object. An object reachable from a ref and absent is corruption: GC refuses to run. One reachable only from the reflog may be gone (expired history), which is not.
+
+_Collection never deletes_:
+
+```text
+plan (reads only)  ->  run: refs revision and reflog unchanged, no unresolved GC, nothing missing
+  journal "copying"   ->  every live object of each segment with garbage copied into one new segment
+  journal "retiring"  ->  those old segments moved to quarantine/gc-<id>/, the store re-indexed
+  every reachable object present?  no -> segments moved back, RecoveryRequired
+  journal "done"      ->  purge (explicit, separate): quarantine/gc-* deleted
+```
+
+The journal (`gc/journal.json`) is written durably before each step. A GC interrupted anywhere leaves a consistent store -- every live object is in an old segment, the new one, or both, and duplicates are read as one -- reported on the next open (`interruptedGc`) and never finished by itself: GC and purge are refused until it is rolled back (its segments moved back; nothing lost). Damaged files set aside on open (`*.corrupt`, `*.torn`) are evidence and are never purged. GC holds the writer lock and the store's mutation lock; a second Yavin process is read-only and cannot collect or purge. A reader in another process whose segment was retired gets a read error and sees the store after a reload. GC of one workspace's store never reads or writes another's.
+
+**Retention** (`RetentionPolicy`; by default nothing expires): reflog entries older than `reflogMaxAgeDays` stop keeping their objects, except each ref's newest `reflogKeepRecent` -- how old automatic and recovery checkpoints, abandoned states and deleted branches' history go; and with `aiFinishedMaxAgeDays`, records of AI runs that are finished with nothing left to undo (undone, or cancelled or failed with no changes) are removed first. Branches, tags, stashes, the index, an operation in progress and every AI run that may still be undone -- checkpointed, running, interrupted, with changes, committed -- are refs: never expired by age. The checkpoint list shows only checkpoints still in the store.
+
+**Storage statistics** (`localgit_storage`): objects by kind, segments, bytes, refs, reflog records, AI runs, stashes, what waits in quarantine (GC's, and damaged files apart), the last GC's journal -- from the in-memory index, the refs and the reflog, without reading objects. The GC plan adds reachable and unreachable counts and bytes, segments to rewrite, roots by kind, expired entries.
+
+**Integrity** (`localgit_integrity`): the store's own checks (dangling refs; with `full`, every object re-hashed and everything reachable walked), plus every record it keeps -- the reflog, the operation state, the AI run records, the GC journal -- and an interrupted GC, as structured findings, each with a suggested step for the user (`repair`). Nothing is repaired: no ref rewritten, no object recreated, no history deleted, no branch moved.
+
+**Compression** stays deferred (the object format is unchanged): GC's copy-and-retire reclaims space without a new format; compression would need a versioned codec, migration and crash tests for little gain on source text.
+
+**API** (native commands, typed in `services/localgit/types.ts`, on the service): `compareWithGit`, `promote` (with a dry run), `gcPlan`, `gcRun`, `gcRollBack`, `gcPurge`, `storage`, `integrity`. No UI is added: Local History (LG-08) stays as it is; these are the backend for it.
+
+**Performance**: (release, `cargo test -p ide-localgit --release --test lg09_scale -- --ignored --nocapture --test-threads=1`) 10,000 files (22,174 objects): GC plan 1.3 s, run 62 ms, full integrity scan (every object re-hashed) 3.1 s, stats 4 ms, purge 11 ms, comparison with real Git 1.9 s, promotion plan 548 ms; peak working set 33 MB. 100,000 files (111,274 objects): GC plan 1.65 s, run 129 ms, full integrity 16.7 s, stats 5 ms, comparison 3.2 s, promotion plan 1.7 s; peak 186 MB. 1,000,000 objects (500,000 unreachable): reopen 0.7 s, GC plan (reachability over hash sets) 6.5 s, GC run (500,000 objects copied, one open file per segment, every object re-hashed) 12.3 s, quick integrity 16 ms, stats 146 ms; peak about 300 MB. (The 10k and 100k GC plans were measured before reads were batched per segment, which took the 1M plan from 43.5 s to 6.5 s and the run from 50 s to 12 s; they are upper bounds.) The full integrity scan re-hashes every object and is the expensive check; the quick one checks refs only.
+
+**Known limitations**: rename detection across the bridge is by path (a rename is a delete and a create); comparison reads Local content to compute real Git ids where the working tree cannot vouch for it (bounded by what differs); a multi-folder workspace compares each folder with the repository it is in; promotion writes the working tree only -- staging and committing are the user's, in Source Control; a reader in another process sees a retired segment as a read error until it reloads; there is no UI yet for comparison, promotion or GC.
 
 **Invariants**
 
@@ -1353,6 +1406,8 @@ LocalGit service (one per workspace, its generation's handle) ──> localgit_*
 27. An AI commit holds exactly the AI's recorded changes, never a human's; staged human work stays staged. Ownership is never guessed: when it cannot be shown, the commit is refused.
 28. Undo AI Run takes out only the AI's changes, never a human's work or unsaved text -- never a reset to the checkpoint -- and is refused rather than guess.
 29. Local History presents Local Git and owns nothing: every fact comes from the Local Git service, every change goes through it after its dry run is shown, and every refusal is shown as the backend gave it.
+30. Local Git never changes real Git: comparison reads it with read-only commands; promotion writes the working tree only, refuses over the user's real Git work or a real Git that changed since the plan, and never stages, commits or pushes.
+31. GC deletes nothing reachable from any ref, and deletes nothing at all until an explicit purge; an interrupted GC leaves a consistent store and is rolled back, never finished by itself; corruption is reported, never repaired.
 
 ## Explorer provider platform
 

@@ -17,6 +17,9 @@ struct Loc {
     kind: ObjectKind,
 }
 
+/// A segment (by number) and the objects to read from it, as (offset, id) in file order.
+type SegmentObjects = (usize, Vec<(u64, ObjectId)>);
+
 pub struct ObjectDb {
     objects_dir: PathBuf,
     segments: Vec<PathBuf>,
@@ -158,5 +161,94 @@ impl ObjectDb {
     /// Every object id, for a full verify.
     pub fn ids(&self) -> impl Iterator<Item = &ObjectId> {
         self.index.keys()
+    }
+
+    /// Each segment's file name, and the objects found through it (an object in two segments is
+    /// listed under the first, the one reads use). GC's view of what each segment holds.
+    pub(crate) fn segments_with_objects(&self) -> Vec<(String, Vec<ObjectId>)> {
+        let mut out: Vec<(String, Vec<ObjectId>)> = self
+            .segments
+            .iter()
+            .map(|path| {
+                (
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        for (id, loc) in &self.index {
+            out[loc.segment as usize].1.push(*id);
+        }
+        out
+    }
+
+    /// `ids` grouped by the segment they are read from, each group in file order.
+    fn by_segment(&self, ids: &[ObjectId]) -> Result<Vec<SegmentObjects>> {
+        let mut groups: HashMap<u32, Vec<(u64, ObjectId)>> = HashMap::new();
+        for id in ids {
+            let loc = self.index.get(id).ok_or(LgError::MissingObject(*id))?;
+            groups
+                .entry(loc.segment)
+                .or_default()
+                .push((loc.offset, *id));
+        }
+        let mut out: Vec<SegmentObjects> = groups
+            .into_iter()
+            .map(|(segment, mut objects)| {
+                objects.sort();
+                (segment as usize, objects)
+            })
+            .collect();
+        out.sort_by_key(|(segment, _)| *segment);
+        Ok(out)
+    }
+
+    /// Reads `ids`, one open file per segment and in file order -- each re-hashed, as every
+    /// read is -- handing each to `each`.
+    pub(crate) fn read_each(
+        &self,
+        ids: &[ObjectId],
+        mut each: impl FnMut(&ObjectId, ObjectKind, Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        for (segment, objects) in self.by_segment(ids)? {
+            let path = &self.segments[segment];
+            let mut file = fs::File::open(path)?;
+            for (offset, id) in objects {
+                let (kind, bytes) =
+                    segment::read_object_in(path, &mut file, offset, &id, u64::MAX)?;
+                each(&id, kind, bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The payload sizes of `ids`, from their entry headers (one open file per segment).
+    pub(crate) fn sizes(&self, ids: &[ObjectId]) -> Result<u64> {
+        let mut total = 0;
+        for (segment, objects) in self.by_segment(ids)? {
+            let path = &self.segments[segment];
+            let mut file = fs::File::open(path)?;
+            for (offset, _) in objects {
+                total += segment::entry_info_in(path, &mut file, offset)?.1;
+            }
+        }
+        Ok(total)
+    }
+
+    /// How many objects of each kind the store holds.
+    pub(crate) fn kind_counts(&self) -> [usize; 4] {
+        let mut counts = [0usize; 4];
+        for loc in self.index.values() {
+            let at = match loc.kind {
+                ObjectKind::Blob => 0,
+                ObjectKind::Tree => 1,
+                ObjectKind::Root => 2,
+                ObjectKind::Commit => 3,
+            };
+            counts[at] += 1;
+        }
+        counts
     }
 }

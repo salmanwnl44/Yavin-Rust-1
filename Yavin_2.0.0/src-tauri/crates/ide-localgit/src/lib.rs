@@ -13,11 +13,14 @@
 
 pub mod ai;
 pub mod branches;
+pub mod compare;
 pub mod diff;
 pub mod error;
 pub mod exclude;
 pub mod fault;
 pub mod finding;
+pub mod gc;
+pub mod gitblob;
 pub mod history;
 pub mod id;
 pub mod index;
@@ -26,6 +29,7 @@ pub mod merge3;
 pub mod object;
 pub mod odb;
 pub mod operation;
+pub mod promote;
 pub mod reflog;
 pub mod refs;
 pub mod repository;
