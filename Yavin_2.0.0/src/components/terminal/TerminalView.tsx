@@ -8,17 +8,24 @@ import { isTauri } from "@tauri-apps/api/core";
 import { native } from "../../services/native";
 import {
   describeExit,
-  onExitFor,
-  onOutputFor,
   closeLeftoverShells,
   nextGeneration,
-  fromLaunch,
-  openArgsFor,
+  openRequestFor,
+  openTerminal,
+  type TerminalStreamHandlers,
+  type TerminalTransport,
   terminalKeyAction,
   usableSize,
   type TerminalKeyAction,
   type TerminalSession,
 } from "../../services/terminal";
+import {
+  asTerminalError,
+  chunkInput,
+  type Generation,
+  type TerminalId,
+} from "../../services/terminalProtocol";
+import { useWorkspace } from "../../services/workspaces";
 
 export interface SearchSettings {
   caseSensitive: boolean;
@@ -80,6 +87,14 @@ export const TerminalView = forwardRef<
   ref,
 ) {
   const { id, shell } = session;
+  const sessionId = id as TerminalId;
+  // Read at open time: the panel is remounted for every workspace, so this is the workspace
+  // the terminal belongs to, and the native side refuses a launch for any other.
+  const workspace = useWorkspace();
+  const workspaceId = useRef(workspace.id);
+  workspaceId.current = workspace.id;
+  /** The launch input and resizes are for; `null` before the first. */
+  const current = useRef<Generation | null>(null);
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<{ term: XTerm; fit: FitAddon; search: SearchAddon } | null>(null);
   /** True only while a shell is attached, so nothing is sent into the void. */
@@ -110,11 +125,25 @@ export const TerminalView = forwardRef<
       .catch(() => report.current.onStatus("The clipboard is not available."));
   };
 
+  /**
+   * Input for the running launch, in requests the contract allows (`chunkInput`). The native
+   * side only queues it, and runs these requests in the order they are sent, so a long paste
+   * arrives whole and in order.
+   */
+  const send = (data: string) => {
+    const generation = current.current;
+    if (!running.current || generation === null) return;
+    for (const piece of chunkInput(data))
+      void native("terminal_write", { request: { sessionId, generation, data: piece } }).catch(
+        (error) => report.current.onStatus(asTerminalError(error).message),
+      );
+  };
+
   const pasteInto = () => {
     void navigator.clipboard
       .readText()
       .then((text) => {
-        if (text && running.current) return native("terminal_write", { id, data: text });
+        if (text) send(text);
       })
       .catch(() => report.current.onStatus("The clipboard is not available."));
   };
@@ -203,22 +232,69 @@ export const TerminalView = forwardRef<
     }
 
     /** The launch this view is showing; events of any other are ignored. */
-    let generation = 0;
+    let generation: Generation | null = null;
     /** Set when this view goes: a launch that answers after that is not left running. */
     let closed = false;
+
+    const transport: TerminalTransport = {
+      open: (args) => native("terminal_open", args),
+      ack: (request) => native("terminal_ack", { request }),
+    };
+    /**
+     * What this view does with one launch's stream, which arrives on that launch's own channel.
+     * The bytes are raw and may end inside a character or an escape sequence: xterm decodes them
+     * as a stream, and its write callback -- the bytes parsed -- is the acknowledgement. A
+     * launch this view has moved on from (a restart, or React's second mount) is still
+     * acknowledged, so its stream drains instead of holding output for nobody.
+     */
+    const handlersFor = (mine: Generation): TerminalStreamHandlers => {
+      const current = () => !closed && mine === generation;
+      /** The launch's end: an exit is reported in grey, a failure in red and on the status. */
+      const ended = (message: string, failed: boolean) => {
+        running.current = false;
+        setExited(message);
+        report.current.onStatus(failed ? message : "");
+        term.writeln(`\r\n\x1b[38;5;${failed ? 203 : 244}m[${message}]\x1b[0m`);
+      };
+      return {
+        output: (chunk, accepted) => {
+          if (!current()) return accepted();
+          term.write(chunk.bytes, accepted);
+        },
+        exit: (exit) => {
+          if (current()) ended(describeExit(exit.exitCode), false);
+        },
+        error: (event) => {
+          if (current()) ended(event.error.message, true);
+        },
+        detached: (event) => {
+          if (current()) ended(event.error.message, true);
+        },
+      };
+    };
+
     const open = (clear: boolean) => {
       if (clear) term.clear();
       setExited("");
       running.current = false;
       generation = nextGeneration();
+      current.current = generation;
       const mine = generation;
       const size = usableSize(term.cols, term.rows);
       void closeLeftoverShells(() => native("terminal_close_all"))
-        .then(() => native("terminal_open", { ...openArgsFor(launch.current, size), generation }))
+        .then(() =>
+          openTerminal(
+            openRequestFor(launch.current, size, mine, workspaceId.current),
+            handlersFor(mine),
+            transport,
+          ),
+        )
         .then(() => {
           // Started after its view (or its workspace) went: nobody would ever end it.
           if (closed) {
-            void native("terminal_close", { id, generation: mine }).catch(() => undefined);
+            void native("terminal_close", { request: { sessionId, generation: mine } }).catch(
+              () => undefined,
+            );
             return;
           }
           // A restart since: that launch is the one to report.
@@ -229,35 +305,16 @@ export const TerminalView = forwardRef<
         .catch((error) => {
           if (closed || mine !== generation) return;
           running.current = false;
-          setExited(String(error));
-          report.current.onStatus(String(error));
-          term.writeln(`\x1b[38;5;203m${String(error)}\x1b[0m`);
+          const message = asTerminalError(error).message;
+          setExited(message);
+          report.current.onStatus(message);
+          term.writeln(`\x1b[38;5;203m${message}\x1b[0m`);
         });
     };
     start.current = open;
 
     // Keystrokes go to the shell as bytes; the shell decides what they mean.
-    const typed = term.onData((data) => {
-      if (!running.current) return;
-      void native("terminal_write", { id, data }).catch((error) =>
-        report.current.onStatus(String(error)),
-      );
-    });
-    // Routed by id rather than filtered from a broadcast, so one terminal's output costs
-    // one lookup instead of waking every other open terminal.
-    const stopOutput = onOutputFor(id, (data, payload) => {
-      if (fromLaunch(payload, generation)) term.write(data);
-    });
-    const stopExit = onExitFor(id, (code, payload) => {
-      // The end of a shell this one replaced (a restart, or React's second mount).
-      if (!fromLaunch(payload, generation)) return;
-      running.current = false;
-      const message = describeExit(code);
-      setExited(message);
-      report.current.onStatus("");
-      term.writeln(`\r\n\x1b[38;5;244m[${message}]\x1b[0m`);
-    });
-
+    const typed = term.onData(send);
     open(false);
 
     // Keep the shell's idea of the window the same as what is drawn. Dragging the
@@ -269,8 +326,11 @@ export const TerminalView = forwardRef<
       if (!running.current) return;
       clearTimeout(pending);
       pending = setTimeout(() => {
-        const next = usableSize(term.cols, term.rows);
-        void native("terminal_resize", { id, ...next }).catch(() => undefined);
+        if (generation === null) return;
+        const dimensions = usableSize(term.cols, term.rows);
+        void native("terminal_resize", { request: { sessionId, generation, dimensions } }).catch(
+          () => undefined,
+        );
       }, 100);
     });
     observer.observe(container);
@@ -284,11 +344,12 @@ export const TerminalView = forwardRef<
       results.dispose();
       bell.dispose();
       typed.dispose();
-      stopOutput();
-      stopExit();
       view.current = null;
       term.dispose();
-      void native("terminal_close", { id, generation }).catch(() => undefined);
+      if (generation !== null)
+        void native("terminal_close", { request: { sessionId, generation } }).catch(
+          () => undefined,
+        );
     };
   }, [id, shell]);
 
@@ -297,9 +358,12 @@ export const TerminalView = forwardRef<
     if (!visible || !view.current) return;
     view.current.fit.fit();
     view.current.term.focus();
-    if (!running.current) return;
-    const size = usableSize(view.current.term.cols, view.current.term.rows);
-    void native("terminal_resize", { id, ...size }).catch(() => undefined);
+    const generation = current.current;
+    if (!running.current || generation === null) return;
+    const dimensions = usableSize(view.current.term.cols, view.current.term.rows);
+    void native("terminal_resize", { request: { sessionId, generation, dimensions } }).catch(
+      () => undefined,
+    );
   }, [visible, id]);
 
   useEffect(() => {

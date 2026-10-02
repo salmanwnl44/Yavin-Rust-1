@@ -1,0 +1,11 @@
+[package]
+name = "ide-terminal-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Yavin Terminal contract (TERMINAL-00): identities, the session state machine, typed errors and the raw-byte output protocol"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Output bytes travel as standard base64 inside the JSON events.
+base64 = "0.22"

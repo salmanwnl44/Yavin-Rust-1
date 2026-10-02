@@ -28,12 +28,12 @@ Complex features belong in TypeScript. Add a Web Worker for expensive browser-sa
 
 ## Preserved historical work
 
-The seven excluded crates (`ide-core`, `ide-config`, `ide-syntax`, `ide-lsp`, `ide-dap`, `ide-terminal`, `ide-plugin-host`) and the inactive `search.rs`/`watcher.rs` are pre-existing, uncommitted work retained for reference. They are not compiled, linked, or maintained as part of the active application. Their old Cargo inheritance is not a supported standalone build. Do not extend them or reconnect complex Rust logic. Port useful behavior into TypeScript only when the corresponding feature is implemented.
+The six excluded crates (`ide-core`, `ide-config`, `ide-syntax`, `ide-lsp`, `ide-dap`, `ide-plugin-host`) and the inactive `search.rs`/`watcher.rs` are pre-existing, uncommitted work retained for reference. They are not compiled, linked, or maintained as part of the active application. Their old Cargo inheritance is not a supported standalone build. Do not extend them or reconnect complex Rust logic. Port useful behavior into TypeScript only when the corresponding feature is implemented. A seventh, `ide-terminal`, was an empty PTY placeholder and was removed in TERMINAL-00; the terminal's contract crate is `ide-terminal-protocol` (see [Terminal](#terminal)).
 
 ## Remaining product and release work
 
 1. Add language tooling (language servers, completion, diagnostics) to the Monaco editor; see [Editor](#editor). Existing inactive Rust buffers were never connected to the UI.
-2. Implement debugging, AI, and extension services in TypeScript (language servers: see [Language servers](#language-servers-lsp-platform)). Keep any Rust process transport small and restrict process spawning to explicit user actions and validated arguments. The terminal follows this shape: `src-tauri/src/terminal.rs` only opens a PTY, starts the user's own shell with no arguments, and streams bytes; xterm.js does the emulation in TypeScript. One session exists per window, started by an explicit user action and ended when the panel closes.
+2. Implement debugging, AI, and extension services in TypeScript (language servers: see [Language servers](#language-servers-lsp-platform)). Keep any Rust process transport small and restrict process spawning to explicit user actions and validated arguments. The terminal follows this shape: `src-tauri/src/terminal.rs` opens a PTY per terminal, starts a detected shell (with a launch profile's arguments, environment and folder when one is given) and streams its output; xterm.js does the emulation in TypeScript. See [Terminal](#terminal) for what runs today and the contract it is moving to.
 3. Add desktop end-to-end coverage for folder selection, CRUD, unsaved-close prompts, window controls, and failure recovery. Exercise nested Git repositories, UNC paths, read-only files, symlinks/junctions, and non-ASCII names on supported platforms.
 4. Add conflict detection for open documents before enabling autosave. The watcher reports external changes (see [Filesystem events](#filesystem-events)) and the explorer follows them, but an open, dirty document is not yet told that its file changed on disk; the guarded save still refuses to overwrite it.
 5. Measure large-workspace traversal and memory use. Native scans currently run synchronously and stop at a bounded depth; add incremental loading or background execution when needed.
@@ -781,6 +781,277 @@ closing → closed    opening → active
 3. Work that finishes after its workspace closed changes nothing.
 4. What a workspace remembers is stored under its own identity, never shared with another.
 5. The window is never left with one workspace's UI over another's services.
+
+## Terminal
+
+The terminal is being rebuilt module by module (TERMINAL-00 to TERMINAL-07). This section says what runs **today** and the **contract** the modules build on; anything marked TARGET is not implemented yet.
+
+### Current (what runs today)
+
+| Layer   | Where                                      | Responsibility                                                                                                                                                      |
+| ------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Panel   | `src/components/layout/TerminalPanel.tsx`  | the bottom panel's terminal tab: the list of terminals, the active one, split, shell picker, find, rename, zoom, bells                                              |
+| View    | `src/components/terminal/TerminalView.tsx` | one xterm.js instance and its shell: opens it on mount, closes it on unmount, input, copy/paste, search, links, resize, exit footer and Restart                     |
+| Helpers | `src/services/terminal.ts`                 | open requests, launch generations, the per-session event router (payloads parsed against the contract), key bindings, the panel request channel                     |
+| Native  | `src-tauri/src/terminal.rs`                | the session runtime (TERMINAL-01): `terminal_shells`, `terminal_open`, `terminal_write`, `terminal_resize`, `terminal_close`, `terminal_kill`, `terminal_close_all` |
+
+The native side and the renderer speak only the contract below: there is no other terminal protocol.
+
+**Native session runtime (TERMINAL-01).** One session is one PTY (portable-pty: ConPTY / Unix PTY) and the shell in it, run by four pieces:
+
+- **The commands.** None waits on a shell.
+  - Starting a shell, ending one and detecting shells run off the main thread.
+  - `terminal_write` only queues input and `terminal_resize` only sets a size. Both stay on the main thread, which runs them in the order they were sent, so keystrokes reach the shell in the order they were typed. Async commands run concurrently and could reorder them.
+- **A writer thread** per session, fed by a bounded queue of 64 requests.
+  - A shell that stops reading its input gets that much queued.
+  - After that `terminal_write` is refused with `WriteFailed`; nothing blocks, and no other terminal is affected.
+- **A reader thread.** Every PTY read is handed, untouched, to the session's output stream (see "Output pipeline (TERMINAL-02)" below). Nothing is decoded natively.
+- **A reaper thread.** It waits for the shell, then:
+  1. ends whatever the shell started;
+  2. hangs up the PTY;
+  3. lets the output drain, for at most 3 s;
+  4. closes the output, so no chunk can follow;
+  5. reports `TerminalExit`, or `TerminalErrorEvent` if the process could not be waited on;
+  6. removes the session.
+
+  The 3 s limit exists because ConPTY keeps its output open until its console host finishes, and a host still waiting for an answer to its first cursor-position query (a terminal killed the instant it was created) may never finish.
+
+- **Process trees.** The shell and everything it starts are contained together.
+  - On Windows: a kill-on-close Job Object, which `ide-workspace`'s LSP job now shares. The shell is put in the job right after it starts; portable-pty cannot start it suspended, so a process it started in that instant would escape. The job's handle closes when Yavin ends, however it ends, which ends the tree.
+  - On Unix: the shell's own process group (portable-pty makes the shell a session leader).
+    - A kill is `killpg(SIGKILL)`.
+    - If Yavin dies, the kernel closing the PTY hangs up the session; there is no Unix equivalent of kill-on-close.
+- **Ending a generation.**
+  - `terminal_close` hangs up and kills after a 2 s grace.
+  - `terminal_kill` ends the tree now.
+  - When the shell exits by itself, what it started ends with it.
+- **The session map** is locked only to find, add or remove a session. Each session has its own locks, so one terminal never waits on another.
+- **Generations are enforced natively.**
+  - An open must name a generation newer than any its id had, and opening a newer one replaces (ends) the older.
+  - Write and resize must name the current generation, or fail with `InvalidSession`.
+  - Close and kill naming any other generation do nothing.
+- **Workspaces are enforced natively.**
+  - An open must name the window's workspace (`WorkspaceSpec`'s `workspace_id`, the renderer's `WorkspaceId`; `empty:` with none), or it fails with `InvalidWorkspace`.
+  - Entering another workspace ends every session of the one left, alongside revoking its Local Git handles.
+- **Lifecycle.**
+  - Disposing a workspace calls `terminal_close_all`.
+  - A page reload closes leftover shells before the first new one opens.
+  - App exit closes every shell.
+- **Failures are typed** (`"Cause: message"`). OS failures are described by kind (`TerminalError::from_io`), never by the OS's own text.
+
+**Still to come.**
+
+- The renderer still keeps session state in the panel and filters messages by generation rather than applying `applyEvent` (TERMINAL-03).
+- Replay of output a subscriber missed, and more than one window following a session, are TERMINAL-03.
+
+### Ownership (TARGET)
+
+```text
+WorkspaceManager ── owns ──> WorkspaceContext
+                                 └─ TerminalService (one per workspace; disposed with it)
+                                      └─ TerminalSession (identity, generation, state, profile)
+                                           └─ native session (PTY, writer, reader, process)
+TerminalPanel, TerminalView: views. They render sessions and send intents; they own nothing.
+```
+
+- **React components own none of the following.** The process lifecycle, PTY state, session identity, output history and the workspace lifecycle are not owned by any component.
+  - Today the panel's state holds the session list and the view starts and ends the process.
+  - TERMINAL-03 moves that into the TerminalService.
+- **Every session belongs to exactly one workspace** (`workspaceId`, the canonical `WorkspaceId`).
+  - Disposing the workspace ends all of its sessions.
+  - Nothing of one workspace's terminals reaches another's.
+- **Native handles never cross the contract.** Handles and process objects stay native.
+  - The renderer sees `TerminalSession`: `TerminalSessionMetadata`, which a later module may keep across a reload, plus `TerminalSessionRuntime`, which a process's end discards.
+
+### The contract (TERMINAL-00)
+
+The contract is held in two places:
+
+- `src/services/terminalProtocol.ts`
+- the pure crate `src-tauri/crates/ide-terminal-protocol`
+
+Both read and write the wire forms in `src/services/terminalProtocol.fixtures.json` identically, and each side's tests check that. The native runtime and the renderer's event router use it (TERMINAL-01).
+
+**Identities.**
+
+- `TerminalId` (a session; the events call it `sessionId`) and `SubscriptionId`: 1-128 characters of `[A-Za-z0-9._-]`.
+- `Generation`: an integer from 1.
+- `Sequence`: an integer from 0.
+- Both numbers stay within 2^53 - 1, so JavaScript holds them exactly.
+- `WorkspaceId` is the canonical one from `workspaceManager.ts`, carried natively as its string.
+
+**Session state machine.** There is one state per generation:
+
+```text
+Spawning ──> Running ──> Exiting ──> Exited
+    │           │           │
+    └───────────┴───────────┴──────> Failed
+```
+
+| State      | Meaning                                                       |
+| ---------- | ------------------------------------------------------------- |
+| `Spawning` | The open was accepted.                                        |
+| `Running`  | The process runs.                                             |
+| `Exiting`  | The end was seen or asked for, and output still drains.       |
+| `Exited`   | Final: the process ended and all of its output was delivered. |
+| `Failed`   | Final: the generation ended through an error.                 |
+
+No other step exists. In particular there is no going back, no `Running → Exited` without `Exiting`, and nothing after a final state.
+
+**Generation semantics.** A generation is one incarnation of a session.
+
+- **The requester chooses it.** The workspace's TerminalService picks it when it opens the session, so it recognises the generation's first event even if that event arrives before the open's answer.
+- **It only ever increases for an id.** The native side refuses an open whose generation is not newer than every earlier one for that id.
+- **It changes exactly when a new process may start under an id:**
+  - the first open;
+  - every restart;
+  - every reopen of a closed id.
+- **It does not change** on a resize, a subscribe or unsubscribe, or a view detaching from a session.
+- **Disposing a workspace retires its sessions' generations for good.**
+- **Stale requests.** A write or resize naming any generation but the current one fails with `InvalidSession`. A close naming one succeeds and does nothing.
+- **Stale events.** Any event naming another generation, such as late output or a late exit of a replaced launch, is discarded by consumers and can never change the current session.
+
+**Sequence semantics.** `seq` orders output within one generation.
+
+- **Numbering.** The first chunk is 0, each next chunk is one more, and none is ever skipped or repeated.
+- **A new generation starts again at 0.**
+- **Only output chunks carry `seq`.** A lifecycle event never takes one.
+- **The two end events, `TerminalExit` and `TerminalErrorEvent`, carry `lastSeq`.** It is the `seq` of the generation's final chunk, or `null` if the generation wrote nothing, so a consumer knows it has every byte.
+- **Consumers reject out-of-order output.**
+  - A `seq` below the next expected one is a duplicate, and is dropped.
+  - A `seq` above it is a gap, which the protocol never allows; dropping output requires a protocol revision.
+- **ACKs (TERMINAL-02) will be cumulative.** An ACK will acknowledge "every chunk up to and including `seq` N of generation G".
+
+**Output protocol.** `TerminalOutputChunk { sessionId, generation, seq, bytes }`.
+
+- **`bytes` are raw**, standard base64 inside JSON on the wire.
+- **The raw-byte rule.** A chunk may end anywhere: inside a UTF-8 character, inside a CSI/ANSI escape, inside an OSC sequence. It may also hold several of them.
+  - Nothing in the protocol decodes output.
+  - The consumer feeds chunks in `seq` order to a streaming decoder (xterm's `write(Uint8Array)`), which keeps the partial tail.
+- **The shape never changes.** TERMINAL-01 may send one PTY read per chunk; TERMINAL-02 may batch many reads into one chunk. The shape and the meaning of every field are the same either way.
+
+**Events and their order.** For each generation:
+
+- **Order.**
+  - `TerminalStateChanged` to `Running` (with `pid`, or `null`) precedes any output.
+  - Output chunks arrive in `seq` order.
+  - `TerminalStateChanged` to `Exiting` may come before the last chunks, because output drains.
+  - Exactly one end event comes last: `TerminalExit` (`Exited`, with `exitCode`) or `TerminalErrorEvent` (`Failed`, with `{code, message}`), each carrying `lastSeq`.
+- **Nothing follows the end.**
+- **A failed open has no events.** An open that fails returns its error and emits nothing for that generation.
+- **Every event carries `sessionId` and `generation`.**
+
+`applyEvent` in `terminalProtocol.ts` is the consumer's rule for all of this. It accepts or rejects one event with a reason (`other-session`, `stale-generation`, `duplicate`, `gap`, `after-end`, `illegal-transition`). A rejected event changes nothing.
+
+**Requests.** Open, write, resize, close and kill are implemented natively (TERMINAL-01). A restart is an open of a newer generation of the same id, which replaces the older one; no separate restart command exists yet.
+
+| Request   | Contract                                                                                                                                                                                                                                                                     |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `open`    | `{sessionId, workspaceId, generation, profile, cwd, dimensions}`. Answers the `TerminalSession` (`Spawning` or `Running`).                                                                                                                                                   |
+| `write`   | `{sessionId, generation, data}`. Answering means the input was **queued** for the session's writer, never that the PTY took it, so no request waits on a blocked process. At most 64 KiB of UTF-8 per request; larger input is split at character boundaries (`chunkInput`). |
+| `resize`  | The latest size wins. Only a `Running` generation is resized.                                                                                                                                                                                                                |
+| `close`   | Gentle and idempotent.                                                                                                                                                                                                                                                       |
+| `kill`    | Forced: the shell and everything it started.                                                                                                                                                                                                                                 |
+| `restart` | `{sessionId, previousGeneration, generation, dimensions}`, keeping the profile and folder.                                                                                                                                                                                   |
+
+**Dimensions.** `{cols, rows}`, whole cells.
+
+- Valid sizes are 1-1000 each way.
+- Zero, fractional or larger sizes are refused, not clamped. The renderer turns an unlaid-out panel into a real size first.
+- Pixel sizes are layout, not contract.
+
+**Subscriptions.**
+
+- `subscribe {subscriptionId, sessionId, generation}`: the subscriber chooses its id (like a generation), and that generation's messages are delivered on its own channel alone. This is targeted delivery: there is no global broadcast.
+- `ack {subscriptionId, sessionId, generation, seq}` is cumulative (see the output pipeline below).
+- Several subscribers may follow one session.
+- `unsubscribe` is idempotent and leaves the session and its other subscribers alone.
+- Replay of earlier output is not in the contract yet; TERMINAL-03 adds where a subscription starts from.
+
+**Profiles.** `TerminalProfile {id, name, executable, args, cwd, env}`.
+
+- These are only what the launch already carries.
+- `env` is ordered pairs.
+- A login shell is requested through `args`.
+- The validation rules are the launch's own: no line breaks or NUL, and environment names without `=`.
+
+**Errors.** A `TerminalError` is `{code: TerminalErrorCause, message}`.
+
+- **Causes:** `InvalidSession`, `InvalidWorkspace`, `ShellUnavailable`, `SpawnFailed`, `InvalidCwd`, `PermissionDenied`, `WriteFailed`, `ResizeFailed`, `ProcessFailed`, `TerminationFailed`, `ProtocolError`, `StaleGeneration`, `OutputOverflow`, `SubscriberFailed`, `TransportFailed`, `Unknown` (internal, or not in this list). The four before `Unknown` came with TERMINAL-02: a stale request or acknowledgement is `StaleGeneration` (it was `InvalidSession`).
+- **Wire forms.** Commands reject with `"Cause: message"`, the Local Git convention; events carry the object.
+- **Messages are one line and fit to show.**
+  - The native side describes an OS failure by what it was doing and the kind of failure (`TerminalError::from_io`), never the OS's own text.
+  - The renderer turns any failure it does not recognise into `Unknown`, with a generic message; the raw text is kept in `detail` for logs only.
+
+### Output pipeline (TERMINAL-02)
+
+`src-tauri/src/terminal_stream.rs`: one `OutputStream` per generation, between the reader and that generation's subscribers.
+
+```text
+PTY ─> reader ─push─> pending (bounded) ─pump─> sealed entries (shared, bounded)
+                                                  ├─ subscriber A: cursor, window ─> its Channel ─> xterm.write
+                                                  └─ subscriber B: cursor, window ─> its Channel ─> xterm.write
+                        reader pauses <── queued ≥ ingress high, resumes ≤ ingress low
+                        a window refills <── ack(generation, seq), cumulative, after xterm parsed it
+```
+
+- **The reader only appends.** It never serializes, never delivers, never waits on a subscriber -- only on the bound. While it waits, the PTY fills and the program writing to it blocks: that is the backpressure, and no byte is dropped to keep up.
+- **One pump thread per generation** seals what is pending into numbered chunks, serializes each message once (shared by every subscriber), and sends to each subscriber whose window has room, outside the lock. It is the only sender, so each subscriber sees one ordered stream: `Running`, the output in `seq` order, `Exiting`, then exactly one end, after all the output. (Output read after the end was seen comes after `Exiting`, as the contract allows.)
+- **Each subscriber is isolated.** It has its own channel (a Tauri `Channel`, created by the renderer and passed with `terminal_open`/`terminal_subscribe`), its own cursor into the shared entries, and its own in-flight window. Entries are kept only until every subscriber has been sent them.
+- **Acknowledgements** come from the renderer once xterm has parsed a chunk (`term.write(bytes, callback)`). They are cumulative: a duplicate or an older one changes nothing, a late one after the stream ended is harmless, one for another generation is `StaleGeneration`, one beyond what was sent is `ProtocolError`. A transport has no backpressure of its own (`Channel::send` queues on the webview), so acknowledgements are the only signal of a consumer keeping up.
+- **Generations** each have their own stream: a restart's new stream starts at `seq` 0, and an old stream's buffered output only ever goes to the old stream's subscribers.
+- **No replay.** A subscriber sees the stream from when it subscribed, and output with no subscriber at all is not kept. This is flow-control buffering only; replay is TERMINAL-03.
+
+**Limits** (`terminal_stream::LIMITS`):
+
+| Limit                        | Value             | Why                                                                                                                                                                       |
+| ---------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Largest chunk (and batch)    | 64 KiB            | Matches the largest input request; xterm parses it well within a frame, and its message (~88 KiB base64) still crosses the transport in one piece.                        |
+| Reads per batch              | 32                | Many tiny writes (a progress bar) become one message.                                                                                                                     |
+| Batch latency                | 5 ms              | Typing echoes with no visible delay; a burst becomes a few messages. Windows timer resolution can stretch it to ~16 ms.                                                   |
+| Ingress high / low           | 1 MiB / 256 KiB   | The output one terminal may hold for its subscribers; the reader resumes with room for a burst.                                                                           |
+| Subscriber window high / low | 512 KiB / 128 KiB | Output in one subscriber's transport and parser at once.                                                                                                                  |
+| Laggard timeout              | 5 s               | How long a subscriber behind another may keep the reader paused.                                                                                                          |
+| Unresponsive timeout         | 30 s              | How long a subscriber with a full window may go without any acknowledgement. Long, so a slow or hidden view that is still acknowledging is never mistaken for a dead one. |
+
+The PTY read itself is 8 KiB.
+
+**Three regimes:**
+
+- **Normal:** every byte reaches every subscriber.
+- **Backpressured:** the reader is paused until subscribers acknowledge. Nothing is lost.
+- **Overflow:** never a silent hole. Instead, a subscriber is detached with a `detached` message that says how far it got (`lastSeq`), and the session and the other subscribers go on. This happens in two cases:
+  - A subscriber behind another keeps the reader paused past the laggard timeout (`OutputOverflow`).
+  - A subscriber sends no acknowledgement at all past the unresponsive timeout (`SubscriberFailed`). This applies even to a sole subscriber, so a broken view cannot hold its terminal, and its end, for ever.
+
+  A sole subscriber that is merely slow is never detached; it is simply backpressured. A channel whose window has gone is removed silently, as a normal end.
+
+**Observability.** `terminal_stats(sessionId)` reports what the session's stream is doing, never its content:
+
+- queued and peak queued bytes;
+- the highest `seq`;
+- whether it is backpressured;
+- for each subscriber: its sent and acknowledged `seq`, its in-flight bytes, and whether it is throttled.
+
+**Measured** (development machine, debug build):
+
+| Run                            | Time  | Peak queued | Note                                                                 |
+| ------------------------------ | ----- | ----------- | -------------------------------------------------------------------- |
+| Pipeline, 50 MB                | 8.5 s | 1 MiB       | 848 chunks; every byte and `seq` checked                             |
+| Pipeline, 10 MB, slow consumer | 1.6 s | 1 MiB       |                                                                      |
+| Real shell, ~4.2 MB            | ~9 s  | ~6 KiB      | ConPTY is the bottleneck; commands answered in under 1 ms throughout |
+
+`stress_50_mb` is `#[ignore]`d and runs with `cargo test -p yavin-ide --lib terminal_stream -- --ignored`.
+
+### Module plan
+
+| Module      | Scope                                                                           |
+| ----------- | ------------------------------------------------------------------------------- |
+| TERMINAL-01 | Done: the native runtime on this contract (see "Native session runtime" above). |
+| TERMINAL-02 | Done: the output pipeline (see "Output pipeline (TERMINAL-02)" above).          |
+| TERMINAL-03 | The workspace-scoped TerminalService, with views as subscribers.                |
+
+Later modules are listed in the Terminal roadmap.
 
 ## Source Control panel
 

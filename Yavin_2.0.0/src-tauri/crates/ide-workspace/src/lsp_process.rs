@@ -79,6 +79,33 @@ pub mod job {
             // SAFETY: both handles are live: the job's is owned here, the child's by `child`.
             unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as HANDLE) != 0 }
         }
+
+        /// Puts the process `pid` in the job, for a process this crate did not start itself
+        /// (a terminal's shell, started through a pseudoconsole). What it starts from now on is
+        /// in the job too.
+        pub fn assign_process_id(&self, pid: u32) -> bool {
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+            };
+            // SAFETY: the process handle is opened, used once and closed here; the job's is
+            // owned by `self`.
+            unsafe {
+                let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+                if process.is_null() {
+                    return false;
+                }
+                let assigned = AssignProcessToJobObject(self.0, process) != 0;
+                CloseHandle(process);
+                assigned
+            }
+        }
+
+        /// Ends every process in the job now.
+        pub fn terminate(&self) -> bool {
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+            // SAFETY: the job's handle is owned by `self` and live.
+            unsafe { TerminateJobObject(self.0, 1) != 0 }
+        }
     }
 
     impl Drop for Job {

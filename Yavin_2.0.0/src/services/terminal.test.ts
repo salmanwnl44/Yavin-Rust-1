@@ -5,11 +5,14 @@ import {
   describeExit,
   nextTerminalName,
   terminalKeyAction,
-  openArgsFor,
-  onOutputFor,
-  deliverForTest,
+  openRequestFor,
   usableSize,
+  streamReceiver,
+  createSubscriptionId,
+  type TerminalStreamHandlers,
 } from "./terminal.ts";
+import { isSubscriptionId, validateProfile } from "./terminalProtocol.ts";
+import type { Generation, WorkspaceId } from "./terminalProtocol.ts";
 
 test("terminal sizes are whole cells and never zero", () => {
   assert.deepEqual(usableSize(120, 40), { cols: 120, rows: 40 });
@@ -18,6 +21,8 @@ test("terminal sizes are whole cells and never zero", () => {
   assert.deepEqual(usableSize(-5, -1), { cols: 1, rows: 1 });
   assert.deepEqual(usableSize(80.9, 24.7), { cols: 80, rows: 24 });
   assert.deepEqual(usableSize(Number.NaN, Number.NaN), { cols: 80, rows: 24 });
+  // Never more than the contract allows, however wide the panel.
+  assert.deepEqual(usableSize(4000, 2000), { cols: 1000, rows: 1000 });
 });
 
 test("terminal names stay distinct as more of the same shell open", () => {
@@ -145,16 +150,36 @@ test("the navigation keys do not collide with the existing copy and zoom binding
   assert.equal(terminalKeyAction(key("5", { ctrl: true, shift: true }), false), "split");
 });
 
-test("a plain session sends no profile extras, so the native side keeps its defaults", () => {
-  const args = openArgsFor({ id: "t1", name: "Shell", shell: "/bin/bash" }, { cols: 80, rows: 24 });
-  assert.deepEqual(args, { id: "t1", shell: "/bin/bash", cols: 80, rows: 24 });
-  assert.equal("args" in args, false);
-  assert.equal("env" in args, false);
-  assert.equal("cwd" in args, false);
+const size = { cols: 80, rows: 24 };
+const workspace = "file://c:/work" as WorkspaceId;
+
+test("a plain session is a profile of its shell alone, in the workspace that opens it", () => {
+  const request = openRequestFor(
+    { id: "t1", name: "Shell", shell: "/bin/bash" },
+    size,
+    3 as Generation,
+    workspace,
+  );
+  assert.deepEqual(request, {
+    sessionId: "t1",
+    workspaceId: workspace,
+    generation: 3,
+    profile: {
+      id: "/bin/bash",
+      name: "Shell",
+      executable: "/bin/bash",
+      args: [],
+      cwd: null,
+      env: [],
+    },
+    cwd: null,
+    dimensions: size,
+  });
+  assert.equal(validateProfile(request.profile!), null);
 });
 
-test("a profile's arguments, environment and folder all reach the native call", () => {
-  const args = openArgsFor(
+test("a profile's arguments, environment and folder all reach the open request", () => {
+  const request = openRequestFor(
     {
       id: "t2",
       name: "PowerShell",
@@ -164,12 +189,13 @@ test("a profile's arguments, environment and folder all reach the native call", 
       cwd: "C:/work/sub",
     },
     { cols: 100, rows: 30 },
+    1 as Generation,
+    workspace,
   );
-  assert.deepEqual(args, {
-    id: "t2",
-    shell: "pwsh.exe",
-    cols: 100,
-    rows: 30,
+  assert.deepEqual(request.profile, {
+    id: "pwsh.exe",
+    name: "PowerShell",
+    executable: "pwsh.exe",
     args: ["-NoLogo"],
     // Pairs, not an object: the native side keeps the author's ordering, which matters when
     // one variable is written in terms of another.
@@ -177,43 +203,99 @@ test("a profile's arguments, environment and folder all reach the native call", 
       ["YAVIN", "1"],
       ["TERM_PROGRAM", "Yavin"],
     ],
-    cwd: "C:/work/sub",
+    cwd: null,
   });
+  assert.equal(request.cwd, "C:/work/sub");
+  assert.deepEqual(request.dimensions, { cols: 100, rows: 30 });
 });
 
-test("empty profile extras are omitted rather than sent as empty", () => {
-  const args = openArgsFor(
-    { id: "t3", name: "Shell", shell: "/bin/sh", args: [], env: {}, cwd: "" },
-    { cols: 80, rows: 24 },
+test("with no shell picked the native default shell starts, and an empty folder means the root", () => {
+  const request = openRequestFor(
+    { id: "t3", name: "Terminal", shell: "", cwd: "" },
+    size,
+    1 as Generation,
+    workspace,
   );
-  assert.deepEqual(args, { id: "t3", shell: "/bin/sh", cols: 80, rows: 24 });
+  assert.equal(request.profile, null);
+  assert.equal(request.cwd, null);
 });
 
-test("unsubscribing twice does not tear down a later subscription for the same terminal", () => {
-  // The unsubscribe captured its own handler set; calling it again deleted whatever set a
-  // newer subscription had since installed, silently stopping that terminal's output.
-  const first: string[] = [];
-  const second: string[] = [];
-  const stopFirst = onOutputFor("t1", (data) => first.push(data));
-  stopFirst();
-  const stopSecond = onOutputFor("t1", (data) => second.push(data));
-  stopFirst(); // the stale unsubscribe must be a no-op
-
-  deliverForTest("terminal-output", { id: "t1", data: "hello" });
-  assert.deepEqual(second, ["hello"]);
-  assert.deepEqual(first, []);
-  stopSecond();
+const message = (kind: string, fields: Record<string, unknown>) => ({
+  kind,
+  sessionId: "t1",
+  generation: 1,
+  ...fields,
 });
+const output = (text: string, seq = 0, extra: Record<string, unknown> = {}) =>
+  message("output", { seq, bytes: Buffer.from(text, "utf8").toString("base64"), ...extra });
+const text = (bytes: Uint8Array) => Buffer.from(bytes).toString("utf8");
 
-test("one terminal's failing handler does not stop another from receiving output", () => {
+/** A receiver for launch 1 of `t1`, recording what reaches each handler and every ack. */
+function receiver(handlers: Partial<TerminalStreamHandlers> = {}) {
   const seen: string[] = [];
-  const stopBad = onOutputFor("t1", () => {
-    throw new Error("handler blew up");
+  const acks: number[] = [];
+  const pendingAccepts: (() => void)[] = [];
+  const receive = streamReceiver({ sessionId: "t1", generation: 1 }, (seq) => acks.push(seq), {
+    output: (chunk, accepted) => {
+      seen.push(`output ${chunk.seq} ${text(chunk.bytes)}`);
+      pendingAccepts.push(accepted);
+    },
+    exit: (exit) => seen.push(`exit ${exit.exitCode}`),
+    error: (event) => seen.push(`error ${event.error.code}`),
+    detached: (event) => seen.push(`detached ${event.error.code}`),
+    ...handlers,
   });
-  const stopGood = onOutputFor("t1", (data) => seen.push(data));
+  return { receive, seen, acks, pendingAccepts };
+}
 
-  assert.doesNotThrow(() => deliverForTest("terminal-output", { id: "t1", data: "still here" }));
-  assert.deepEqual(seen, ["still here"]);
-  stopBad();
-  stopGood();
+test("a launch's channel delivers its own messages and drops everything else", () => {
+  const { receive, seen } = receiver();
+  receive(output("other session", 0, { sessionId: "t2" }));
+  receive(output("other launch", 0, { generation: 2 }));
+  // The old text event, and a chunk whose bytes are not base64: neither is the protocol.
+  receive({ id: "t1", data: "old shape" });
+  receive({ ...output(""), bytes: "not base64!" });
+  receive(output("mine"));
+  receive(message("exit", { exitCode: 0, lastSeq: 0 }));
+  assert.deepEqual(seen, ["output 0 mine", "exit 0"]);
+});
+
+test("each chunk is acknowledged once, when the terminal says it has consumed it", () => {
+  const { receive, acks, pendingAccepts } = receiver();
+  receive(output("a", 0));
+  receive(output("b", 1));
+  // Nothing is acknowledged before the terminal has parsed it.
+  assert.deepEqual(acks, []);
+  pendingAccepts[1]();
+  pendingAccepts[0]();
+  pendingAccepts[0](); // a second call for the same chunk changes nothing
+  assert.deepEqual(acks, [1, 0]);
+});
+
+test("errors and detachment reach the view, and a throwing handler stops nothing", () => {
+  const { receive, seen } = receiver({
+    exit: () => {
+      throw new Error("handler blew up");
+    },
+  });
+  assert.doesNotThrow(() => receive(message("exit", { exitCode: 1, lastSeq: null })));
+  receive(
+    message("error", {
+      error: { code: "ProcessFailed", message: "Lost track of the shell." },
+      lastSeq: null,
+    }),
+  );
+  receive(
+    message("detached", {
+      error: { code: "OutputOverflow", message: "Fell behind." },
+      lastSeq: 3,
+    }),
+  );
+  assert.deepEqual(seen, ["error ProcessFailed", "detached OutputOverflow"]);
+});
+
+test("every launch gets its own subscription id", () => {
+  const ids = new Set(Array.from({ length: 20 }, () => createSubscriptionId("terminal-x-1")));
+  assert.equal(ids.size, 20);
+  for (const id of ids) assert.ok(isSubscriptionId(id), id);
 });

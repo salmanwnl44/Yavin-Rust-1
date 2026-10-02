@@ -56,6 +56,9 @@ async function desktop(
     };
     const callbacks: Record<number, (event: unknown) => void> = {};
     const listeners: Record<string, number[]> = {};
+    const sequences: Record<string, number> = {};
+    /** Each launch's own channel, by `sessionId:generation`. */
+    const channels: Record<string, { onmessage: (message: unknown) => void }> = {};
     let nextId = 1;
 
     Object.assign(window, {
@@ -63,6 +66,31 @@ async function desktop(
       // Delivers a native event to every listener registered for it.
       __emit: (event: string, payload: unknown) => {
         for (const id of listeners[event] ?? []) callbacks[id]?.({ event, id, payload });
+      },
+      // A terminal's output and exit as the native side sends them -- on the channel that
+      // launch was opened with, never broadcast: for its latest launch unless one is named,
+      // bytes in base64, numbered from 0 within the launch.
+      __terminal: (
+        kind: "output" | "exit",
+        sessionId: string,
+        value: string | number,
+        launch?: number,
+      ) => {
+        const generation =
+          launch ??
+          (calls.filter((c) => c.command === "terminal_open" && c.args.id === sessionId).at(-1)
+            ?.args.generation as number);
+        const key = `${sessionId}:${generation}`;
+        const next = sequences[key] ?? 0;
+        const send = (message: unknown) => channels[key]?.onmessage(message);
+        if (kind === "output") {
+          sequences[key] = next + 1;
+          const bytes = btoa(String.fromCharCode(...new TextEncoder().encode(value as string)));
+          send({ kind: "output", sessionId, generation, seq: next, bytes });
+        } else {
+          const lastSeq = next === 0 ? null : next - 1;
+          send({ kind: "exit", sessionId, generation, exitCode: value, lastSeq });
+        }
       },
       isTauri: true,
       __TAURI_INTERNALS__: {
@@ -73,7 +101,28 @@ async function desktop(
           return id;
         },
         unregisterCallback: (id: number) => delete callbacks[id],
-        invoke: async (command: string, args: Record<string, unknown> = {}) => {
+        invoke: async (command: string, raw: Record<string, unknown> = {}) => {
+          // Terminal commands take one contract request; it is recorded flat, with the
+          // session id as `id`, the shell as `shell` and the size as `cols`/`rows`.
+          const request = raw.request as
+            | {
+                sessionId: string;
+                profile?: { executable: string; cwd: string | null } | null;
+                cwd?: string | null;
+                dimensions?: { cols: number; rows: number };
+              }
+            | undefined;
+          const args: Record<string, unknown> = request
+            ? {
+                ...request,
+                id: request.sessionId,
+                shell: request.profile?.executable ?? "",
+                cwd: request.cwd ?? request.profile?.cwd ?? undefined,
+                cols: request.dimensions?.cols,
+                rows: request.dimensions?.rows,
+                ...(raw.subscriptionId ? { subscriptionId: raw.subscriptionId } : {}),
+              }
+            : raw;
           calls.push({ command, args });
           if (command === "plugin:event|listen") {
             const event = args.event as string;
@@ -128,13 +177,24 @@ async function desktop(
             ];
           if (command === "terminal_open") {
             if (setup.failOpen) throw setup.failOpen;
+            channels[`${request!.sessionId}:${args.generation}`] = raw.events as {
+              onmessage: (message: unknown) => void;
+            };
             // A slow start, for tests of what happens meanwhile; its end is recorded too.
             const delay = (window as unknown as { __openDelay?: number }).__openDelay;
             if (delay) {
               await new Promise((resolve) => setTimeout(resolve, delay));
               calls.push({ command: "terminal_open:done", args });
             }
-            return args.shell || "C:\\Windows\\System32\\cmd.exe";
+            // The session as the native side answers it: already running.
+            return {
+              ...request,
+              generation: args.generation,
+              state: "Running",
+              pid: 4242,
+              startedAt: 0,
+              exitCode: null,
+            };
           }
           if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
           if (command === "git_repo_state") return "";
@@ -160,14 +220,37 @@ const calls = (page: Page, command: string) =>
 
 const countCalls = async (page: Page, command: string) => (await calls(page, command)).length;
 
-const emit = (page: Page, event: string, payload: unknown) =>
+type TerminalEvent = (
+  kind: "output" | "exit",
+  id: string,
+  value: string | number,
+  launch?: number,
+) => void;
+
+/** Output from a terminal's shell (its latest launch unless `launch` names another). */
+const output = (page: Page, id: string, text: string, launch?: number) =>
   page.evaluate(
-    ([name, data]) =>
-      (window as unknown as { __emit: (e: string, p: unknown) => void }).__emit(
-        name as string,
-        data,
+    ([sessionId, value, generation]) =>
+      (window as unknown as { __terminal: TerminalEvent }).__terminal(
+        "output",
+        sessionId as string,
+        value as string,
+        generation as number | undefined,
       ),
-    [event, payload] as const,
+    [id, text, launch] as const,
+  );
+
+/** A terminal's shell exiting with `code` (its latest launch unless `launch` names another). */
+const exit = (page: Page, id: string, code: number, launch?: number) =>
+  page.evaluate(
+    ([sessionId, value, generation]) =>
+      (window as unknown as { __terminal: TerminalEvent }).__terminal(
+        "exit",
+        sessionId as string,
+        value as number,
+        generation as number | undefined,
+      ),
+    [id, code, launch] as const,
   );
 
 const uniqueIds = async (page: Page) => {
@@ -198,7 +281,7 @@ test("a shell starts with the panel and its output is displayed", async ({ page 
   expect(open.args.cols).toBeGreaterThan(0);
   expect(open.args.rows).toBeGreaterThan(0);
 
-  await emit(page, "terminal-output", { id, data: "hello from the shell\r\n" });
+  await output(page, id, "hello from the shell\r\n");
   await expect(view(page, id)).toContainText("hello from the shell");
 });
 
@@ -224,8 +307,8 @@ test("output is delivered only to the terminal that produced it", async ({ page 
   await page.getByLabel("New Terminal").click();
   const [first, second] = await terminalIds(page, 2);
 
-  await emit(page, "terminal-output", { id: first, data: "belongs to one" });
-  await emit(page, "terminal-output", { id: second, data: "belongs to two" });
+  await output(page, first, "belongs to one");
+  await output(page, second, "belongs to two");
 
   await expect(view(page, second)).toContainText("belongs to two");
   await expect(view(page, second)).not.toContainText("belongs to one");
@@ -333,7 +416,7 @@ test("hiding the panel keeps shells running", async ({ page }) => {
   await desktop(page);
   await openPanel(page);
   const [id] = await terminalIds(page);
-  await emit(page, "terminal-output", { id, data: "long running build" });
+  await output(page, id, "long running build");
 
   const closed = await countCalls(page, "terminal_close");
   await page.getByLabel("Close Panel").click();
@@ -347,7 +430,7 @@ test("hiding the panel keeps shells running", async ({ page }) => {
 });
 
 test("a shell that will not start says why instead of looking idle", async ({ page }) => {
-  await desktop(page, { failOpen: "Open a workspace first" });
+  await desktop(page, { failOpen: "InvalidWorkspace: Open a workspace first" });
   await openPanel(page);
   const [id] = await terminalIds(page);
 
@@ -364,7 +447,7 @@ test("an exited shell reports its code and can be restarted", async ({ page }) =
   await openPanel(page);
   const [id] = await terminalIds(page);
 
-  await emit(page, "terminal-exit", { id, code: 130 });
+  await exit(page, id, 130);
   await expect(view(page, id)).toContainText("exited with code 130");
 
   // Typing into a dead shell is not sent anywhere.
@@ -396,16 +479,16 @@ test("the end of a shell that was replaced is never taken for the one replacing 
   const first = (await launches()).at(-1)!;
 
   // Restarted: a new launch of the same terminal.
-  await emit(page, "terminal-exit", { id, generation: first, code: 130 });
+  await exit(page, id, 130, first);
   await expect(view(page, id)).toContainText("exited with code 130");
   await page.getByRole("button", { name: "Restart", exact: true }).click();
   await expect.poll(async () => (await launches()).at(-1)).toBeGreaterThan(first);
   const second = (await launches()).at(-1)!;
 
   // The old shell's late output and exit are ignored; the new one's are shown.
-  await emit(page, "terminal-output", { id, generation: first, data: "from the old shell" });
-  await emit(page, "terminal-exit", { id, generation: first, code: 1 });
-  await emit(page, "terminal-output", { id, generation: second, data: "from the new shell" });
+  await output(page, id, "from the old shell", first);
+  await exit(page, id, 1, first);
+  await output(page, id, "from the new shell", second);
   await expect(view(page, id)).toContainText("from the new shell");
   await expect(view(page, id)).not.toContainText("from the old shell");
   await expect(view(page, id)).not.toContainText("exited with code 1.");
@@ -421,7 +504,7 @@ test("a shell that ends cleanly is not reported as a failure", async ({ page }) 
   await openPanel(page);
   const [id] = await terminalIds(page);
 
-  await emit(page, "terminal-exit", { id, code: 0 });
+  await exit(page, id, 0);
   await expect(view(page, id)).toContainText("The shell exited.");
   await expect(view(page, id)).not.toContainText("code");
 });
@@ -432,7 +515,7 @@ test("find locates output and reports when there is no match", async ({ page }) 
   const [id] = await terminalIds(page);
   // Wait for the shell to be attached so the search runs against a settled terminal.
   await expect(page.getByRole("status")).toContainText("Running");
-  await emit(page, "terminal-output", { id, data: "compiling widget.rs\r\n" });
+  await output(page, id, "compiling widget.rs\r\n");
 
   // xterm writes asynchronously; search only sees what has reached its buffer.
   await expect(view(page, id)).toContainText("widget.rs");
@@ -454,7 +537,7 @@ test("find counts every match and can be made case sensitive", async ({ page }) 
   await desktop(page);
   await openPanel(page);
   const [id] = await terminalIds(page);
-  await emit(page, "terminal-output", { id, data: "Widget widget WIDGET\r\n" });
+  await output(page, id, "Widget widget WIDGET\r\n");
   await expect(view(page, id)).toContainText("WIDGET");
 
   await page.getByLabel("Find in Terminal", { exact: true }).click();
@@ -473,7 +556,7 @@ test("right clicking offers the terminal actions, with copy disabled until there
   await desktop(page);
   await openPanel(page);
   const [id] = await terminalIds(page);
-  await emit(page, "terminal-output", { id, data: "some output to clear\r\n" });
+  await output(page, id, "some output to clear\r\n");
   await expect(view(page, id)).toContainText("some output");
 
   await view(page, id).click({ button: "right" });
@@ -535,7 +618,7 @@ test("a terminal that rings while hidden is marked", async ({ page }) => {
   await terminalIds(page, 2);
 
   // The first terminal is no longer on screen when it rings.
-  await emit(page, "terminal-output", { id: first, data: "\u0007" });
+  await output(page, first, "\u0007");
   const tab = page.getByRole("tab", { name: "Command Prompt", exact: true }).locator("..");
   await expect(tab.getByTitle("This terminal rang")).toBeVisible();
 
@@ -661,7 +744,7 @@ test("switching away from the terminal and back keeps the same shell running", a
   await desktop(page);
   await openPanel(page);
   const [id] = await terminalIds(page);
-  await emit(page, "terminal-output", { id, data: "before switching\r\n" });
+  await output(page, id, "before switching\r\n");
   await expect(view(page, id)).toContainText("before switching");
 
   const tabs = page.getByRole("tablist", { name: "Panel views" });
@@ -837,32 +920,45 @@ test("Kill All Terminals closes every terminal at once", async ({ page }) => {
     .toBe(true);
 });
 
-test("output reaches only the terminal it belongs to, with one native subscription", async ({
-  page,
-}) => {
-  // Routed by id rather than every terminal filtering a broadcast.
+test("output reaches only the terminal it belongs to, on its own channel", async ({ page }) => {
+  // Each launch is opened with a channel of its own; nothing listens to a broadcast.
   await desktop(page);
   await openPanel(page);
   await terminalIds(page);
   await page.getByLabel("New Terminal").click();
   const [first, second] = await terminalIds(page, 2);
 
-  await emit(page, "terminal-output", { id: second, data: "only for the second" });
+  await output(page, second, "only for the second");
   await expect(view(page, second)).toContainText("only for the second");
   await expect(view(page, first)).not.toContainText("only for the second");
 
-  // The count must not grow with the number of terminals: one subscription routes to all of
-  // them. (It is not exactly one overall, because React's development StrictMode mounts,
-  // unmounts and remounts, which legitimately resubscribes.)
-  const outputListens = async () =>
-    (await calls(page, "plugin:event|listen")).filter(
-      (call) => call.args.event === "terminal-output",
-    ).length;
-  const before = await outputListens();
-  await page.getByLabel("New Terminal").click();
-  await page.getByLabel("New Terminal").click();
-  await terminalIds(page, 4);
-  expect(await outputListens()).toBe(before);
+  const terminalListens = (await calls(page, "plugin:event|listen")).filter((call) =>
+    String(call.args.event).startsWith("terminal-"),
+  );
+  expect(terminalListens).toEqual([]);
+  // Every launch names the subscription its channel belongs to, and no two share one.
+  const subscriptions = (await calls(page, "terminal_open")).map((c) => c.args.subscriptionId);
+  expect(subscriptions.every((id) => typeof id === "string")).toBe(true);
+  expect(new Set(subscriptions).size).toBe(subscriptions.length);
+});
+
+test("output is acknowledged once the terminal has taken it in", async ({ page }) => {
+  // The acknowledgement is what lets the native side send more: it comes from the view, after
+  // xterm has parsed the bytes, naming the launch and the chunk.
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await output(page, id, "first\r\n");
+  await output(page, id, "second\r\n");
+  await expect(view(page, id)).toContainText("second");
+  await expect
+    .poll(async () => (await calls(page, "terminal_ack")).map((c) => c.args.seq))
+    .toEqual([0, 1]);
+  const [ack] = await calls(page, "terminal_ack");
+  const [open] = (await calls(page, "terminal_open")).slice(-1);
+  expect(ack.args.sessionId).toBe(id);
+  expect(ack.args.generation).toBe(open.args.generation);
+  expect(ack.args.subscriptionId).toBe(open.args.subscriptionId);
 });
 
 test("Open in Integrated Terminal starts a shell in the chosen folder", async ({ page }) => {
@@ -1249,7 +1345,7 @@ test("closing the first pane of a split leaves one working terminal", async ({ p
   await page.getByLabel("Close Command Prompt", { exact: true }).click();
 
   await expect(view(page, ids[1])).toBeVisible();
-  await emit(page, "terminal-output", { id: ids[1], data: "still alive" });
+  await output(page, ids[1], "still alive");
   await expect(view(page, ids[1])).toContainText("still alive");
 });
 

@@ -1,5 +1,22 @@
-import { isTauri } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { Channel } from "@tauri-apps/api/core";
+import {
+  MAX_COLS,
+  MAX_ROWS,
+  parseTerminalMessage,
+  type Generation,
+  type Sequence,
+  type SubscriptionId,
+  type TerminalAckRequest,
+  type TerminalDetached,
+  type TerminalDimensions,
+  type TerminalErrorEvent,
+  type TerminalExit,
+  type TerminalId,
+  type TerminalOpenRequest,
+  type TerminalOutputChunk,
+  type TerminalSession as NativeTerminalSession,
+  type WorkspaceId,
+} from "./terminalProtocol.ts";
 
 /** A shell the native side found on this machine and is willing to start. */
 export interface Shell {
@@ -7,43 +24,14 @@ export interface Shell {
   path: string;
 }
 
-export interface TerminalOutput {
-  id: string;
-  /** The launch it came from (see `terminal_open`); absent from older senders. */
-  generation?: number;
-  data: string;
-}
-
-export interface TerminalExit {
-  id: string;
-  generation?: number;
-  code: number | null;
-}
-
 let launches = 0;
-/** A new launch's generation: unique for as long as the window runs. */
-export const nextGeneration = () => ++launches;
-
-/** Whether an event belongs to the launch `current`: one from another launch is stale. */
-export const fromLaunch = (payload: { generation?: number }, current: number) =>
-  payload.generation === undefined || payload.generation === current;
-
 /**
- * How a terminal is launched. A profile is a shell plus the extras VS Code lets a profile
- * carry -- arguments, environment and a starting folder. None of these widen what a terminal
- * can do (anyone who can open one can type any command into it); they just save typing the
- * same setup every time.
+ * A new launch's generation (see the Terminal contract): newer than every earlier one for as
+ * long as the window runs, so each id's generations only ever increase.
  */
-export interface TerminalProfile {
-  /** Shown on the tab and in the New Terminal menu. */
-  name: string;
-  /** Absolute path to the shell. Must be one the native side detected. */
-  shell: string;
-  args?: string[];
-  env?: Record<string, string>;
-  /** Where the shell starts. The workspace root when omitted. */
-  cwd?: string;
-}
+export const nextGeneration = (): Generation => ++launches as Generation;
+
+// A launch profile is a contract type: `TerminalProfile` in `terminalProtocol.ts`.
 
 /** One terminal in the panel. The id is what every native call is keyed by. */
 export interface TerminalSession {
@@ -57,151 +45,130 @@ export interface TerminalSession {
 }
 
 /**
- * The arguments `terminal_open` takes for a session. Environment is sent as pairs rather than
- * an object so the native side keeps the author's ordering, which matters when one variable
- * is written in terms of another.
+ * The `terminal_open` request for a launch of `session`. A shell picked in the panel is sent as
+ * a profile of that shell (with the session's arguments and environment, as ordered pairs: a
+ * variable may be written in terms of an earlier one); with none picked -- detection failed --
+ * the native side starts its default shell.
  */
-export function openArgsFor(
+export function openRequestFor(
   session: TerminalSession,
-  size: { cols: number; rows: number },
-): {
-  id: string;
-  shell: string;
-  cols: number;
-  rows: number;
-  args?: string[];
-  env?: [string, string][];
-  cwd?: string;
-} {
-  const env = session.env ? Object.entries(session.env) : undefined;
+  dimensions: TerminalDimensions,
+  generation: Generation,
+  workspaceId: WorkspaceId,
+): TerminalOpenRequest {
   return {
-    id: session.id,
-    shell: session.shell,
-    ...size,
-    ...(session.args?.length ? { args: session.args } : {}),
-    ...(env?.length ? { env } : {}),
-    ...(session.cwd ? { cwd: session.cwd } : {}),
+    sessionId: session.id as TerminalId,
+    workspaceId,
+    generation,
+    profile: session.shell
+      ? {
+          id: session.shell,
+          name: session.name,
+          executable: session.shell,
+          args: session.args ?? [],
+          cwd: null,
+          env: session.env ? Object.entries(session.env) : [],
+        }
+      : null,
+    cwd: session.cwd || null,
+    dimensions,
   };
 }
 
-/**
- * Subscribes to one terminal event. Returns an unsubscribe function that is safe to
- * call before the listener has finished registering.
- */
-function subscribe<T>(event: string, handler: (payload: T) => void): () => void {
-  if (!isTauri()) return () => {};
-  let cancelled = false;
-  const pending = listen<T>(event, (message) => {
-    if (!cancelled) handler(message.payload);
-  }).catch(() => undefined);
-  return () => {
-    cancelled = true;
-    void pending.then((unlisten) => unlisten?.());
-  };
+/** What a terminal view does with its launch's stream (TERMINAL-02). */
+export interface TerminalStreamHandlers {
+  /**
+   * The next output, in order. Call `accepted` once the terminal has consumed the bytes (xterm's
+   * write callback): that is the acknowledgement that lets more be sent, and, past the bound,
+   * lets the shell's output be read again.
+   */
+  output(chunk: TerminalOutputChunk, accepted: () => void): void;
+  exit(exit: TerminalExit): void;
+  error(event: TerminalErrorEvent): void;
+  /** This view was detached from a session that goes on: it will be sent nothing more. */
+  detached(event: TerminalDetached): void;
 }
 
 /**
- * Routes native terminal events to the one terminal they belong to.
- *
- * The native side broadcasts `terminal-output` globally, so every open terminal used to
- * receive every other terminal's bytes and discard the ones whose id did not match -- work
- * proportional to the number of open terminals for every chunk of output, on the hot path of
- * a build scrolling past. The router subscribes once and dispatches by id, so a chunk costs
- * one map lookup no matter how many terminals are open.
+ * One subscriber's handling of its channel: each message parsed against the contract, anything
+ * not of its own launch dropped, the rest handed on in the order it arrived. A handler that
+ * throws stops neither the stream nor the window.
  */
-interface Router<T> {
-  handlers: Map<string, Set<(payload: T) => void>>;
-  stop: (() => void) | null;
-}
-
-const outputRouter: Router<TerminalOutput> = { handlers: new Map(), stop: null };
-const exitRouter: Router<TerminalExit> = { handlers: new Map(), stop: null };
-
-/**
- * Hands a payload to the terminal it belongs to. A copy of the set, and one try per listener:
- * a handler that throws must not swallow the chunk for every other terminal, nor escape into
- * the native event callback.
- */
-function dispatch<T extends { id: string }>(router: Router<T>, payload: T): void {
-  const listeners = router.handlers.get(payload.id);
-  if (!listeners) return;
-  for (const listener of [...listeners]) {
+export function streamReceiver(
+  launch: { sessionId: string; generation: number },
+  acknowledge: (seq: Sequence) => void,
+  handlers: TerminalStreamHandlers,
+): (message: unknown) => void {
+  return (message) => {
+    const event = parseTerminalMessage(message);
+    if (!event || event.sessionId !== launch.sessionId || event.generation !== launch.generation)
+      return;
     try {
-      listener(payload);
+      if (event.kind === "output") {
+        let acknowledged = false;
+        handlers.output(event, () => {
+          if (acknowledged) return;
+          acknowledged = true;
+          acknowledge(event.seq);
+        });
+      } else if (event.kind === "exit") handlers.exit(event);
+      else if (event.kind === "error") handlers.error(event);
+      else if (event.kind === "detached") handlers.detached(event);
     } catch {
-      /* One terminal's failure is not the others' problem. */
-    }
-  }
-}
-
-function route<T extends { id: string }>(
-  router: Router<T>,
-  event: string,
-  id: string,
-  handler: (payload: T) => void,
-): () => void {
-  let forId = router.handlers.get(id);
-  if (!forId) {
-    forId = new Set();
-    router.handlers.set(id, forId);
-  }
-  forId.add(handler);
-  router.stop ??= subscribe<T>(event, (payload) => dispatch(router, payload));
-
-  const registered = forId;
-  return () => {
-    // Only tear down what this subscription actually owns. Calling an unsubscribe twice
-    // would otherwise delete the set a *later* subscription for the same id had installed,
-    // silently stopping that terminal's output and dropping the native listener with it.
-    if (router.handlers.get(id) !== registered) return;
-    registered.delete(handler);
-    if (registered.size > 0) return;
-    router.handlers.delete(id);
-    // Nothing is listening any more, so nothing should stay subscribed either.
-    if (router.handlers.size === 0) {
-      router.stop?.();
-      router.stop = null;
+      /* One handler's failure is not the stream's. */
     }
   };
 }
 
+/** How a launch reaches the native side; the application passes its `native` calls. */
+export interface TerminalTransport {
+  open(args: {
+    request: TerminalOpenRequest;
+    subscriptionId: SubscriptionId;
+    events: Channel<unknown>;
+  }): Promise<NativeTerminalSession>;
+  ack(request: TerminalAckRequest): Promise<unknown>;
+}
+
+let subscriptions = 0;
+
+/** A subscription id for one launch: unique for the life of the window. */
+export function createSubscriptionId(sessionId: string): SubscriptionId {
+  subscriptions += 1;
+  return `${sessionId}-view-${subscriptions}` as SubscriptionId;
+}
+
 /**
- * Test seam: delivers a payload exactly as the native event would. The routers subscribe
- * through `listen`, which is inert outside Tauri, so without this the routing rules -- which
- * is where the bugs were -- could only be checked in a browser test.
+ * Opens a launch with a channel of its own: its output and lifecycle arrive there, for this
+ * view alone, and each chunk is acknowledged once `handlers.output` says it was consumed.
  */
-export function deliverForTest(
-  event: "terminal-output" | "terminal-exit",
-  payload: { id: string; data?: string; code?: number | null },
-): void {
-  // Goes through the same `dispatch` the native subscription uses, so what the tests check
-  // is the real routing rather than a re-implementation of it.
-  if (event === "terminal-output") dispatch(outputRouter, payload as TerminalOutput);
-  else dispatch(exitRouter, payload as TerminalExit);
-}
-
-/** This terminal's output only. */
-export function onOutputFor(
-  id: string,
-  handler: (data: string, payload: TerminalOutput) => void,
-): () => void {
-  return route(outputRouter, "terminal-output", id, (payload) => handler(payload.data, payload));
-}
-
-/** This terminal's exit only. */
-export function onExitFor(
-  id: string,
-  handler: (code: number | null, payload: TerminalExit) => void,
-): () => void {
-  return route(exitRouter, "terminal-exit", id, (payload) => handler(payload.code, payload));
+export function openTerminal(
+  request: TerminalOpenRequest,
+  handlers: TerminalStreamHandlers,
+  transport: TerminalTransport,
+): Promise<NativeTerminalSession> {
+  const subscriptionId = createSubscriptionId(request.sessionId);
+  const acknowledge = (seq: Sequence) =>
+    void transport
+      .ack({
+        subscriptionId,
+        sessionId: request.sessionId,
+        generation: request.generation,
+        seq,
+      })
+      .catch(() => undefined);
+  const events = new Channel<unknown>(streamReceiver(request, acknowledge, handlers));
+  return transport.open({ request, subscriptionId, events });
 }
 
 /**
  * The terminal size in whole cells. xterm reports 0 before it has been laid out,
  * which the shell would take literally, so a sane minimum is enforced here.
  */
-export function usableSize(cols: number, rows: number): { cols: number; rows: number } {
-  return { cols: Math.max(1, Math.floor(cols) || 80), rows: Math.max(1, Math.floor(rows) || 24) };
+export function usableSize(cols: number, rows: number): TerminalDimensions {
+  const cells = (value: number, fallback: number, max: number) =>
+    Math.min(max, Math.max(1, Math.floor(value) || fallback));
+  return { cols: cells(cols, 80, MAX_COLS), rows: cells(rows, 24, MAX_ROWS) };
 }
 
 let created = 0;

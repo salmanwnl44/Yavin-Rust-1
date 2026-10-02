@@ -23,6 +23,7 @@ mod paths;
 mod ports;
 mod session;
 mod terminal;
+mod terminal_stream;
 mod trust;
 mod workbench;
 use checkers::{available_checkers, cancel_checker, run_checker, Checks};
@@ -55,7 +56,8 @@ use lsp::{lsp_send, lsp_servers, lsp_start, lsp_stop, lsp_stop_all, LspSessions}
 use ports::{list_listening_ports, stop_listening_process};
 use session::{forget_workspace, read_session, save_workspace_session, Sessions};
 use terminal::{
-    terminal_close, terminal_close_all, terminal_open, terminal_resize, terminal_shells,
+    terminal_ack, terminal_close, terminal_close_all, terminal_kill, terminal_open,
+    terminal_resize, terminal_shells, terminal_stats, terminal_subscribe, terminal_unsubscribe,
     terminal_write, Terminals,
 };
 use trust::{forget_trusted_folder, set_workspace_trust, trusted_folders, workspace_trust, Trust};
@@ -499,6 +501,8 @@ fn enter_workspace(
         .ok()
         .map(|spec| spec.workspace_id);
     app.state::<LocalGit>().revoke_except(now.as_deref());
+    // So are its terminals: no shell of the workspace left keeps running in its folder.
+    terminal::end_other_workspaces(&app.state::<Terminals>(), now.as_deref());
     watch_workspace(app, watch, &watched);
     Ok(root)
 }
@@ -787,7 +791,12 @@ pub fn run() {
             terminal_write,
             terminal_resize,
             terminal_close,
+            terminal_kill,
             terminal_close_all,
+            terminal_subscribe,
+            terminal_unsubscribe,
+            terminal_ack,
+            terminal_stats,
             lsp_servers,
             lsp_start,
             lsp_send,

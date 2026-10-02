@@ -1807,6 +1807,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ide-terminal-protocol"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ide-workspace"
 version = "0.1.0"
 dependencies = [
@@ -5227,8 +5236,11 @@ checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 name = "yavin-ide"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "ide-localgit",
+ "ide-terminal-protocol",
  "ide-workspace",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",

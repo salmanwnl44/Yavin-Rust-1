@@ -1,7 +1,20 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import type { Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { FileNode } from "../types";
 import type { Shell } from "./terminal";
+import type {
+  SubscriptionId,
+  TerminalAckRequest,
+  TerminalSubscribeRequest,
+  TerminalUnsubscribeRequest,
+  TerminalCloseRequest,
+  TerminalKillRequest,
+  TerminalOpenRequest,
+  TerminalResizeRequest,
+  TerminalSession,
+  TerminalWriteRequest,
+} from "./terminalProtocol.ts";
 import type { Session, WorkspaceSession } from "./session";
 import type { TrustState } from "./trust";
 import type {
@@ -136,26 +149,28 @@ interface Commands {
   };
   git_unwatch_repo: { args: { repositoryId: string }; result: void };
   terminal_shells: { args: undefined; result: Shell[] };
+  /** The Terminal contract's requests (`terminalProtocol.ts`); failures are `"Cause: message"`. */
+  /** `events` is this launch's own channel: every message for it, acknowledged with `terminal_ack`. */
   terminal_open: {
     args: {
-      id: string;
-      shell?: string;
-      cols: number;
-      rows: number;
-      /** Extra arguments from a terminal profile, e.g. `-NoLogo`. */
-      args?: string[];
-      /** Profile environment, as pairs so ordering is preserved on the native side. */
-      env?: [string, string][];
-      /** Where the shell starts; the workspace root when omitted. */
-      cwd?: string;
-      /** Which launch of this terminal it is; its events carry it back. */
-      generation?: number;
+      request: TerminalOpenRequest;
+      subscriptionId: SubscriptionId;
+      events: Channel<unknown>;
     };
-    result: string;
+    result: TerminalSession;
   };
-  terminal_write: { args: { id: string; data: string }; result: void };
-  terminal_resize: { args: { id: string; cols: number; rows: number }; result: void };
-  terminal_close: { args: { id: string; generation?: number }; result: void };
+  terminal_ack: { args: { request: TerminalAckRequest }; result: void };
+  terminal_subscribe: {
+    args: { request: TerminalSubscribeRequest; events: Channel<unknown> };
+    result: void;
+  };
+  terminal_unsubscribe: { args: { request: TerminalUnsubscribeRequest }; result: void };
+  /** What a session's output stream is doing, for development; never terminal content. */
+  terminal_stats: { args: { sessionId: string }; result: unknown };
+  terminal_write: { args: { request: TerminalWriteRequest }; result: void };
+  terminal_resize: { args: { request: TerminalResizeRequest }; result: void };
+  terminal_close: { args: { request: TerminalCloseRequest }; result: void };
+  terminal_kill: { args: { request: TerminalKillRequest }; result: void };
   terminal_close_all: { args: undefined; result: void };
   /** Local Git (`services/localgit`): by handle and object id only, never by path. */
   localgit_open: { args: { folders: string[] }; result: LocalGitInfo };

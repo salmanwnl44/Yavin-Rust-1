@@ -1,0 +1,586 @@
+{
+  "comment": "Wire forms of the Terminal contract (TERMINAL-00), read by terminalProtocol.test.ts and by src-tauri/crates/ide-terminal-protocol's tests: both sides must parse every valid form to the same values, write it back identically, and refuse every invalid one.",
+  "transitions": {
+    "Spawning": ["Running", "Failed"],
+    "Running": ["Exiting", "Failed"],
+    "Exiting": ["Exited", "Failed"],
+    "Exited": [],
+    "Failed": []
+  },
+  "outputChunks": [
+    {
+      "about": "a UTF-8 character cut after its second byte (the euro sign is e2 82 ac)",
+      "wire": {
+        "sessionId": "terminal-a1-1",
+        "generation": 1,
+        "seq": 0,
+        "bytes": "4oI="
+      },
+      "hex": "e282"
+    },
+    {
+      "about": "a CSI sequence cut in the middle, then text",
+      "wire": {
+        "sessionId": "terminal-a1-1",
+        "generation": 1,
+        "seq": 1,
+        "bytes": "rBtbMzFtcmVk"
+      },
+      "hex": "ac1b5b33316d726564"
+    },
+    {
+      "about": "an OSC title sequence cut before its terminator",
+      "wire": {
+        "sessionId": "terminal-a1-1",
+        "generation": 2,
+        "seq": 7,
+        "bytes": "G10wO3RpdGxl"
+      },
+      "hex": "1b5d303b7469746c65"
+    },
+    {
+      "about": "bytes that are not text at all",
+      "wire": {
+        "sessionId": "t.2_x",
+        "generation": 9007199254740991,
+        "seq": 3,
+        "bytes": "AAH/fg=="
+      },
+      "hex": "0001ff7e"
+    },
+    {
+      "about": "an empty chunk",
+      "wire": {
+        "sessionId": "terminal-a1-1",
+        "generation": 1,
+        "seq": 2,
+        "bytes": ""
+      },
+      "hex": ""
+    }
+  ],
+  "invalidOutputChunks": [
+    {
+      "sessionId": "",
+      "generation": 1,
+      "seq": 0,
+      "bytes": ""
+    },
+    {
+      "sessionId": "has space",
+      "generation": 1,
+      "seq": 0,
+      "bytes": ""
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 0,
+      "seq": 0,
+      "bytes": ""
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1.5,
+      "seq": 0,
+      "bytes": ""
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "seq": -1,
+      "bytes": ""
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "seq": 0,
+      "bytes": "not base64!"
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "seq": 0,
+      "bytes": [104, 105]
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "seq": 0,
+      "data": "hi"
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "bytes": ""
+    }
+  ],
+  "stateChanges": [
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "state": "Running",
+      "pid": 4242
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "state": "Running",
+      "pid": null
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "state": "Exiting"
+    }
+  ],
+  "invalidStateChanges": [
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "state": "Running"
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "state": "Running",
+      "pid": 0
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "state": "Exiting",
+      "pid": 4242
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "state": "Exited"
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "state": "running",
+      "pid": 1
+    }
+  ],
+  "exits": [
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "exitCode": 0,
+      "lastSeq": 41
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 3,
+      "exitCode": -1073741510,
+      "lastSeq": null
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "exitCode": null,
+      "lastSeq": 0
+    }
+  ],
+  "invalidExits": [
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "exitCode": 0
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "exitCode": "0",
+      "lastSeq": null
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "exitCode": 0,
+      "lastSeq": -1
+    }
+  ],
+  "errorEvents": [
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 2,
+      "error": {
+        "code": "ProcessFailed",
+        "message": "The shell stopped responding."
+      },
+      "lastSeq": 12
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "error": {
+        "code": "SpawnFailed",
+        "message": "Cannot start cmd.exe: not found."
+      },
+      "lastSeq": null
+    }
+  ],
+  "invalidErrorEvents": [
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "error": {
+        "code": "Exploded",
+        "message": "x"
+      },
+      "lastSeq": null
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "error": {
+        "code": "WriteFailed",
+        "message": ""
+      },
+      "lastSeq": null
+    },
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "error": "WriteFailed: x",
+      "lastSeq": null
+    }
+  ],
+  "errors": [
+    {
+      "wire": "InvalidSession: That terminal is no longer running.",
+      "code": "InvalidSession",
+      "message": "That terminal is no longer running."
+    },
+    {
+      "wire": "InvalidWorkspace: That workspace is not open.",
+      "code": "InvalidWorkspace",
+      "message": "That workspace is not open."
+    },
+    {
+      "wire": "ShellUnavailable: No shell was found on this machine.",
+      "code": "ShellUnavailable",
+      "message": "No shell was found on this machine."
+    },
+    {
+      "wire": "SpawnFailed: Cannot start pwsh.exe: not found.",
+      "code": "SpawnFailed",
+      "message": "Cannot start pwsh.exe: not found."
+    },
+    {
+      "wire": "InvalidCwd: C:\\missing is not a folder.",
+      "code": "InvalidCwd",
+      "message": "C:\\missing is not a folder."
+    },
+    {
+      "wire": "PermissionDenied: Cannot start bash: permission denied.",
+      "code": "PermissionDenied",
+      "message": "Cannot start bash: permission denied."
+    },
+    {
+      "wire": "WriteFailed: Cannot send input: the shell has closed its input.",
+      "code": "WriteFailed",
+      "message": "Cannot send input: the shell has closed its input."
+    },
+    {
+      "wire": "ResizeFailed: Cannot resize the terminal.",
+      "code": "ResizeFailed",
+      "message": "Cannot resize the terminal."
+    },
+    {
+      "wire": "ProcessFailed: The shell stopped responding.",
+      "code": "ProcessFailed",
+      "message": "The shell stopped responding."
+    },
+    {
+      "wire": "TerminationFailed: Cannot end the shell: permission denied.",
+      "code": "TerminationFailed",
+      "message": "Cannot end the shell: permission denied."
+    },
+    {
+      "wire": "ProtocolError: A terminal is 1-1000 columns by 1-1000 rows.",
+      "code": "ProtocolError",
+      "message": "A terminal is 1-1000 columns by 1-1000 rows."
+    },
+    {
+      "wire": "StaleGeneration: That request is for an earlier launch of this terminal.",
+      "code": "StaleGeneration",
+      "message": "That request is for an earlier launch of this terminal."
+    },
+    {
+      "wire": "OutputOverflow: This view fell too far behind the terminal's output and was detached.",
+      "code": "OutputOverflow",
+      "message": "This view fell too far behind the terminal's output and was detached."
+    },
+    {
+      "wire": "SubscriberFailed: This view stopped taking the terminal's output and was detached.",
+      "code": "SubscriberFailed",
+      "message": "This view stopped taking the terminal's output and was detached."
+    },
+    {
+      "wire": "TransportFailed: The terminal's output could not be delivered to this view.",
+      "code": "TransportFailed",
+      "message": "The terminal's output could not be delivered to this view."
+    },
+    {
+      "wire": "Unknown: The terminal failed unexpectedly.",
+      "code": "Unknown",
+      "message": "The terminal failed unexpectedly."
+    }
+  ],
+  "unrecognisedErrors": [
+    "Access is denied. (os error 5)",
+    "Exploded: something",
+    "called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound }",
+    ""
+  ],
+  "dimensions": {
+    "valid": [
+      {
+        "cols": 1,
+        "rows": 1
+      },
+      {
+        "cols": 80,
+        "rows": 24
+      },
+      {
+        "cols": 1000,
+        "rows": 1000
+      }
+    ],
+    "invalid": [
+      {
+        "cols": 0,
+        "rows": 24
+      },
+      {
+        "cols": 80,
+        "rows": 0
+      },
+      {
+        "cols": -1,
+        "rows": 24
+      },
+      {
+        "cols": 80.5,
+        "rows": 24
+      },
+      {
+        "cols": 1001,
+        "rows": 24
+      },
+      {
+        "cols": 80,
+        "rows": 1001
+      },
+      {
+        "cols": 80
+      }
+    ]
+  },
+  "profiles": [
+    {
+      "id": "git-bash",
+      "name": "Git Bash",
+      "executable": "C:\\Program Files\\Git\\bin\\bash.exe",
+      "args": ["--login", "-i"],
+      "cwd": null,
+      "env": [
+        ["BASE", "/opt"],
+        ["TOOLS", "$BASE/tools"]
+      ]
+    },
+    {
+      "id": "plain",
+      "name": "Command Prompt",
+      "executable": "C:\\Windows\\System32\\cmd.exe",
+      "args": [],
+      "cwd": "C:\\work",
+      "env": []
+    }
+  ],
+  "invalidProfiles": [
+    {
+      "id": "",
+      "name": "x",
+      "executable": "sh",
+      "args": [],
+      "cwd": null,
+      "env": []
+    },
+    {
+      "id": "p",
+      "name": "",
+      "executable": "sh",
+      "args": [],
+      "cwd": null,
+      "env": []
+    },
+    {
+      "id": "p",
+      "name": "x",
+      "executable": "",
+      "args": [],
+      "cwd": null,
+      "env": []
+    },
+    {
+      "id": "p",
+      "name": "x",
+      "executable": "sh",
+      "args": ["a\nb"],
+      "cwd": null,
+      "env": []
+    },
+    {
+      "id": "p",
+      "name": "x",
+      "executable": "sh",
+      "args": [],
+      "cwd": null,
+      "env": [["A=B", "1"]]
+    },
+    {
+      "id": "p",
+      "name": "x",
+      "executable": "sh",
+      "args": [],
+      "cwd": null,
+      "env": [["", "1"]]
+    },
+    {
+      "id": "p",
+      "name": "x",
+      "executable": "sh",
+      "args": [],
+      "cwd": null,
+      "env": [["A", "1\r"]]
+    },
+    {
+      "id": "p",
+      "name": "x",
+      "executable": "sh",
+      "args": [],
+      "cwd": "",
+      "env": []
+    }
+  ],
+  "openRequest": {
+    "sessionId": "terminal-a1-1",
+    "workspaceId": "file://c:/work",
+    "generation": 1,
+    "profile": null,
+    "cwd": null,
+    "dimensions": {
+      "cols": 80,
+      "rows": 24
+    }
+  },
+  "session": {
+    "sessionId": "terminal-a1-1",
+    "workspaceId": "file://c:/work",
+    "profile": null,
+    "cwd": null,
+    "generation": 2,
+    "state": "Running",
+    "pid": 4242,
+    "dimensions": {
+      "cols": 120,
+      "rows": 30
+    },
+    "startedAt": 1790000000000,
+    "exitCode": null
+  },
+  "messages": [
+    {
+      "kind": "output",
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "seq": 0,
+      "bytes": "4oI="
+    },
+    {
+      "kind": "state",
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "state": "Running",
+      "pid": 4242
+    },
+    {
+      "kind": "state",
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "state": "Exiting"
+    },
+    {
+      "kind": "exit",
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "exitCode": 0,
+      "lastSeq": 41
+    },
+    {
+      "kind": "error",
+      "sessionId": "terminal-a1-1",
+      "generation": 2,
+      "error": {
+        "code": "ProcessFailed",
+        "message": "The shell stopped responding."
+      },
+      "lastSeq": null
+    },
+    {
+      "kind": "detached",
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "error": {
+        "code": "OutputOverflow",
+        "message": "This view fell too far behind the terminal's output and was detached."
+      },
+      "lastSeq": 7
+    }
+  ],
+  "invalidMessages": [
+    {
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "seq": 0,
+      "bytes": ""
+    },
+    {
+      "kind": "stdout",
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "seq": 0,
+      "bytes": ""
+    },
+    {
+      "kind": "output",
+      "id": "terminal-a1-1",
+      "data": "old shape"
+    },
+    {
+      "kind": "detached",
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "error": {
+        "code": "OutputOverflow",
+        "message": "x"
+      }
+    }
+  ],
+  "ackRequest": {
+    "subscriptionId": "sub-1",
+    "sessionId": "terminal-a1-1",
+    "generation": 1,
+    "seq": 12
+  },
+  "subscribeRequest": {
+    "subscriptionId": "sub-2",
+    "sessionId": "terminal-a1-1",
+    "generation": 1
+  }
+}

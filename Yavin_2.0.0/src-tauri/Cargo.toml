@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/ide-workspace", "crates/ide-localgit"]
-exclude = ["crates/ide-core", "crates/ide-config", "crates/ide-syntax", "crates/ide-lsp", "crates/ide-dap", "crates/ide-terminal", "crates/ide-plugin-host"]
+members = ["crates/ide-workspace", "crates/ide-localgit", "crates/ide-terminal-protocol"]
+exclude = ["crates/ide-core", "crates/ide-config", "crates/ide-syntax", "crates/ide-lsp", "crates/ide-dap", "crates/ide-plugin-host"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +27,14 @@ serde_json = { workspace = true }
 ide-workspace = { path = "crates/ide-workspace" }
 ide-localgit = { path = "crates/ide-localgit" }
 portable-pty = "0.9.0"
+# portable-pty's own error type, read to tell an OS failure's kind from anything else.
+anyhow = "1"
+# The terminal contract (TERMINAL-00): identities, states, errors and the output protocol.
+ide-terminal-protocol = { path = "crates/ide-terminal-protocol" }
+
+[target.'cfg(unix)'.dependencies]
+# A terminal's shell and everything it starts are ended as one process group (`killpg`).
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # A Local Git restore recreates Windows junctions (FSCTL_SET_REPARSE_POINT), never by a process.
