@@ -8,13 +8,6 @@ export interface CommitBoxHandle {
   commit: () => void;
 }
 
-export interface CommitOptions {
-  /** Replace the last commit (its message, and whatever is staged) instead of adding one. */
-  amend: boolean;
-  /** Add a `Signed-off-by` trailer. */
-  signoff: boolean;
-}
-
 const draftStorageKey = (key: string) => `yavin.commit:${key}`;
 /** The tallest the message box grows before it scrolls, in lines. */
 const MAX_LINES = 10;
@@ -25,9 +18,8 @@ const MAX_LINES = 10;
  * file row (measured 50 ms per keystroke at 1,000 files, 394 ms at 10,000). The panel only
  * hears `onChange` and keeps a boolean plus a ref, so typing re-renders this component alone.
  *
- * The button says what it will do -- "Commit 2 staged", "Commit all 5", "Amend last commit" --
- * and the two options people reach for most, Amend and Sign off, are checkboxes beside it
- * rather than items three levels into a menu. The draft is kept per repository.
+ * The button says what it will do -- "Commit 2 staged", "Commit all 5". Amend and Sign off are
+ * in the Commit dropdown attached to it. The draft is kept per repository.
  */
 export const CommitComposer = forwardRef<
   CommitBoxHandle,
@@ -42,7 +34,7 @@ export const CommitComposer = forwardRef<
     conflictCount: number;
     busy: boolean;
     loading: boolean;
-    onCommit: (message: string, options: CommitOptions) => Promise<boolean>;
+    onCommit: (message: string) => Promise<boolean>;
     onChange: (message: string) => void;
     /** A dropdown trigger rendered attached to the right of the Commit button. */
     menu?: ReactNode;
@@ -63,7 +55,6 @@ export const CommitComposer = forwardRef<
   ref,
 ) {
   const [text, setText] = useState("");
-  const [options, setOptions] = useState<CommitOptions>({ amend: false, signoff: false });
   const box = useRef<HTMLTextAreaElement>(null);
 
   const update = useCallback(
@@ -94,7 +85,6 @@ export const CommitComposer = forwardRef<
     }
     setText(saved);
     onChange(saved);
-    setOptions({ amend: false, signoff: false });
   }, [draftKey, onChange]);
 
   // The box grows with the message, up to a limit, then scrolls.
@@ -113,32 +103,28 @@ export const CommitComposer = forwardRef<
   }, [text]);
 
   // With nothing staged, a commit takes every tracked change (`-a`), as the dropdown's Commit
-  // does. Amending needs nothing staged at all: it can change the message alone.
+  // does.
   const willCommitAll = stagedCount === 0;
   const commitCount = willCommitAll ? modifiedCount : stagedCount;
-  const canCommit =
-    text.trim().length > 0 && conflictCount === 0 && (options.amend || commitCount > 0);
+  const canCommit = text.trim().length > 0 && conflictCount === 0 && commitCount > 0;
 
   const commit = () => {
     if (!canCommit) return;
-    void onCommit(text, options).then((ok) => {
-      if (!ok) return;
-      update("", draftKey);
-      setOptions((current) => ({ ...current, amend: false }));
+    void onCommit(text).then((ok) => {
+      if (ok) update("", draftKey);
     });
   };
 
   useImperativeHandle(
     ref,
     () => ({ clear: () => update("", draftKey), commit }),
-    // `commit` closes over the current text, options and counts.
+    // `commit` closes over the current text and counts.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [update, draftKey, text, options, stagedCount, modifiedCount, conflictCount],
+    [update, draftKey, text, stagedCount, modifiedCount, conflictCount],
   );
 
-  const label = options.amend
-    ? "Amend last commit"
-    : commitCount === 0
+  const label =
+    commitCount === 0
       ? "Commit"
       : willCommitAll
         ? `Commit all ${commitCount}`
@@ -146,15 +132,13 @@ export const CommitComposer = forwardRef<
   const reason =
     conflictCount > 0
       ? "Resolve conflicts first"
-      : !options.amend && commitCount === 0
+      : commitCount === 0
         ? "Nothing to commit"
         : !text.trim()
           ? "Enter a commit message"
-          : options.amend
-            ? "Replace the last commit with this message and whatever is staged"
-            : willCommitAll
-              ? `Commit all ${commitCount} changed file${commitCount === 1 ? "" : "s"} (nothing is staged)`
-              : `Commit ${commitCount} staged file${commitCount === 1 ? "" : "s"}`;
+          : willCommitAll
+            ? `Commit all ${commitCount} changed file${commitCount === 1 ? "" : "s"} (nothing is staged)`
+            : `Commit ${commitCount} staged file${commitCount === 1 ? "" : "s"}`;
   const hint = branchName ? ` on "${branchName}"` : "";
 
   return (
@@ -192,31 +176,6 @@ export const CommitComposer = forwardRef<
             {menu}
           </div>
         )}
-      </div>
-
-      <div className="flex items-center gap-3 px-0.5 text-[11px] text-ink-3">
-        {(
-          [
-            ["amend", "Amend", "Replace the last commit instead of adding a new one"],
-            ["signoff", "Sign off", "Add a Signed-off-by line with your name and email"],
-          ] as const
-        ).map(([key, text, title]) => (
-          <label
-            key={key}
-            title={title}
-            className="flex cursor-pointer items-center gap-1.5 hover:text-ink-2"
-          >
-            <input
-              type="checkbox"
-              checked={options[key]}
-              onChange={(event) =>
-                setOptions((current) => ({ ...current, [key]: event.target.checked }))
-              }
-              className="size-3 accent-[var(--color-accent)]"
-            />
-            {text}
-          </label>
-        ))}
       </div>
     </div>
   );

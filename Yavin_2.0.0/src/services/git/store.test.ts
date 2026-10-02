@@ -432,3 +432,42 @@ test("a poll overlapping a refresh the user asked for does not hold the spinner 
   pending[1]?.("");
   await polling;
 });
+
+test("a refresh that finds nothing new notifies nobody and keeps the same snapshot", async () => {
+  const calls: string[] = [];
+  const repo = fakeRepository(calls, {
+    status: () => Promise.resolve(" M a.ts\0"),
+    refs: () => Promise.resolve({ local: ["main", "dev"], remote: ["origin/main"] }),
+    remotes: () => Promise.resolve(["origin"]),
+  });
+  const store = new RepoStore(repo);
+  await store.refresh(undefined, { silent: true });
+  const first = store.getSnapshot();
+  let notified = 0;
+  const unsubscribe = store.subscribe(() => notified++);
+  // The poll: everything fetched again, all of it the same (new arrays, same content).
+  await store.refresh(undefined, { silent: true });
+  await store.refresh(["entries"], { silent: true });
+  assert.equal(notified, 0, "an unchanged repository re-renders nothing");
+  assert.equal(store.getSnapshot(), first, "the snapshot keeps its identity");
+  unsubscribe();
+});
+
+test("a refresh that does find something new still notifies, with only that change", async () => {
+  let branches = ["main"];
+  const repo = fakeRepository([], {
+    refs: () => Promise.resolve({ local: branches, remote: [] }),
+  });
+  const store = new RepoStore(repo);
+  await store.refresh(undefined, { silent: true });
+  const before = store.getSnapshot();
+  let notified = 0;
+  store.subscribe(() => notified++);
+  branches = ["main", "feature"];
+  await store.refresh(undefined, { silent: true });
+  assert.equal(notified, 1);
+  const after = store.getSnapshot();
+  assert.deepEqual(after.branches, ["main", "feature"]);
+  assert.equal(after.entries, before.entries, "unchanged fields keep their identity");
+  assert.equal(after.branch, before.branch);
+});

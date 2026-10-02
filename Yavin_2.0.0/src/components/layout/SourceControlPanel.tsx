@@ -147,7 +147,6 @@ export function SourceControlPanel({
   onEntries,
   apply,
   activeDiffPath,
-  onOpenGraph,
   onShowOutput,
   onDialog,
   onOpenFile,
@@ -166,7 +165,6 @@ export function SourceControlPanel({
   onEntries: (entries: GitEntry[]) => void;
   apply: (changes: Replacement[]) => Promise<{ applied: Replacement[]; errors: string[] }>;
   activeDiffPath?: string;
-  onOpenGraph?: () => void;
   /** Opens the Git Output view -- the log of every Git command the app has run. */
   onShowOutput?: () => void;
   /** Opens the shared app dialog (prompt/picker/confirm) -- see `ui/AppDialog.tsx`. Every
@@ -1451,15 +1449,12 @@ export function SourceControlPanel({
                         busy={busy}
                         loading={loading}
                         onChange={onMessageChange}
-                        onCommit={(message, options) =>
+                        onCommit={(message) =>
                           guarded("commit", () =>
                             // Nothing staged means "commit every tracked change", exactly as
-                            // the dropdown's own Commit item does; an amend takes only what is
-                            // staged (possibly nothing: a new message).
+                            // the dropdown's own Commit item does.
                             activeRepo.store.repository.commit(message, {
-                              all: stagedCount === 0 && !options.amend,
-                              amend: options.amend,
-                              signoff: options.signoff,
+                              all: stagedCount === 0,
                             }),
                           )
                         }
@@ -1686,7 +1681,6 @@ export function SourceControlPanel({
             dirty={dirty}
             collapsed={sectionCollapsed.graph}
             onToggleCollapse={() => toggleCollapsed("graph")}
-            onExpand={onOpenGraph}
             onDiff={onDiff}
             onDialog={onDialog}
           />

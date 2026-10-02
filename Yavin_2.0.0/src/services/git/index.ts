@@ -35,6 +35,7 @@ export { guardedAffecting, SIBLING_INVALIDATES, GRAPH_RESETS } from "./sync.ts";
 export {
   useGitRegistry,
   useActiveRepo,
+  useActiveRepoId,
   useRepoSnapshot,
   useTotalChanges,
   useCommitGraph,

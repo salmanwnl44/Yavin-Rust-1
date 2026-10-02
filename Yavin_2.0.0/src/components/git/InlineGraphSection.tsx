@@ -30,6 +30,8 @@ import {
   SyncIcon,
 } from "../ui/Icons";
 import { GitMenu } from "./GitMenu";
+import { ContextMenu } from "../ui/ContextMenu";
+import { buildCommitMenu } from "../../services/git/commitMenu";
 
 /** A remote-branch marker. Drawn inline: the shared icon set has no cloud. */
 const CloudGlyph = () => (
@@ -49,7 +51,8 @@ const CloudGlyph = () => (
 const ROW_HEIGHT = 22;
 const LANE_WIDTH = 12;
 const NODE_RADIUS = 3.5;
-const VISIBLE_COUNT = 30;
+/** Rows shown at first, and how many more each "Show more commits" adds. */
+const PAGE_ROWS = 30;
 
 const PALETTE = [
   "#818cf8",
@@ -257,7 +260,6 @@ export function InlineGraphSection({
   dirty,
   collapsed,
   onToggleCollapse,
-  onExpand,
   onDiff,
   onDialog,
 }: {
@@ -265,7 +267,6 @@ export function InlineGraphSection({
   dirty: boolean;
   collapsed: boolean;
   onToggleCollapse: () => void;
-  onExpand?: () => void;
   /** Opens the selected commit's file diff -- omitted call sites (a background repo row has
    * none) simply don't get inline commit selection. */
   onDiff?: (document: DiffDocument) => void;
@@ -282,6 +283,18 @@ export function InlineGraphSection({
   // items drive the same state the panel's own Tree/List button does -- the menu entry was
   // previously a permanently-disabled label with nothing behind it.
   const [filesAsTree, setFilesAsTree] = useState(false);
+  // How many commits are drawn. Rows are absolutely positioned and every one costs layout, so
+  // the list grows only when asked to; the loader fetches older pages as the rows reach them.
+  const [visibleCount, setVisibleCount] = useState(PAGE_ROWS);
+  const repository = entry?.store.repository;
+  useEffect(() => setVisibleCount(PAGE_ROWS), [repository, snapshot.scope]);
+  /** The commit whose right-click menu is open; `remote` is filled in once it is known. */
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    commit: RawCommit;
+    remote?: RemoteWebLink | null;
+  } | null>(null);
   // Resting on a commit shows what it is without opening it; see `CommitHoverCard`. Declared
   // with the other hooks, above the early return for "no repository open".
   // Given the section's own box so the card can sit beside it rather than over the commits.
@@ -312,8 +325,14 @@ export function InlineGraphSection({
 
   if (!entry) return null;
 
-  const visible = snapshot.layout.nodes.slice(0, VISIBLE_COUNT);
-  const edges = snapshot.layout.edges.filter((e) => e.fromRow < VISIBLE_COUNT);
+  const visible = snapshot.layout.nodes.slice(0, visibleCount);
+  const edges = snapshot.layout.edges.filter((e) => e.fromRow < visibleCount);
+  const canShowMore = visibleCount < snapshot.layout.nodes.length || snapshot.hasMore;
+  const showMore = () => {
+    const next = visibleCount + PAGE_ROWS;
+    setVisibleCount(next);
+    if (next > snapshot.layout.nodes.length && snapshot.hasMore) loadMore();
+  };
   const gutterWidth = Math.max(1, Math.min(snapshot.layout.laneCount, 4)) * LANE_WIDTH + 6;
   const totalHeight = visible.length * ROW_HEIGHT;
   /**
@@ -341,6 +360,34 @@ export function InlineGraphSection({
   // extra manual call.
   const run = (kind: string, op: () => Promise<string>) =>
     void guardedAffecting(entry, kind, dirty, op);
+
+  const openMenu = (commit: RawCommit, x: number, y: number) => {
+    setMenu({ x, y, commit });
+    defaultRemoteWebLink(entry.store.repository).then(
+      (remote) =>
+        setMenu((current) => (current?.commit === commit ? { ...current, remote } : current)),
+      () => undefined,
+    );
+  };
+  /** Revert and cherry-pick can stop on a conflict, so each is confirmed first. */
+  const confirmApply = (kind: "cherryPick" | "revertCommit", commit: RawCommit) => {
+    if (!onDialog) return;
+    const verb = kind === "cherryPick" ? "Cherry-pick" : "Revert";
+    onDialog({
+      title: `${verb} commit`,
+      message:
+        kind === "cherryPick"
+          ? `Apply "${commit.subject}" onto the current branch? It may stop on a conflict for you to resolve.`
+          : `Create a new commit undoing "${commit.subject}"? It may stop on a conflict for you to resolve.`,
+      confirmLabel: verb,
+      submit: () =>
+        run(kind, () =>
+          kind === "cherryPick"
+            ? entry.store.repository.cherryPick(commit.fullHash)
+            : entry.store.repository.revertCommit(commit.fullHash),
+        ),
+    });
+  };
 
   const scopeLabel =
     snapshot.scope === "auto" ? "Auto" : snapshot.scope === "all" ? "All" : snapshot.scope;
@@ -514,7 +561,7 @@ export function InlineGraphSection({
                 const y1 = edge.fromRow * ROW_HEIGHT + ROW_HEIGHT / 2 + shift(edge.fromRow);
                 const x2 = laneX(edge.toLane);
                 const toRow =
-                  edge.toRow !== null && edge.toRow < VISIBLE_COUNT ? edge.toRow : VISIBLE_COUNT;
+                  edge.toRow !== null && edge.toRow < visibleCount ? edge.toRow : visibleCount;
                 const y2 = toRow * ROW_HEIGHT + ROW_HEIGHT / 2 + shift(toRow);
                 const color = colorFor(edge.color);
                 if (x1 === x2)
@@ -564,12 +611,20 @@ export function InlineGraphSection({
                   tabIndex={onDiff ? 0 : undefined}
                   aria-selected={onDiff ? isSelected : undefined}
                   onClick={onDiff ? () => setSelected(isSelected ? null : node.commit) : undefined}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    openMenu(node.commit, e.clientX, e.clientY);
+                  }}
                   onKeyDown={
                     onDiff
                       ? (e) => {
                           if (e.key === "Enter" || e.key === " ") {
                             e.preventDefault();
                             setSelected(isSelected ? null : node.commit);
+                          } else if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+                            e.preventDefault();
+                            const box = e.currentTarget.getBoundingClientRect();
+                            openMenu(node.commit, box.left + 24, box.bottom);
                           }
                         }
                       : undefined
@@ -658,26 +713,45 @@ export function InlineGraphSection({
             </p>
           )}
           <div className="flex items-center justify-center gap-3 py-1.5">
-            {snapshot.hasMore && (
+            {canShowMore && (
               <button
                 disabled={snapshot.loading}
-                onClick={loadMore}
+                onClick={showMore}
                 className="text-[11px] text-ink-2 hover:text-ink disabled:opacity-40"
               >
                 {snapshot.loading ? "Loading…" : "Show more commits"}
               </button>
             )}
-            {onExpand && (
-              <button
-                onClick={onExpand}
-                className="text-[11px] text-ink-3 hover:text-ink"
-                title="Open full commit graph"
-              >
-                Open in full view
-              </button>
-            )}
           </div>
         </div>
+      )}
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          label="Commit actions"
+          onClose={() => setMenu(null)}
+          onError={(error) => entry.store.setNotice(String(error))}
+          items={buildCommitMenu(
+            menu.commit,
+            { busy, operationInProgress: repo?.operationInProgress ?? "" },
+            {
+              open: onDiff ? () => setSelected(menu.commit) : undefined,
+              copyHash: () => navigator.clipboard.writeText(menu.commit.fullHash),
+              undoLastCommit: () =>
+                run("undoLastCommit", () => entry.store.repository.undoLastCommit()),
+              revert: onDialog ? () => confirmApply("revertCommit", menu.commit) : undefined,
+              cherryPick: onDialog ? () => confirmApply("cherryPick", menu.commit) : undefined,
+              openOnRemote: menu.remote
+                ? {
+                    label: menu.remote.label,
+                    open: () =>
+                      void openExternalUrl(`${menu.remote!.url}/commit/${menu.commit.fullHash}`),
+                  }
+                : undefined,
+            },
+          )}
+        />
       )}
     </section>
   );

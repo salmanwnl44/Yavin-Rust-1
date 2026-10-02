@@ -37,7 +37,6 @@ import type { Replacement } from "./components/layout/SearchPanel";
 import { SourceControlPanel } from "./components/layout/SourceControlPanel";
 import { DiffEditor } from "./components/layout/DiffEditor";
 import type { DiffDocument } from "./components/layout/DiffEditor";
-import { CommitGraphPanel } from "./components/git/CommitGraphPanel";
 import type { SearchHit } from "./services/search";
 import { requestTerminal, onTerminalRequestObserved } from "./services/terminal";
 import type { PanelViewId } from "./services/panel/views";
@@ -75,8 +74,7 @@ import {
   bumpGitRevision,
   guardedAffecting,
   sameDecorations,
-  useActiveRepo,
-  useGitRegistry,
+  useActiveRepoId,
   useTotalChanges,
 } from "./services/git";
 import type { Decorations } from "./services/git";
@@ -348,7 +346,6 @@ export default function App() {
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const [activeActivityTab, setActiveActivityTab] = useState("explorer");
   const [diff, setDiff] = useState<DiffDocument | null>(null);
-  const [showGraph, setShowGraph] = useState(false);
   /**
    * What the panel has been asked to show, if anything.
    *
@@ -404,8 +401,7 @@ export default function App() {
   const [pendingHit, setPendingHit] = useState<SearchHit | null>(null);
   const hasUnsavedChanges = tabs.some((tab) => tab.dirty);
   const totalGitChanges = useTotalChanges();
-  const activeRepo = useActiveRepo();
-  const activeRepoId = useGitRegistry().activeRepoId;
+  const activeRepoId = useActiveRepoId();
 
   // A diff view has no identity of its own tying it to the repository it came
   // from (DiffEditor is keyed only by diff content, never by repository -- see
@@ -2590,10 +2586,6 @@ export default function App() {
               setDecorations((previous) => (sameDecorations(previous, next) ? previous : next));
             }}
             activeDiffPath={diff?.path}
-            onOpenGraph={() => {
-              setDiff(null);
-              setShowGraph(true);
-            }}
             onShowOutput={() => {
               // The Output view in the bottom panel, with Git selected -- where VS Code
               // shows it, rather than a second, Git-only view of the same log.
@@ -2652,33 +2644,7 @@ export default function App() {
 
           {/* Center: Editor + Bottom Terminal Panel */}
           <div className="flex flex-1 flex-col min-w-0 bg-[#000000]">
-            {showGraph && activeRepo ? (
-              <CommitGraphPanel
-                key={activeRepo.repoId}
-                repository={activeRepo.store.repository}
-                entry={activeRepo}
-                onDialog={setDialog}
-                onClose={() => setShowGraph(false)}
-                onDiff={setDiff}
-                onApplyCommit={(kind, commit) => {
-                  const verb = kind === "cherryPick" ? "Cherry-pick" : "Revert";
-                  setDialog({
-                    title: `${verb} commit`,
-                    message:
-                      kind === "cherryPick"
-                        ? `Apply "${commit.subject}" onto the current branch? It may stop on a conflict for you to resolve.`
-                        : `Create a new commit undoing "${commit.subject}"? It may stop on a conflict for you to resolve.`,
-                    confirmLabel: verb,
-                    submit: () =>
-                      void guardedAffecting(activeRepo, kind, hasUnsavedChanges, () =>
-                        kind === "cherryPick"
-                          ? activeRepo.store.repository.cherryPick(commit.fullHash)
-                          : activeRepo.store.repository.revertCommit(commit.fullHash),
-                      ),
-                  });
-                }}
-              />
-            ) : diff ? (
+            {diff ? (
               <DiffEditor
                 key={diff.path + diff.title + diff.text}
                 document={diff}

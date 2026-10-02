@@ -1471,25 +1471,38 @@ test("the changes list works from the keyboard: arrows move, Space stages, Enter
   await expect(page.locator("section[aria-label='Git diff editor']")).toBeVisible();
 });
 
-test("the Commit button says what it will do, and Amend and Sign off are one click away", async ({
+test("the Commit button says what it will do, and Amend and Sign off are in its dropdown", async ({
   page,
 }) => {
-  const region = await panel(page, { status: " M a.ts\0 M b.ts\0" });
-  await region.getByLabel("Commit message").fill("message");
-  // Nothing staged: every tracked change.
-  await expect(region.getByRole("button", { name: "Commit all 2" })).toBeEnabled();
+  const region = await panel(page, { status: "M  a.ts  M b.ts " });
+  const message = region.getByLabel("Commit message");
+  await message.fill("message");
+  await expect(region.getByRole("button", { name: "Commit 1 staged" })).toBeEnabled();
 
-  await region.getByLabel("Amend").check();
-  await region.getByLabel("Sign off").check();
-  const amend = region.getByRole("button", { name: "Amend last commit" });
-  await expect(amend).toBeEnabled();
-  await amend.click();
-  await expect.poll(() => gitCalls(page, "commit")).toBe(1);
-  const args = await lastGitArgs(page, "commit");
-  expect(args).toContain("--amend");
-  expect(args).toContain("-s");
-  // An amend takes what is staged (here nothing: a new message), never `-a`.
-  expect(args).not.toContain("-a");
+  const commitWith = async (item: string) => {
+    await region.getByRole("button", { name: "Commit actions" }).click();
+    await page.getByRole("menuitem", { name: /^Commit ›/ }).click();
+    await page.getByRole("menuitem", { name: item, exact: true }).click();
+  };
+  const commits = () =>
+    page.evaluate(() =>
+      (window as unknown as { __calls: { command: string; args: { args?: string[] } }[] }).__calls
+        .filter((c) => c.command === "git_exec" && c.args.args?.[0] === "commit")
+        .map((c) => c.args.args ?? []),
+    );
+
+  // An amend takes only what is staged, never `-a`.
+  await commitWith("Commit Staged (Amend)");
+  await expect.poll(async () => (await commits()).length).toBe(1);
+  expect((await commits())[0]).toContain("--amend");
+  expect((await commits())[0]).not.toContain("-a");
+  await expect(message).toHaveValue("");
+
+  await message.fill("signed");
+  await commitWith("Commit Staged (Signed Off)");
+  await expect.poll(async () => (await commits()).length).toBe(2);
+  expect((await commits())[1]).toContain("-s");
+  expect((await commits())[1]).not.toContain("--amend");
 });
 
 test("the branch bar lists, filters, switches to and deletes branches", async ({ page }) => {

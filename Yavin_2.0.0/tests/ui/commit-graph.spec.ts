@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import type { Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 
 interface RawLine {
   hash: string;
@@ -23,7 +23,12 @@ interface Scenario {
   originUrl?: string;
 }
 
-async function panel(page: Page, scenario: Scenario, options: { inline?: boolean } = {}) {
+/**
+ * The commit graph in the Source Control sidebar -- the only graph there is: the full-page
+ * graph view was removed, and what it offered that is still offered lives here or in the
+ * commit hover card.
+ */
+async function graph(page: Page, scenario: Scenario) {
   await page.addInitScript((s) => {
     const calls: { command: string; args: Record<string, unknown> }[] = [];
     const ok = (stdout: string) => ({ stdout, stderr: "", code: 0, truncated: false });
@@ -105,12 +110,205 @@ async function panel(page: Page, scenario: Scenario, options: { inline?: boolean
   await page.getByTitle("Source Control (Ctrl+Shift+G)").click();
   const region = page.getByRole("complementary", { name: "Source control" });
   await expect(region).toBeVisible();
-  if (options.inline) return region;
-  await region.getByText("Open in full view").click();
-  const graph = page.getByRole("grid", { name: "Commit history" });
-  await expect(graph).toBeVisible();
-  return graph;
+  const section = region.locator("section[aria-label='Graph']");
+  await expect(section).toBeVisible();
+  return section;
 }
+
+const row = (section: Locator, subject: string) =>
+  section.getByRole("button").filter({ hasText: subject }).first();
+
+/**
+ * Expands a commit's details under its row. Clicking a row also rests the pointer and the
+ * focus on it, which opens the hover card with buttons of the same names, so the card is
+ * dismissed first: what is left is the expanded detail.
+ */
+async function expand(page: Page, section: Locator, subject: string) {
+  await row(section, subject).click();
+  await expect(section.getByRole("button", { name: "Close commit details" })).toBeVisible();
+  await page.mouse.move(0, 0);
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: /^Commit / })).toHaveCount(0);
+  await expect(section.getByText(/\d+ files? changed/)).toBeVisible();
+}
+
+test("the graph shows each commit's subject", async ({ page }) => {
+  const section = await graph(page, {
+    commits: [
+      { hash: "c3", parents: ["c2"], subject: "Third commit" },
+      { hash: "c2", parents: ["c1"], subject: "Second commit" },
+      { hash: "c1", parents: [], subject: "First commit" },
+    ],
+  });
+  await expect(row(section, "Third commit")).toBeVisible();
+  await expect(row(section, "Second commit")).toBeVisible();
+  await expect(row(section, "First commit")).toBeVisible();
+  await expect(section.getByText("Show more commits")).toHaveCount(0);
+});
+
+test("a branch is a badge on its commit's row, and its tags are in the commit's card", async ({
+  page,
+}) => {
+  const section = await graph(page, {
+    commits: [{ hash: "c1", subject: "Tagged", refs: "HEAD -> main, tag: v1.0" }],
+  });
+  await expect(row(section, "Tagged").getByText("main", { exact: true })).toBeVisible();
+  await row(section, "Tagged").hover();
+  const card = page.getByRole("dialog", { name: /^Commit / });
+  await expect(card.getByText("v1.0", { exact: true })).toBeVisible();
+});
+
+test("expanding a commit shows its changed files and their totals", async ({ page }) => {
+  const section = await graph(page, {
+    commits: [{ hash: "c1", subject: "Add a file" }],
+    numstat: { c1: ["5\t2\tsrc/a.ts", "-\t-\timage.png"] },
+  });
+  await expand(page, section, "Add a file");
+  await expect(section.getByRole("button", { name: /src\/a\.ts/ })).toBeVisible();
+  await expect(section.getByRole("button", { name: /image\.png/ })).toBeVisible();
+  await expect(section.getByText("2 files changed")).toBeVisible();
+  await expect(section.getByText("+5", { exact: true })).toBeVisible();
+});
+
+test("clicking a commit's changed file opens its diff", async ({ page }) => {
+  const diffText = [
+    "diff --git a/src/a.ts b/src/a.ts",
+    "index abc..def 100644",
+    "--- a/src/a.ts",
+    "+++ b/src/a.ts",
+    "@@ -1,2 +1,2 @@",
+    " one",
+    "-two",
+    "+TWO",
+  ].join("\n");
+  const section = await graph(page, {
+    commits: [{ hash: "c1", subject: "Add a file" }],
+    numstat: { c1: ["5\t2\tsrc/a.ts"] },
+    fileDiffs: { c1: diffText },
+  });
+  await expand(page, section, "Add a file");
+  await section.getByRole("button", { name: /src\/a\.ts/ }).click();
+
+  const diffView = page.locator("section[aria-label='Git diff editor']");
+  await expect(diffView).toBeVisible();
+  await expect(diffView.getByText("TWO", { exact: true })).toBeVisible();
+});
+
+test("the graph says a shallow clone's history may be incomplete", async ({ page }) => {
+  const section = await graph(page, {
+    commits: [{ hash: "c1", subject: "Only commit this clone has" }],
+    shallow: true,
+  });
+  await expect(section.getByText(/History may be incomplete/)).toBeVisible();
+});
+
+test("the graph shows no incomplete-history notice for a full clone", async ({ page }) => {
+  const section = await graph(page, {
+    commits: [{ hash: "c1", subject: "Only commit" }],
+    shallow: false,
+  });
+  await expect(row(section, "Only commit")).toBeVisible();
+  await expect(section.getByText(/History may be incomplete/)).toHaveCount(0);
+});
+
+test("a graph reset that removes the expanded commit closes its details", async ({ page }) => {
+  const section = await graph(page, {
+    commits: [
+      { hash: "c2", parents: ["c1"], subject: "Second commit" },
+      { hash: "c1", parents: [], subject: "First commit" },
+    ],
+  });
+  await expand(page, section, "Second commit");
+
+  // Simulate a same-repository history rewrite (an amend, a rebase, or an
+  // external rewrite the .git watcher picked up): the previously-expanded
+  // commit no longer exists once the graph reloads.
+  await page.evaluate(() => {
+    (window as unknown as { __scenario: { commits: unknown[] } }).__scenario.commits = [
+      { hash: "c3", parents: [], subject: "Rewritten commit" },
+    ];
+  });
+  await section.getByTitle("Refresh Graph").click();
+
+  await expect(row(section, "Rewritten commit")).toBeVisible();
+  await expect(section.getByText("Second commit")).toHaveCount(0);
+  await expect(section.getByRole("button", { name: "Close commit details" })).toHaveCount(0);
+});
+
+test("a commit's card shows the message body beyond the subject, and the commit's absolute date", async ({
+  page,
+}) => {
+  const section = await graph(page, {
+    commits: [{ hash: "c1", subject: "Fix the thing" }],
+    bodies: { c1: "Fix the thing\n\nA longer explanation of why." },
+  });
+  await row(section, "Fix the thing").hover();
+  const card = page.getByRole("dialog", { name: /^Commit / });
+  await expect(card.getByText("A longer explanation of why.")).toBeVisible();
+  await expect(card).toContainText("Jan 1");
+});
+
+test("copying the hash shows a confirmation, and the button copies the FULL hash, not the short one", async ({
+  page,
+}) => {
+  const section = await graph(page, {
+    commits: [{ hash: "c1-full-hash", subject: "Add a file" }],
+  });
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await expand(page, section, "Add a file");
+  await section.getByRole("button", { name: "Copy commit hash" }).click();
+  await expect(section.getByText("Copied")).toBeVisible();
+  const clipboard = await page.evaluate(() => navigator.clipboard.readText());
+  expect(clipboard).toBe("c1-full-hash");
+});
+
+test("with a recognized remote configured, the details offer to open the commit on it", async ({
+  page,
+}) => {
+  const section = await graph(page, {
+    commits: [{ hash: "c1", subject: "Add a file" }],
+    originUrl: "https://github.com/owner/repo.git",
+  });
+  await expand(page, section, "Add a file");
+  await expect(section.getByRole("button", { name: /Open on GitHub/ })).toBeVisible();
+});
+
+test("with no remote configured, the details offer no open-on-remote link", async ({ page }) => {
+  const section = await graph(page, { commits: [{ hash: "c1", subject: "Add a file" }] });
+  await expand(page, section, "Add a file");
+  await expect(section.getByRole("button", { name: /Open on/ })).toHaveCount(0);
+});
+
+test("a commit's changed files can be viewed as a tree", async ({ page }) => {
+  const section = await graph(page, {
+    commits: [{ hash: "c1", subject: "Refactor" }],
+    numstat: { c1: ["1\t0\tsrc/a.ts", "1\t0\tsrc/b.ts", "1\t0\tREADME.md"] },
+  });
+  await expand(page, section, "Refactor");
+  await expect(section.getByRole("button", { name: /src\/a\.ts/ })).toBeVisible();
+
+  await section.getByRole("button", { name: "View as Tree" }).click();
+  // Folders start expanded, like a freshly opened Explorer tree.
+  await expect(section.getByRole("button", { name: /src\/a\.ts/ })).toHaveCount(0);
+  await expect(section.getByRole("button", { name: "Collapse src" })).toBeVisible();
+  await expect(section.getByRole("button", { name: /a\.ts/ })).toBeVisible();
+  await expect(section.getByRole("button", { name: /b\.ts/ })).toBeVisible();
+  await expect(section.getByRole("button", { name: /README\.md/ })).toBeVisible();
+
+  await section.getByRole("button", { name: "Collapse src" }).click();
+  await expect(section.getByRole("button", { name: /a\.ts/ })).toHaveCount(0);
+  await expect(section.getByRole("button", { name: "Expand src" })).toBeVisible();
+
+  await section.getByRole("button", { name: "View as List" }).click();
+  await expect(section.getByRole("button", { name: /src\/a\.ts/ })).toBeVisible();
+});
+
+const history = (count: number): RawLine[] =>
+  Array.from({ length: count }, (_, i) => ({
+    hash: `c${count - i}`,
+    parents: i < count - 1 ? [`c${count - i - 1}`] : [],
+    subject: `Commit ${count - i}`,
+  }));
 
 const logCallCount = (page: Page) =>
   page.evaluate(
@@ -122,229 +320,124 @@ const logCallCount = (page: Page) =>
       ).__calls.filter((c) => c.command === "git_exec" && c.args.args?.[0] === "log").length,
   );
 
-test("opening the graph shows commit subjects and their authors", async ({ page }) => {
-  const graph = await panel(page, {
-    commits: [
-      { hash: "c3", parents: ["c2"], subject: "Third commit" },
-      { hash: "c2", parents: ["c1"], subject: "Second commit" },
-      { hash: "c1", parents: [], subject: "First commit" },
-    ],
-  });
-  await expect(graph.getByText("Third commit")).toBeVisible();
-  await expect(graph.getByText("Second commit")).toBeVisible();
-  await expect(graph.getByText("First commit")).toBeVisible();
-  await expect(graph.getByText("Load older commits")).toHaveCount(0);
+test("Show more commits draws thirty more each time, until there are no more", async ({ page }) => {
+  const section = await graph(page, { commits: history(75) });
+  await expect(row(section, "Commit 46")).toBeVisible();
+  await expect(section.getByText("Commit 45", { exact: true })).toHaveCount(0);
+
+  const more = section.getByRole("button", { name: "Show more commits" });
+  await more.click();
+  await expect(row(section, "Commit 16")).toBeVisible();
+  await expect(section.getByText("Commit 15", { exact: true })).toHaveCount(0);
+
+  await more.click();
+  await expect(row(section, "Commit 1")).toBeVisible();
+  await expect(more).toHaveCount(0);
 });
 
-test("a branch/tag decoration is shown as a badge next to its commit", async ({ page }) => {
-  const graph = await panel(page, {
-    commits: [{ hash: "c1", subject: "Tagged", refs: "HEAD -> main, tag: v1.0" }],
-  });
-  await expect(graph.getByText("main", { exact: true })).toBeVisible();
-  await expect(graph.getByText("v1.0", { exact: true })).toBeVisible();
-});
-
-test("selecting a commit shows its file changes", async ({ page }) => {
-  const graph = await panel(page, {
-    commits: [{ hash: "c1", subject: "Add a file" }],
-    numstat: { c1: ["5\t2\tsrc/a.ts", "-\t-\timage.png"] },
-  });
-  await graph.getByText("Add a file").click();
-  const detail = page.getByRole("complementary").filter({ hasText: "Commit" });
-  const fileRow = detail.getByRole("listitem").filter({ hasText: "src/a.ts" });
-  await expect(fileRow).toBeVisible();
-  await expect(detail.getByText("image.png")).toBeVisible();
-  await expect(fileRow.getByText("+5")).toBeVisible();
-});
-
-test("clicking a changed file opens its diff and closes the graph view", async ({ page }) => {
-  const diffText = [
-    "diff --git a/src/a.ts b/src/a.ts",
-    "index abc..def 100644",
-    "--- a/src/a.ts",
-    "+++ b/src/a.ts",
-    "@@ -1,2 +1,2 @@",
-    " one",
-    "-two",
-    "+TWO",
-  ].join("\n");
-  const graph = await panel(page, {
-    commits: [{ hash: "c1", subject: "Add a file" }],
-    numstat: { c1: ["5\t2\tsrc/a.ts"] },
-    fileDiffs: { c1: diffText },
-  });
-  await graph.getByText("Add a file").click();
-  const detail = page.getByRole("complementary").filter({ hasText: "Commit" });
-  await detail.getByText("src/a.ts").click();
-
-  const diffView = page.locator("section[aria-label='Git diff editor']");
-  await expect(diffView).toBeVisible();
-  await expect(diffView.getByText("TWO", { exact: true })).toBeVisible();
-  await expect(graph).toHaveCount(0);
-});
-
-test("a repository with more history than one page offers to load older commits", async ({
+test("Show more commits fetches older history once the drawn rows reach its end", async ({
   page,
 }) => {
-  const commits: RawLine[] = Array.from({ length: 305 }, (_, i) => ({
-    hash: `c${305 - i}`,
-    parents: i < 304 ? [`c${304 - i}`] : [],
-    subject: `Commit ${305 - i}`,
-  }));
-  const graph = await panel(page, { commits });
-  await expect(graph.getByText("Load older commits")).toBeVisible();
-
+  test.setTimeout(60_000);
+  // More than one page of `git log` (300 commits): the last rows need a second fetch.
+  const section = await graph(page, { commits: history(305) });
+  const more = section.getByRole("button", { name: "Show more commits" });
   const before = await logCallCount(page);
-  await graph.getByText("Load older commits").click();
+  // 30 rows, then 60, ... 300 are all from the first fetch.
+  for (let i = 0; i < 9; i++) await more.click();
+  await expect(row(section, "Commit 6")).toBeVisible();
+  expect(await logCallCount(page)).toBe(before);
+
+  await more.click();
   await expect.poll(() => logCallCount(page)).toBeGreaterThan(before);
-  await expect(graph.getByText("Load older commits")).toHaveCount(0);
+  await expect(row(section, "Commit 1")).toBeVisible();
+  await expect(more).toHaveCount(0);
 });
 
-test("a shallow clone's exhausted history says so instead of looking complete", async ({
-  page,
-}) => {
-  const graph = await panel(page, {
-    commits: [{ hash: "c1", subject: "Only commit this clone has" }],
-    shallow: true,
-  });
-  await expect(graph.getByText(/History may be incomplete/)).toBeVisible();
-  await expect(graph.getByText("Load older commits")).toHaveCount(0);
-});
+const A = "a".repeat(40);
+const B = "b".repeat(40);
 
-test("the sidebar's own graph says a shallow clone's history may be incomplete", async ({
-  page,
-}) => {
-  const region = await panel(
-    page,
-    { commits: [{ hash: "c1", subject: "Only commit this clone has" }], shallow: true },
-    { inline: true },
+const gitArgs = (page: Page, first: string) =>
+  page.evaluate(
+    (name) =>
+      (window as unknown as { __calls: { command: string; args: { args?: string[] } }[] }).__calls
+        .filter((call) => call.command === "git_exec" && call.args.args?.[0] === name)
+        .map((call) => call.args.args!),
+    first,
   );
-  await expect(region.getByText(/History may be incomplete/)).toBeVisible();
-});
 
-test("the sidebar's graph shows no incomplete-history notice for a full clone", async ({
-  page,
-}) => {
-  const region = await panel(
-    page,
-    { commits: [{ hash: "c1", subject: "Only commit" }], shallow: false },
-    { inline: true },
-  );
-  await expect(region.getByText("Only commit")).toBeVisible();
-  await expect(region.getByText(/History may be incomplete/)).toHaveCount(0);
-});
+async function commitMenu(page: Page, section: Locator, subject: string) {
+  await row(section, subject).click({ button: "right" });
+  const menu = page.getByRole("menu", { name: "Commit actions" });
+  await expect(menu).toBeVisible();
+  return menu;
+}
 
-test("a normal (non-shallow) repository's exhausted history shows no incomplete-history notice", async ({
-  page,
-}) => {
-  const graph = await panel(page, {
-    commits: [{ hash: "c1", subject: "Only commit" }],
-    shallow: false,
-  });
-  await expect(graph.getByText(/History may be incomplete/)).toHaveCount(0);
-});
-
-test("closing the graph returns to the editor", async ({ page }) => {
-  const graph = await panel(page, { commits: [{ hash: "c1", subject: "Only commit" }] });
-  await page.getByTitle("Close graph").click();
-  await expect(graph).toHaveCount(0);
-});
-
-test("a graph reset that removes the selected commit clears its detail panel", async ({ page }) => {
-  const graph = await panel(page, {
+test("a commit's menu reverts it, after asking", async ({ page }) => {
+  const section = await graph(page, {
     commits: [
-      { hash: "c2", parents: ["c1"], subject: "Second commit" },
-      { hash: "c1", parents: [], subject: "First commit" },
+      { hash: B, parents: [A], subject: "Newer", refs: "HEAD -> main" },
+      { hash: A, subject: "Older" },
     ],
   });
-  await graph.getByText("Second commit").click();
-  const detail = page
-    .getByRole("complementary")
-    .filter({ has: page.getByTitle("Close commit details") });
-  await expect(detail).toBeVisible();
+  const menu = await commitMenu(page, section, "Older");
+  await menu.getByRole("menuitem", { name: "Revert Commit…" }).click();
+  const dialog = page.getByRole("dialog", { name: "Revert commit" });
+  await expect(dialog).toContainText('undoing "Older"');
+  expect(await gitArgs(page, "revert")).toEqual([]);
 
-  // Simulate a same-repository history rewrite (an amend, a rebase, or an
-  // external rewrite the .git watcher picked up): the previously-selected
-  // commit no longer exists once the graph reloads.
-  await page.evaluate(() => {
-    (window as unknown as { __scenario: { commits: unknown[] } }).__scenario.commits = [
-      { hash: "c3", parents: [], subject: "Rewritten commit" },
-    ];
-  });
-  await page.getByTitle("Refresh Graph").click();
-
-  await expect(graph.getByText("Rewritten commit")).toBeVisible();
-  await expect(graph.getByText("Second commit")).toHaveCount(0);
-  await expect(detail).toHaveCount(0);
-});
-test("the commit detail shows the message body beyond the subject, and the commit's absolute date", async ({
-  page,
-}) => {
-  const graph = await panel(page, {
-    commits: [{ hash: "c1", subject: "Fix the thing" }],
-    bodies: { c1: "Fix the thing\n\nA longer explanation of why." },
-  });
-  await graph.getByText("Fix the thing").click();
-  const detail = page.getByRole("complementary").filter({ hasText: "Commit" });
-  await expect(detail.getByText("A longer explanation of why.")).toBeVisible();
-  await expect(detail.getByText("Jan 1")).toBeVisible();
+  await dialog.getByRole("button", { name: "Revert" }).click();
+  await expect.poll(() => gitArgs(page, "revert")).toEqual([["revert", A]]);
 });
 
-test("copying the hash shows a confirmation, and the button copies the FULL hash, not the short one", async ({
-  page,
-}) => {
-  const graph = await panel(page, {
-    commits: [{ hash: "c1-full-hash", subject: "Add a file" }],
-  });
-  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
-  await graph.getByText("Add a file").click();
-  const detail = page.getByRole("complementary").filter({ hasText: "Commit" });
-  await detail.getByRole("button", { name: "Copy commit hash" }).click();
-  await expect(detail.getByText("Copied")).toBeVisible();
-  const clipboard = await page.evaluate(() => navigator.clipboard.readText());
-  expect(clipboard).toBe("c1-full-hash");
+test("a commit's menu cherry-picks it, after asking", async ({ page }) => {
+  const section = await graph(page, { commits: [{ hash: A, subject: "Elsewhere" }] });
+  const menu = await commitMenu(page, section, "Elsewhere");
+  await menu.getByRole("menuitem", { name: "Cherry-pick Commit…" }).click();
+  const dialog = page.getByRole("dialog", { name: "Cherry-pick commit" });
+  await dialog.getByRole("button", { name: "Cherry-pick" }).click();
+  await expect.poll(() => gitArgs(page, "cherry-pick")).toEqual([["cherry-pick", A]]);
 });
 
-test("with a recognized remote configured, the detail offers to open the commit on it", async ({
+test("Undo Last Commit is in the checked-out commit's menu only", async ({ page }) => {
+  const section = await graph(page, {
+    commits: [
+      { hash: B, parents: [A], subject: "Newer", refs: "HEAD -> main" },
+      { hash: A, subject: "Older" },
+    ],
+  });
+  let menu = await commitMenu(page, section, "Older");
+  await expect(menu.getByRole("menuitem", { name: "Undo Last Commit" })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+
+  menu = await commitMenu(page, section, "Newer");
+  await menu.getByRole("menuitem", { name: "Undo Last Commit" }).click();
+  await expect.poll(() => gitArgs(page, "reset")).toEqual([["reset", "--soft", "HEAD~1"]]);
+});
+
+test("a commit's menu copies its full hash, opens it, and links to its remote page", async ({
   page,
 }) => {
-  const graph = await panel(page, {
-    commits: [{ hash: "c1", subject: "Add a file" }],
+  const section = await graph(page, {
+    commits: [{ hash: A, subject: "Add a file" }],
+    numstat: { [A]: ["1\t0\tsrc/a.ts"] },
     originUrl: "https://github.com/owner/repo.git",
   });
-  await graph.getByText("Add a file").click();
-  const detail = page.getByRole("complementary").filter({ hasText: "Commit" });
-  await expect(detail.getByRole("button", { name: /Open on GitHub/ })).toBeVisible();
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  let menu = await commitMenu(page, section, "Add a file");
+  await expect(menu.getByRole("menuitem", { name: "Open on GitHub" })).toBeVisible();
+  await menu.getByRole("menuitem", { name: "Copy Commit Hash" }).click();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(A);
+
+  menu = await commitMenu(page, section, "Add a file");
+  await menu.getByRole("menuitem", { name: "Open", exact: true }).click();
+  await expect(section.getByRole("button", { name: "Close commit details" })).toBeVisible();
+  await expect(section.getByRole("button", { name: /src\/a\.ts/ })).toBeVisible();
 });
 
-test("with no remote configured, the detail offers no open-on-remote link", async ({ page }) => {
-  const graph = await panel(page, { commits: [{ hash: "c1", subject: "Add a file" }] });
-  await graph.getByText("Add a file").click();
-  const detail = page.getByRole("complementary").filter({ hasText: "Commit" });
-  await expect(detail.getByRole("button", { name: /Open on/ })).toHaveCount(0);
-});
-
-test("the commit detail's file list can be viewed as a tree", async ({ page }) => {
-  const graph = await panel(page, {
-    commits: [{ hash: "c1", subject: "Refactor" }],
-    numstat: { c1: ["1\t0\tsrc/a.ts", "1\t0\tsrc/b.ts", "1\t0\tREADME.md"] },
-  });
-  await graph.getByText("Refactor").click();
-  const detail = page.getByRole("complementary", { name: "Commit details" });
-  await expect(detail.getByText("src/a.ts")).toBeVisible();
-
-  await detail.getByRole("button", { name: "Tree" }).click();
-  // Folders start expanded, like a freshly opened Explorer tree.
-  await expect(detail.getByText("src/a.ts")).toHaveCount(0);
-  await expect(detail.getByRole("button", { name: "Collapse src" })).toBeVisible();
-  await expect(detail.getByText("a.ts")).toBeVisible();
-  await expect(detail.getByText("b.ts")).toBeVisible();
-  await expect(detail.getByText("README.md")).toBeVisible();
-
-  await detail.getByRole("button", { name: "Collapse src" }).click();
-  await expect(detail.getByText("a.ts")).toHaveCount(0);
-  await expect(detail.getByRole("button", { name: "Expand src" })).toBeVisible();
-
-  await detail.getByRole("button", { name: "List" }).click();
-  await expect(detail.getByText("src/a.ts")).toBeVisible();
+test("the keyboard's menu key opens a commit's menu too", async ({ page }) => {
+  const section = await graph(page, { commits: [{ hash: A, subject: "Only commit" }] });
+  await row(section, "Only commit").focus();
+  await page.keyboard.press("Shift+F10");
+  await expect(page.getByRole("menu", { name: "Commit actions" })).toBeVisible();
 });

@@ -150,6 +150,20 @@ const initialSnapshot: RepoSnapshot = {
 };
 
 /**
+ * Whether a snapshot field's new value is the one it already has. The parsed values a refresh
+ * rebuilds every time (the branch, branch lists, remotes, stashes) are compared by content --
+ * they are small; `entries` keeps its identity when `git status` printed the same thing, so
+ * identity is enough for it.
+ */
+function sameValue(current: unknown, next: unknown): boolean {
+  if (Object.is(current, next)) return true;
+  if (typeof current !== "object" || typeof next !== "object" || current === null || next === null)
+    return false;
+  if (Array.isArray(current) && Array.isArray(next) && current.length !== next.length) return false;
+  return JSON.stringify(current) === JSON.stringify(next);
+}
+
+/**
  * The reactive state for one open repository, shared by everything that displays it
  * (the active Source Control panel, the repo switcher's badge count, the status bar).
  * `subscribe`/`getSnapshot` are shaped for `useSyncExternalStore`.
@@ -246,7 +260,19 @@ export class RepoStore {
   getSnapshot = (): RepoSnapshot => this.snapshot;
 
   private patch(next: Partial<RepoSnapshot>) {
-    this.snapshot = { ...this.snapshot, ...next };
+    // A refresh that found nothing new changes nothing: no new snapshot, no notification --
+    // otherwise every five-second poll re-rendered the panel, its rows and (through the
+    // registry) the whole window for an unchanged repository.
+    const changed: Partial<RepoSnapshot> = {};
+    let any = false;
+    for (const key of Object.keys(next) as (keyof RepoSnapshot)[]) {
+      if (!sameValue(this.snapshot[key], next[key])) {
+        (changed as Record<string, unknown>)[key] = next[key];
+        any = true;
+      }
+    }
+    if (!any) return;
+    this.snapshot = { ...this.snapshot, ...changed };
     for (const listener of this.listeners) listener();
     // Lets the registry re-notify its own subscribers (the repo switcher's badge
     // counts, the aggregated activity-bar total) without them each subscribing to

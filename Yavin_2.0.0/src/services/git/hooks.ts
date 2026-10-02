@@ -39,8 +39,20 @@ export function useRepoSnapshot(store: RepoStore | null | undefined): RepoSnapsh
  * tracked repo's status changes, via the store-to-registry change bridge.
  */
 export function useTotalChanges(): number {
-  const snapshot = useGitRegistry();
-  return snapshot.repos.reduce((sum, entry) => sum + entry.store.getSnapshot().entries.length, 0);
+  const registry = useGitRegistryInstance();
+  // A number, not the registry snapshot: a store change that leaves the count alone
+  // (a loading flag, a branch) re-renders nothing.
+  return useSyncExternalStore(registry.subscribe, () =>
+    registry
+      .getSnapshot()
+      .repos.reduce((sum, entry) => sum + entry.store.getSnapshot().entries.length, 0),
+  );
+}
+
+/** The active repository's id alone: re-renders only when another repository becomes active. */
+export function useActiveRepoId(): string | null {
+  const registry = useGitRegistryInstance();
+  return useSyncExternalStore(registry.subscribe, () => registry.getSnapshot().activeRepoId);
 }
 
 const EMPTY_GRAPH_SNAPSHOT: GraphSnapshot = {
