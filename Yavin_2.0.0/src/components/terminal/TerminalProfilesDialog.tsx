@@ -1,5 +1,6 @@
 import { useState, useSyncExternalStore } from "react";
 import { asTerminalError } from "../../services/terminalProtocol";
+import type { TerminalSettingsStore } from "../../services/terminalSettings";
 import {
   supportsLogin,
   type ProfileEntry,
@@ -50,19 +51,32 @@ const toInput = (draft: Draft): ProfileInput => ({
 
 /**
  * Terminal profiles (TERMINAL-05): list, make, change and remove profiles, and choose the
- * defaults. Deliberately small -- settings proper are TERMINAL-07 -- and every change goes
- * through the registry, which validates it; the dialog keeps only the form it is editing.
+ * defaults, and whether shells' integration is read (TERMINAL-07). Every change goes through
+ * the registry or the terminal settings, which validate and keep it; the dialog keeps only the
+ * form it is editing.
  */
 export function TerminalProfilesDialog({
   profiles,
+  settings,
   onLaunch,
   onClose,
 }: {
   profiles: WorkspaceProfiles;
+  /** Where the integration setting is kept; without it the setting is not offered. */
+  settings?: TerminalSettingsStore;
   onLaunch: (profileId: string) => void;
   onClose: () => void;
 }) {
   const snapshot = useSyncExternalStore(profiles.subscribe, profiles.getSnapshot);
+  const noSettings = () => null;
+  const userIntegration = useSyncExternalStore(
+    settings?.subscribe ?? (() => () => {}),
+    settings ? () => settings.user().shellIntegration : noSettings,
+  );
+  const workspaceIntegration = useSyncExternalStore(
+    settings?.subscribe ?? (() => () => {}),
+    settings ? () => settings.workspace(profiles.workspaceId).shellIntegration : noSettings,
+  );
   const shells = (profiles.registry.getSnapshot().shells ?? []).filter((shell) => shell.available);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [error, setError] = useState("");
@@ -197,6 +211,48 @@ export function TerminalProfilesDialog({
           >
             Use the platform default
           </button>
+        )}
+
+        {settings && (
+          <fieldset aria-label="Shell integration" className="mt-3 border-t border-[#1c1c1c] pt-3">
+            <legend className="mb-1 text-[11px] font-semibold text-zinc-400">
+              Shell integration
+            </legend>
+            <p className="mb-2 text-[11px] text-zinc-500">
+              Reads the folder and command boundaries a shell reports (OSC 7 and 133), if it is set
+              up to. Applies to terminals started from now on.
+            </p>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={userIntegration ?? true}
+                onChange={(event) =>
+                  settings.updateUser({ shellIntegration: event.target.checked })
+                }
+              />
+              Read shell integration
+            </label>
+            <label className="mt-2 flex items-center gap-2">
+              In this workspace
+              <select
+                aria-label="Shell integration in this workspace"
+                value={
+                  workspaceIntegration === null ? "inherit" : workspaceIntegration ? "on" : "off"
+                }
+                onChange={(event) =>
+                  settings.updateWorkspace(profiles.workspaceId, {
+                    shellIntegration:
+                      event.target.value === "inherit" ? null : event.target.value === "on",
+                  })
+                }
+                className="rounded border border-[#2a2a2a] bg-[#111111] px-1 py-0.5"
+              >
+                <option value="inherit">As above</option>
+                <option value="on">On</option>
+                <option value="off">Off</option>
+              </select>
+            </label>
+          </fieldset>
         )}
 
         {draft === null ? (

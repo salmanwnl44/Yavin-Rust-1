@@ -20,13 +20,9 @@
  * The menus, the Explorer and the panel act on terminals through it -- explicitly, on this
  * workspace's terminals -- rather than through a window-wide message channel.
  */
-import {
-  DEFAULT_FONT_SIZE,
-  nextTerminalName,
-  zoomFontSize,
-  type TerminalKeyAction,
-} from "./terminal.ts";
+import { nextTerminalName, zoomFontSize, type TerminalKeyAction } from "./terminal.ts";
 import { samePathString } from "./resource.ts";
+import { DEFAULT_LAYOUT, LAYOUT_LIMITS, type TerminalLayout } from "./terminalSettings.ts";
 import type { TerminalId } from "./terminalProtocol.ts";
 import type { TerminalService } from "./terminalService.ts";
 import type { WorkspaceProfiles } from "./terminalProfiles.ts";
@@ -71,6 +67,8 @@ export interface TerminalUiState {
   readonly keyboard: TerminalId | null;
   readonly splitRatio: number;
   readonly fontSize: number;
+  /** The panel's height, in pixels (the window may show less of it). */
+  readonly panelHeight: number;
   /** The find bar is open; `findRequest` changes each time it is asked for. */
   readonly finding: boolean;
   readonly findRequest: number;
@@ -121,6 +119,7 @@ export interface TerminalUi {
   /** Splits (a second terminal beside the first) or, if split, collapses to one pane. */
   toggleSplit(): void;
   setSplitRatio(ratio: number): void;
+  setPanelHeight(height: number): void;
   close(id: TerminalId): void;
   /** Ends a terminal and everything it started, now (Kill Terminal). */
   kill(id: TerminalId): void;
@@ -143,19 +142,35 @@ export interface TerminalUi {
   viewOf(id: TerminalId): TerminalViewHandle | undefined;
 }
 
+/**
+ * What a workspace's terminal UI keeps across restarts (TERMINAL-07), through the workspace's
+ * settings: its layout, and whether shells' integration is read. Without it, nothing is kept.
+ */
+export interface TerminalUiSettings {
+  /** The layout to start with; `null` for the defaults. */
+  layout: TerminalLayout | null;
+  /** Called whenever the layout changes (the store writes it once it settles). */
+  saveLayout(layout: TerminalLayout): void;
+  /** Whether a terminal started now reads its shell's integration (OSC 7/133). */
+  shellIntegration(): boolean;
+}
+
 export function createTerminalUi(
   service: TerminalService,
   profiles: WorkspaceProfiles,
+  settings?: TerminalUiSettings,
 ): TerminalUi {
   const listeners = new Set<() => void>();
+  const layout = settings?.layout ?? DEFAULT_LAYOUT;
   const views = new Map<TerminalId, TerminalViewHandle>();
   let state: TerminalUiState = Object.freeze({
     primary: null,
     secondary: null,
     focused: "primary" as Pane,
     keyboard: null,
-    splitRatio: 0.5,
-    fontSize: DEFAULT_FONT_SIZE,
+    splitRatio: layout.splitRatio,
+    fontSize: layout.fontSize,
+    panelHeight: layout.panelHeight,
     finding: false,
     findRequest: 0,
     focusRequest: 0,
@@ -204,7 +219,19 @@ export function createTerminalUi(
       (key) => next[key] === state[key],
     );
     if (same) return;
+    const before = state;
     state = Object.freeze(next);
+    if (
+      settings &&
+      (before.fontSize !== state.fontSize ||
+        before.splitRatio !== state.splitRatio ||
+        before.panelHeight !== state.panelHeight)
+    )
+      settings.saveLayout({
+        fontSize: state.fontSize,
+        splitRatio: state.splitRatio,
+        panelHeight: state.panelHeight,
+      });
     for (const listener of [...listeners]) {
       try {
         listener();
@@ -265,6 +292,10 @@ export function createTerminalUi(
         // the terminal still opens: the native side says why, in its own typed error.
         if (!(error instanceof TerminalError)) throw error;
       }
+      // Turned off (TERMINAL-07): the shell's signals are not read. The setting is read when a
+      // terminal starts; one already running keeps how it started.
+      if (settings && !settings.shellIntegration())
+        integration = { integration: "disabled", pathStyle: integration?.pathStyle ?? "posix" };
       const id = service.open({
         title: nextTerminalName(
           service.getSnapshot().sessions.map((session) => session.title),
@@ -324,6 +355,10 @@ export function createTerminalUi(
           .filter((id) => id !== state.primary)
           .at(-1) ?? ui.newTerminal({ show: false });
       set({ secondary: other, focused: "primary" });
+    },
+    setPanelHeight(height) {
+      const [min, max] = LAYOUT_LIMITS.panelHeight;
+      set({ panelHeight: Math.round(Math.max(min, Math.min(height, max))) });
     },
     setSplitRatio(ratio) {
       set({ splitRatio: Math.max(0.2, Math.min(ratio, 0.8)) });

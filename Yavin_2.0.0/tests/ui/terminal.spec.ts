@@ -2202,3 +2202,131 @@ test("the default profile is what New Terminal starts", async ({ page }) => {
   const open = (await calls(page, "terminal_open")).filter((c) => c.args.id === id)[0];
   expect(open.args.shell).toBe(BASH);
 });
+
+// --- Persistence and settings (TERMINAL-07) ---------------------------------------------------
+
+/** The terminal's font size, as xterm draws it. */
+const fontSizeOf = (page: Page, id: string) =>
+  page.evaluate(
+    (label) =>
+      parseFloat(
+        getComputedStyle(document.querySelector(`[aria-label="${label}"] .xterm-rows`) as Element)
+          .fontSize,
+      ),
+    `Terminal ${id}`,
+  );
+
+async function manageProfiles(page: Page) {
+  await page.getByLabel("Choose a shell").click();
+  await page.getByRole("menuitem", { name: "Manage Profiles…" }).click();
+  return page.getByRole("dialog", { name: "Terminal profiles" });
+}
+
+test("profiles, the default and the layout are there after a restart; terminals are not", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openPanel(page);
+  const [first] = await terminalIds(page);
+  const dialog = await manageProfiles(page);
+  await dialog.getByRole("button", { name: "New Profile" }).click();
+  await dialog.getByLabel("Name", { exact: true }).fill("Builds");
+  await dialog.getByLabel("Shell", { exact: true }).selectOption({ label: "Git Bash" });
+  await dialog.getByLabel("Arguments").fill("--norc");
+  await dialog.getByRole("button", { name: "Save Profile" }).click();
+  await dialog
+    .getByRole("listitem", { name: "Builds" })
+    .getByRole("button", { name: "Make default" })
+    .click();
+  await dialog.getByLabel("Close profiles").click();
+
+  // A bigger font and a taller panel.
+  await view(page, first).click();
+  await page.keyboard.press("Control+=");
+  await page.keyboard.press("Control+=");
+  const zoomed = await fontSizeOf(page, first);
+  const separator = page.getByRole("separator", { name: "Resize panel" });
+  const box = (await separator.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + 1);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2, box.y - 120, { steps: 5 });
+  await page.mouse.up();
+  const panel = separator.locator("..");
+  const tall = (await panel.boundingBox())!.height;
+
+  await page.reload();
+  await openPanel(page);
+  // A new shell -- sessions are not kept -- started with the kept default profile.
+  const [after] = await terminalIds(page);
+  expect(after).not.toBe(first);
+  const opened = (await calls(page, "terminal_open")).find((call) => call.args.id === after)!;
+  expect(opened.args.profile).toMatchObject({ name: "Builds", args: ["--norc"] });
+  await expect.poll(() => fontSizeOf(page, after)).toBe(zoomed);
+  await expect
+    .poll(async () => Math.round((await panel.boundingBox())!.height))
+    .toBe(Math.round(tall));
+  // Nothing of the old terminal is shown again.
+  await expect(view(page, first)).toHaveCount(0);
+});
+
+test("shell integration can be turned off, and stays off after a restart", async ({ page }) => {
+  await desktop(page, { unixShell: true });
+  await openPanel(page);
+  await terminalIds(page);
+  const dialog = await manageProfiles(page);
+  await dialog.getByLabel("Read shell integration").uncheck();
+  await dialog.getByLabel("Close profiles").click();
+
+  await page.reload();
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await expect((await manageProfiles(page)).getByLabel("Read shell integration")).not.toBeChecked();
+  await page.keyboard.press("Escape");
+  // Its shell's report is not read: no folder, no command state.
+  await signal(page, id, { signal: "cwd", uri: "file:///work/src", local: true });
+  await signal(page, id, { signal: "executing" });
+  await expect(page.getByRole("status").filter({ hasText: "Running" })).toHaveText("Running");
+  await expect(page.getByTestId("terminal-folder")).toHaveCount(0);
+});
+
+test("unreadable terminal settings are said once, kept aside, and the terminal still works", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    // Only the first load finds them broken; what Yavin writes back is then read.
+    if (!sessionStorage.getItem("seeded")) {
+      localStorage.setItem("yavin.terminal.user", "{this is not json");
+      sessionStorage.setItem("seeded", "1");
+    }
+  });
+  await desktop(page);
+  await expect(page.getByRole("alert")).toContainText("not valid JSON");
+  await openPanel(page);
+  await terminalIds(page);
+  const kept = await page.evaluate(() => localStorage.getItem("yavin.terminal.user.corrupt"));
+  expect(kept).toBe("{this is not json");
+});
+
+test("settings saved by a newer Yavin are left untouched", async ({ page }) => {
+  const theirs = JSON.stringify({ version: 99, fromTheFuture: true });
+  await page.addInitScript((value) => {
+    localStorage.setItem("yavin.terminal.user", value);
+  }, theirs);
+  await desktop(page);
+  await expect(page.getByRole("alert")).toContainText("newer version of Yavin");
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await view(page, id).click();
+  await page.keyboard.press("Control+=");
+  // Leaving the page writes whatever is waiting: no timing involved.
+  await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+  expect(await page.evaluate(() => localStorage.getItem("yavin.terminal.user"))).toBe(theirs);
+  // The same flush did write this version's own record (the workspace's layout), so the check
+  // above is not passing merely because nothing was written yet.
+  const fontSizes = await page.evaluate(() =>
+    Object.keys(localStorage)
+      .filter((key) => key.startsWith("yavin.terminal.workspace:") && !key.endsWith(".corrupt"))
+      .map((key) => JSON.parse(localStorage.getItem(key)!).layout?.fontSize),
+  );
+  expect(fontSizes).toContain(13);
+});

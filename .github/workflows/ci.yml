@@ -36,5 +36,9 @@ jobs:
         working-directory: Yavin_2.0.0/src-tauri
       - run: cargo test --workspace --locked
         working-directory: Yavin_2.0.0/src-tauri
+      # The terminal's output stress tests (up to 50 MB through the bounded stream), kept out of
+      # the default run for time; real shells and process containment run above, on Windows.
+      - run: cargo test -p yavin-ide --lib --locked terminal_stream::tests::stress -- --include-ignored
+        working-directory: Yavin_2.0.0/src-tauri
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
         working-directory: Yavin_2.0.0/src-tauri

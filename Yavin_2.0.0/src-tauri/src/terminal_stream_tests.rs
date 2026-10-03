@@ -1009,3 +1009,51 @@ fn shell_signals_arrive_in_order_with_the_output_and_are_not_replayed() {
     assert!(stream.wait_finished(Duration::from_secs(5)));
     consumer.join().unwrap();
 }
+
+// --- TERMINAL-08: output fidelity with shell integration in the stream --------------------------
+
+#[test]
+fn every_byte_survives_shell_integration_long_lines_and_line_endings() {
+    // The real limits: a 200 KiB line is several chunks and past the replay window.
+    let (stream, recorder) = open(LIMITS);
+    let stop = Arc::new(AtomicBool::new(false));
+    let consumer = consume(&stream, &recorder, "a", Duration::ZERO, stop);
+    let long_line = "x".repeat(200 * 1024);
+    let whole: Vec<u8> = [
+        "😀 snowman ☃\r\n".as_bytes(),
+        b"bare lf\nbare cr\rcrlf\r\n\n\r\r\n",
+        b"\x1b]133;A\x07\x1b]133;B\x07",
+        // A folder with spaces and non-ASCII, percent-encoded as OSC 7 asks.
+        b"\x1b]7;file://localhost/c/Users/%C3%A9t%C3%A9%20x\x1b\\",
+        b"\x1b]133;C\x07",
+        long_line.as_bytes(),
+        &[0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff, 0x00],
+        b"\x1b[2K\x1b[1G\x1b]133;D;0\x07",
+        // An unrelated OSC (a hyperlink) and an unfinished escape at the very end.
+        b"\x1b]8;;https://example.com\x07link\x1b]8;;\x07\x1b[",
+    ]
+    .concat();
+    // A prime chunk size cuts sequences and characters somewhere.
+    for piece in whole.chunks(61) {
+        assert!(stream.push(piece));
+    }
+    stream.finish(End::Exit(Some(0)));
+    assert!(stream.wait_finished(Duration::from_secs(20)));
+    consumer.join().unwrap();
+    // Not a byte lost, added, changed or reordered: the signals are side-band.
+    assert_eq!(recorder.bytes(), whole);
+    let shells: Vec<String> = shape(&recorder.all())
+        .into_iter()
+        .filter(|kind| kind.starts_with("shell"))
+        .collect();
+    assert_eq!(
+        shells,
+        [
+            "shell Prompt",
+            "shell Input",
+            "shell Cwd",
+            "shell Executing",
+            "shell Finished"
+        ]
+    );
+}

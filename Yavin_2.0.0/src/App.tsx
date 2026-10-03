@@ -104,7 +104,7 @@ import type { LanguageFeaturesHost } from "./editor/lspMonaco";
 import type { EditorRange } from "./editor/editorTypes";
 import type { PaletteSymbol, SymbolScope } from "./components/command-palette/CommandPalette";
 import { clearProblems, publishProblems } from "./services/panel/problems";
-import { currentGit, useWorkspace, workspaces } from "./services/workspaces";
+import { currentGit, terminalSettings, useWorkspace, workspaces } from "./services/workspaces";
 import { createOverlayTracker } from "./services/localgit/overlays";
 import { fileUri } from "./services/resource";
 import { loadMinimapPreferences, saveMinimapPreferences } from "./services/minimapPreferences";
@@ -1176,6 +1176,16 @@ export default function App() {
     () => watchFinishedCommands(workspace.services.terminals, bumpGitRevision),
     [workspace],
   );
+  // What went wrong keeping the terminal's settings (TERMINAL-07) -- unreadable, written by a
+  // newer Yavin, not saved -- is said once; the terminal works on with what could be read.
+  useEffect(() => {
+    const show = () => {
+      const problems = terminalSettings.takeProblems();
+      if (problems.length) reportError(problems.join(" "));
+    };
+    show();
+    return terminalSettings.subscribe(show);
+  }, [reportError]);
   /**
    * The symbols of the document in front, for the Outline and the breadcrumbs: asked of its
    * server when it comes to the front, and again a moment after each edit.

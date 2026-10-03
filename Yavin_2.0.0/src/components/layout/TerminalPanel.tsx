@@ -5,6 +5,7 @@ import type { TerminalKeyAction } from "../../services/terminal";
 import type { TerminalId } from "../../services/terminalProtocol";
 import { statusOf } from "../../services/terminalUi";
 import { describeReportedCwd } from "../../services/terminalShell";
+import { terminalSettings } from "../../services/workspaces";
 import {
   useTerminalSessions,
   useTerminalUi,
@@ -20,8 +21,6 @@ import { DebugConsoleView } from "../panel/views/DebugConsoleView";
 import { PortsView } from "../panel/views/PortsView";
 
 const MIN_HEIGHT = 120;
-
-const DEFAULT_HEIGHT = 260;
 
 function Icon({ path, size = 12 }: { path: string; size?: number }) {
   return (
@@ -139,6 +138,9 @@ export function TerminalPanel({
   const sessions = useTerminalSessions(service);
   const view = useTerminalUiState(ui);
   const { primary, secondary, focused, splitRatio, fontSize, finding, bells } = view;
+  // Kept across restarts by the workspace's TerminalUi (TERMINAL-07); a smaller window shows
+  // less of it, without changing what is kept.
+  const height = Math.max(MIN_HEIGHT, Math.min(view.panelHeight, window.innerHeight - 160));
   // How terminals can start (TERMINAL-05): the workspace's profiles, built-in and its own.
   const profileState = useSyncExternalStore(
     ui.profiles.subscribe,
@@ -155,7 +157,6 @@ export function TerminalPanel({
   const [find, setFind] = useState("");
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [regex, setRegex] = useState(false);
-  const [height, setHeight] = useState(DEFAULT_HEIGHT);
   /** The context menu, and the terminal it was opened on: every item acts on that one. */
   const [menu, setMenu] = useState<{ x: number; y: number; id: TerminalId } | null>(null);
   const [renaming, setRenaming] = useState<TerminalId | null>(null);
@@ -286,7 +287,7 @@ export function TerminalPanel({
     const move = (moved: MouseEvent) => {
       if (mode === "panel") {
         const next = startHeight + (startY - moved.clientY);
-        setHeight(Math.max(MIN_HEIGHT, Math.min(next, window.innerHeight - 160)));
+        ui.setPanelHeight(Math.max(MIN_HEIGHT, Math.min(next, window.innerHeight - 160)));
       } else {
         ui.setSplitRatio(startRatio + (moved.clientX - startX) / width);
       }
@@ -752,6 +753,7 @@ export function TerminalPanel({
       {managing && (
         <TerminalProfilesDialog
           profiles={ui.profiles}
+          settings={terminalSettings}
           onLaunch={(profileId) => {
             try {
               ui.newTerminal({ profileId });

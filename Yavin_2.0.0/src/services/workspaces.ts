@@ -11,6 +11,7 @@ import type { TerminalService } from "./terminalService.ts";
 import { createTerminalUi } from "./terminalUi.ts";
 import type { TerminalUi } from "./terminalUi.ts";
 import { createProfileRegistry } from "./terminalProfiles.ts";
+import { createTerminalSettings } from "./terminalSettings.ts";
 import type { WorkspaceContext, WorkspaceId } from "./workspaceManager.ts";
 
 /**
@@ -68,10 +69,22 @@ export const gitStorageKey = (id: WorkspaceId) => `yavin.git.repos:${id}`;
 const LEGACY_GIT_KEY = "yavin.git.repos";
 
 /**
- * Terminal profiles (TERMINAL-05): built-in profiles from discovery (asked for once, for the
- * window), user profiles, and each workspace's own. In memory until TERMINAL-07.
+ * What the terminal keeps across restarts (TERMINAL-07): profiles, defaults, the integration
+ * setting and the layout -- never sessions or their output. Written as it changes; a layout
+ * still settling is written when the page goes.
  */
-export const terminalProfiles = createProfileRegistry(() => native("terminal_shells"));
+export const terminalSettings = createTerminalSettings();
+if (typeof window !== "undefined")
+  window.addEventListener("pagehide", () => terminalSettings.flush());
+
+/**
+ * Terminal profiles (TERMINAL-05): built-in profiles from discovery (asked for once, for the
+ * window), user profiles, and each workspace's own, kept by `terminalSettings`.
+ */
+export const terminalProfiles = createProfileRegistry(
+  () => native("terminal_shells"),
+  terminalSettings,
+);
 
 const terminalUis = new Map<WorkspaceId, TerminalUi>();
 /**
@@ -81,7 +94,15 @@ const terminalUis = new Map<WorkspaceId, TerminalUi>();
 function terminalUiFor(id: WorkspaceId): TerminalUi {
   let ui = terminalUis.get(id);
   if (!ui) {
-    ui = createTerminalUi(terminalServices.forWorkspace(id), terminalProfiles.forWorkspace(id));
+    ui = createTerminalUi(terminalServices.forWorkspace(id), terminalProfiles.forWorkspace(id), {
+      // Its own layout, else the one last used anywhere, else the defaults.
+      layout: terminalSettings.workspace(id).layout ?? terminalSettings.user().layout,
+      saveLayout(layout) {
+        terminalSettings.updateWorkspace(id, { layout });
+        terminalSettings.updateUser({ layout });
+      },
+      shellIntegration: () => terminalSettings.shellIntegration(id),
+    });
     terminalUis.set(id, ui);
   }
   return ui;

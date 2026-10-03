@@ -1771,3 +1771,161 @@ fn a_shell_without_integration_sends_no_signals_and_works_as_before() {
     .unwrap();
     assert!(recorder.wait(Duration::from_secs(30), Recorder::ended));
 }
+
+// --- TERMINAL-08: containment, by process identity ---------------------------------------------
+
+/// Every process descended from `root`, from one snapshot of the process table (pid, parent).
+/// Identity is by ancestry from this test's own shell, so no other process is ever looked at
+/// twice, let alone touched.
+fn descendants(root: u32) -> Vec<u32> {
+    let table = if cfg!(windows) {
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId)\" }",
+            ])
+            .output()
+            .expect("the process table can be listed")
+            .stdout
+    } else {
+        std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=,ppid="])
+            .output()
+            .expect("the process table can be listed")
+            .stdout
+    };
+    let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&table)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().map(|f| f.parse::<u32>().ok());
+            Some((fields.next()??, fields.next()??))
+        })
+        .collect();
+    let mut found = vec![root];
+    let mut at = 0;
+    while at < found.len() {
+        let parent = found[at];
+        for &(pid, ppid) in &pairs {
+            if ppid == parent && pid != parent && !found.contains(&pid) {
+                found.push(pid);
+            }
+        }
+        at += 1;
+    }
+    found.remove(0);
+    found
+}
+
+#[test]
+fn killing_a_terminal_ends_its_shells_children_and_grandchildren_by_pid() {
+    let terminals = Terminals::default();
+    let recorder = start(&terminals, "t-pids", 1);
+    let shell = shell_pid(&recorder);
+    // shell -> child -> grandchild -> great-grandchild, each waiting on the next.
+    let chain = if cfg!(windows) {
+        "cmd /d /c \"cmd /d /c ping -n 600 127.0.0.1 >nul\"\r"
+    } else {
+        "sh -c 'sh -c \"sleep 600\"'\r"
+    };
+    type_in(&terminals, "t-pids", 1, chain);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut tree = descendants(shell);
+    while tree.len() < 3 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(250));
+        tree = descendants(shell);
+    }
+    assert!(
+        tree.len() >= 3,
+        "the shell's descendants never appeared: {tree:?}"
+    );
+
+    kill(
+        &terminals,
+        TerminalKillRequest {
+            session_id: id("t-pids"),
+            generation: generation(1),
+        },
+    )
+    .unwrap();
+    assert!(
+        recorder.wait(Duration::from_secs(30), Recorder::ended),
+        "never ended"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut alive: Vec<u32> = tree
+        .iter()
+        .copied()
+        .filter(|&p| process_exists(p))
+        .collect();
+    while !alive.is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(250));
+        alive.retain(|&p| process_exists(p));
+    }
+    assert!(
+        alive.is_empty(),
+        "outlived the kill: {alive:?} (of {tree:?})"
+    );
+    assert!(
+        !process_exists(shell),
+        "the shell {shell} outlived the kill"
+    );
+}
+
+#[test]
+fn several_shells_at_once_keep_their_output_apart_and_all_end() {
+    for count in [2usize, 4, 8] {
+        let terminals = Terminals::default();
+        let names: Vec<String> = (0..count).map(|i| format!("t-many-{count}-{i}")).collect();
+        // Started together, on separate threads: no session waits on another.
+        let recorders: Vec<Arc<Recorder>> = thread::scope(|scope| {
+            let started: Vec<_> = names
+                .iter()
+                .map(|name| scope.spawn(|| start(&terminals, name, 1)))
+                .collect();
+            started.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        let shells: Vec<u32> = recorders.iter().map(|r| shell_pid(r)).collect();
+        for (name, _) in names.iter().zip(&recorders) {
+            type_in(&terminals, name, 1, &format!("echo marker-{name}-end\r"));
+        }
+        for (name, recorder) in names.iter().zip(&recorders) {
+            let own = format!("marker-{name}-end");
+            assert!(
+                recorder.wait(Duration::from_secs(30), |r| r.text().matches(&own).count()
+                    >= 2),
+                "{name} never printed its own marker; saw {:?}",
+                recorder.text()
+            );
+            // Nobody else's output.
+            for other in names.iter().filter(|other| *other != name) {
+                assert!(
+                    !recorder.text().contains(&format!("marker-{other}-end")),
+                    "{name} shows {other}'s output"
+                );
+            }
+        }
+        close_all(&terminals);
+        for (name, recorder) in names.iter().zip(&recorders) {
+            assert!(
+                recorder.wait(Duration::from_secs(30), Recorder::ended),
+                "{name} never ended"
+            );
+            assert_protocol_order(&recorder.snapshot(), 1);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut alive: Vec<u32> = shells.clone();
+        while !alive.is_empty() && Instant::now() < deadline {
+            alive.retain(|&pid| process_exists(pid));
+            if !alive.is_empty() {
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+        assert!(
+            alive.is_empty(),
+            "{count} terminals: shells outlived close_all: {alive:?}"
+        );
+        assert!(terminals.registry().sessions.is_empty());
+    }
+}

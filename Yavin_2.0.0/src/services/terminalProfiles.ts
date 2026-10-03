@@ -16,8 +16,9 @@
  * command line), and the native side still checks the folder, the arguments and the
  * environment at launch. A profile holds no session, process, output or view state.
  *
- * Nothing here is persisted yet (TERMINAL-07): user and workspace profiles live in memory for
- * the window. The registry's API is what a persistence layer would sit behind.
+ * User and workspace profiles and defaults are kept across restarts by the terminal settings
+ * (TERMINAL-07, `terminalSettings.ts`), which this registry reads and writes; built-in profiles
+ * are never kept -- discovery makes them each time.
  */
 import {
   TerminalError,
@@ -26,6 +27,7 @@ import {
   type WorkspaceId,
 } from "./terminalProtocol.ts";
 import type { Shell, ShellKind } from "./terminal.ts";
+import type { StoredProfile, TerminalSettingsStore } from "./terminalSettings.ts";
 
 export type ProfileScope = "builtin" | "user" | "workspace";
 
@@ -166,7 +168,16 @@ const freeze = (profile: TerminalProfile): Readonly<TerminalProfile> =>
     ][],
   });
 
-export function createProfileRegistry(discover: () => Promise<unknown>): ProfileRegistry {
+/**
+ * The window's profiles. With `settings` (TERMINAL-07) the user's and each workspace's own
+ * profiles and defaults are read from it when first needed and written back on every change;
+ * without, they last as long as the window. Either way a running terminal keeps the copy of
+ * the profile it started with: changing or deleting a profile affects only later launches.
+ */
+export function createProfileRegistry(
+  discover: () => Promise<unknown>,
+  settings?: TerminalSettingsStore,
+): ProfileRegistry {
   const listeners = new Set<() => void>();
   let shells: Shell[] | null = null;
   let error: string | null = null;
@@ -197,6 +208,29 @@ export function createProfileRegistry(discover: () => Promise<unknown>): Profile
 
   const shellFor = (executable: string) =>
     shells?.find((shell) => shell.available && samePath(shell.path, executable));
+
+  /**
+   * A kept profile, as it was saved: already validated as configuration when it was read. It
+   * is not checked against discovery here -- the shell may be missing now, or not known yet --
+   * but, like any user profile, it can only launch while discovery finds its shell (`refresh`).
+   */
+  const restore = (scope: "user" | "workspace", stored: StoredProfile): ProfileEntry => {
+    const { kind, ...profile } = stored;
+    return refresh(
+      Object.freeze({ scope, profile: freeze(profile), kind, available: false, reason: null }),
+    );
+  };
+  const toStored = (entry: ProfileEntry): StoredProfile => ({
+    ...entry.profile,
+    args: [...entry.profile.args],
+    env: entry.profile.env.map(([k, v]) => [k, v] as [string, string]),
+    kind: entry.kind,
+  });
+  const saveUser = () =>
+    settings?.updateUser({
+      profiles: [...users.values()].map(toStored),
+      defaultProfile: userDefault,
+    });
 
   /** A profile's availability, from what discovery found now. */
   const refresh = (entry: ProfileEntry): ProfileEntry => {
@@ -322,7 +356,21 @@ export function createProfileRegistry(discover: () => Promise<unknown>): Profile
 
     constructor(workspaceId: WorkspaceId) {
       this.workspaceId = workspaceId;
+      if (settings) {
+        const kept = settings.workspace(workspaceId);
+        for (const stored of kept.profiles)
+          // Ids are unique across scopes; a hand-edited clash is not let in.
+          if (!idTaken(stored.id)) this.own.set(stored.id, restore("workspace", stored));
+        this.workspaceDefault = kept.defaultProfile;
+      }
       this.snapshot = this.compute();
+    }
+
+    private save() {
+      settings?.updateWorkspace(this.workspaceId, {
+        profiles: [...this.own.values()].map(toStored),
+        defaultProfile: this.workspaceDefault,
+      });
     }
 
     has(id: string) {
@@ -422,6 +470,7 @@ export function createProfileRegistry(discover: () => Promise<unknown>): Profile
     addWorkspace(input: ProfileInput) {
       const entry = make("workspace", nextId("workspace"), input);
       this.own.set(entry.profile.id, entry);
+      this.save();
       this.changed();
       return entry;
     }
@@ -430,6 +479,7 @@ export function createProfileRegistry(discover: () => Promise<unknown>): Profile
       if (!this.own.has(id)) throw invalid("That is not one of this workspace's profiles.");
       const entry = make("workspace", id, input);
       this.own.set(id, entry);
+      this.save();
       this.changed();
       return entry;
     }
@@ -437,11 +487,13 @@ export function createProfileRegistry(discover: () => Promise<unknown>): Profile
       refuseBuiltin(id);
       if (!this.own.delete(id)) throw invalid("That is not one of this workspace's profiles.");
       if (this.workspaceDefault === id) this.workspaceDefault = null;
+      this.save();
       this.changed();
     }
     setWorkspaceDefault(id: string | null) {
       if (id !== null && !this.get(id)) throw invalid("There is no such terminal profile.");
       this.workspaceDefault = id;
+      this.save();
       this.changed();
     }
   }
@@ -473,6 +525,7 @@ export function createProfileRegistry(discover: () => Promise<unknown>): Profile
     addUser(input) {
       const entry = make("user", nextId("user"), input);
       users.set(entry.profile.id, entry);
+      saveUser();
       changed();
       return entry;
     },
@@ -481,6 +534,7 @@ export function createProfileRegistry(discover: () => Promise<unknown>): Profile
       if (!users.has(id)) throw invalid("That is not one of your profiles.");
       const entry = make("user", id, input);
       users.set(id, entry);
+      saveUser();
       changed();
       return entry;
     },
@@ -488,12 +542,14 @@ export function createProfileRegistry(discover: () => Promise<unknown>): Profile
       refuseBuiltin(id);
       if (!users.delete(id)) throw invalid("That is not one of your profiles.");
       if (userDefault === id) userDefault = null;
+      saveUser();
       changed();
     },
     setUserDefault(id) {
       if (id !== null && !builtins().some((e) => e.profile.id === id) && !users.has(id))
         throw invalid("A user default must be a built-in or user profile.");
       userDefault = id;
+      saveUser();
       changed();
     },
     forWorkspace(id) {
@@ -505,6 +561,17 @@ export function createProfileRegistry(discover: () => Promise<unknown>): Profile
       return view;
     },
   };
-  snapshot = Object.freeze({ shells, error, builtins: [], users: [], userDefault });
+  if (settings) {
+    const kept = settings.user();
+    for (const stored of kept.profiles) users.set(stored.id, restore("user", stored));
+    userDefault = kept.defaultProfile;
+  }
+  snapshot = Object.freeze({
+    shells,
+    error,
+    builtins: [],
+    users: [...users.values()].map(refresh),
+    userDefault,
+  });
   return registry;
 }

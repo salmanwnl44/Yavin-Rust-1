@@ -784,7 +784,7 @@ closing → closed    opening → active
 
 ## Terminal
 
-The terminal is being rebuilt module by module (TERMINAL-00 to TERMINAL-07). This section says what runs **today** and the **contract** the modules build on; anything marked TARGET is not implemented yet.
+The terminal was rebuilt module by module, TERMINAL-00 to TERMINAL-08 (the module plan below); all of them are done. This section says what runs and the **contract** it is built on. Future work is named as such where it comes up (Unix validation, a Problems parser, AI's controlled access).
 
 ### Current (what runs today)
 
@@ -885,7 +885,7 @@ TerminalPanel: renders them. TerminalView: one xterm.js attached to one session.
 - kept natively in the generation's output stream, in memory only;
 - dropped when the session is closed, or when the generation is replaced.
 
-There is no disk, no persistence across a reload and no session restoration (later modules).
+Replay is never written to disk, and sessions are never restored across a reload or restart. TERMINAL-07 keeps only configuration and layout.
 
 **Workspace switch.** The workspace's context is disposed, but its TerminalService is not:
 
@@ -905,7 +905,7 @@ No process is started again because a view remounted.
 
 Today the window's end does this implicitly: a reload closes every leftover shell, and exit closes every shell. There is no "close this workspace" action yet that calls it.
 
-**Reload.** The page's services go with the page; the next page closes the shells the last one left (`terminal_close_all`, once, before its first open). Restoring terminals across a reload is TERMINAL-07.
+**Reload.** The page's services go with the page; the next page closes the shells the last one left (`terminal_close_all`, once, before its first open). Terminals are never restored across a reload or restart: TERMINAL-07 keeps their configuration and layout, never their sessions.
 
 ### Renderer (TERMINAL-04)
 
@@ -938,7 +938,7 @@ TerminalView                       one xterm.js on one existing session
 - **Shortcuts.** `matchesShortcut` also matches a punctuation key by its physical key (`event.code`), so `Mod+Shift+\`` works although Shift makes the key `~`.
 - **Workspace switch.** The panel is remounted, so views detach and xterm instances are disposed; sessions, panes, split, zoom and titles stay with the workspace. Coming back reattaches each session (replay, then live). Nothing is closed, killed or started again.
 
-**T04 → T05.** TERMINAL-05 owns shells and profiles (below). Panel height and the find text are not kept across a remount; persistence is TERMINAL-07.
+**T04 → T05.** TERMINAL-05 owns shells and profiles (below). The find text is not kept across a remount. Panel height is kept since TERMINAL-07 (it is the TerminalUi's).
 
 ### Shells and profiles (TERMINAL-05)
 
@@ -948,7 +948,7 @@ T05 is shell **launch configuration**: which shell, with which arguments, folder
 discovery (native terminal_shells)     what shells are there: found or not (and why), the default
 ProfileRegistry (window, terminalProfiles.ts)
   built-in profiles                    one per discovered shell; read-only; unavailable ones marked
-  user profiles, user default          in memory (TERMINAL-07 persists them)
+  user profiles, user default          kept by the terminal settings (TERMINAL-07)
 WorkspaceProfiles (per WorkspaceId)    + workspace profiles, workspace default; resolve()
 TerminalUi.newTerminal(profileId?)  -> TerminalService.open({ profile }) -> native open (T01)
 ```
@@ -1076,7 +1076,7 @@ Each command record holds an id (counting across generations), `startedAt`, `fin
 | `active`      | A valid signal has arrived this generation.                                                                                                  |
 | `unsupported` | A shell with no integration (cmd, sh, an unknown or default shell). It is still a full terminal. If one reports anyway, it becomes `active`. |
 | `error`       | Only unreadable sequences so far. A valid signal makes it `active`.                                                                          |
-| `disabled`    | Reserved for a setting (TERMINAL-07). Every signal is ignored.                                                                               |
+| `disabled`    | Turned off by the setting (TERMINAL-07) when the terminal started. Every signal is ignored.                                                  |
 
 A terminal works the same in every state; integration only adds information.
 
@@ -1292,6 +1292,163 @@ Terminal keys never fire when the terminal does not have the keyboard: they live
 
 **T06 → T07.** T07 persists what T06 keeps in memory: profiles and defaults, an integration on/off setting (`disabled`), and panel layout. T06 stores nothing.
 
+### Persistence and settings (TERMINAL-07)
+
+T07 makes the existing terminal behavior durable; it adds no terminal behavior. The only new switch is the integration setting, whose `disabled` state T05A already defined.
+
+| Kept across restarts                                      | Never kept                                                      |
+| --------------------------------------------------------- | --------------------------------------------------------------- |
+| user profiles, workspace profiles                         | sessions, PTYs, processes, pids, generations                    |
+| user default, workspace default                           | output, scrollback, the replay buffer                           |
+| font size, split ratio, panel height                      | the shell's reported folder, the current command, exit statuses |
+| shell integration on/off (user), and a workspace override | xterm instances, focus, find, bells, notices                    |
+| the format's version                                      | built-in profiles (discovery makes them each time)              |
+
+**Where.** These are this installation's preferences, not part of a project, so they live in the webview's storage, as the minimap's preferences and Git's repository lists already do. Nothing is written into a workspace.
+
+```text
+yavin.terminal.user                      {version, profiles, defaultProfile, shellIntegration, layout}
+yavin.terminal.workspace:<WorkspaceId>   {version, profiles, defaultProfile, shellIntegration|null, layout}
+```
+
+```text
+terminalSettings.ts  (one store per window: `terminalSettings` in workspaces.ts)
+   ├─ ProfileRegistry (T05)  reads user profiles and default once; workspace ones when a workspace is first used
+   │                         writes them back on every change
+   ├─ TerminalUi (per workspace)  starts from its layout (else the last one used, else defaults)
+   │                              saves it when it changes; asks whether integration is on at each launch
+   └─ the window                  shows what went wrong reading or writing, once (`takeProblems`)
+```
+
+**Scope.**
+
+- Profiles and defaults are user or workspace, as T05 defined them. A workspace's own profiles and default exist only in that workspace.
+- Integration: the workspace's override (`null` means "as the user setting"), else the user setting, else on.
+- Layout: each workspace keeps its own, and the user record keeps the last one used, which a workspace with no layout of its own starts from.
+
+**Running terminals are never changed by settings.**
+
+- A session keeps the copy of the profile it started with (T05). Editing or deleting the profile, or changing the default, affects only later launches. A restart launches the same copy again.
+- The integration setting is read when a terminal starts. Turning it off does not touch terminals already running, and a restart keeps how its terminal started.
+
+**Restoring profiles.** A kept profile is restored as it was saved. It was validated as configuration when it was read: the same rules a launch uses, plus a valid id that is not `builtin.*`, and ids unique within the record and across scopes. It is not checked against discovery. Like any user profile, it can launch only while discovery finds its shell. Before discovery answers, or once its shell is uninstalled, it is listed but unavailable, with the reason. The default chain then skips it (T05). It is never launched under its name with another shell, and never deleted.
+
+**Format and versions.** Every record carries `version` (1). Reading validates everything, field by field and profile by profile:
+
+| Found                                                   | What happens                                                                                                                                        |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| nothing                                                 | the defaults                                                                                                                                        |
+| unreadable: not JSON, not an object, no version         | the defaults. The stored text is copied to `<key>.corrupt` before anything is written back.                                                         |
+| partly unreadable: a bad profile, field or layout value | that part is dropped and the rest is used. The original is copied to `<key>.corrupt` first, so a repair never loses data.                           |
+| a newer `version`                                       | nothing is read, and the record is **never written over**. Changes apply until the window closes, so a newer Yavin's settings survive an older one. |
+| storage blocked or full                                 | everything still applies for this window                                                                                                            |
+
+In every case the problem is reported once, through the window's error banner, and the terminal works on.
+
+**Writes.** Configuration (profiles, defaults, the integration setting) is written at once. Layout changes are written once they settle (300 ms), because a drag changes the height many times a second. Anything still waiting is written when the page goes (`pagehide`).
+
+**UI.** The profiles dialog has a "Shell integration" section: the user setting, and the workspace's override (as above, on, or off). The panel's height now lives in the workspace's TerminalUi (`panelHeight`) instead of the panel's local state, so it survives remounts and restarts. A smaller window shows less of it without changing what is kept.
+
+**Limits.**
+
+- One window's storage: two windows writing at once keep the last write. Yavin opens one window.
+- Settings are not synced between machines.
+- A whole-split layout is not restored, because there are no sessions to put in it; the split ratio is.
+
+**Tests.**
+
+- `terminalSettings.test.ts` covers:
+  - the format's round trip and defaults;
+  - unreadable, partly unreadable and newer records;
+  - storage that fails;
+  - write timing;
+  - integration precedence;
+  - profiles and defaults across a restart, including a shell that is gone and deletions;
+  - running terminals unchanged by edits;
+  - layout limits and saving;
+  - integration off for new terminals only;
+  - no session data ever stored.
+- `terminal.spec.ts` covers:
+  - a reload keeps the profile, default, font and panel height but no terminal;
+  - integration off survives a reload;
+  - corrupt settings are reported and kept aside;
+  - a newer version is left untouched.
+
+**T07 → T08.** T08 is production hardening: the full suites, CI, the 50 MB stress test, the final integration gate, and documentation. It adds no behavior.
+
+### Production gate (TERMINAL-08)
+
+T08 audited the whole terminal subsystem and ran the final gate. It added tests, one CI step and documentation, and changed no terminal behavior.
+
+**Audit.** None of the following were found:
+
+- remnants of the pre-T03 architecture (no window-wide terminal channel, old native commands or global session arrays);
+- TODOs left in terminal code;
+- UI components calling native terminal APIs (the one `TerminalNative` adapter in `workspaces.ts` is the only caller);
+- logging of output or environment.
+
+There is one process launch: a structured executable, argument list, folder and environment, never a command line. OSC 7 and OSC 133 are metadata only. Output and file links never act without a click. A kept profile is configuration until it is launched. `terminal_stats` is a deliberate development diagnostic (T02) and stays. Five stale statements in this section were corrected:
+
+- the module status;
+- that persistence was a later module;
+- ACKs and replay in the future tense;
+- the side-band messages (`detached`, `shell`), now listed in the contract.
+
+**Tests added.**
+
+| Test                                                                   | What it checks                                                                                                                                                                                                                                    |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `killing_a_terminal_ends_its_shells_children_and_grandchildren_by_pid` | A shell, child, grandchild and great-grandchild are recorded by pid from the process table, by ancestry from the test's own shell. After a kill, every one of them is gone.                                                                       |
+| `several_shells_at_once_keep_their_output_apart_and_all_end`           | 2, 4 and 8 real shells started together: each shows only its own output, and every shell is gone after `close_all`.                                                                                                                               |
+| `every_byte_survives_shell_integration_long_lines_and_line_endings`    | With the real limits: 4-byte UTF-8, CR/LF combinations, a 200 KiB line, NUL and invalid bytes, OSC 7/133 and other OSCs, and a trailing partial escape, cut at a prime size. The bytes are identical, and the signals are side-band and in order. |
+| `terminalIntegration.test.ts`                                          | eight terminals with independent output, folder, commands, generation, resize and kill; several views of one session; open then immediate restart; late events after a workspace's disposal; reloaded settings followed by an open                |
+
+The T07 "newer version" UI test now flushes through `pagehide`, with a positive control, instead of waiting out the write delay.
+
+**Measured (Windows 11, debug build).**
+
+| Stress (T02 stream, real limits) | Time   | Peak queued | Peak process working set |
+| -------------------------------- | ------ | ----------- | ------------------------ |
+| 1 MB, slow consumer              | 0.15 s | 960 KiB     | 8.9 MB                   |
+| 10 MB                            | 1.7 s  | 1 MiB       | 9.4 MB                   |
+| 10 MB, slow consumer             | 1.5 s  | 1 MiB       | 9.5 MB                   |
+| 50 MB                            | 7.7 s  | 1 MiB       | 9.7 MB                   |
+
+Memory is flat from 1 MB to 50 MB, and the queue never passes its bound. The UI's first test on a fresh dev server took 23.9 s; the same test on a warm server took 4.9 s.
+
+**Gate results.**
+
+| Check                                                 | Result                                                              |
+| ----------------------------------------------------- | ------------------------------------------------------------------- |
+| `npm test`                                            | 746 passed                                                          |
+| `cargo test --workspace`                              | 565 passed, 19 ignored (the scale and stress tests, run separately) |
+| terminal stress, including 50 MB                      | 4 passed                                                            |
+| full UI suite, warm server                            | 394 passed, none flaky                                              |
+| isolation and race tests ×3                           | TS 108 per run; UI 21 of 21                                         |
+| Rust terminal tests ×3 (real shells)                  | 58 per run                                                          |
+| fmt, clippy `-D warnings`, prettier, typecheck, build | clean                                                               |
+| process leaks                                         | none                                                                |
+
+The process leak audit lists shell-type processes created since the run began, with their ancestry, and stops nothing. Every survivor belonged to the tools running the gate, never to a test.
+
+**CI.** The existing Windows job already ran every suite, real shells included. It now also runs the terminal stress tests, 50 MB included (`terminal_stream::tests::stress -- --include-ignored`).
+
+**Platform coverage.** Windows (ConPTY, Job Objects, Git Bash, cmd, PowerShell) is executed. The Unix paths are written, and unit-checked where possible, but **not executed**:
+
+- the PTY and process group (`killpg`);
+- discovery of `$SHELL`;
+- `-l` login shells;
+- the `ps`-based branch of the containment test.
+
+A Linux CI job would need the Tauri Linux system libraries and a Linux build of the bundled search tool (`resources/search/rg.exe` is Windows-only today). That is a cross-platform build task, not a terminal one, and it is left for when Yavin targets Unix.
+
+**Known limitations.**
+
+- The first UI test on a cold dev server can approach its timeout. This is environmental: the same tests pass on a warm server.
+- Settings are per installation (webview storage), last write wins across windows, and are not synced.
+- File links do not span wrapped lines or account for wide characters.
+- Problems parsing, AI access, a Unix CI job and session restoration are not part of the terminal, by design or for later.
+
 **T06 → AI.** There is none in T06: no tool calls, agent runs, approvals, ChangeSets or AI command history. When the AI architecture arrives, the terminal becomes a _controlled tool_ through it, with its own permissions and approvals. It is never reached directly through TerminalService.
 
 ### The contract (TERMINAL-00)
@@ -1351,7 +1508,7 @@ No other step exists. In particular there is no going back, no `Running → Exit
 - **Consumers reject out-of-order output.**
   - A `seq` below the next expected one is a duplicate, and is dropped.
   - A `seq` above it is a gap, which the protocol never allows; dropping output requires a protocol revision.
-- **ACKs (TERMINAL-02) will be cumulative.** An ACK will acknowledge "every chunk up to and including `seq` N of generation G".
+- **ACKs (TERMINAL-02) are cumulative.** An ACK acknowledges "every chunk up to and including `seq` N of generation G".
 
 **Output protocol.** `TerminalOutputChunk { sessionId, generation, seq, bytes }`.
 
@@ -1371,10 +1528,13 @@ No other step exists. In particular there is no going back, no `Running → Exit
 - **Nothing follows the end.**
 - **A failed open has no events.** An open that fails returns its error and emits nothing for that generation.
 - **Every event carries `sessionId` and `generation`.**
+- **Two side-band messages carry no `seq` and never change the state.**
+  - `detached` (TERMINAL-02) tells one subscriber it was let go (overflow), with how far it got. The session and its other subscribers go on.
+  - `shell` (TERMINAL-05A) is a shell-integration signal, in order with the output. It is accepted only while the generation is `Running` or `Exiting`, and never replayed.
 
 `applyEvent` in `terminalProtocol.ts` is the consumer's rule for all of this. It accepts or rejects one event with a reason (`other-session`, `stale-generation`, `duplicate`, `gap`, `after-end`, `illegal-transition`). A rejected event changes nothing.
 
-**Requests.** Open, write, resize, close and kill are implemented natively (TERMINAL-01). A restart is an open of a newer generation of the same id, which replaces the older one; no separate restart command exists yet.
+**Requests.** Open, write, resize, close and kill are implemented natively (TERMINAL-01). A restart is an open of a newer generation of the same id, which replaces the older one. There is no separate restart command: TerminalService's `restart` is that open.
 
 | Request   | Contract                                                                                                                                                                                                                                                                     |
 | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1397,7 +1557,7 @@ No other step exists. In particular there is no going back, no `Running → Exit
 - `ack {subscriptionId, sessionId, generation, seq}` is cumulative (see the output pipeline below).
 - Several subscribers may follow one session.
 - `unsubscribe` is idempotent and leaves the session and its other subscribers alone.
-- Replay of earlier output is not in the contract yet; TERMINAL-03 adds where a subscription starts from.
+- A subscription that joins a running generation is first replayed what the generation retains (its `Running`, the last 256 KiB of output, and its end if it has ended), then continues live, with nothing twice (TERMINAL-02/03).
 
 **Profiles.** `TerminalProfile {id, name, executable, args, cwd, env, login?}` (`login` since TERMINAL-05; see "Shells and profiles").
 
@@ -1486,6 +1646,8 @@ The PTY read itself is 8 KiB.
 | TERMINAL-05  | Done: shells and profiles (see "Shells and profiles (TERMINAL-05)").                 |
 | TERMINAL-05A | Done: shell integration, OSC 7 and OSC 133 (see "Shell integration (TERMINAL-05A)"). |
 | TERMINAL-06  | Done: IDE integration (see "IDE integration (TERMINAL-06)").                         |
+| TERMINAL-07  | Done: persistence and settings (see "Persistence and settings (TERMINAL-07)").       |
+| TERMINAL-08  | Done: production gate (see "Production gate (TERMINAL-08)").                         |
 
 Later modules are listed in the Terminal roadmap.
 
