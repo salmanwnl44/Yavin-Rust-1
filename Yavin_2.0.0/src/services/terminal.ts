@@ -1,27 +1,32 @@
-import { Channel } from "@tauri-apps/api/core";
 import {
   MAX_COLS,
   MAX_ROWS,
-  parseTerminalMessage,
   type Generation,
-  type Sequence,
   type SubscriptionId,
-  type TerminalAckRequest,
-  type TerminalDetached,
   type TerminalDimensions,
-  type TerminalErrorEvent,
-  type TerminalExit,
   type TerminalId,
   type TerminalOpenRequest,
-  type TerminalOutputChunk,
-  type TerminalSession as NativeTerminalSession,
+  type TerminalProfile,
   type WorkspaceId,
 } from "./terminalProtocol.ts";
 
-/** A shell the native side found on this machine and is willing to start. */
+/** What kind of shell a program is: what decides its login flag (see `terminalProfiles.ts`). */
+export type ShellKind = "cmd" | "powershell" | "pwsh" | "bash" | "zsh" | "fish" | "sh" | "other";
+
+/**
+ * A shell discovery knows of (TERMINAL-05): found on this machine or not (and why not), and
+ * whether it is the platform's default. Discovery says what there is; profiles say how to
+ * launch it.
+ */
 export interface Shell {
+  /** A display name to suggest. */
   name: string;
   path: string;
+  kind: ShellKind;
+  platform: "windows" | "unix";
+  available: boolean;
+  reason: string | null;
+  isDefault: boolean;
 }
 
 let launches = 0;
@@ -31,103 +36,26 @@ let launches = 0;
  */
 export const nextGeneration = (): Generation => ++launches as Generation;
 
-// A launch profile is a contract type: `TerminalProfile` in `terminalProtocol.ts`.
-
-/** One terminal in the panel. The id is what every native call is keyed by. */
-export interface TerminalSession {
-  id: string;
-  name: string;
-  shell: string;
-  /** Present when the terminal was started from a profile with extras. */
-  args?: string[];
-  env?: Record<string, string>;
-  cwd?: string;
-}
-
 /**
- * The `terminal_open` request for a launch of `session`. A shell picked in the panel is sent as
- * a profile of that shell (with the session's arguments and environment, as ordered pairs: a
- * variable may be written in terms of an earlier one); with none picked -- detection failed --
- * the native side starts its default shell.
+ * The `terminal_open` request for a launch of session `id`: the profile it starts with (`null`
+ * for the native default shell) and the folder asked for, which overrides the profile's.
  */
 export function openRequestFor(
-  session: TerminalSession,
+  id: string,
+  profile: TerminalProfile | null,
+  cwd: string | null,
   dimensions: TerminalDimensions,
   generation: Generation,
   workspaceId: WorkspaceId,
 ): TerminalOpenRequest {
   return {
-    sessionId: session.id as TerminalId,
+    sessionId: id as TerminalId,
     workspaceId,
     generation,
-    profile: session.shell
-      ? {
-          id: session.shell,
-          name: session.name,
-          executable: session.shell,
-          args: session.args ?? [],
-          cwd: null,
-          env: session.env ? Object.entries(session.env) : [],
-        }
-      : null,
-    cwd: session.cwd || null,
+    profile: profile ? { ...profile, args: [...profile.args], env: [...profile.env] } : null,
+    cwd: cwd || null,
     dimensions,
   };
-}
-
-/** What a terminal view does with its launch's stream (TERMINAL-02). */
-export interface TerminalStreamHandlers {
-  /**
-   * The next output, in order. Call `accepted` once the terminal has consumed the bytes (xterm's
-   * write callback): that is the acknowledgement that lets more be sent, and, past the bound,
-   * lets the shell's output be read again.
-   */
-  output(chunk: TerminalOutputChunk, accepted: () => void): void;
-  exit(exit: TerminalExit): void;
-  error(event: TerminalErrorEvent): void;
-  /** This view was detached from a session that goes on: it will be sent nothing more. */
-  detached(event: TerminalDetached): void;
-}
-
-/**
- * One subscriber's handling of its channel: each message parsed against the contract, anything
- * not of its own launch dropped, the rest handed on in the order it arrived. A handler that
- * throws stops neither the stream nor the window.
- */
-export function streamReceiver(
-  launch: { sessionId: string; generation: number },
-  acknowledge: (seq: Sequence) => void,
-  handlers: TerminalStreamHandlers,
-): (message: unknown) => void {
-  return (message) => {
-    const event = parseTerminalMessage(message);
-    if (!event || event.sessionId !== launch.sessionId || event.generation !== launch.generation)
-      return;
-    try {
-      if (event.kind === "output") {
-        let acknowledged = false;
-        handlers.output(event, () => {
-          if (acknowledged) return;
-          acknowledged = true;
-          acknowledge(event.seq);
-        });
-      } else if (event.kind === "exit") handlers.exit(event);
-      else if (event.kind === "error") handlers.error(event);
-      else if (event.kind === "detached") handlers.detached(event);
-    } catch {
-      /* One handler's failure is not the stream's. */
-    }
-  };
-}
-
-/** How a launch reaches the native side; the application passes its `native` calls. */
-export interface TerminalTransport {
-  open(args: {
-    request: TerminalOpenRequest;
-    subscriptionId: SubscriptionId;
-    events: Channel<unknown>;
-  }): Promise<NativeTerminalSession>;
-  ack(request: TerminalAckRequest): Promise<unknown>;
 }
 
 let subscriptions = 0;
@@ -136,29 +64,6 @@ let subscriptions = 0;
 export function createSubscriptionId(sessionId: string): SubscriptionId {
   subscriptions += 1;
   return `${sessionId}-view-${subscriptions}` as SubscriptionId;
-}
-
-/**
- * Opens a launch with a channel of its own: its output and lifecycle arrive there, for this
- * view alone, and each chunk is acknowledged once `handlers.output` says it was consumed.
- */
-export function openTerminal(
-  request: TerminalOpenRequest,
-  handlers: TerminalStreamHandlers,
-  transport: TerminalTransport,
-): Promise<NativeTerminalSession> {
-  const subscriptionId = createSubscriptionId(request.sessionId);
-  const acknowledge = (seq: Sequence) =>
-    void transport
-      .ack({
-        subscriptionId,
-        sessionId: request.sessionId,
-        generation: request.generation,
-        seq,
-      })
-      .catch(() => undefined);
-  const events = new Channel<unknown>(streamReceiver(request, acknowledge, handlers));
-  return transport.open({ request, subscriptionId, events });
 }
 
 /**
@@ -307,65 +212,4 @@ export function zoomFontSize(current: number, action: TerminalKeyAction): number
   if (action === "zoom-out") return Math.max(current - 1, 6);
   if (action === "zoom-reset") return DEFAULT_FONT_SIZE;
   return current;
-}
-
-/** Panel actions that the Terminal menu and the terminal itself can ask for. */
-export type TerminalRequestName = "new" | "split" | "clear" | "find" | "kill";
-
-/** A request, optionally carrying the folder a new terminal should start in. */
-export type TerminalRequest = TerminalRequestName | { name: "new"; cwd: string };
-
-const REQUEST = "yavin.terminal.request";
-
-/** How many panels are currently listening, and requests that arrived while none were. */
-let panelListeners = 0;
-const undelivered: TerminalRequest[] = [];
-
-/**
- * Asks the panel to do something. A message keeps the menu in `App` independent of
- * how the panel tracks its sessions, which is the panel's own business.
- *
- * The panel is mounted lazily, so the first request of a session -- "Open in Integrated
- * Terminal" from the explorer, say -- is sent before there is anything to receive it. Rather
- * than drop it, it is held and delivered as soon as a panel subscribes.
- */
-export function requestTerminal(request: TerminalRequest): void {
-  // Dispatched first and unconditionally, so observers -- the app shell, which reveals the
-  // panel -- always see it. Only then is it held for a panel that has yet to mount.
-  window.dispatchEvent(new CustomEvent(REQUEST, { detail: request }));
-  // A queue, not one slot: opening two folders in a terminal before the panel exists should
-  // open two terminals, not silently drop the first.
-  if (panelListeners === 0) undelivered.push(request);
-}
-
-/** Subscribes the panel. Only the panel should use this: it is what "delivered" means. */
-export function onTerminalRequest(handler: (request: TerminalRequest) => void): () => void {
-  const listener = (event: Event) => handler((event as CustomEvent<TerminalRequest>).detail);
-  window.addEventListener(REQUEST, listener);
-  panelListeners += 1;
-  let live = true;
-  if (undelivered.length) {
-    // Drained inside the callback, not before it: development StrictMode subscribes,
-    // unsubscribes and subscribes again, so taking the queue up front threw the request away
-    // on the discarded first mount and nothing ever delivered it.
-    queueMicrotask(() => {
-      if (!live) return;
-      for (const request of undelivered.splice(0, undelivered.length)) handler(request);
-    });
-  }
-  return () => {
-    live = false;
-    panelListeners -= 1;
-    window.removeEventListener(REQUEST, listener);
-  };
-}
-
-/**
- * Watches requests without counting as the panel's handler, so the app shell can reveal the
- * panel for a request the panel does not exist yet to receive.
- */
-export function onTerminalRequestObserved(handler: (request: TerminalRequest) => void): () => void {
-  const listener = (event: Event) => handler((event as CustomEvent<TerminalRequest>).detail);
-  window.addEventListener(REQUEST, listener);
-  return () => window.removeEventListener(REQUEST, listener);
 }

@@ -385,7 +385,17 @@ test("every message a subscriber receives parses to its kind, and anything else 
     assert.ok(parsed, JSON.stringify(message));
     return parsed.kind;
   });
-  assert.deepEqual(kinds, ["output", "state", "state", "exit", "error", "detached"]);
+  assert.deepEqual(kinds, [
+    "output",
+    "state",
+    "state",
+    "exit",
+    "error",
+    "detached",
+    "shell",
+    "shell",
+    "shell",
+  ]);
   for (const message of fixtures.invalidMessages)
     assert.equal(parseTerminalMessage(message), null, JSON.stringify(message));
 });

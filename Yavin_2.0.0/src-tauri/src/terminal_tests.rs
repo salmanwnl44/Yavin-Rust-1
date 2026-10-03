@@ -1,7 +1,7 @@
 use super::*;
 use ide_terminal_protocol::{
-    TerminalDetached, TerminalErrorEvent, TerminalExit, TerminalMessage, TerminalOutputChunk,
-    TerminalProfile, FIRST_SEQUENCE,
+    ShellSignal, TerminalDetached, TerminalErrorEvent, TerminalExit, TerminalMessage,
+    TerminalOutputChunk, TerminalProfile, TerminalShellEvent, FIRST_SEQUENCE,
 };
 use std::path::Path;
 use std::sync::Condvar;
@@ -9,16 +9,22 @@ use std::time::Instant;
 
 const WORKSPACE: &str = "file://c:/test-workspace";
 
+fn shell(name: &str, path: &str, is_default: bool) -> Shell {
+    Shell {
+        name: name.into(),
+        path: path.into(),
+        kind: ShellKind::of(path),
+        platform: "windows",
+        available: true,
+        reason: None,
+        is_default,
+    }
+}
+
 fn offered() -> Vec<Shell> {
     vec![
-        Shell {
-            name: "First".into(),
-            path: "C:/Windows/System32/cmd.exe".into(),
-        },
-        Shell {
-            name: "Second".into(),
-            path: "C:/Program Files/Git/bin/bash.exe".into(),
-        },
+        shell("First", "C:/Windows/System32/cmd.exe", true),
+        shell("Second", "C:/Program Files/Git/bin/bash.exe", false),
     ]
 }
 
@@ -31,6 +37,7 @@ enum Event {
     Exit(TerminalExit),
     Error(TerminalErrorEvent),
     Detached(TerminalDetached),
+    Shell(TerminalShellEvent),
 }
 
 #[derive(Default)]
@@ -116,6 +123,7 @@ impl Sink for Recorder {
             TerminalMessage::Exit(event) => Event::Exit(event),
             TerminalMessage::Error(event) => Event::Error(event),
             TerminalMessage::Detached(event) => Event::Detached(event),
+            TerminalMessage::Shell(event) => Event::Shell(event),
         });
         true
     }
@@ -168,17 +176,44 @@ fn subscriber(
 }
 
 /// Opens `session`'s launch `launch` with a recording, acknowledging subscriber.
+/// Opens `session`'s launch `launch` the way the TerminalService does -- with a lifecycle
+/// subscriber -- and attaches a recording, acknowledging view, which is replayed whatever the
+/// shell wrote before it attached. Answers the view.
 fn open_recorded(
     terminals: &Terminals,
     session: &str,
     launch: u64,
 ) -> Result<Arc<Recorder>, TerminalError> {
-    let (id, recorder) = subscriber(terminals, session, launch);
+    open_recorded_with(terminals, request(session, launch), self::launch())
+}
+
+/// `open_recorded` for a request and launch of the test's own (a profile, a folder).
+fn open_recorded_with(
+    terminals: &Terminals,
+    request: TerminalOpenRequest,
+    launch: Launch,
+) -> Result<Arc<Recorder>, TerminalError> {
+    let owned = request.session_id.as_str().to_string();
+    let (session, launch_no) = (owned.as_str(), request.generation.get());
+    let service = Arc::new(Recorder::default());
     open(
         terminals,
-        request(session, launch),
-        self::launch(),
-        (id, recorder.clone()),
+        request,
+        launch,
+        (
+            SubscriptionId::new(format!("{session}-{launch_no}-service")).unwrap(),
+            service,
+        ),
+    )?;
+    let (id, recorder) = subscriber(terminals, session, launch_no);
+    subscribe(
+        terminals,
+        TerminalSubscribeRequest {
+            subscription_id: id,
+            session_id: self::id(session),
+            generation: generation(launch_no),
+        },
+        recorder.clone(),
     )?;
     Ok(recorder)
 }
@@ -241,6 +276,10 @@ fn assert_protocol_order(events: &[Event], launch: u64) {
                 next_seq += 1;
             }
             Event::Detached(detached) => panic!("a subscriber was detached: {detached:?}"),
+            Event::Shell(shell) => {
+                assert!(index > 0, "shell integration before Running");
+                assert_eq!(shell.generation, generation(launch));
+            }
             Event::Exit(TerminalExit { last_seq, .. })
             | Event::Error(TerminalErrorEvent { last_seq, .. }) => {
                 let expected = next_seq.checked_sub(1);
@@ -588,17 +627,113 @@ fn a_terminal_killed_before_its_shell_finished_starting_still_ends() {
 }
 
 #[test]
-fn entering_another_workspace_ends_the_previous_ones_shells() {
+fn a_session_with_no_view_keeps_running_and_replays_to_the_next_view() {
+    // Switching workspace detaches a terminal's views; the shell goes on, and a view attaching
+    // later is replayed what it wrote meanwhile, then continues live.
     let terminals = Terminals::default();
-    let recorder = start(&terminals, "t-ws", 1);
-    // The same workspace again changes nothing.
-    end_other_workspaces(&terminals, Some(WORKSPACE));
-    thread::sleep(Duration::from_millis(300));
-    assert!(registered(&terminals, "t-ws"));
+    let first = start(&terminals, "t-detach", 1);
+    unsubscribe(
+        &terminals,
+        TerminalUnsubscribeRequest {
+            subscription_id: subscription("t-detach", 1),
+        },
+    );
+    type_in(&terminals, "t-detach", 1, "echo while-detached\r");
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        registered(&terminals, "t-detach"),
+        "detaching ended the session"
+    );
+    assert!(!first.text().contains("while-detached\r\n"));
 
-    end_other_workspaces(&terminals, Some("file://c:/elsewhere"));
-    assert!(recorder.wait(Duration::from_secs(30), Recorder::ended));
-    assert!(!registered(&terminals, "t-ws"));
+    let again = SubscriptionId::new("t-detach-again").unwrap();
+    let view = Arc::new(Recorder::default());
+    *view.acks.lock().unwrap() = Some((terminals.clone(), again.clone()));
+    subscribe(
+        &terminals,
+        TerminalSubscribeRequest {
+            subscription_id: again,
+            session_id: id("t-detach"),
+            generation: generation(1),
+        },
+        view.clone(),
+    )
+    .unwrap();
+    assert!(view.wait(Duration::from_secs(30), |r| r
+        .text()
+        .matches("while-detached")
+        .count()
+        >= 2));
+    type_in(&terminals, "t-detach", 1, "echo after-attach\r");
+    assert!(view.wait(Duration::from_secs(30), |r| r
+        .text()
+        .matches("after-attach")
+        .count()
+        >= 2));
+    kill(
+        &terminals,
+        TerminalKillRequest {
+            session_id: id("t-detach"),
+            generation: generation(1),
+        },
+    )
+    .unwrap();
+    assert!(view.wait(Duration::from_secs(30), Recorder::ended));
+    assert_protocol_order(&view.snapshot(), 1);
+}
+
+#[test]
+fn a_view_attaching_after_the_shell_exited_is_shown_its_output_and_end_until_closed() {
+    let terminals = Terminals::default();
+    let first = start(&terminals, "t-after", 1);
+    type_in(&terminals, "t-after", 1, "echo last-words & exit 7\r");
+    assert!(first.wait(Duration::from_secs(30), Recorder::ended));
+    assert!(!registered(&terminals, "t-after"));
+
+    // Attaching to the ended session does not revive it: it replays, then the end.
+    let late = SubscriptionId::new("t-after-late").unwrap();
+    let view = Arc::new(Recorder::default());
+    subscribe(
+        &terminals,
+        TerminalSubscribeRequest {
+            subscription_id: late,
+            session_id: id("t-after"),
+            generation: generation(1),
+        },
+        view.clone(),
+    )
+    .unwrap();
+    assert!(view.text().contains("last-words"));
+    let Some(Event::Exit(exit)) = view.snapshot().last().cloned() else {
+        panic!("no end was replayed: {:?}", view.snapshot().last());
+    };
+    assert_eq!(exit.exit_code, Some(7));
+    assert!(
+        !registered(&terminals, "t-after"),
+        "attaching revived the session"
+    );
+
+    // Closing it lets go of it: nothing more can attach.
+    close(
+        &terminals,
+        TerminalCloseRequest {
+            session_id: id("t-after"),
+            generation: generation(1),
+        },
+    );
+    let refused = subscribe(
+        &terminals,
+        TerminalSubscribeRequest {
+            subscription_id: SubscriptionId::new("t-after-gone").unwrap(),
+            session_id: id("t-after"),
+            generation: generation(1),
+        },
+        Arc::new(Recorder::default()),
+    );
+    assert_eq!(
+        refused.unwrap_err().code,
+        TerminalErrorCause::InvalidSession
+    );
 }
 
 #[test]
@@ -634,12 +769,15 @@ fn stalled_session(terminals: &Terminals, session: &str) -> Receiver<Vec<u8>> {
         id(session),
         generation(1),
         LIMITS.clone(),
-        (subscription(session, 1), Arc::new(Recorder::default())),
+        (
+            subscription(session, 1),
+            Arc::new(Recorder::default()),
+            Delivery::Output,
+        ),
     );
     let session = Arc::new(Session {
         id: id(session),
         generation: generation(1),
-        workspace_id: WORKSPACE.into(),
         metadata: TerminalSessionMetadata {
             session_id: id(session),
             workspace_id: WORKSPACE.into(),
@@ -655,6 +793,7 @@ fn stalled_session(terminals: &Terminals, session: &str) -> Receiver<Vec<u8>> {
         state: Mutex::new(TerminalState::Running),
         dimensions: Mutex::new(TerminalDimensions::new(80, 24).unwrap()),
         stream,
+        closing: std::sync::atomic::AtomicBool::new(false),
     });
     terminals
         .registry()
@@ -768,6 +907,7 @@ fn a_launch_that_cannot_start_says_why_and_reports_no_events() {
         args: vec![],
         cwd: None,
         env: vec![],
+        login: false,
     });
     assert_eq!(
         refused(unknown, launch()).code,
@@ -789,6 +929,7 @@ fn a_launch_that_cannot_start_says_why_and_reports_no_events() {
         args: vec!["a\nb".into()],
         cwd: None,
         env: vec![],
+        login: false,
     });
     assert_eq!(
         refused(bad_profile, launch()).code,
@@ -819,15 +960,22 @@ fn a_launch_that_cannot_start_says_why_and_reports_no_events() {
 fn only_a_detected_shell_can_be_started() {
     let shells = offered();
     // No request at all takes the first detected shell.
-    assert_eq!(resolve_shell(None, &shells).unwrap(), shells[0].path);
-    assert_eq!(resolve_shell(Some(""), &shells).unwrap(), shells[0].path);
+    assert_eq!(resolve_shell(None, &shells).unwrap().path, shells[0].path);
+    assert_eq!(
+        resolve_shell(Some(""), &shells).unwrap().path,
+        shells[0].path
+    );
     // A detected shell is accepted whatever its casing on disk.
     assert_eq!(
-        resolve_shell(Some("c:/windows/system32/CMD.EXE"), &shells).unwrap(),
+        resolve_shell(Some("c:/windows/system32/CMD.EXE"), &shells)
+            .unwrap()
+            .path,
         shells[0].path
     );
     assert_eq!(
-        resolve_shell(Some(r"C:\Windows\System32\cmd.exe"), &shells).unwrap(),
+        resolve_shell(Some(r"C:\Windows\System32\cmd.exe"), &shells)
+            .unwrap()
+            .path,
         shells[0].path
     );
     // Anything else is refused, including a real program that was never offered.
@@ -1243,4 +1391,383 @@ fn a_second_subscriber_gets_its_own_stream_and_leaving_it_ends_nothing() {
         unknown.unwrap_err().code,
         TerminalErrorCause::InvalidSession
     );
+}
+
+// --- TERMINAL-05: discovery, profiles and login shells -----------------------------------------
+
+/// Answers ConPTY's first cursor-position query as soon as it is asked (as xterm.js does), or
+/// returns once the shell has written its result or ended: a shell that never asks is not
+/// waited on.
+fn answer_cursor_query(terminals: &Terminals, recorder: &Recorder, session: &str) {
+    let asked = recorder.wait(Duration::from_secs(15), |r| {
+        r.text().contains("\u{1b}[6n") || r.text().contains("yavin-") || r.ended()
+    });
+    if asked && recorder.text().contains("\u{1b}[6n") {
+        let _ = write(
+            terminals,
+            TerminalWriteRequest {
+                session_id: id(session),
+                generation: generation(1),
+                data: "\x1b[1;1R".into(),
+            },
+        );
+    }
+}
+
+#[test]
+fn discovery_reports_every_candidate_with_its_availability_and_one_default() {
+    let shells = discover_shells();
+    assert!(!shells.is_empty());
+    let defaults: Vec<_> = shells.iter().filter(|s| s.is_default).collect();
+    assert_eq!(defaults.len(), 1, "exactly one default among {shells:?}");
+    assert!(defaults[0].available);
+    for shell in &shells {
+        assert_eq!(
+            shell.platform,
+            if cfg!(windows) { "windows" } else { "unix" }
+        );
+        if shell.available {
+            assert!(
+                Path::new(&shell.path).is_file(),
+                "{} is not there",
+                shell.path
+            );
+            assert!(shell.reason.is_none());
+        } else {
+            assert!(
+                shell.reason.is_some(),
+                "{} unavailable without a reason",
+                shell.name
+            );
+        }
+    }
+    // The allowlist is exactly the available ones.
+    assert_eq!(
+        available_shells().len(),
+        shells.iter().filter(|s| s.available).count()
+    );
+    eprintln!(
+        "discovered: {:?}",
+        shells
+            .iter()
+            .map(|s| format!(
+                "{} ({:?}) {}",
+                s.name,
+                s.kind,
+                if s.available { "yes" } else { "no" }
+            ))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn shell_kinds_and_login_flags_are_the_shells_own() {
+    assert_eq!(ShellKind::of("C:/Windows/System32/cmd.exe"), ShellKind::Cmd);
+    assert_eq!(
+        ShellKind::of(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+        ShellKind::Pwsh
+    );
+    assert_eq!(ShellKind::of("/bin/bash"), ShellKind::Bash);
+    assert_eq!(ShellKind::of("/usr/bin/fish"), ShellKind::Fish);
+    assert_eq!(ShellKind::of("/bin/dash"), ShellKind::Sh);
+    assert_eq!(ShellKind::Bash.login_flag(), Some("-l"));
+    assert_eq!(ShellKind::Zsh.login_flag(), Some("-l"));
+    assert_eq!(ShellKind::Cmd.login_flag(), None);
+    assert_eq!(ShellKind::PowerShell.login_flag(), None);
+    assert_eq!(ShellKind::Pwsh.login_flag(), None);
+}
+
+fn profile(executable: &str, args: &[&str], login: bool) -> TerminalProfile {
+    TerminalProfile {
+        id: "p".into(),
+        name: "P".into(),
+        executable: executable.into(),
+        args: args.iter().map(|a| a.to_string()).collect(),
+        cwd: None,
+        env: vec![],
+        login,
+    }
+}
+
+#[test]
+fn launch_arguments_keep_their_boundaries_and_put_the_login_flag_first() {
+    let bash = shell("Bash", "/bin/bash", false);
+    let spaced = ["--rcfile", "a file with spaces & a quote\"", "-i"];
+    assert_eq!(
+        launch_args(&bash, Some(&profile("/bin/bash", &spaced, false))).unwrap(),
+        spaced
+    );
+    assert_eq!(
+        launch_args(&bash, Some(&profile("/bin/bash", &["-i"], true))).unwrap(),
+        ["-l", "-i"]
+    );
+    let cmd = shell("Command Prompt", "C:/Windows/System32/cmd.exe", true);
+    let refused = launch_args(&cmd, Some(&profile("cmd.exe", &[], true))).unwrap_err();
+    assert_eq!(refused.code, TerminalErrorCause::ProtocolError);
+    assert!(
+        refused.message.contains("no login mode"),
+        "{}",
+        refused.message
+    );
+    assert!(launch_args(&cmd, None).unwrap().is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn a_profile_starts_its_shell_with_its_arguments_environment_and_relative_folder() {
+    let root = env::temp_dir().join(format!("yavin-profile-root-{}", std::process::id()));
+    let sub = root.join("sub dir");
+    std::fs::create_dir_all(&sub).unwrap();
+    let cmd = available_shells()
+        .into_iter()
+        .find(|s| s.kind == ShellKind::Cmd)
+        .expect("cmd.exe");
+    let terminals = Terminals::default();
+    let mut request = request("t-profile", 1);
+    request.profile = Some(TerminalProfile {
+        id: "builds".into(),
+        name: "Builds".into(),
+        executable: cmd.path.clone(),
+        // Each its own argument: no command line is ever assembled from them.
+        args: vec![
+            "/d".into(),
+            "/k".into(),
+            "echo yavin-%YAVIN_T05%& cd".into(),
+        ],
+        cwd: Some("sub dir".into()),
+        env: vec![("YAVIN_T05".into(), "profile-env".into())],
+        login: false,
+    });
+    let launch = Launch {
+        root: root.clone(),
+        ..launch()
+    };
+    let recorder = open_recorded_with(&terminals, request, launch).unwrap();
+    answer_cursor_query(&terminals, &recorder, "t-profile");
+    let done = recorder.wait(Duration::from_secs(30), |r| {
+        let text = r.text();
+        text.contains("yavin-profile-env") && text.to_lowercase().contains("sub dir")
+    });
+    assert!(done, "saw {:?}", recorder.text());
+    kill(
+        &terminals,
+        TerminalKillRequest {
+            session_id: id("t-profile"),
+            generation: generation(1),
+        },
+    )
+    .unwrap();
+    assert!(recorder.wait(Duration::from_secs(30), Recorder::ended));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_login_profile_starts_its_shell_as_a_login_shell() {
+    // Git Bash on Windows, or bash on Unix; skipped (and said so) where there is none.
+    let Some(bash) = available_shells()
+        .into_iter()
+        .find(|s| s.kind == ShellKind::Bash)
+    else {
+        eprintln!("SKIPPED: no bash on this machine");
+        return;
+    };
+    let script = "shopt -q login_shell && echo yavin-login-yes || echo yavin-login-no";
+    let run = |session: &str, login: bool| {
+        let terminals = Terminals::default();
+        let mut request = request(session, 1);
+        request.profile = Some(profile(&bash.path, &["-c", script], login));
+        let recorder = open_recorded_with(&terminals, request, launch()).unwrap();
+        let seen = |r: &Recorder| {
+            r.text().contains("yavin-login-yes") || r.text().contains("yavin-login-no")
+        };
+        answer_cursor_query(&terminals, &recorder, session);
+        assert!(
+            recorder.wait(Duration::from_secs(30), seen),
+            "saw {:?}",
+            recorder.text()
+        );
+        assert!(recorder.wait(Duration::from_secs(30), Recorder::ended));
+        recorder.text()
+    };
+    assert!(run("t-login", true).contains("yavin-login-yes"));
+    assert!(run("t-nologin", false).contains("yavin-login-no"));
+}
+
+#[test]
+fn a_profile_that_cannot_launch_says_why_and_starts_nothing() {
+    let terminals = Terminals::default();
+    let refused =
+        |request: TerminalOpenRequest| match open_recorded_with(&terminals, request, launch()) {
+            Ok(_) => panic!("a profile that cannot launch was launched"),
+            Err(error) => error,
+        };
+    // A program discovery did not offer.
+    let mut unknown = request("t-p-bad", 1);
+    unknown.profile = Some(profile("C:/Windows/System32/notepad.exe", &[], false));
+    assert_eq!(refused(unknown).code, TerminalErrorCause::ShellUnavailable);
+    // A folder that is not there, relative or not: never a launch somewhere else.
+    for (n, folder) in ["no-such-folder", "/definitely/not/here"]
+        .iter()
+        .enumerate()
+    {
+        let mut nowhere = request("t-p-bad", 2 + n as u64);
+        let mut p = profile(&available_shells()[0].path, &[], false);
+        p.cwd = Some(folder.to_string());
+        nowhere.profile = Some(p);
+        assert_eq!(refused(nowhere).code, TerminalErrorCause::InvalidCwd);
+    }
+    // Login asked of a shell with no login mode.
+    if let Some(cmd) = available_shells()
+        .into_iter()
+        .find(|s| s.kind.login_flag().is_none())
+    {
+        let mut login = request("t-p-bad", 9);
+        login.profile = Some(profile(&cmd.path, &[], true));
+        assert_eq!(refused(login).code, TerminalErrorCause::ProtocolError);
+    }
+    assert!(terminals.registry().sessions.is_empty());
+}
+
+// --- TERMINAL-05A: shell integration with a real shell -----------------------------------------
+
+/// The shell-integration events the service's lifecycle subscription was sent.
+fn shell_events(recorder: &Recorder) -> Vec<TerminalShellEvent> {
+    recorder
+        .snapshot()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Shell(shell) => Some(shell),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_real_shell_reports_its_folder_and_command_boundaries() {
+    // Git Bash on Windows (bash on Unix), with integration set up the way a user would: through
+    // PROMPT_COMMAND in the profile's environment for this one test terminal -- no startup file
+    // of anyone's is touched. Skipped, and said so, without bash.
+    let Some(bash) = available_shells()
+        .into_iter()
+        .find(|s| s.kind == ShellKind::Bash)
+    else {
+        eprintln!("SKIPPED: no bash on this machine");
+        return;
+    };
+    let terminals = Terminals::default();
+    let mut request = request("t-osc", 1);
+    let mut p = profile(&bash.path, &["--norc", "--noprofile", "-i"], false);
+    p.env = vec![
+        (
+            "PROMPT_COMMAND".into(),
+            r#"printf '\033]133;D;%s\007\033]7;file://%s%s\007\033]133;A\007' "$?" "$HOSTNAME" "$PWD""#
+                .into(),
+        ),
+        ("PS1".into(), r"\[\033]133;B\007\]yavin$ ".into()),
+        ("PS0".into(), r"\[\033]133;C\007\]".into()),
+    ];
+    request.profile = Some(p);
+    let service = Arc::new(Recorder::default());
+    open(
+        &terminals,
+        request,
+        launch(),
+        (
+            SubscriptionId::new("t-osc-service").unwrap(),
+            service.clone(),
+        ),
+    )
+    .unwrap();
+    let (view_id, view) = subscriber(&terminals, "t-osc", 1);
+    subscribe(
+        &terminals,
+        TerminalSubscribeRequest {
+            subscription_id: view_id,
+            session_id: id("t-osc"),
+            generation: generation(1),
+        },
+        view.clone(),
+    )
+    .unwrap();
+    answer_cursor_query(&terminals, &view, "t-osc");
+    assert!(
+        service.wait(Duration::from_secs(30), |r| shell_events(r)
+            .iter()
+            .any(|e| e.signal == ShellSignal::Prompt)),
+        "no prompt marker; saw {:?}",
+        view.text()
+    );
+    let folder = env::temp_dir().join(format!("yavin osc {}", std::process::id()));
+    std::fs::create_dir_all(&folder).unwrap();
+    let posix = {
+        let text = folder.to_string_lossy().replace(char::from(92), "/");
+        match text.split_once(':') {
+            Some((drive, rest)) if drive.len() == 1 => format!("/{}{rest}", drive.to_lowercase()),
+            _ => text,
+        }
+    };
+    type_in(&terminals, "t-osc", 1, &format!("cd '{posix}'; false\r"));
+    let finished = |r: &Recorder| {
+        shell_events(r)
+            .iter()
+            .any(|e| e.signal == ShellSignal::Finished && e.exit_code == Some(1))
+    };
+    assert!(
+        service.wait(Duration::from_secs(30), finished),
+        "no completion; saw {:?}",
+        shell_events(&service)
+    );
+    assert!(service.wait(Duration::from_secs(10), |r| shell_events(r)
+        .iter()
+        .any(|e| e.signal == ShellSignal::Cwd
+            && e.uri.as_deref().is_some_and(|u| u.contains("yavin")))));
+    let events = shell_events(&service);
+    let cwd = events
+        .iter()
+        .rev()
+        .find(|e| e.signal == ShellSignal::Cwd)
+        .unwrap();
+    assert_eq!(cwd.local, Some(true), "{cwd:?}");
+    assert!(events.iter().any(|e| e.signal == ShellSignal::Executing));
+    assert!(events.iter().any(|e| e.signal == ShellSignal::Input));
+    eprintln!(
+        "real shell integration: {:?}",
+        events
+            .iter()
+            .map(|e| (e.signal, e.exit_code, e.uri.clone()))
+            .collect::<Vec<_>>()
+    );
+    kill(
+        &terminals,
+        TerminalKillRequest {
+            session_id: id("t-osc"),
+            generation: generation(1),
+        },
+    )
+    .unwrap();
+    assert!(view.wait(Duration::from_secs(30), Recorder::ended));
+    assert_protocol_order(&view.snapshot(), 1);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+#[test]
+fn a_shell_without_integration_sends_no_signals_and_works_as_before() {
+    let terminals = Terminals::default();
+    let recorder = start(&terminals, "t-plain", 1);
+    type_in(&terminals, "t-plain", 1, "echo plain-terminal\r");
+    assert!(recorder.wait(Duration::from_secs(30), |r| r
+        .text()
+        .matches("plain-terminal")
+        .count()
+        >= 2));
+    assert!(shell_events(&recorder).is_empty());
+    kill(
+        &terminals,
+        TerminalKillRequest {
+            session_id: id("t-plain"),
+            generation: generation(1),
+        },
+    )
+    .unwrap();
+    assert!(recorder.wait(Duration::from_secs(30), Recorder::ended));
 }

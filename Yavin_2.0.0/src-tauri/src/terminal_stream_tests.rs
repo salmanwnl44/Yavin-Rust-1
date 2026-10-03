@@ -14,6 +14,7 @@ fn small() -> Limits {
         subscriber_low: 16,
         stall_timeout: Duration::from_millis(300),
         unresponsive_timeout: Duration::from_millis(900),
+        replay_bytes: 64,
     }
 }
 
@@ -112,7 +113,7 @@ fn open(limits: Limits) -> (Arc<OutputStream>, Arc<Recorder>) {
         session(),
         FIRST_GENERATION,
         limits,
-        (sid("a"), recorder.clone()),
+        (sid("a"), recorder.clone(), Delivery::Output),
     );
     (stream, recorder)
 }
@@ -381,7 +382,9 @@ fn a_slow_subscriber_never_holds_up_a_fast_one_and_is_detached_explicitly() {
     let limits = small();
     let (stream, fast) = open(limits.clone());
     let slow = Arc::new(Recorder::default());
-    stream.subscribe(sid("slow"), slow.clone()).unwrap();
+    stream
+        .subscribe(sid("slow"), slow.clone(), Delivery::Output, false)
+        .unwrap();
     let consumer = consume(
         &stream,
         &fast,
@@ -431,7 +434,9 @@ fn a_slow_subscriber_never_holds_up_a_fast_one_and_is_detached_explicitly() {
 fn a_closed_window_is_removed_without_disturbing_the_others() {
     let (stream, open_window) = open(small());
     let closed = Arc::new(Recorder::default());
-    stream.subscribe(sid("closed"), closed.clone()).unwrap();
+    stream
+        .subscribe(sid("closed"), closed.clone(), Delivery::Output, false)
+        .unwrap();
     let consumer = consume(
         &stream,
         &open_window,
@@ -444,6 +449,12 @@ fn a_closed_window_is_removed_without_disturbing_the_others() {
     closed.gone.store(true, Ordering::SeqCst);
     assert!(stream.push(b"second"));
     assert!(open_window.wait(Duration::from_secs(2), |m| bytes_of(m) == b"firstsecond"));
+    // Removed in the same delivery pass that found its transport gone -- which finishes after
+    // the other subscriber's send, so it is waited for (bounded), not assumed.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while stream.has_subscriber(&sid("closed")) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
     assert!(!stream.has_subscriber(&sid("closed")));
     stream.finish(End::Exit(Some(0)));
     assert!(stream.wait_finished(Duration::from_secs(5)));
@@ -460,7 +471,9 @@ fn unsubscribing_releases_what_was_held_for_that_subscriber() {
     let limits = small();
     let (stream, recorder) = open(limits.clone());
     let idle = Arc::new(Recorder::default());
-    stream.subscribe(sid("idle"), idle).unwrap();
+    stream
+        .subscribe(sid("idle"), idle, Delivery::Output, false)
+        .unwrap();
     let consumer = consume(
         &stream,
         &recorder,
@@ -526,6 +539,7 @@ fn every_subscriber_sees_running_the_output_exiting_and_exactly_one_end_last() {
             TerminalMessage::Exit(_) => "exit",
             TerminalMessage::Error(_) => "error",
             TerminalMessage::Detached(_) => "detached",
+            TerminalMessage::Shell(_) => "shell",
         })
         .collect();
     assert_eq!(kinds.first(), Some(&"running"));
@@ -542,11 +556,28 @@ fn every_subscriber_sees_running_the_output_exiting_and_exactly_one_end_last() {
         recorder.outputs().last().map(|c| c.seq.get())
     );
     assert_eq!(recorder.bytes(), pattern(0, 50));
-    // Nothing is held once it is over, and nobody can join it.
+    // Nothing is held for flow control once it is over; a view attaching now is sent the
+    // replay and the end (TERMINAL-03), and once released, nothing at all.
     assert_eq!(stream.stats().queued_bytes, 0);
-    assert!(stream
-        .subscribe(sid("late"), Arc::new(Recorder::default()))
-        .is_err());
+    let late = Arc::new(Recorder::default());
+    stream
+        .subscribe(sid("late"), late.clone(), Delivery::Output, true)
+        .unwrap();
+    assert_eq!(late.bytes(), pattern(0, 50));
+    assert!(matches!(late.all().last(), Some(TerminalMessage::Exit(_))));
+    stream.release();
+    assert_eq!(
+        stream
+            .subscribe(
+                sid("later"),
+                Arc::new(Recorder::default()),
+                Delivery::Output,
+                true
+            )
+            .unwrap_err()
+            .code,
+        TerminalErrorCause::InvalidSession
+    );
 }
 
 #[test]
@@ -716,4 +747,262 @@ fn stress_10_mb_with_a_slow_consumer() {
     // The consumer is slower than the producer, so the reader spends most of this paused: the
     // memory bound holds under sustained backpressure, and nothing is lost.
     stress(10 * 1024 * 1024, Duration::from_millis(1));
+}
+
+// --- TERMINAL-03: replay and lifecycle subscribers ---------------------------------------------
+
+/// The kinds of messages, in order, with each output's seq.
+fn shape(messages: &[TerminalMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .map(|m| match m {
+            TerminalMessage::Output(c) => format!("output {}", c.seq.get()),
+            TerminalMessage::State(s) if matches!(s.state, LiveState::Running { .. }) => {
+                "running".into()
+            }
+            TerminalMessage::State(_) => "exiting".into(),
+            TerminalMessage::Exit(_) => "exit".into(),
+            TerminalMessage::Error(_) => "error".into(),
+            TerminalMessage::Detached(_) => "detached".into(),
+            TerminalMessage::Shell(s) => format!("shell {:?}", s.signal),
+        })
+        .collect()
+}
+
+#[test]
+fn a_view_attaching_later_is_replayed_the_recent_output_then_continues_live() {
+    let (stream, first) = open(small());
+    let consumer = consume(
+        &stream,
+        &first,
+        "a",
+        Duration::ZERO,
+        Arc::new(AtomicBool::new(false)),
+    );
+    stream.live(running());
+    assert!(stream.push(&pattern(0, 40)));
+    assert!(first.wait(Duration::from_secs(2), |m| bytes_of(m).len() == 40));
+
+    // The second view attaches mid-stream: the replay, then live, with nothing twice.
+    let late = Arc::new(Recorder::default());
+    stream
+        .subscribe(sid("late"), late.clone(), Delivery::Output, true)
+        .unwrap();
+    let late_consumer = consume(
+        &stream,
+        &late,
+        "late",
+        Duration::ZERO,
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert!(stream.push(&pattern(40, 24)));
+    stream.finish(End::Exit(Some(0)));
+    assert!(stream.wait_finished(Duration::from_secs(5)));
+    consumer.join().unwrap();
+    late_consumer.join().unwrap();
+
+    assert_eq!(late.bytes(), pattern(0, 64), "missing or repeated output");
+    assert_eq!(late.bytes(), first.bytes());
+    let kinds = shape(&late.all());
+    assert_eq!(kinds.first().map(String::as_str), Some("running"));
+    assert_eq!(kinds.last().map(String::as_str), Some("exit"));
+    assert_sequenced(&late.outputs(), 16);
+}
+
+#[test]
+fn replay_is_bounded_and_says_where_it_starts() {
+    let mut limits = small();
+    limits.replay_bytes = 32;
+    let (stream, first) = open(limits);
+    let consumer = consume(
+        &stream,
+        &first,
+        "a",
+        Duration::ZERO,
+        Arc::new(AtomicBool::new(false)),
+    );
+    stream.live(running());
+    for i in 0..10 {
+        assert!(stream.push(&pattern(i * 16, 16)));
+        assert!(first.wait(Duration::from_secs(2), |m| bytes_of(m).len()
+            == (i + 1) * 16));
+    }
+    let late = Arc::new(Recorder::default());
+    stream
+        .subscribe(sid("late"), late.clone(), Delivery::Output, true)
+        .unwrap();
+    assert!(late.wait(Duration::from_secs(2), |m| bytes_of(m).len() == 32));
+    // Only the most recent 32 bytes are kept; the replay is the tail of the stream, numbered
+    // as it was, so the view knows where it joined.
+    let chunks = late.outputs();
+    assert_eq!(chunks.first().map(|c| c.seq.get()), Some(8));
+    assert_eq!(late.bytes(), pattern(128, 32));
+    assert!(stream.stats().replay_bytes <= 32);
+    stream.finish(End::Exit(None));
+    assert!(stream.wait_finished(Duration::from_secs(5)));
+    consumer.join().unwrap();
+}
+
+#[test]
+fn a_lifecycle_subscriber_gets_no_output_and_never_holds_the_reader() {
+    let limits = small();
+    let lifecycle = Arc::new(Recorder::default());
+    let stream = OutputStream::start(
+        session(),
+        FIRST_GENERATION,
+        limits.clone(),
+        (sid("service"), lifecycle.clone(), Delivery::Lifecycle),
+    );
+    stream.live(running());
+    // Far more than every bound, with no view attached and nothing acknowledged: the reader is
+    // never paused, and memory stays at the replay bound.
+    let started = Instant::now();
+    for i in 0..500 {
+        assert!(stream.push(&pattern(i * 8, 8)));
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the reader was held"
+    );
+    stream.live(exiting());
+    stream.finish(End::Exit(Some(0)));
+    assert!(stream.wait_finished(Duration::from_secs(5)));
+    assert_eq!(shape(&lifecycle.all()), ["running", "exiting", "exit"]);
+    assert!(stream.stats().replay_bytes <= limits.replay_bytes);
+    assert!(stream.stats().peak_queued_bytes <= limits.ingress_high + 8);
+}
+
+#[test]
+fn a_lifecycle_subscriber_is_never_taken_for_a_laggard() {
+    // A view that is slow but the only one: with the service always caught up, it must still be
+    // backpressured rather than detached for being behind.
+    let limits = small();
+    let lifecycle = Arc::new(Recorder::default());
+    let stream = OutputStream::start(
+        session(),
+        FIRST_GENERATION,
+        limits.clone(),
+        (sid("service"), lifecycle, Delivery::Lifecycle),
+    );
+    let view = Arc::new(Recorder::default());
+    stream
+        .subscribe(sid("view"), view.clone(), Delivery::Output, true)
+        .unwrap();
+    let reader = {
+        let stream = stream.clone();
+        thread::spawn(move || {
+            for i in 0..100 {
+                if !stream.push(&pattern(i * 8, 8)) {
+                    return;
+                }
+            }
+        })
+    };
+    // Longer than the laggard timeout, shorter than the unresponsive one.
+    thread::sleep(limits.stall_timeout + Duration::from_millis(300));
+    assert!(!view
+        .all()
+        .iter()
+        .any(|m| matches!(m, TerminalMessage::Detached(_))));
+    let consumer = consume(
+        &stream,
+        &view,
+        "view",
+        Duration::ZERO,
+        Arc::new(AtomicBool::new(false)),
+    );
+    reader.join().unwrap();
+    stream.finish(End::Exit(Some(0)));
+    assert!(stream.wait_finished(Duration::from_secs(5)));
+    consumer.join().unwrap();
+    assert_eq!(view.bytes(), pattern(0, 800));
+}
+
+#[test]
+fn a_released_stream_keeps_nothing_and_refuses_views() {
+    let (stream, recorder) = open(small());
+    let consumer = consume(
+        &stream,
+        &recorder,
+        "a",
+        Duration::ZERO,
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert!(stream.push(&pattern(0, 40)));
+    stream.finish(End::Exit(Some(0)));
+    assert!(stream.wait_finished(Duration::from_secs(5)));
+    consumer.join().unwrap();
+    assert!(stream.stats().replay_bytes > 0);
+    stream.release();
+    assert_eq!(stream.stats().replay_bytes, 0);
+    assert!(stream
+        .subscribe(
+            sid("v"),
+            Arc::new(Recorder::default()),
+            Delivery::Output,
+            true
+        )
+        .is_err());
+}
+
+// --- TERMINAL-05A: shell integration -----------------------------------------------------------
+
+#[test]
+fn shell_signals_arrive_in_order_with_the_output_and_are_not_replayed() {
+    let lifecycle = Arc::new(Recorder::default());
+    let stream = OutputStream::start(
+        session(),
+        FIRST_GENERATION,
+        small(),
+        (sid("service"), lifecycle.clone(), Delivery::Lifecycle),
+    );
+    let view = Arc::new(Recorder::default());
+    stream
+        .subscribe(sid("view"), view.clone(), Delivery::Output, true)
+        .unwrap();
+    let consumer = consume(
+        &stream,
+        &view,
+        "view",
+        Duration::ZERO,
+        Arc::new(AtomicBool::new(false)),
+    );
+    stream.live(running());
+    // Split mid-sequence, as a PTY read may.
+    let output: &[u8] = b"$ \x1b]133;A\x07\x1b]133;B\x07ls\r\n\x1b]133;C\x07a.txt\r\n\x1b]133;D;3\x07\x1b]7;file://localhost/c/x\x07";
+    for piece in output.chunks(5) {
+        assert!(stream.push(piece));
+    }
+    assert!(view.wait(Duration::from_secs(2), |m| bytes_of(m).len()
+        == output.len()));
+    // The bytes themselves are untouched: the sequences stay in the output.
+    assert_eq!(view.bytes(), output);
+    let shells = |r: &Recorder| -> Vec<String> {
+        shape(&r.all())
+            .into_iter()
+            .filter(|k| k.starts_with("shell"))
+            .collect()
+    };
+    let expected = [
+        "shell Prompt",
+        "shell Input",
+        "shell Executing",
+        "shell Finished",
+        "shell Cwd",
+    ];
+    assert_eq!(shells(&view), expected);
+    // The service's lifecycle subscription gets them too, without the output.
+    assert!(lifecycle.wait(Duration::from_secs(2), |m| m.len() >= 6));
+    assert_eq!(shells(&lifecycle), expected);
+    assert!(lifecycle.outputs().is_empty());
+    // A view attaching now is replayed the output, never the old signals.
+    let late = Arc::new(Recorder::default());
+    stream
+        .subscribe(sid("late"), late.clone(), Delivery::Output, true)
+        .unwrap();
+    assert!(late.wait(Duration::from_secs(2), |m| !bytes_of(m).is_empty()));
+    assert!(shells(&late).is_empty());
+    stream.finish(End::Exit(Some(0)));
+    assert!(stream.wait_finished(Duration::from_secs(5)));
+    consumer.join().unwrap();
 }

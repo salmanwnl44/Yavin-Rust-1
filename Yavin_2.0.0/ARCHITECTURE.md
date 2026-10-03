@@ -709,7 +709,7 @@ closing → closed    opening → active
  dispose, in order:  services made:
   Git registry        Git registry (restores, opens each folder's repository)
   checker cancelled
-  terminals closed    the window then resets its own UI state for B
+  terminals detached  the window then resets its own UI state for B
   Problems cleared    (documents, editor views, tabs, Explorer; terminal panel remounted)
   owned cleanups
 ```
@@ -724,16 +724,16 @@ closing → closed    opening → active
 
 **Stale work.** A context's `signal` is aborted and `isActive()` becomes false when it starts closing. Work that awaits captures the context (or its request's own identity) and checks before applying:
 
-| Boundary                    | Protection                                                                                                                                            |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Git open, refresh, events   | the disposed registry is inert (no repositories, no persistence, no notifications); a late open is closed                                             |
-| Git watcher events          | routed to the workspace in front's registry by repository identity; the old one's watchers are stopped                                                |
-| Checker (Problems)          | the run captures its workspace and drops a late answer; disposal cancels it and clears Problems                                                       |
-| Language servers            | a request's answer for a closed or changed document is a `StaleResultError`; diagnostics from a server no longer the manager's are ignored            |
-| Explorer listings           | each answer must match the entry and generation it was asked for; the old roots' entries are forgotten                                                |
-| Search                      | aborted by a newer query and by the workspace's signal; the native search is cancelled                                                                |
-| Terminals                   | each launch has a generation; events of another launch are ignored; a launch that finishes after its view went is closed; disposal closes every shell |
-| Filesystem watcher (native) | the old watcher ends before the new one starts; batches carry their root and generation                                                               |
+| Boundary                    | Protection                                                                                                                                                                                                       |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Git open, refresh, events   | the disposed registry is inert (no repositories, no persistence, no notifications); a late open is closed                                                                                                        |
+| Git watcher events          | routed to the workspace in front's registry by repository identity; the old one's watchers are stopped                                                                                                           |
+| Checker (Problems)          | the run captures its workspace and drops a late answer; disposal cancels it and clears Problems                                                                                                                  |
+| Language servers            | a request's answer for a closed or changed document is a `StaleResultError`; diagnostics from a server no longer the manager's are ignored                                                                       |
+| Explorer listings           | each answer must match the entry and generation it was asked for; the old roots' entries are forgotten                                                                                                           |
+| Search                      | aborted by a newer query and by the workspace's signal; the native search is cancelled                                                                                                                           |
+| Terminals                   | each launch has a generation; messages of another launch are dropped; a launch that finishes after its session was closed is killed; a switch detaches views, the workspace's TerminalService keeps its sessions |
+| Filesystem watcher (native) | the old watcher ends before the new one starts; batches carry their root and generation                                                                                                                          |
 
 **Ownership.**
 
@@ -742,14 +742,14 @@ closing → closed    opening → active
 | Workspace manager            | which workspace is open; creating and closing contexts; the order of a switch; generations       |
 | Workspace context            | identity, folders, generation, lifecycle state, services, cleanups given to it                   |
 | Git registry (per workspace) | repositories, `.git` watchers, polling, the active repository, the list remembered for it        |
-| Workspace disposal           | stopping the checker, closing the terminals' shells, clearing Problems                           |
+| Workspace disposal           | stopping the checker, clearing Problems (terminals are detached, not closed: see Terminal)       |
 | The window (`App.tsx`)       | its UI state, reset on the same switch: documents, editor views, tabs, Explorer, panels          |
 | LSP manager                  | servers per workspace folder; follows the Explorer's roots (folders removed: their servers stop) |
 | DocumentService              | document content -- unchanged; nothing here holds content                                        |
 
 **Git.** One registry per workspace. It restores what was remembered for that workspace (`yavin.git.repos:<WorkspaceId>`) and opens each of its folders' own repositories; the active repository is the one remembered for that workspace, else a folder's. Leaving closes every repository, stops its watcher and drops its shared commit graph; what was remembered is kept for next time, so A → B → A brings back A's repositories and the one chosen. The list every folder shared before (`yavin.git.repos`) is adopted by the first workspace opened after the upgrade and then removed. Watcher events, guarded operations, cloning and the commit graph resolve the workspace in front (`currentGit()`); the AI Git tools take the registry of the workspace they were made for, with no global default. The commit hover card caches per repository.
 
-**Terminals.** The shells belong to the workspace: its disposal closes all of them natively, whatever the views are doing, and the terminal panel is remounted per workspace, so the next folder's first terminal starts in it (the native side starts a shell in the workspace root at launch). Terminal metadata is not yet restored on A → B → A.
+**Terminals.** The shells belong to the workspace, but outlive a switch (TERMINAL-03). The terminal panel is remounted per workspace, so its views detach from A's sessions and the next folder gets its own. A's TerminalService keeps A's sessions running, and A → B → A finds them again, replayed. They end when the window does (reload or exit) or when closed. See [Terminal](#terminal).
 
 **Documents and editors.** Leaving a folder with unsaved changes asks first; the documents, editor views and tabs are reset, and A's tabs and Explorer state are restored from the session when A is opened again. Unsaved content is not kept across a switch yet.
 
@@ -757,16 +757,16 @@ closing → closed    opening → active
 
 **Persistence boundary.** Where each kind of state belongs -- today and for the modules that build on this one:
 
-| Kind      | Examples                                                                 | Where                                                        |
-| --------- | ------------------------------------------------------------------------ | ------------------------------------------------------------ |
-| Global    | theme, keybindings, editor and panel preferences                         | user settings / browser storage, application-wide            |
-| Machine   | recent folders, trusted folders, shell detection                         | Yavin's user-data directory (`session.json`, trust file)     |
-| Workspace | Git repositories and selection; later workspace configuration            | keyed by `WorkspaceId` in user data (`yavin.git.repos:<id>`) |
-| Folder    | shareable project configuration (later)                                  | `.yavin/` in the folder, when a module needs it              |
-| Session   | open tabs, active tab, Explorer expansion/selection/scroll; later layout | user data, per workspace (`session.json`)                    |
-| Runtime   | shells, language servers, watchers, running checkers, pending requests   | never persisted; ended with the workspace                    |
-| Document  | editor content                                                           | DocumentService; recovery (M04) for interrupted saves        |
-| Secret    | API keys, tokens, passwords                                              | the OS credential store; never in `.yavin/` or session files |
+| Kind      | Examples                                                                 | Where                                                               |
+| --------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------- |
+| Global    | theme, keybindings, editor and panel preferences                         | user settings / browser storage, application-wide                   |
+| Machine   | recent folders, trusted folders, shell detection                         | Yavin's user-data directory (`session.json`, trust file)            |
+| Workspace | Git repositories and selection; later workspace configuration            | keyed by `WorkspaceId` in user data (`yavin.git.repos:<id>`)        |
+| Folder    | shareable project configuration (later)                                  | `.yavin/` in the folder, when a module needs it                     |
+| Session   | open tabs, active tab, Explorer expansion/selection/scroll; later layout | user data, per workspace (`session.json`)                           |
+| Runtime   | shells, language servers, watchers, running checkers, pending requests   | never persisted; ended with the workspace (shells: with the window) |
+| Document  | editor content                                                           | DocumentService; recovery (M04) for interrupted saves               |
+| Secret    | API keys, tokens, passwords                                              | the OS credential store; never in `.yavin/` or session files        |
 
 **`.yavin/`.** Not created by W1. When it is, it holds only what is meant to be shared with the project and is safe to commit (workspace configuration, working-set and changeset metadata). Private session state -- unsaved content, terminal output, AI conversations, Git selection -- stays in Yavin's user-data directory by default, so it cannot end up in a repository. Secrets are never written to either.
 
@@ -788,12 +788,12 @@ The terminal is being rebuilt module by module (TERMINAL-00 to TERMINAL-07). Thi
 
 ### Current (what runs today)
 
-| Layer   | Where                                      | Responsibility                                                                                                                                                      |
-| ------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Panel   | `src/components/layout/TerminalPanel.tsx`  | the bottom panel's terminal tab: the list of terminals, the active one, split, shell picker, find, rename, zoom, bells                                              |
-| View    | `src/components/terminal/TerminalView.tsx` | one xterm.js instance and its shell: opens it on mount, closes it on unmount, input, copy/paste, search, links, resize, exit footer and Restart                     |
-| Helpers | `src/services/terminal.ts`                 | open requests, launch generations, the per-session event router (payloads parsed against the contract), key bindings, the panel request channel                     |
-| Native  | `src-tauri/src/terminal.rs`                | the session runtime (TERMINAL-01): `terminal_shells`, `terminal_open`, `terminal_write`, `terminal_resize`, `terminal_close`, `terminal_kill`, `terminal_close_all` |
+| Layer   | Where                                                           | Responsibility                                                                                                                                                      |
+| ------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Panel   | `src/components/layout/TerminalPanel.tsx`                       | renders the workspace's terminals: tabs, panes, toolbar, find bar, context menu, status line; panel-only state (height, the find text, the open menu)               |
+| View    | `src/components/terminal/TerminalView.tsx`                      | one xterm.js attached to one existing session: replay then live output, ACK after parsing, input (paste through xterm), measurement, search, links, exit footer     |
+| Helpers | `src/services/terminal.ts`, `terminalUi.ts`, `terminalHooks.ts` | open requests, generations, key bindings; the per-workspace view state and commands (`TerminalUi`); React hooks over both                                           |
+| Native  | `src-tauri/src/terminal.rs`                                     | the session runtime (TERMINAL-01): `terminal_shells`, `terminal_open`, `terminal_write`, `terminal_resize`, `terminal_close`, `terminal_kill`, `terminal_close_all` |
 
 The native side and the renderer speak only the contract below: there is no other terminal protocol.
 
@@ -828,40 +828,282 @@ The native side and the renderer speak only the contract below: there is no othe
 - **The session map** is locked only to find, add or remove a session. Each session has its own locks, so one terminal never waits on another.
 - **Generations are enforced natively.**
   - An open must name a generation newer than any its id had, and opening a newer one replaces (ends) the older.
-  - Write and resize must name the current generation, or fail with `InvalidSession`.
+  - Write and resize must name the current generation (`StaleGeneration` otherwise), and the session must still run (`SessionEnded`).
   - Close and kill naming any other generation do nothing.
 - **Workspaces are enforced natively.**
   - An open must name the window's workspace (`WorkspaceSpec`'s `workspace_id`, the renderer's `WorkspaceId`; `empty:` with none), or it fails with `InvalidWorkspace`.
-  - Entering another workspace ends every session of the one left, alongside revoking its Local Git handles.
+  - Entering another workspace does **not** end the sessions of the one left (TERMINAL-03): their views detach and the workspace's TerminalService keeps them.
 - **Lifecycle.**
-  - Disposing a workspace calls `terminal_close_all`.
+  - A session that ends by itself keeps its stream's bounded replay until it is closed, so a view can still attach and see how it ended; a session closed or killed lets go of it at its end.
   - A page reload closes leftover shells before the first new one opens.
   - App exit closes every shell.
 - **Failures are typed** (`"Cause: message"`). OS failures are described by kind (`TerminalError::from_io`), never by the OS's own text.
 
 **Still to come.**
 
-- The renderer still keeps session state in the panel and filters messages by generation rather than applying `applyEvent` (TERMINAL-03).
-- Replay of output a subscriber missed, and more than one window following a session, are TERMINAL-03.
+- More than one window following one session (the subscription model allows it; nothing opens a second window yet).
 
-### Ownership (TARGET)
+### Workspace Terminal Service (TERMINAL-03)
 
 ```text
-WorkspaceManager ── owns ──> WorkspaceContext
-                                 └─ TerminalService (one per workspace; disposed with it)
-                                      └─ TerminalSession (identity, generation, state, profile)
-                                           └─ native session (PTY, writer, reader, process)
-TerminalPanel, TerminalView: views. They render sessions and send intents; they own nothing.
+WorkspaceManager ── WorkspaceId ──> TerminalService (src/services/terminalService.ts)
+  (terminalServices: one per        ├─ Map<TerminalId, session record>   state, metadata, generation
+   WorkspaceId, for the window)     │    └─ lifecycle subscription        Running, Exiting, the end
+                                    └─ attachments (views)               replay, live output, ACKs
+                                         └─ native session (T01) + output stream (T02)
+TerminalUi: how they are shown (panes, split, focus, zoom, find, bells, notices) -- view state.
+TerminalPanel: renders them. TerminalView: one xterm.js attached to one session.
 ```
 
-- **React components own none of the following.** The process lifecycle, PTY state, session identity, output history and the workspace lifecycle are not owned by any component.
-  - Today the panel's state holds the session list and the view starts and ends the process.
-  - TERMINAL-03 moves that into the TerminalService.
-- **Every session belongs to exactly one workspace** (`workspaceId`, the canonical `WorkspaceId`).
-  - Disposing the workspace ends all of its sessions.
-  - Nothing of one workspace's terminals reaches another's.
-- **Native handles never cross the contract.** Handles and process objects stay native.
-  - The renderer sees `TerminalSession`: `TerminalSessionMetadata`, which a later module may keep across a reload, plus `TerminalSessionRuntime`, which a process's end discards.
+**Ownership.** The TerminalService of a workspace owns its sessions.
+
+- **Records and identity.** A session's record is keyed by `TerminalId` in a `Map`. Its identity is the session id together with the workspace: a service holds only its own sessions, and refuses an id that belongs to another workspace (`InvalidWorkspace`). It never looks a session up by id alone.
+- **What a record holds:** generation, state, title, shell and launch settings, folder, pid, dimensions, exit code or error, and how many views are attached.
+- **What it never holds:** a native handle, a process, an xterm instance or React state.
+- **Reading it.** `getSnapshot()` returns immutable views of the sessions, enough to render the tabs; `subscribe(listener)` reports state changes and never per-byte output. React reads the service through `useSyncExternalStore`; the service itself knows nothing of React or Tauri (the native side is injected).
+- **View state is not session state.** Active terminal, split, focus, bells, find and zoom are the renderer's (TerminalUi, TERMINAL-04), never a session's.
+
+**Lifecycle.** One path, owned by the service:
+
+1. create the record (`Spawning`);
+2. allocate a generation;
+3. `terminal_open`, with the service's own lifecycle-only subscription;
+4. apply the lifecycle messages (`Running` with its pid, `Exiting`, then exactly one end) through `applyEvent`.
+
+`applyEvent` validates every message before it changes anything: the session must be this service's, the generation current, the step one the state machine allows. Anything else is dropped. `restart` is a new generation of the same session. `close` and `kill` end it and forget it.
+
+**Attach and detach.** A view attaches to a session (`terminal_subscribe` on its own channel).
+
+- It is first sent the session's bounded replay, then live output. Each chunk is validated against the view's own stream (generation, sequence, starting where the replay starts), then acknowledged once xterm has parsed it.
+- Detaching (unmounting) only unsubscribes: the session goes on.
+- Attaching to a session that has ended replays its output and its end, and revives nothing.
+- Several views may attach to one session; each has its own window and acknowledgements, and detaching one leaves the others.
+
+**Replay boundary.** Replay is "enough recent output to redraw a remounted view", never a history:
+
+- the last 256 KiB of output (`LIMITS.replay_bytes`), plus the generation's `Running` and its end;
+- kept natively in the generation's output stream, in memory only;
+- dropped when the session is closed, or when the generation is replaced.
+
+There is no disk, no persistence across a reload and no session restoration (later modules).
+
+**Workspace switch.** The workspace's context is disposed, but its TerminalService is not:
+
+- the panel is remounted, so A's views detach;
+- A's shells keep running;
+- B's service is its own;
+- opening A again finds A's service with its sessions; views attach, are replayed, and continue live.
+
+No process is started again because a view remounted.
+
+**Workspace disposal.** `terminalServices.dispose(id)` disposes a workspace's terminals:
+
+- it refuses everything from then on (`InvalidWorkspace`);
+- detaches every view;
+- kills every session natively and forgets it;
+- ignores any late message.
+
+Today the window's end does this implicitly: a reload closes every leftover shell, and exit closes every shell. There is no "close this workspace" action yet that calls it.
+
+**Reload.** The page's services go with the page; the next page closes the shells the last one left (`terminal_close_all`, once, before its first open). Restoring terminals across a reload is TERMINAL-07.
+
+### Renderer (TERMINAL-04)
+
+```text
+TerminalService (per WorkspaceId)  sessions: identity, state, lifecycle, output stream, replay
+TerminalUi      (per WorkspaceId)  view state + commands: panes (primary, secondary), focus,
+                                   split ratio, zoom, find, bells, per-terminal notices and
+                                   matches, the registry of mounted views
+TerminalPanel                      renders both; owns only height, find text, the open menu
+TerminalView                       one xterm.js on one existing session
+```
+
+- **The renderer is a view.** Mounting a TerminalView renders an existing session and never starts a shell; unmounting detaches it and never ends one.
+  - React reads the service and the UI through `useSyncExternalStore` (`terminalHooks.ts`).
+  - Neither the service nor the UI is ever made by a component: both are the workspace's (`workspaces.ts`), made once per WorkspaceId for the window.
+- **Output bypasses React.** A session's replay and live output go from its view's channel straight to `term.write`, and each chunk is acknowledged in xterm's write callback. Output changes no React state and re-renders nothing; only state changes (a session starting, exiting, renamed; a pane or zoom change) do.
+- **Panes always name real sessions.** TerminalUi reconciles its panes with the service's sessions on every change:
+  - a pane never names a session that is gone;
+  - the two halves of a split are never the same session;
+  - closing the left pane's terminal moves the right one over.
+
+  Choosing a tab focuses that terminal's pane if it is on screen, and stepping skips the other pane's terminal.
+
+- **Every action names its terminal.** The menus, the toolbar and the context menu act on an explicit TerminalId: the context menu on the terminal it was opened on, the toolbar on the focused pane's. They act through TerminalUi or the service; the window-wide `requestTerminal` channel is gone. The Terminal menu and the Explorer's "Open in Integrated Terminal" call the workspace's TerminalUi directly.
+- **Per terminal, never shared:**
+  - The status line is the focused terminal's own: its notice, otherwise its state.
+  - Bells, notices and search results are kept per terminal.
+- **Input goes through xterm.** A paste is `term.paste` (bracketed when the program asked for it, newlines normalised), then `onData`, then `TerminalService.write`, which splits it to the contract's limits.
+- **Resize:** the view measures and the service resizes. A size taken while the shell is spawning is sent once it runs; an unchanged size is never sent.
+- **Shortcuts.** `matchesShortcut` also matches a punctuation key by its physical key (`event.code`), so `Mod+Shift+\`` works although Shift makes the key `~`.
+- **Workspace switch.** The panel is remounted, so views detach and xterm instances are disposed; sessions, panes, split, zoom and titles stay with the workspace. Coming back reattaches each session (replay, then live). Nothing is closed, killed or started again.
+
+**T04 → T05.** TERMINAL-05 owns shells and profiles (below). Panel height and the find text are not kept across a remount; persistence is TERMINAL-07.
+
+### Shells and profiles (TERMINAL-05)
+
+T05 is shell **launch configuration**: which shell, with which arguments, folder and environment, as a login shell or not. It knows nothing of what happens inside the shell -- command boundaries, the shell's own idea of its folder (OSC 7/133) are TERMINAL-05A.
+
+```text
+discovery (native terminal_shells)     what shells are there: found or not (and why), the default
+ProfileRegistry (window, terminalProfiles.ts)
+  built-in profiles                    one per discovered shell; read-only; unavailable ones marked
+  user profiles, user default          in memory (TERMINAL-07 persists them)
+WorkspaceProfiles (per WorkspaceId)    + workspace profiles, workspace default; resolve()
+TerminalUi.newTerminal(profileId?)  -> TerminalService.open({ profile }) -> native open (T01)
+```
+
+- **Discovery is not profiles.** Native `discover_shells()` reports each candidate:
+  - name, path, kind (cmd, powershell, pwsh, bash, zsh, fish, sh), platform;
+  - whether it is available, and if not, why;
+  - whether it is the platform default.
+
+  The candidates per platform are:
+
+  | Platform | Candidates                                                                                                                                                       | Default                       |
+  | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+  | Windows  | `%COMSPEC%` cmd; PowerShell 7 (on PATH or under Program Files); Windows PowerShell; Git Bash (both Program Files and the per-user `%LOCALAPPDATA%\Programs\Git`) | the Command Prompt, as before |
+  | Unix     | `$SHELL`, `/bin/zsh`, `/bin/bash`, `/usr/bin/fish`, `/bin/sh`                                                                                                    | `$SHELL`                      |
+
+  The available ones are the native allowlist.
+
+- **Profiles describe how a shell starts**, and own no session, process, output or view state. A profile is the contract's `TerminalProfile {id, name, executable, args, cwd, env, login?}`, with one type end to end. The registry adds its scope (built-in, user, workspace) and whether it can start here. Sessions keep an immutable copy of their profile (a restart launches it again) and show its id and name.
+- **Built-in profiles** are one per discovered shell, with stable ids (`builtin.<kind>`). They are read-only, and offered even when unavailable, marked with the reason. An unavailable one is never launched or silently replaced by another shell under its id.
+- **Validation.** A profile is configuration, not permission:
+  - its executable must be one of the shells discovery found;
+  - its arguments stay a structured list, never joined into a command line;
+  - names are 1-64 characters; environment names are non-empty, without `=`, CR, LF or NUL.
+
+  Ids are unique across scopes, and built-in profiles cannot be changed or removed. The native side still checks the shell, folder, arguments and environment at launch, and the process model (Job Object or process group, cleanup, generations, workspace ownership) is untouched.
+
+- **Default precedence:**
+  1. the profile asked for (an unavailable one fails, `ShellUnavailable`);
+  2. the workspace default;
+  3. the user default;
+  4. the platform default;
+  5. the first available.
+
+  Unavailable defaults are skipped. With none available, the result is a typed `ShellUnavailable`.
+
+- **Folder precedence:**
+  1. the folder asked for (Explorer's "Open in Integrated Terminal");
+  2. the profile's folder;
+  3. the workspace root (home, with no folder open).
+
+  A relative folder is relative to the workspace root. It must exist (`InvalidCwd`), and a terminal never starts somewhere else instead.
+
+- **Environment:** ordered `NAME=value` overrides on top of the inherited environment. An entry adds a variable or replaces it; removing an inherited variable is not supported. Values are never logged.
+- **Login shells:** `login: true` is translated natively into the shell's own flag (`-l` for bash, zsh, fish and sh, Git Bash included), placed before the profile's arguments. It is refused, as a typed `ProtocolError`, for cmd and PowerShell: Windows has no login-shell concept to translate to.
+- **UI.** The panel's shell menu lists every profile (unavailable ones disabled, with the reason as a tooltip) and opens a small "Terminal profiles" dialog. The dialog lists, opens, makes, edits and deletes user and workspace profiles, and sets the user or workspace default. A terminal's tab says which profile it runs.
+- **Tested on Windows only.** The Unix discovery candidates, `$SHELL` default and `-l` login flag are written and unit-checked by kind, but have not run on Unix; a Unix CI job should run `terminal::tests` there.
+
+**T05 → T05A.** TERMINAL-05A owns shell integration: OSC 7 (the shell reporting its folder) and OSC 133 (command boundaries). T05 knows neither.
+
+### Shell integration (TERMINAL-05A)
+
+The three layers are separate:
+
+- T05 is shell **launch configuration**: which shell starts, and how.
+- T05A is **runtime shell integration**: what the running shell says about itself.
+- T06 is **IDE integration**: what the rest of Yavin does with that.
+
+T05A reads what the shell reports. It acts on none of it.
+
+```text
+PTY reader -> OutputStream::push (T02)
+               └─ OscScanner (terminal_shell.rs): one per generation, sees every byte once, in order
+                    output bytes unchanged ─────────> views (xterm ignores OSC 7/133)
+                    TerminalMessage::Shell ─────────> every subscriber, in order with the output,
+                                                      never replayed
+TerminalService.applyEvent (per workspace)
+   └─ reduceShell (terminalShell.ts) -> session view .shell   (the one interpretation)
+TerminalUi / TerminalPanel: status line reads view.shell        (views never parse OSC)
+```
+
+**Where it is read.** The scanner runs natively in the output pump, once per generation. It never changes, removes or holds back a byte; a sequence split across reads anywhere is found once, at its end. Payloads over 4 KiB are abandoned rather than buffered. Each finding becomes a `shell` message:
+
+- shape: `{sessionId, generation, signal, uri?, local?, exitCode?}`;
+- `signal` is one of `cwd`, `prompt`, `input`, `executing`, `finished` or `invalid`;
+- it goes into the T02 stream right after the bytes that carried it, so it is ordered with the output;
+- it goes to every subscriber, lifecycle-only ones included;
+- it is not kept in the replay ring;
+- it carries no `seq`, and the contract accepts it only while the session is `Running` or `Exiting`.
+
+The TerminalService interprets these messages, and nothing else does. A view's own channel receives them too, but it ignores them.
+
+**Untrusted metadata.** A signal changes only the session's `shell` state. It never:
+
+- runs a command, or opens or writes a file;
+- changes a profile, the workspace or its ownership;
+- calls Git or another application.
+
+Yavin never edits a shell's startup files (`.bashrc`, `.zshrc`, PowerShell profiles, `config.fish`, Git Bash's). A shell reports only if the user has configured it to.
+
+**OSC 7, the shell's folder** (`ESC ] 7 ; file://host/path BEL|ST`).
+
+- The native side checks the URL: it must start `file://`, be at most 2,048 characters, and contain no control characters.
+- The native side decides `local`: the host is empty, `localhost`, or this machine's name.
+- The renderer reads it with `resource.ts` (`parseUri`/`fsPath`); there is no second normalization. `cwdFromOsc7` answers one of:
+  - `local` (a path);
+  - `remote` (another host, which **never** becomes a local path);
+  - `unmapped` (Git Bash's MSYS paths with no drive, such as `/tmp`, or a bare POSIX path from a Windows shell);
+  - nothing, when the URL is unreadable. The previous folder is then kept, and the miss is counted.
+- MSYS drive paths (`/c/x`, `/cygdrive/c/x`) map to `C:/x` for Git Bash. Whether a shell writes MSYS paths comes from its profile: a bash, zsh or sh at a Windows path.
+- Percent-encoding is decoded. A literal space, as Git Bash writes it, is read as is. A stray `%` that is not an escape makes the URL unreadable.
+
+**Folder precedence** (`terminalFolder`):
+
+1. the shell's last local report;
+2. otherwise, where the session was started (`view.cwd`, which is also where a restart starts again).
+
+A remote or unmapped report gives no local folder (`null`): the shell is no longer where it started, and Yavin does not guess.
+
+**OSC 133, command boundaries** (`ESC ] 133 ; A|B|C|D[;status]`). The command state machine is `idle → prompt (A) → input (B) → executing (C) → completed (D)`. It is tolerant:
+
+- a `D` with no command running is ignored (bash's first `PROMPT_COMMAND` sends one);
+- a repeated `C` is the same command;
+- a new `A` or `B` while a command runs ends it with no status;
+- a `C` without `A` or `B` still starts a command;
+- a `D` whose status is not a number finishes the command without one.
+
+Each command record holds an id (counting across generations), `startedAt`, `finishedAt` and `exitCode`. Only the current command and the last finished one are kept; there is no history and no persistence. A command's text is never reconstructed from the screen. Its exit status is separate from the session's: a `Running` session can have a last command that exited 1.
+
+**Integration states** (`view.shell.integration`):
+
+| State         | Meaning                                                                                                                                      |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `available`   | The profile's shell can report (bash, zsh, fish, pwsh, Windows PowerShell), and has not yet this generation.                                 |
+| `active`      | A valid signal has arrived this generation.                                                                                                  |
+| `unsupported` | A shell with no integration (cmd, sh, an unknown or default shell). It is still a full terminal. If one reports anyway, it becomes `active`. |
+| `error`       | Only unreadable sequences so far. A valid signal makes it `active`.                                                                          |
+| `disabled`    | Reserved for a setting (TERMINAL-07). Every signal is ignored.                                                                               |
+
+A terminal works the same in every state; integration only adds information.
+
+**Generations, restarts, views.**
+
+- Signals are validated like every lifecycle message: this workspace's session, the current generation, and a contract-valid message. A stale generation, another workspace's session or a malformed signal changes nothing.
+- A restart (`launch`) starts the shell state again (folder, command, integration), keeping only the command-id counter.
+- A detached view leaves the state with the service. A view attaching later reads the current state; old signals are never replayed to it.
+
+**UI.** The status line shows the focused terminal's own state:
+
+- `Running · Running a command`;
+- `Running · Last command exited with N`;
+- `Running · Shell integration: unreadable sequences`;
+- the shell's reported folder (a local path, `host (remote)`, or a note that it has no Windows path).
+
+Nothing is shown for a shell that has not reported.
+
+**Tests.**
+
+- `terminal_shell.rs`: OSC 7 and 133 parsing, splits at every offset, malformed and oversized input.
+- `terminal_stream_tests.rs`: ordering with the output, and no replay.
+- `terminal_tests.rs`: a real Git Bash configured through environment variables only (`PROMPT_COMMAND`, `PS0`, `PS1`, with `--norc --noprofile`). It reports its folder and the boundaries of a failing command. A shell without integration sends nothing.
+- `terminalShell.test.ts`: OSC 7 mapping, the state machine, integration states, and the service's generations, restarts, detach and reattach.
+- `terminal.spec.ts`: the status line, per terminal, reset on restart.
+
+**T05A → T06.** T06 is IDE integration: using the folder and the command boundaries (Explorer's "reveal the terminal's folder", task and Run integration, command decorations, links). T05A only provides them, and it persists nothing: no command history, and no integration setting (that is TERMINAL-07).
 
 ### The contract (TERMINAL-00)
 
@@ -968,11 +1210,11 @@ No other step exists. In particular there is no going back, no `Running → Exit
 - `unsubscribe` is idempotent and leaves the session and its other subscribers alone.
 - Replay of earlier output is not in the contract yet; TERMINAL-03 adds where a subscription starts from.
 
-**Profiles.** `TerminalProfile {id, name, executable, args, cwd, env}`.
+**Profiles.** `TerminalProfile {id, name, executable, args, cwd, env, login?}` (`login` since TERMINAL-05; see "Shells and profiles").
 
 - These are only what the launch already carries.
 - `env` is ordered pairs.
-- A login shell is requested through `args`.
+- A login shell is requested with `login`, which the native side translates into the shell's flag.
 - The validation rules are the launch's own: no line breaks or NUL, and environment names without `=`.
 
 **Errors.** A `TerminalError` is `{code: TerminalErrorCause, message}`.
@@ -1000,19 +1242,20 @@ PTY ─> reader ─push─> pending (bounded) ─pump─> sealed entries (shared
 - **Each subscriber is isolated.** It has its own channel (a Tauri `Channel`, created by the renderer and passed with `terminal_open`/`terminal_subscribe`), its own cursor into the shared entries, and its own in-flight window. Entries are kept only until every subscriber has been sent them.
 - **Acknowledgements** come from the renderer once xterm has parsed a chunk (`term.write(bytes, callback)`). They are cumulative: a duplicate or an older one changes nothing, a late one after the stream ended is harmless, one for another generation is `StaleGeneration`, one beyond what was sent is `ProtocolError`. A transport has no backpressure of its own (`Channel::send` queues on the webview), so acknowledgements are the only signal of a consumer keeping up.
 - **Generations** each have their own stream: a restart's new stream starts at `seq` 0, and an old stream's buffered output only ever goes to the old stream's subscribers.
-- **No replay.** A subscriber sees the stream from when it subscribed, and output with no subscriber at all is not kept. This is flow-control buffering only; replay is TERMINAL-03.
+- **Replay (TERMINAL-03)** is kept apart from this flow-control buffering: a bounded ring of recent output (see "Workspace Terminal Service" above). A subscriber attaching with replay is sent the ring, then continues live from exactly where it stops. A _lifecycle_ subscriber -- the TerminalService -- is sent no output and never holds the reader back.
 
 **Limits** (`terminal_stream::LIMITS`):
 
-| Limit                        | Value             | Why                                                                                                                                                                       |
-| ---------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Largest chunk (and batch)    | 64 KiB            | Matches the largest input request; xterm parses it well within a frame, and its message (~88 KiB base64) still crosses the transport in one piece.                        |
-| Reads per batch              | 32                | Many tiny writes (a progress bar) become one message.                                                                                                                     |
-| Batch latency                | 5 ms              | Typing echoes with no visible delay; a burst becomes a few messages. Windows timer resolution can stretch it to ~16 ms.                                                   |
-| Ingress high / low           | 1 MiB / 256 KiB   | The output one terminal may hold for its subscribers; the reader resumes with room for a burst.                                                                           |
-| Subscriber window high / low | 512 KiB / 128 KiB | Output in one subscriber's transport and parser at once.                                                                                                                  |
-| Laggard timeout              | 5 s               | How long a subscriber behind another may keep the reader paused.                                                                                                          |
-| Unresponsive timeout         | 30 s              | How long a subscriber with a full window may go without any acknowledgement. Long, so a slow or hidden view that is still acknowledging is never mistaken for a dead one. |
+| Limit                        | Value             | Why                                                                                                                                                                                                                               |
+| ---------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Largest chunk (and batch)    | 64 KiB            | Matches the largest input request; xterm parses it well within a frame, and its message (~88 KiB base64) still crosses the transport in one piece.                                                                                |
+| Reads per batch              | 32                | Many tiny writes (a progress bar) become one message.                                                                                                                                                                             |
+| Batch latency                | 5 ms              | Typing echoes with no visible delay; a burst becomes a few messages. Windows timer resolution can stretch it to ~16 ms.                                                                                                           |
+| Ingress high / low           | 1 MiB / 256 KiB   | The output one terminal may hold for its subscribers; the reader resumes with room for a burst.                                                                                                                                   |
+| Subscriber window high / low | 512 KiB / 128 KiB | Output in one subscriber's transport and parser at once.                                                                                                                                                                          |
+| Laggard timeout              | 5 s               | How long a subscriber behind another may keep the reader paused.                                                                                                                                                                  |
+| Unresponsive timeout         | 30 s              | How long a subscriber with a full window may go without any acknowledgement. Long, so a slow or hidden view that is still acknowledging is never mistaken for a dead one.                                                         |
+| Replay                       | 256 KiB           | Recent output kept per generation for a view that attaches later (TERMINAL-03): enough to redraw a screen and its recent scrollback, never a history. At most one subscriber window, so a replay never waits on acknowledgements. |
 
 The PTY read itself is 8 KiB.
 
@@ -1045,11 +1288,14 @@ The PTY read itself is 8 KiB.
 
 ### Module plan
 
-| Module      | Scope                                                                           |
-| ----------- | ------------------------------------------------------------------------------- |
-| TERMINAL-01 | Done: the native runtime on this contract (see "Native session runtime" above). |
-| TERMINAL-02 | Done: the output pipeline (see "Output pipeline (TERMINAL-02)" above).          |
-| TERMINAL-03 | The workspace-scoped TerminalService, with views as subscribers.                |
+| Module       | Scope                                                                                |
+| ------------ | ------------------------------------------------------------------------------------ |
+| TERMINAL-01  | Done: the native runtime on this contract (see "Native session runtime" above).      |
+| TERMINAL-02  | Done: the output pipeline (see "Output pipeline (TERMINAL-02)" above).               |
+| TERMINAL-03  | Done: the Workspace Terminal Service (see above).                                    |
+| TERMINAL-04  | Done: the renderer as a view of the service (see "Renderer (TERMINAL-04)").          |
+| TERMINAL-05  | Done: shells and profiles (see "Shells and profiles (TERMINAL-05)").                 |
+| TERMINAL-05A | Done: shell integration, OSC 7 and OSC 133 (see "Shell integration (TERMINAL-05A)"). |
 
 Later modules are listed in the Terminal roadmap.
 

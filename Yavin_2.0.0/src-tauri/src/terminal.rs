@@ -22,14 +22,15 @@
 //! The map of sessions is locked only to look one up, add one or remove one; every session
 //! has its own locks, so one terminal never waits on another.
 
-use crate::terminal_stream::{End, OutputStream, Sink, StreamStats, LIMITS};
+use crate::terminal_stream::{Delivery, End, OutputStream, Sink, StreamStats, LIMITS};
 use crate::{with_workspace, Workspace};
 use ide_terminal_protocol::{
     require_current, Generation, LiveState, SubscriptionId, TerminalAckRequest,
     TerminalCloseRequest, TerminalDimensions, TerminalError, TerminalErrorCause, TerminalId,
-    TerminalKillRequest, TerminalOpenRequest, TerminalResizeRequest, TerminalSession,
-    TerminalSessionMetadata, TerminalSessionRuntime, TerminalState, TerminalStateChanged,
-    TerminalSubscribeRequest, TerminalUnsubscribeRequest, TerminalWriteRequest,
+    TerminalKillRequest, TerminalOpenRequest, TerminalProfile, TerminalResizeRequest,
+    TerminalSession, TerminalSessionMetadata, TerminalSessionRuntime, TerminalState,
+    TerminalStateChanged, TerminalSubscribeRequest, TerminalUnsubscribeRequest,
+    TerminalWriteRequest,
 };
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
@@ -158,7 +159,6 @@ impl ProcessTree {
 struct Session {
     id: TerminalId,
     generation: Generation,
-    workspace_id: String,
     metadata: TerminalSessionMetadata,
     started_at: u64,
     pid: Option<u32>,
@@ -173,6 +173,9 @@ struct Session {
     dimensions: Mutex<TerminalDimensions>,
     /// This generation's output and lifecycle, in order, to its subscribers.
     stream: Arc<OutputStream>,
+    /// It was closed or killed: once it has ended, its replay is released rather than kept for a
+    /// view to attach to.
+    closing: std::sync::atomic::AtomicBool,
 }
 
 impl Session {
@@ -259,6 +262,9 @@ struct Registry {
     /// The newest generation each id has had, kept after its session ends, so an open naming an
     /// older one -- a late request from before a restart -- is refused rather than run.
     newest: HashMap<TerminalId, Generation>,
+    /// The stream of a session that ended by itself, kept (with its bounded replay) until the
+    /// session is closed, so a view can attach to it and show how it ended.
+    ended: HashMap<TerminalId, Arc<OutputStream>>,
 }
 
 /// Every terminal session of the application.
@@ -289,7 +295,10 @@ impl Terminals {
         let session = self.find(id).ok_or_else(gone)?;
         require_current(generation, session.generation)?;
         if session.state() != TerminalState::Running {
-            return Err(gone());
+            return Err(TerminalError::new(
+                TerminalErrorCause::SessionEnded,
+                "That terminal has ended.",
+            ));
         }
         Ok(session)
     }
@@ -318,7 +327,8 @@ impl Terminals {
             })
     }
 
-    /// Removes `session` if it is still the one registered under its id.
+    /// Removes `session` if it is still the one registered under its id. Unless it was closed,
+    /// its stream is kept for views to attach to until the session is closed.
     fn forget(&self, session: &Arc<Session>) {
         let mut registry = self.registry();
         if registry
@@ -327,7 +337,32 @@ impl Terminals {
             .is_some_and(|current| Arc::ptr_eq(current, session))
         {
             registry.sessions.remove(&session.id);
+            if session.closing.load(std::sync::atomic::Ordering::SeqCst) {
+                session.stream.release();
+            } else {
+                registry
+                    .ended
+                    .insert(session.id.clone(), session.stream.clone());
+            }
+        } else {
+            session.stream.release();
         }
+    }
+
+    /// Releases the kept stream of an ended session, if it is of `generation`.
+    fn release_ended(&self, id: &TerminalId, generation: Generation) -> bool {
+        let mut registry = self.registry();
+        if registry
+            .ended
+            .get(id)
+            .is_some_and(|stream| stream.generation() == generation)
+        {
+            if let Some(stream) = registry.ended.remove(id) {
+                stream.release();
+            }
+            return true;
+        }
+        false
     }
 }
 
@@ -366,8 +401,9 @@ fn pty_error(cause: TerminalErrorCause, doing: &str, error: &anyhow::Error) -> T
 }
 
 /// Opens a generation of a session: checks everything, starts the shell in its process tree,
-/// and starts the session's threads, with `subscriber` -- the opener -- already receiving its
-/// output. Answers the session, already `Running`.
+/// and starts the session's threads. `subscriber` -- the opener, the workspace's
+/// TerminalService -- is sent the generation's lifecycle; views attach with `subscribe`.
+/// Answers the session, already `Running`.
 pub fn open(
     terminals: &Terminals,
     request: TerminalOpenRequest,
@@ -391,10 +427,12 @@ pub fn open(
     if let Some(profile) = &request.profile {
         profile.validate()?;
     }
-    let executable = resolve_shell(
+    let shell = resolve_shell(
         request.profile.as_ref().map(|p| p.executable.as_str()),
         &launch.shells,
     )?;
+    let args = launch_args(&shell, request.profile.as_ref())?;
+    let executable = shell.path.clone();
     let cwd = resolve_cwd(
         request
             .cwd
@@ -415,6 +453,9 @@ pub fn open(
         registry
             .newest
             .insert(request.session_id.clone(), request.generation);
+        if let Some(stream) = registry.ended.remove(&request.session_id) {
+            stream.release();
+        }
         registry.sessions.remove(&request.session_id)
     };
     // A restart: the previous generation ends, all of it.
@@ -439,10 +480,8 @@ pub fn open(
     // The shell is started as itself. Arguments come only from a profile, never from an
     // interpolated command line, so there is no string to inject into.
     let mut command = CommandBuilder::new(&executable);
-    if let Some(profile) = &request.profile {
-        for argument in &profile.args {
-            command.arg(argument);
-        }
+    for argument in &args {
+        command.arg(argument);
     }
     command.cwd(&cwd);
     command.env("TERM", "xterm-256color");
@@ -493,12 +532,11 @@ pub fn open(
         request.session_id.clone(),
         request.generation,
         LIMITS.clone(),
-        subscriber,
+        (subscriber.0, subscriber.1, Delivery::Lifecycle),
     );
     let session = Arc::new(Session {
         id: request.session_id.clone(),
         generation: request.generation,
-        workspace_id: request.workspace_id.clone(),
         metadata: TerminalSessionMetadata {
             session_id: request.session_id.clone(),
             workspace_id: request.workspace_id.clone(),
@@ -514,6 +552,7 @@ pub fn open(
         state: Mutex::new(TerminalState::Spawning),
         dimensions: Mutex::new(request.dimensions),
         stream: stream.clone(),
+        closing: std::sync::atomic::AtomicBool::new(false),
     });
 
     {
@@ -677,17 +716,24 @@ pub fn resize(terminals: &Terminals, request: TerminalResizeRequest) -> Result<(
     Ok(())
 }
 
-/// Ends a generation gently. Closing one that has ended, or a stale one, does nothing.
+/// Ends a generation gently, and lets go of it once it has ended. Closing a session that has
+/// already ended releases what was kept of it; a stale generation is left alone.
 pub fn close(terminals: &Terminals, request: TerminalCloseRequest) {
     if let Some(session) = terminals
         .find(&request.session_id)
         .filter(|s| s.generation == request.generation)
     {
+        session
+            .closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         session.end(false);
+    } else {
+        terminals.release_ended(&request.session_id, request.generation);
     }
 }
 
-/// Ends a generation and everything it started, now. A stale generation is left alone.
+/// Ends a generation and everything it started, now, and lets go of it once it has ended. A
+/// stale generation is left alone.
 pub fn kill(terminals: &Terminals, request: TerminalKillRequest) -> Result<(), TerminalError> {
     if let Some(session) = terminals
         .find(&request.session_id)
@@ -699,29 +745,46 @@ pub fn kill(terminals: &Terminals, request: TerminalKillRequest) -> Result<(), T
                 "Cannot end that terminal's processes.",
             ));
         }
+        session
+            .closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         session.end(true);
+    } else {
+        terminals.release_ended(&request.session_id, request.generation);
     }
     Ok(())
 }
 
-/// Adds a subscriber to the current generation of a session: it is sent that generation's
-/// output from now on (no replay -- TERMINAL-03), in its own stream with its own window.
+/// Attaches a view to a session's generation, running or ended: it is first sent the bounded
+/// replay (its `Running`, recent output, and its end if it has ended), then live output, in its
+/// own stream with its own window.
 pub fn subscribe(
     terminals: &Terminals,
     request: TerminalSubscribeRequest,
     sink: Arc<dyn Sink>,
 ) -> Result<(), TerminalError> {
-    let session = terminals.find(&request.session_id).ok_or_else(|| {
+    let stream = {
+        let registry = terminals.registry();
+        registry
+            .sessions
+            .get(&request.session_id)
+            .map(|session| session.stream.clone())
+            .or_else(|| registry.ended.get(&request.session_id).cloned())
+    }
+    .ok_or_else(|| {
         TerminalError::new(
             TerminalErrorCause::InvalidSession,
             "That terminal is no longer running.",
         )
     })?;
-    require_current(request.generation, session.stream.generation())?;
-    session
-        .stream
-        .subscribe(request.subscription_id.clone(), sink)?;
-    terminals.record(request.subscription_id, session.stream.clone());
+    require_current(request.generation, stream.generation())?;
+    stream.subscribe(
+        request.subscription_id.clone(),
+        sink,
+        Delivery::Output,
+        true,
+    )?;
+    terminals.record(request.subscription_id, stream);
     Ok(())
 }
 
@@ -746,39 +809,91 @@ pub fn stats(terminals: &Terminals, id: &TerminalId) -> Option<StreamStats> {
     terminals.find(id).map(|session| session.stream.stats())
 }
 
-/// Ends every session now: the page reloaded, the workspace was disposed, or Yavin is exiting.
+/// Ends every session now and keeps nothing: the page reloaded, or Yavin is exiting.
 pub fn close_all(terminals: &Terminals) {
-    let sessions: Vec<_> = terminals.registry().sessions.values().cloned().collect();
+    let (sessions, ended): (Vec<_>, Vec<_>) = {
+        let mut registry = terminals.registry();
+        (
+            registry.sessions.values().cloned().collect(),
+            registry.ended.drain().map(|(_, stream)| stream).collect(),
+        )
+    };
     for session in sessions {
+        session
+            .closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         session.end(true);
     }
-}
-
-/// Ends the sessions of every workspace but `current`: entering a workspace leaves nothing of
-/// the previous one's shells running, whatever the renderer manages to do.
-pub fn end_other_workspaces(terminals: &Terminals, current: Option<&str>) {
-    let current = current.unwrap_or(EMPTY_WORKSPACE);
-    let sessions: Vec<_> = terminals
-        .registry()
-        .sessions
-        .values()
-        .filter(|s| s.workspace_id != current)
-        .cloned()
-        .collect();
-    for session in sessions {
-        session.end(true);
+    for stream in ended {
+        stream.release();
     }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Shells and folders
 
-/// A shell the user can actually start, as offered in the New Terminal menu.
+/// What kind of shell a program is: what decides its login flag, nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellKind {
+    Cmd,
+    PowerShell,
+    Pwsh,
+    Bash,
+    Zsh,
+    Fish,
+    Sh,
+    Other,
+}
+
+impl ShellKind {
+    /// The kind of `path`, by its file name.
+    pub fn of(path: &str) -> ShellKind {
+        let name = std::path::Path::new(path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        match name.as_str() {
+            "cmd" => ShellKind::Cmd,
+            "powershell" => ShellKind::PowerShell,
+            "pwsh" => ShellKind::Pwsh,
+            "bash" => ShellKind::Bash,
+            "zsh" => ShellKind::Zsh,
+            "fish" => ShellKind::Fish,
+            "sh" | "dash" | "ksh" => ShellKind::Sh,
+            _ => ShellKind::Other,
+        }
+    }
+
+    /// The flag that starts this shell as a login shell, if it has such a mode. cmd and
+    /// PowerShell do not: Windows has no login-shell concept to translate to.
+    pub fn login_flag(self) -> Option<&'static str> {
+        match self {
+            ShellKind::Bash | ShellKind::Zsh | ShellKind::Fish | ShellKind::Sh => Some("-l"),
+            _ => None,
+        }
+    }
+}
+
+/// One shell discovery knows of (TERMINAL-05): found or not, and why not. Discovery answers
+/// "what shells are there"; how one is launched is a profile's business.
 #[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Shell {
+    /// A display name to suggest; profiles carry their own.
     pub name: String,
     pub path: String,
+    pub kind: ShellKind,
+    /// "windows" or "unix".
+    pub platform: &'static str,
+    pub available: bool,
+    /// Why it is not available, fit to show.
+    pub reason: Option<String>,
+    /// The platform's default among the available shells (exactly one, when any is available).
+    pub is_default: bool,
 }
+
+const PLATFORM: &str = if cfg!(windows) { "windows" } else { "unix" };
 
 /// Whether two paths name the same program, ignoring separator style and case.
 /// Windows is case-insensitive and the panel may echo a path back in either form.
@@ -796,95 +911,185 @@ fn find_on_path(program: &str) -> Option<PathBuf> {
     })
 }
 
-fn push_shell(shells: &mut Vec<Shell>, name: &str, path: Option<PathBuf>) {
-    let Some(path) = path.filter(|path| path.is_file()) else {
-        return;
+/// A candidate shell: the first of `places` that exists, or, if none does, unavailable with the
+/// reason. `places` are where this one shell may be; none is ever another shell.
+fn candidate(shells: &mut Vec<Shell>, name: &str, places: Vec<Option<PathBuf>>, missing: &str) {
+    let known: Vec<PathBuf> = places.into_iter().flatten().collect();
+    let found = known.iter().find(|path| path.is_file());
+    let (path, available, reason) = match found {
+        Some(path) => (path.to_string_lossy().into_owned(), true, None),
+        None => (
+            known
+                .first()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            false,
+            Some(missing.to_string()),
+        ),
     };
-    let path = path.to_string_lossy().into_owned();
-    // The same shell can be reached by several names; offer it once.
-    if shells.iter().any(|shell| same_path(&shell.path, &path)) {
+    // The same shell can be reached by several names; it is offered once.
+    if available
+        && shells
+            .iter()
+            .any(|shell| shell.available && same_path(&shell.path, &path))
+    {
         return;
     }
     shells.push(Shell {
         name: name.to_string(),
+        kind: ShellKind::of(&path),
         path,
+        platform: PLATFORM,
+        available,
+        reason,
+        is_default: false,
     });
 }
 
-/// The shells present on this machine, best first. The list is also the program allowlist:
-/// a terminal can only be started with a program that appears here. (What the shell is then
-/// told to do -- by a profile's arguments or by typing -- is the user's own authority.)
-pub fn available_shells() -> Vec<Shell> {
+/// Every shell discovery looks for on this platform, found or not, best first. The platform
+/// default is the first one found ($SHELL on Unix; the Command Prompt on Windows, as it always
+/// has been -- a profile can make any other shell the default).
+pub fn discover_shells() -> Vec<Shell> {
     let mut shells = Vec::new();
     if cfg!(windows) {
-        let system = env::var_os("SystemRoot").map(PathBuf::from);
-        push_shell(
+        let var = |name: &str| env::var_os(name).map(PathBuf::from);
+        let system = var("SystemRoot");
+        candidate(
             &mut shells,
             "Command Prompt",
-            env::var_os("COMSPEC").map(PathBuf::from).or_else(|| {
+            vec![
+                var("COMSPEC"),
                 system
                     .as_ref()
-                    .map(|root| root.join("System32").join("cmd.exe"))
-            }),
+                    .map(|root| root.join("System32").join("cmd.exe")),
+            ],
+            "cmd.exe was not found.",
         );
-        push_shell(&mut shells, "PowerShell", find_on_path("pwsh.exe"));
-        push_shell(
+        candidate(
+            &mut shells,
+            "PowerShell",
+            vec![
+                find_on_path("pwsh.exe"),
+                var("ProgramFiles").map(|root| root.join("PowerShell").join("7").join("pwsh.exe")),
+            ],
+            "PowerShell 7 (pwsh.exe) is not installed.",
+        );
+        candidate(
             &mut shells,
             "Windows PowerShell",
-            system.as_ref().map(|root| {
+            vec![system.as_ref().map(|root| {
                 root.join("System32")
                     .join("WindowsPowerShell")
                     .join("v1.0")
                     .join("powershell.exe")
-            }),
+            })],
+            "Windows PowerShell was not found.",
         );
-        for program_files in ["ProgramFiles", "ProgramFiles(x86)"] {
-            push_shell(
+        let git_bash =
+            |root: Option<PathBuf>| root.map(|root| root.join("Git").join("bin").join("bash.exe"));
+        candidate(
+            &mut shells,
+            "Git Bash",
+            vec![
+                git_bash(var("ProgramFiles")),
+                git_bash(var("ProgramFiles(x86)")),
+                // A per-user Git for Windows install.
+                git_bash(var("LOCALAPPDATA").map(|root| root.join("Programs"))),
+            ],
+            "Git Bash (Git for Windows) is not installed.",
+        );
+    } else {
+        if let Some(shell) = env::var_os("SHELL").map(PathBuf::from) {
+            let name = shell
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Default shell".into());
+            candidate(
                 &mut shells,
-                "Git Bash",
-                env::var_os(program_files)
-                    .map(|root| PathBuf::from(root).join("Git").join("bin").join("bash.exe")),
+                &name,
+                vec![Some(shell)],
+                "$SHELL names a program that is not there.",
             );
         }
-    } else {
-        push_shell(
-            &mut shells,
-            "Default shell",
-            env::var_os("SHELL").map(PathBuf::from),
-        );
         for (name, path) in [
             ("zsh", "/bin/zsh"),
             ("bash", "/bin/bash"),
+            ("fish", "/usr/bin/fish"),
             ("sh", "/bin/sh"),
         ] {
-            push_shell(&mut shells, name, Some(PathBuf::from(path)));
+            candidate(
+                &mut shells,
+                name,
+                vec![Some(PathBuf::from(path))],
+                &format!("{path} was not found."),
+            );
         }
+    }
+    if let Some(first) = shells.iter_mut().find(|shell| shell.available) {
+        first.is_default = true;
     }
     shells
 }
 
-/// Accepts only a shell this machine actually offers. Without a request, the first detected
-/// shell is used.
-pub fn resolve_shell(requested: Option<&str>, offered: &[Shell]) -> Result<String, TerminalError> {
-    let Some(first) = offered.first() else {
+/// The shells that can be started: the program allowlist. A terminal can only be started with
+/// a program that appears here. (What the shell is then told to do -- by a profile's arguments
+/// or by typing -- is the user's own authority.)
+pub fn available_shells() -> Vec<Shell> {
+    discover_shells()
+        .into_iter()
+        .filter(|shell| shell.available)
+        .collect()
+}
+
+/// Accepts only a shell this machine actually offers. Without a request, the platform default.
+pub fn resolve_shell(requested: Option<&str>, offered: &[Shell]) -> Result<Shell, TerminalError> {
+    let Some(default) = offered
+        .iter()
+        .find(|shell| shell.is_default)
+        .or_else(|| offered.first())
+    else {
         return Err(TerminalError::new(
             TerminalErrorCause::ShellUnavailable,
             "No shell could be found on this system.",
         ));
     };
     let Some(requested) = requested.filter(|name| !name.is_empty()) else {
-        return Ok(first.path.clone());
+        return Ok(default.clone());
     };
     offered
         .iter()
         .find(|shell| same_path(&shell.path, requested))
-        .map(|shell| shell.path.clone())
+        .cloned()
         .ok_or_else(|| {
             TerminalError::new(
                 TerminalErrorCause::ShellUnavailable,
                 "That shell is not available on this system.",
             )
         })
+}
+
+/// A profile's arguments, as the shell is started with them: the login flag first, when asked
+/// for and the shell has one, then the profile's own, each its own argument -- never joined into
+/// a command line.
+pub fn launch_args(
+    shell: &Shell,
+    profile: Option<&TerminalProfile>,
+) -> Result<Vec<String>, TerminalError> {
+    let Some(profile) = profile else {
+        return Ok(Vec::new());
+    };
+    let mut args = Vec::new();
+    if profile.login {
+        let Some(flag) = shell.kind.login_flag() else {
+            return Err(TerminalError::protocol(format!(
+                "{} has no login mode.",
+                shell.name
+            )));
+        };
+        args.push(flag.to_string());
+    }
+    args.extend(profile.args.iter().cloned());
+    Ok(args)
 }
 
 /// Where a terminal should start when no workspace folder is open: the user's home
@@ -915,7 +1120,13 @@ fn resolve_cwd(requested: Option<&str>, fallback: PathBuf) -> Result<PathBuf, Te
             "A terminal's folder cannot contain a line break or NUL.".into(),
         ));
     }
-    let path = PathBuf::from(requested);
+    // A relative folder is relative to the workspace root (or home, with no folder open), never
+    // to wherever Yavin itself was started.
+    let path = if std::path::Path::new(requested).is_relative() {
+        fallback.join(requested)
+    } else {
+        PathBuf::from(requested)
+    };
     if !path.is_dir() {
         return Err(invalid(format!(
             "{requested} is not a folder this terminal can start in."
@@ -1015,9 +1226,10 @@ fn launch_for(workspace: &Workspace) -> Launch {
     }
 }
 
+/// Every shell discovery looks for, found or not (TERMINAL-05).
 #[tauri::command(async)]
 pub fn terminal_shells() -> Vec<Shell> {
-    available_shells()
+    discover_shells()
 }
 
 /// Opens a session; `events` is the opener's channel, and receives every message of this

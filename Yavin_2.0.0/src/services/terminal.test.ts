@@ -7,9 +7,7 @@ import {
   terminalKeyAction,
   openRequestFor,
   usableSize,
-  streamReceiver,
   createSubscriptionId,
-  type TerminalStreamHandlers,
 } from "./terminal.ts";
 import { isSubscriptionId, validateProfile } from "./terminalProtocol.ts";
 import type { Generation, WorkspaceId } from "./terminalProtocol.ts";
@@ -153,145 +151,44 @@ test("the navigation keys do not collide with the existing copy and zoom binding
 const size = { cols: 80, rows: 24 };
 const workspace = "file://c:/work" as WorkspaceId;
 
-test("a plain session is a profile of its shell alone, in the workspace that opens it", () => {
-  const request = openRequestFor(
-    { id: "t1", name: "Shell", shell: "/bin/bash" },
-    size,
-    3 as Generation,
-    workspace,
-  );
+const bash = {
+  id: "user-1",
+  name: "Bash (login)",
+  executable: "/bin/bash",
+  args: ["-i"],
+  cwd: "tools",
+  env: [
+    ["BASE", "/opt"],
+    ["TOOLS", "$BASE/tools"],
+  ] as [string, string][],
+  login: true,
+};
+
+test("a launch carries its profile whole, in the workspace that opens it", () => {
+  const request = openRequestFor("t1", bash, null, size, 3 as Generation, workspace);
   assert.deepEqual(request, {
     sessionId: "t1",
     workspaceId: workspace,
     generation: 3,
-    profile: {
-      id: "/bin/bash",
-      name: "Shell",
-      executable: "/bin/bash",
-      args: [],
-      cwd: null,
-      env: [],
-    },
+    profile: bash,
     cwd: null,
     dimensions: size,
   });
+  // A copy: the request never shares the profile's arrays.
+  assert.notEqual(request.profile!.args, bash.args);
   assert.equal(validateProfile(request.profile!), null);
 });
 
-test("a profile's arguments, environment and folder all reach the open request", () => {
-  const request = openRequestFor(
-    {
-      id: "t2",
-      name: "PowerShell",
-      shell: "pwsh.exe",
-      args: ["-NoLogo"],
-      env: { YAVIN: "1", TERM_PROGRAM: "Yavin" },
-      cwd: "C:/work/sub",
-    },
-    { cols: 100, rows: 30 },
-    1 as Generation,
-    workspace,
+test("a folder asked for overrides the profile's; an empty one means none", () => {
+  assert.equal(
+    openRequestFor("t2", bash, "C:/work/sub", size, 1 as Generation, workspace).cwd,
+    "C:/work/sub",
   );
-  assert.deepEqual(request.profile, {
-    id: "pwsh.exe",
-    name: "PowerShell",
-    executable: "pwsh.exe",
-    args: ["-NoLogo"],
-    // Pairs, not an object: the native side keeps the author's ordering, which matters when
-    // one variable is written in terms of another.
-    env: [
-      ["YAVIN", "1"],
-      ["TERM_PROGRAM", "Yavin"],
-    ],
-    cwd: null,
-  });
-  assert.equal(request.cwd, "C:/work/sub");
-  assert.deepEqual(request.dimensions, { cols: 100, rows: 30 });
+  assert.equal(openRequestFor("t2", bash, "", size, 1 as Generation, workspace).cwd, null);
 });
 
-test("with no shell picked the native default shell starts, and an empty folder means the root", () => {
-  const request = openRequestFor(
-    { id: "t3", name: "Terminal", shell: "", cwd: "" },
-    size,
-    1 as Generation,
-    workspace,
-  );
-  assert.equal(request.profile, null);
-  assert.equal(request.cwd, null);
-});
-
-const message = (kind: string, fields: Record<string, unknown>) => ({
-  kind,
-  sessionId: "t1",
-  generation: 1,
-  ...fields,
-});
-const output = (text: string, seq = 0, extra: Record<string, unknown> = {}) =>
-  message("output", { seq, bytes: Buffer.from(text, "utf8").toString("base64"), ...extra });
-const text = (bytes: Uint8Array) => Buffer.from(bytes).toString("utf8");
-
-/** A receiver for launch 1 of `t1`, recording what reaches each handler and every ack. */
-function receiver(handlers: Partial<TerminalStreamHandlers> = {}) {
-  const seen: string[] = [];
-  const acks: number[] = [];
-  const pendingAccepts: (() => void)[] = [];
-  const receive = streamReceiver({ sessionId: "t1", generation: 1 }, (seq) => acks.push(seq), {
-    output: (chunk, accepted) => {
-      seen.push(`output ${chunk.seq} ${text(chunk.bytes)}`);
-      pendingAccepts.push(accepted);
-    },
-    exit: (exit) => seen.push(`exit ${exit.exitCode}`),
-    error: (event) => seen.push(`error ${event.error.code}`),
-    detached: (event) => seen.push(`detached ${event.error.code}`),
-    ...handlers,
-  });
-  return { receive, seen, acks, pendingAccepts };
-}
-
-test("a launch's channel delivers its own messages and drops everything else", () => {
-  const { receive, seen } = receiver();
-  receive(output("other session", 0, { sessionId: "t2" }));
-  receive(output("other launch", 0, { generation: 2 }));
-  // The old text event, and a chunk whose bytes are not base64: neither is the protocol.
-  receive({ id: "t1", data: "old shape" });
-  receive({ ...output(""), bytes: "not base64!" });
-  receive(output("mine"));
-  receive(message("exit", { exitCode: 0, lastSeq: 0 }));
-  assert.deepEqual(seen, ["output 0 mine", "exit 0"]);
-});
-
-test("each chunk is acknowledged once, when the terminal says it has consumed it", () => {
-  const { receive, acks, pendingAccepts } = receiver();
-  receive(output("a", 0));
-  receive(output("b", 1));
-  // Nothing is acknowledged before the terminal has parsed it.
-  assert.deepEqual(acks, []);
-  pendingAccepts[1]();
-  pendingAccepts[0]();
-  pendingAccepts[0](); // a second call for the same chunk changes nothing
-  assert.deepEqual(acks, [1, 0]);
-});
-
-test("errors and detachment reach the view, and a throwing handler stops nothing", () => {
-  const { receive, seen } = receiver({
-    exit: () => {
-      throw new Error("handler blew up");
-    },
-  });
-  assert.doesNotThrow(() => receive(message("exit", { exitCode: 1, lastSeq: null })));
-  receive(
-    message("error", {
-      error: { code: "ProcessFailed", message: "Lost track of the shell." },
-      lastSeq: null,
-    }),
-  );
-  receive(
-    message("detached", {
-      error: { code: "OutputOverflow", message: "Fell behind." },
-      lastSeq: 3,
-    }),
-  );
-  assert.deepEqual(seen, ["error ProcessFailed", "detached OutputOverflow"]);
+test("with no profile the native default shell starts", () => {
+  assert.equal(openRequestFor("t3", null, null, size, 1 as Generation, workspace).profile, null);
 });
 
 test("every launch gets its own subscription id", () => {

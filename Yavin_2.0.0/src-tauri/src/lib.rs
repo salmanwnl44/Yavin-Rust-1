@@ -23,6 +23,7 @@ mod paths;
 mod ports;
 mod session;
 mod terminal;
+mod terminal_shell;
 mod terminal_stream;
 mod trust;
 mod workbench;
@@ -501,8 +502,8 @@ fn enter_workspace(
         .ok()
         .map(|spec| spec.workspace_id);
     app.state::<LocalGit>().revoke_except(now.as_deref());
-    // So are its terminals: no shell of the workspace left keeps running in its folder.
-    terminal::end_other_workspaces(&app.state::<Terminals>(), now.as_deref());
+    // Its terminals are not: switching workspace detaches their views and the workspace's
+    // TerminalService keeps them (TERMINAL-03); the page and the application end them.
     watch_workspace(app, watch, &watched);
     Ok(root)
 }

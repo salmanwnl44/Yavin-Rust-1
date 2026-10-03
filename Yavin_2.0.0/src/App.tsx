@@ -38,7 +38,6 @@ import { SourceControlPanel } from "./components/layout/SourceControlPanel";
 import { DiffEditor } from "./components/layout/DiffEditor";
 import type { DiffDocument } from "./components/layout/DiffEditor";
 import type { SearchHit } from "./services/search";
-import { requestTerminal, onTerminalRequestObserved } from "./services/terminal";
 import type { PanelViewId } from "./services/panel/views";
 import { folderKey } from "./services/paths";
 import {
@@ -331,17 +330,6 @@ export default function App() {
   }, []);
   const [isTerminalMaximized, setIsTerminalMaximized] = useState(false);
 
-  // Any request for a new terminal reveals the panel. Observed rather than handled: the
-  // panel itself is the handler, and it may not be mounted yet -- `requestTerminal` holds
-  // the request until it is.
-  useEffect(
-    () =>
-      onTerminalRequestObserved((request) => {
-        if (request === "new" || (typeof request === "object" && request.name === "new"))
-          showTerminal(true);
-      }),
-    [showTerminal],
-  );
   const [isAIOpen, setIsAIOpen] = useState(false);
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const [activeActivityTab, setActiveActivityTab] = useState("explorer");
@@ -383,6 +371,22 @@ export default function App() {
   const showPanelView = useCallback((view: PanelViewId, channel?: string) => {
     setPanelRequest((previous) => ({ nonce: previous.nonce + 1, view, channel }));
   }, []);
+  /** Shows the panel on its terminals. */
+  const revealTerminals = useCallback(() => {
+    showTerminal(true);
+    showPanelView("terminal");
+  }, [showTerminal, showPanelView]);
+  /**
+   * Starts a terminal in the workspace in front -- through its TerminalUi, never a window-wide
+   * channel -- and shows it, optionally in a folder ("Open in Integrated Terminal").
+   */
+  const openTerminal = useCallback(
+    (cwd?: string) => {
+      revealTerminals();
+      workspaces.current().services.terminalUi.newTerminal(cwd ? { cwd } : {});
+    },
+    [revealTerminals],
+  );
   const [searchFocus, setSearchFocus] = useState(0);
   const [replaceRequest, setReplaceRequest] = useState(0);
   /** How the editor's minimap looks: its right-click menu and View › Minimap change it. */
@@ -2343,18 +2347,15 @@ export default function App() {
       menu: "Terminal",
       label: "New Terminal",
       shortcut: "Mod+Shift+" + String.fromCharCode(96),
-      run: () => {
-        showTerminal(true);
-        requestTerminal("new");
-      },
+      run: () => openTerminal(),
     },
     {
       id: "terminal.split",
       menu: "Terminal",
       label: "Split Terminal",
       run: () => {
-        showTerminal(true);
-        requestTerminal("split");
+        revealTerminals();
+        workspaces.current().services.terminalUi.toggleSplit();
       },
     },
     {
@@ -2363,7 +2364,11 @@ export default function App() {
       label: "Clear Terminal",
       disabled: !isTerminalOpen,
       reason: "Show the panel first",
-      run: () => requestTerminal("clear"),
+      run: () => {
+        const ui = workspaces.current().services.terminalUi;
+        const id = ui.focusedId();
+        if (id) ui.viewOf(id)?.clear();
+      },
     },
     {
       id: "terminal.find",
@@ -2371,7 +2376,10 @@ export default function App() {
       label: "Find in Terminal",
       disabled: !isTerminalOpen,
       reason: "Show the panel first",
-      run: () => requestTerminal("find"),
+      run: () => {
+        revealTerminals();
+        workspaces.current().services.terminalUi.openFind();
+      },
     },
     {
       id: "terminal.kill",
@@ -2379,7 +2387,11 @@ export default function App() {
       label: "Close Terminal",
       disabled: !isTerminalOpen,
       reason: "Show the panel first",
-      run: () => requestTerminal("kill"),
+      run: () => {
+        const ui = workspaces.current().services.terminalUi;
+        const id = ui.focusedId();
+        if (id) ui.close(id);
+      },
     },
     {
       id: "help.shortcuts",
@@ -2635,6 +2647,7 @@ export default function App() {
             onMoveFile={handleMovePath}
             onReveal={handleReveal}
             onOpenFolderDialog={handleOpenFolderDialog}
+            onOpenTerminal={openTerminal}
             initialScroll={explorerRef.current.scroll}
             onExplorerState={rememberExplorer}
             outline={

@@ -325,6 +325,11 @@
       "message": "The terminal's output could not be delivered to this view."
     },
     {
+      "wire": "SessionEnded: That terminal has ended.",
+      "code": "SessionEnded",
+      "message": "That terminal has ended."
+    },
+    {
       "wire": "Unknown: The terminal failed unexpectedly.",
       "code": "Unknown",
       "message": "The terminal failed unexpectedly."
@@ -400,6 +405,15 @@
       "args": [],
       "cwd": "C:\\work",
       "env": []
+    },
+    {
+      "id": "login-bash",
+      "name": "Bash (login)",
+      "executable": "/bin/bash",
+      "args": ["-i"],
+      "cwd": "tools",
+      "env": [["EDITOR", "vim"]],
+      "login": true
     }
   ],
   "invalidProfiles": [
@@ -541,6 +555,27 @@
         "message": "This view fell too far behind the terminal's output and was detached."
       },
       "lastSeq": 7
+    },
+    {
+      "kind": "shell",
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "signal": "cwd",
+      "uri": "file://localhost/c/Users/a%20b",
+      "local": true
+    },
+    {
+      "kind": "shell",
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "signal": "finished",
+      "exitCode": 1
+    },
+    {
+      "kind": "shell",
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "signal": "prompt"
     }
   ],
   "invalidMessages": [
@@ -570,6 +605,12 @@
         "code": "OutputOverflow",
         "message": "x"
       }
+    },
+    {
+      "kind": "shell",
+      "sessionId": "terminal-a1-1",
+      "generation": 1,
+      "signal": "dance"
     }
   ],
   "ackRequest": {

@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
@@ -8,41 +8,13 @@ import { isTauri } from "@tauri-apps/api/core";
 import { native } from "../../services/native";
 import {
   describeExit,
-  closeLeftoverShells,
-  nextGeneration,
-  openRequestFor,
-  openTerminal,
-  type TerminalStreamHandlers,
-  type TerminalTransport,
   terminalKeyAction,
   usableSize,
   type TerminalKeyAction,
-  type TerminalSession,
 } from "../../services/terminal";
-import {
-  asTerminalError,
-  chunkInput,
-  type Generation,
-  type TerminalId,
-} from "../../services/terminalProtocol";
-import { useWorkspace } from "../../services/workspaces";
-
-export interface SearchSettings {
-  caseSensitive: boolean;
-  regex: boolean;
-}
-
-export interface TerminalHandle {
-  focus(): void;
-  clear(): void;
-  restart(): void;
-  search(query: string, direction: "next" | "previous", settings: SearchSettings): void;
-  endSearch(): void;
-  copySelection(): void;
-  paste(): void;
-  selectAll(): void;
-  hasSelection(): boolean;
-}
+import { asTerminalError } from "../../services/terminalProtocol";
+import type { TerminalService, TerminalSessionView } from "../../services/terminalService";
+import type { TerminalUi, TerminalViewHandle } from "../../services/terminalUi";
 
 /** How much output a terminal keeps. Beyond this the oldest lines are dropped. */
 const SCROLLBACK = 5000;
@@ -57,95 +29,93 @@ const DECORATIONS = {
   activeMatchColorOverviewRuler: "#facc15",
 };
 
-export const TerminalView = forwardRef<
-  TerminalHandle,
-  {
-    /** The whole session, so a profile's arguments, environment and folder reach the shell. */
-    session: TerminalSession;
-    visible: boolean;
-    /** Whether a split is open, so Alt+Arrow is only claimed when it means something. */
-    hasSplit?: boolean;
-    fontSize: number;
-    onStatus: (message: string) => void;
-    onBell: () => void;
-    onShortcut: (action: TerminalKeyAction) => void;
-    onContextMenu: (position: { x: number; y: number }) => void;
-    onSearchResults: (results: { index: number; count: number }) => void;
-  }
->(function TerminalView(
-  {
-    session,
-    visible,
-    hasSplit,
-    fontSize,
-    onStatus,
-    onBell,
-    onShortcut,
-    onContextMenu,
-    onSearchResults,
-  },
-  ref,
-) {
-  const { id, shell } = session;
-  const sessionId = id as TerminalId;
-  // Read at open time: the panel is remounted for every workspace, so this is the workspace
-  // the terminal belongs to, and the native side refuses a launch for any other.
-  const workspace = useWorkspace();
-  const workspaceId = useRef(workspace.id);
-  workspaceId.current = workspace.id;
-  /** The launch input and resizes are for; `null` before the first. */
-  const current = useRef<Generation | null>(null);
+/**
+ * One view of a terminal session (TERMINAL-04): an xterm.js instance attached to a session the
+ * workspace's TerminalService owns.
+ *
+ * Mounting renders an existing session -- it never starts a shell -- and unmounting only
+ * detaches: the session goes on. The view owns xterm (its DOM, addons, key handling, search,
+ * links and measurement); everything about the session -- its state, its stream, its
+ * generation -- is the service's. Output never enters React state: the session's replay and
+ * live output go straight to `term.write`, and each chunk is acknowledged once xterm has parsed
+ * it. What the view reports (a notice, a bell, its search results) is about its own terminal,
+ * through the workspace's TerminalUi.
+ */
+export function TerminalView({
+  session,
+  service,
+  ui,
+  visible,
+  hasSplit,
+  fontSize,
+  onShortcut,
+  onContextMenu,
+}: {
+  /** The session as the service shows it. */
+  session: TerminalSessionView;
+  service: TerminalService;
+  /** The workspace's terminal UI: this view registers with it, and reports to it. */
+  ui: TerminalUi;
+  visible: boolean;
+  /** Whether a split is open, so Alt+Arrow is only claimed when it means something. */
+  hasSplit?: boolean;
+  fontSize: number;
+  onShortcut: (action: TerminalKeyAction) => void;
+  onContextMenu: (position: { x: number; y: number }) => void;
+}) {
+  const id = session.sessionId;
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<{ term: XTerm; fit: FitAddon; search: SearchAddon } | null>(null);
-  /** True only while a shell is attached, so nothing is sent into the void. */
-  const running = useRef(false);
-  const [exited, setExited] = useState("");
 
-  // Kept in refs so the effect below never re-runs and restarts the shell.
-  const report = useRef({ onStatus, onBell, onShortcut, onContextMenu, onSearchResults });
-  report.current = { onStatus, onBell, onShortcut, onContextMenu, onSearchResults };
-  // Read at open time rather than captured in the effect's dependencies: the effect starts
-  // and disposes the shell, so adding the session object to its deps would restart the user's
-  // shell whenever anything about the session changed.
-  const launch = useRef(session);
-  launch.current = session;
-  // Read through a ref for the same reason: the key handler is attached once, inside the
-  // effect that owns the shell.
+  // Kept in refs so the effects below never re-run (and re-attach) for a callback's sake.
+  const report = useRef({ onShortcut, onContextMenu });
+  report.current = { onShortcut, onContextMenu };
+  /** A message about this terminal alone (`null` clears it). */
+  const notice = (message: string | null) => ui.notice(id, message);
+  // Read through refs because the key handler is attached once, inside the xterm effect.
   const split = useRef(hasSplit);
   split.current = hasSplit;
-  const start = useRef<(clear: boolean) => void>(() => {});
+  const latest = useRef(session);
+  latest.current = session;
 
-  // Declared before the effect below so xterm's custom key handler, which is attached there,
-  // can call them; the imperative handle reuses the same two.
   const copyFrom = (term: XTerm) => {
     const selection = term.getSelection();
     if (!selection) return;
     void navigator.clipboard
       .writeText(selection)
-      .catch(() => report.current.onStatus("The clipboard is not available."));
+      .catch(() => notice("The clipboard is not available."));
   };
 
   /**
-   * Input for the running launch, in requests the contract allows (`chunkInput`). The native
-   * side only queues it, and runs these requests in the order they are sent, so a long paste
-   * arrives whole and in order.
+   * Input for the session, while it runs. Everything xterm produces -- keys, IME composition,
+   * pastes (bracketed when the program asked for them) -- arrives here through `onData`; the
+   * service splits it to the contract's limits and keeps it in order.
    */
   const send = (data: string) => {
-    const generation = current.current;
-    if (!running.current || generation === null) return;
-    for (const piece of chunkInput(data))
-      void native("terminal_write", { request: { sessionId, generation, data: piece } }).catch(
-        (error) => report.current.onStatus(asTerminalError(error).message),
-      );
+    if (latest.current.state !== "Running") return;
+    void service.write(id, data).then(
+      () => notice(null),
+      (error) => notice(asTerminalError(error).message),
+    );
   };
 
+  /** Pasted through xterm, never straight to the shell: xterm brackets it and fixes newlines. */
   const pasteInto = () => {
     void navigator.clipboard
       .readText()
       .then((text) => {
-        if (text) send(text);
+        if (text) view.current?.term.paste(text);
       })
-      .catch(() => report.current.onStatus("The clipboard is not available."));
+      .catch(() => notice("The clipboard is not available."));
+  };
+
+  /** Tells the session the size the view now draws; the service sends only real changes. */
+  const sendSize = () => {
+    const current = view.current;
+    if (!current) return;
+    void service
+      .resize(id, usableSize(current.term.cols, current.term.rows))
+      .catch(() => undefined);
   };
 
   useEffect(() => {
@@ -154,7 +124,7 @@ export const TerminalView = forwardRef<
 
     const term = new XTerm({
       fontFamily: 'ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace',
-      fontSize: 12,
+      fontSize,
       lineHeight: 1.2,
       cursorBlink: true,
       scrollback: SCROLLBACK,
@@ -178,15 +148,16 @@ export const TerminalView = forwardRef<
     term.loadAddon(
       new WebLinksAddon((event, uri) => {
         event.preventDefault();
-        void native("open_external_url", { url: uri }).catch((error) =>
-          report.current.onStatus(String(error)),
-        );
+        void native("open_external_url", { url: uri }).catch((error) => notice(String(error)));
       }),
     );
     term.open(container);
-    // The panel may still be laying out; measuring on the next frame avoids
-    // starting the shell at a size that is about to change.
-    const firstFit = requestAnimationFrame(() => fit.fit());
+    // The panel may still be laying out; measuring on the next frame avoids telling the
+    // session a size that is about to change.
+    const firstFit = requestAnimationFrame(() => {
+      fit.fit();
+      sendSize();
+    });
     view.current = { term, fit, search };
 
     /**
@@ -215,194 +186,122 @@ export const TerminalView = forwardRef<
       return false;
     });
 
+    // Search results and the bell are this terminal's alone.
     const results = search.onDidChangeResults((found) =>
-      report.current.onSearchResults({ index: found.resultIndex, count: found.resultCount }),
+      ui.setMatches(id, { index: found.resultIndex, count: found.resultCount }),
     );
-    const bell = term.onBell(() => report.current.onBell());
-
-    if (!isTauri()) {
-      term.writeln("\x1b[38;5;244mOpen the desktop application to run a shell.\x1b[0m");
-      return () => {
-        cancelAnimationFrame(firstFit);
-        results.dispose();
-        bell.dispose();
-        view.current = null;
-        term.dispose();
-      };
-    }
-
-    /** The launch this view is showing; events of any other are ignored. */
-    let generation: Generation | null = null;
-    /** Set when this view goes: a launch that answers after that is not left running. */
-    let closed = false;
-
-    const transport: TerminalTransport = {
-      open: (args) => native("terminal_open", args),
-      ack: (request) => native("terminal_ack", { request }),
-    };
-    /**
-     * What this view does with one launch's stream, which arrives on that launch's own channel.
-     * The bytes are raw and may end inside a character or an escape sequence: xterm decodes them
-     * as a stream, and its write callback -- the bytes parsed -- is the acknowledgement. A
-     * launch this view has moved on from (a restart, or React's second mount) is still
-     * acknowledged, so its stream drains instead of holding output for nobody.
-     */
-    const handlersFor = (mine: Generation): TerminalStreamHandlers => {
-      const current = () => !closed && mine === generation;
-      /** The launch's end: an exit is reported in grey, a failure in red and on the status. */
-      const ended = (message: string, failed: boolean) => {
-        running.current = false;
-        setExited(message);
-        report.current.onStatus(failed ? message : "");
-        term.writeln(`\r\n\x1b[38;5;${failed ? 203 : 244}m[${message}]\x1b[0m`);
-      };
-      return {
-        output: (chunk, accepted) => {
-          if (!current()) return accepted();
-          term.write(chunk.bytes, accepted);
-        },
-        exit: (exit) => {
-          if (current()) ended(describeExit(exit.exitCode), false);
-        },
-        error: (event) => {
-          if (current()) ended(event.error.message, true);
-        },
-        detached: (event) => {
-          if (current()) ended(event.error.message, true);
-        },
-      };
-    };
-
-    const open = (clear: boolean) => {
-      if (clear) term.clear();
-      setExited("");
-      running.current = false;
-      generation = nextGeneration();
-      current.current = generation;
-      const mine = generation;
-      const size = usableSize(term.cols, term.rows);
-      void closeLeftoverShells(() => native("terminal_close_all"))
-        .then(() =>
-          openTerminal(
-            openRequestFor(launch.current, size, mine, workspaceId.current),
-            handlersFor(mine),
-            transport,
-          ),
-        )
-        .then(() => {
-          // Started after its view (or its workspace) went: nobody would ever end it.
-          if (closed) {
-            void native("terminal_close", { request: { sessionId, generation: mine } }).catch(
-              () => undefined,
-            );
-            return;
-          }
-          // A restart since: that launch is the one to report.
-          if (mine !== generation) return;
-          running.current = true;
-          report.current.onStatus("Running");
-        })
-        .catch((error) => {
-          if (closed || mine !== generation) return;
-          running.current = false;
-          const message = asTerminalError(error).message;
-          setExited(message);
-          report.current.onStatus(message);
-          term.writeln(`\x1b[38;5;203m${message}\x1b[0m`);
-        });
-    };
-    start.current = open;
-
+    const bell = term.onBell(() => ui.ring(id));
     // Keystrokes go to the shell as bytes; the shell decides what they mean.
     const typed = term.onData(send);
-    open(false);
 
-    // Keep the shell's idea of the window the same as what is drawn. Dragging the
-    // panel fires continuously, so only the size it settles on is sent.
+    if (!isTauri())
+      term.writeln("\x1b[38;5;244mOpen the desktop application to run a shell.\x1b[0m");
+
+    // Keep the shell's idea of the window the same as what is drawn. Dragging the panel fires
+    // continuously, so only the size it settles on is sent -- and the service sends it only if
+    // the cells changed.
     let pending: ReturnType<typeof setTimeout> | undefined;
     const observer = new ResizeObserver(() => {
       if (!view.current || !container.clientHeight) return;
       fit.fit();
-      if (!running.current) return;
       clearTimeout(pending);
-      pending = setTimeout(() => {
-        if (generation === null) return;
-        const dimensions = usableSize(term.cols, term.rows);
-        void native("terminal_resize", { request: { sessionId, generation, dimensions } }).catch(
-          () => undefined,
-        );
-      }, 100);
+      pending = setTimeout(sendSize, 100);
     });
     observer.observe(container);
 
     return () => {
-      closed = true;
       cancelAnimationFrame(firstFit);
       clearTimeout(pending);
-      running.current = false;
       observer.disconnect();
       results.dispose();
       bell.dispose();
       typed.dispose();
       view.current = null;
       term.dispose();
-      if (generation !== null)
-        void native("terminal_close", { request: { sessionId, generation } }).catch(
-          () => undefined,
-        );
     };
-  }, [id, shell]);
+    // The xterm instance lives as long as the view of this session.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  // Attached to the session's current generation: its replay, then live output, in order --
+  // each chunk acknowledged once xterm has parsed it -- and its end, after its output. A
+  // restart is a new generation, so the view attaches again. Unmounting only detaches.
+  const generation = session.generation;
+  useEffect(() => {
+    const current = view.current;
+    if (!current || !isTauri()) return;
+    const { term } = current;
+    let attachment: { detach(): void };
+    try {
+      attachment = service.attach(id, {
+        output: (chunk, accepted) => term.write(chunk.bytes, accepted),
+        ended: (message, failed) =>
+          term.writeln(`\r\n\x1b[38;5;${failed ? 203 : 244}m[${message}]\x1b[0m`),
+      });
+    } catch {
+      // The session was closed between rendering and attaching: nothing to show.
+      return;
+    }
+    return () => attachment.detach();
+  }, [service, id, generation]);
+
+  // What the panel and the menus can do to this view, registered under its terminal: they
+  // always name the terminal they act on.
+  useEffect(() => {
+    const handle: TerminalViewHandle = {
+      focus: () => view.current?.term.focus(),
+      clear: () => view.current?.term.clear(),
+      search: (query, direction, settings) => {
+        if (!view.current) return;
+        const options = { ...settings, decorations: DECORATIONS };
+        if (!query) {
+          view.current.search.clearDecorations();
+          return;
+        }
+        // The addon caches highlighting by term and options together, but its cache
+        // update runs before it compares the new options against the cached ones, so
+        // a changed case/regex setting on the same term would otherwise be silently
+        // ignored. Clearing first forces a full recount.
+        view.current.search.clearDecorations();
+        if (direction === "next") view.current.search.findNext(query, options);
+        else view.current.search.findPrevious(query, options);
+      },
+      endSearch: () => view.current?.search.clearDecorations(),
+      copySelection: () => {
+        if (view.current) copyFrom(view.current.term);
+      },
+      paste: pasteInto,
+      selectAll: () => view.current?.term.selectAll(),
+      hasSelection: () => !!view.current?.term.hasSelection(),
+    };
+    return ui.registerView(id, handle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ui, id]);
 
   // Only a laid-out terminal can be measured, so it is fitted when it becomes visible.
   useEffect(() => {
     if (!visible || !view.current) return;
     view.current.fit.fit();
     view.current.term.focus();
-    const generation = current.current;
-    if (!running.current || generation === null) return;
-    const dimensions = usableSize(view.current.term.cols, view.current.term.rows);
-    void native("terminal_resize", { request: { sessionId, generation, dimensions } }).catch(
-      () => undefined,
-    );
+    sendSize();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, id]);
 
   useEffect(() => {
     const current = view.current;
-    if (!current) return;
+    if (!current || current.term.options.fontSize === fontSize) return;
     current.term.options.fontSize = fontSize;
     current.fit.fit();
   }, [fontSize]);
 
-  const copySelection = () => {
-    if (view.current) copyFrom(view.current.term);
-  };
-  const paste = pasteInto;
-
-  useImperativeHandle(ref, () => ({
-    focus: () => view.current?.term.focus(),
-    clear: () => view.current?.term.clear(),
-    restart: () => start.current(true),
-    search: (query, direction, settings) => {
-      if (!view.current) return;
-      const options = { ...settings, decorations: DECORATIONS };
-      if (!query) {
-        view.current.search.clearDecorations();
-        return;
-      }
-      // The addon caches highlighting by term and options together, but its cache
-      // update runs before it compares the new options against the cached ones, so
-      // a changed case/regex setting on the same term would otherwise be silently
-      // ignored. Clearing first forces a full recount.
-      view.current.search.clearDecorations();
-      if (direction === "next") view.current.search.findNext(query, options);
-      else view.current.search.findPrevious(query, options);
-    },
-    endSearch: () => view.current?.search.clearDecorations(),
-    copySelection,
-    paste,
-    selectAll: () => view.current?.term.selectAll(),
-    hasSelection: () => !!view.current?.term.hasSelection(),
-  }));
+  // How the session's current generation ended, from the service: the footer offers Restart.
+  const { state, error } = session;
+  const exited =
+    state === "Exited"
+      ? describeExit(session.exitCode)
+      : state === "Failed"
+        ? (error ?? "The terminal failed.")
+        : "";
 
   return (
     <div className="relative flex h-full min-h-0 w-full flex-col bg-black">
@@ -423,7 +322,10 @@ export const TerminalView = forwardRef<
         <div className="flex shrink-0 items-center gap-2 border-t border-[#181818] bg-[#080808] px-3 py-1">
           <span className="truncate text-[11px] text-zinc-400">{exited}</span>
           <button
-            onClick={() => start.current(true)}
+            onClick={() => {
+              notice(null);
+              ui.restart(id);
+            }}
             className="rounded bg-[#1a1a1a] px-2 py-0.5 text-[11px] text-zinc-200 transition-colors hover:bg-[#252525]"
           >
             Restart
@@ -432,4 +334,4 @@ export const TerminalView = forwardRef<
       )}
     </div>
   );
-});
+}

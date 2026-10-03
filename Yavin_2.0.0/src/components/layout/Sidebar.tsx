@@ -16,7 +16,6 @@ import type {
   ProjectedNode,
 } from "../../services/explorerProvider";
 import type { ExplorerStore } from "../../services/explorerStore";
-import { requestTerminal } from "../../services/terminal";
 import { ContextMenu } from "../ui/ContextMenu";
 import { ChevronIcon } from "../ui/FileIcons";
 import { CollapseIcon, MoreIcon, PlusIcon, FolderPlusIcon, RefreshIcon } from "../ui/Icons";
@@ -84,6 +83,8 @@ interface SidebarProps {
   onMoveFile: (src: string, dest: string) => void;
   onReveal: (path: string) => void;
   onOpenFolderDialog: () => void;
+  /** Starts a terminal in a folder ("Open in Integrated Terminal"). */
+  onOpenTerminal?: (directory: string) => void;
   /** Where the explorer was scrolled last time. */
   initialScroll?: number;
   /** Reports the explorer's state as it changes, so the session can be written. */
@@ -611,9 +612,9 @@ export function Sidebar(props: SidebarProps) {
     openFolderDialog: props.onOpenFolderDialog,
     refresh: props.onRefresh,
     collapseAll: () => setExpanded(new Set(multiRoot ? [] : firstRoot ? [firstRoot.id] : [])),
-    // Goes through the panel's own request channel, so the explorer stays unaware of how
+    // The window starts it in the workspace's terminals; the explorer stays unaware of how
     // terminals are tracked.
-    openTerminal: (directory) => requestTerminal({ name: "new", cwd: directory }),
+    openTerminal: (directory) => props.onOpenTerminal?.(directory),
   };
 
   // --- Keyboard ------------------------------------------------------------

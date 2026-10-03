@@ -2,7 +2,6 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import type { Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { FileNode } from "../types";
-import type { Shell } from "./terminal";
 import type {
   SubscriptionId,
   TerminalAckRequest,
@@ -148,7 +147,8 @@ interface Commands {
     result: void;
   };
   git_unwatch_repo: { args: { repositoryId: string }; result: void };
-  terminal_shells: { args: undefined; result: Shell[] };
+  /** Discovery (TERMINAL-05): every shell looked for, found or not; read with `parseShells`. */
+  terminal_shells: { args: undefined; result: unknown };
   /** The Terminal contract's requests (`terminalProtocol.ts`); failures are `"Cause: message"`. */
   /** `events` is this launch's own channel: every message for it, acknowledged with `terminal_ack`. */
   terminal_open: {

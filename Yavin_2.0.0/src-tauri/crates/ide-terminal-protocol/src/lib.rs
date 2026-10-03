@@ -282,8 +282,10 @@ impl TryFrom<RawDimensions> for TerminalDimensions {
 // ---------------------------------------------------------------------------------------------
 // Profiles
 
-/// How a terminal is launched: only what today's launch already carries. A login shell is asked
-/// for through `args`; the native side has no separate notion of one.
+/// How a terminal is launched (TERMINAL-05): a discovered shell, its arguments (structured, never
+/// a command string), a folder and environment overrides. `login` asks for a login shell; the
+/// native side translates it into that shell's own flag, and refuses it for shells that have no
+/// such mode (cmd, PowerShell).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalProfile {
@@ -296,6 +298,9 @@ pub struct TerminalProfile {
     pub cwd: Option<String>,
     /// Ordered pairs: a variable may be written in terms of an earlier one.
     pub env: Vec<(String, String)>,
+    /// Start it as a login shell. Omitted on the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub login: bool,
 }
 
 fn launch_text(text: &str) -> bool {
@@ -403,12 +408,14 @@ pub enum TerminalErrorCause {
     SubscriberFailed,
     /// Output could not be handed to a subscriber's transport (its window has gone).
     TransportFailed,
+    /// The session exists but has ended: it takes no more input or resizing.
+    SessionEnded,
     /// Anything else: an internal failure, or one not in this list.
     Unknown,
 }
 
 impl TerminalErrorCause {
-    pub const ALL: [TerminalErrorCause; 16] = [
+    pub const ALL: [TerminalErrorCause; 17] = [
         TerminalErrorCause::InvalidSession,
         TerminalErrorCause::InvalidWorkspace,
         TerminalErrorCause::ShellUnavailable,
@@ -424,6 +431,7 @@ impl TerminalErrorCause {
         TerminalErrorCause::OutputOverflow,
         TerminalErrorCause::SubscriberFailed,
         TerminalErrorCause::TransportFailed,
+        TerminalErrorCause::SessionEnded,
         TerminalErrorCause::Unknown,
     ];
 
@@ -824,6 +832,41 @@ pub struct TerminalDetached {
     pub last_seq: Option<Sequence>,
 }
 
+/// What a shell reported about itself through shell integration (TERMINAL-05A).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellSignal {
+    /// OSC 7: its working folder, as a URL (`uri`), and whether the URL's host is this machine.
+    Cwd,
+    /// OSC 133;A -- a prompt starts.
+    Prompt,
+    /// OSC 133;B -- the user's input starts.
+    Input,
+    /// OSC 133;C -- the command starts running.
+    Executing,
+    /// OSC 133;D -- the command finished, with its exit status when the shell gave one.
+    Finished,
+    /// An OSC 7 or OSC 133 sequence that could not be read: counted, never acted on.
+    Invalid,
+}
+
+/// One shell-integration signal, in order with the output around it. Untrusted metadata: it
+/// never runs, opens or changes anything.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalShellEvent {
+    pub session_id: TerminalId,
+    pub generation: Generation,
+    pub signal: ShellSignal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// For `cwd`: the URL's host is empty, `localhost` or this machine's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
 /// Every message a subscriber receives, in one ordered stream, tagged by `kind`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -833,6 +876,7 @@ pub enum TerminalMessage {
     Exit(TerminalExit),
     Error(TerminalErrorEvent),
     Detached(TerminalDetached),
+    Shell(TerminalShellEvent),
 }
 
 impl TerminalMessage {
@@ -843,6 +887,7 @@ impl TerminalMessage {
             TerminalMessage::Exit(m) => &m.session_id,
             TerminalMessage::Error(m) => &m.session_id,
             TerminalMessage::Detached(m) => &m.session_id,
+            TerminalMessage::Shell(m) => &m.session_id,
         }
     }
 }

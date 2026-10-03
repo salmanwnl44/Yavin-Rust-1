@@ -151,6 +151,11 @@ export interface TerminalProfile {
   cwd: string | null;
   /** Ordered pairs, not an object: a variable may be written in terms of an earlier one. */
   env: [string, string][];
+  /**
+   * Start it as a login shell (TERMINAL-05). The native side translates this into the shell's
+   * own flag and refuses it for shells without a login mode. Omitted when false.
+   */
+  login?: boolean;
 }
 
 const LAUNCH_TEXT = /^[^\0\r\n]*$/;
@@ -232,6 +237,8 @@ export type TerminalErrorCause =
   | "SubscriberFailed"
   /** Output could not be handed to a subscriber's transport. */
   | "TransportFailed"
+  /** The session exists but has ended: it takes no more input or resizing. */
+  | "SessionEnded"
   | "Unknown";
 
 export const TERMINAL_ERROR_CAUSES: readonly TerminalErrorCause[] = [
@@ -250,6 +257,7 @@ export const TERMINAL_ERROR_CAUSES: readonly TerminalErrorCause[] = [
   "OutputOverflow",
   "SubscriberFailed",
   "TransportFailed",
+  "SessionEnded",
   "Unknown",
 ];
 
@@ -407,7 +415,61 @@ export type TerminalEvent =
   | ({ kind: "state" } & TerminalStateChanged)
   | ({ kind: "exit" } & TerminalExit)
   | ({ kind: "error" } & TerminalErrorEvent)
-  | ({ kind: "detached" } & TerminalDetached);
+  | ({ kind: "detached" } & TerminalDetached)
+  | ({ kind: "shell" } & TerminalShellEvent);
+
+/** What a shell reported through shell integration (TERMINAL-05A). */
+export type ShellSignal = "cwd" | "prompt" | "input" | "executing" | "finished" | "invalid";
+
+/**
+ * One shell-integration signal (OSC 7 / OSC 133), in order with the output around it. Untrusted
+ * metadata: it never runs, opens or changes anything.
+ */
+export interface TerminalShellEvent {
+  sessionId: TerminalId;
+  generation: Generation;
+  signal: ShellSignal;
+  /** For `cwd`: the OSC 7 URL as the shell wrote it. */
+  uri?: string;
+  /** For `cwd`: the URL's host is empty, `localhost` or this machine's name. */
+  local?: boolean;
+  /** For `finished`: the command's exit status, when the shell gave a valid one. */
+  exitCode?: number;
+}
+
+const SIGNALS: readonly ShellSignal[] = [
+  "cwd",
+  "prompt",
+  "input",
+  "executing",
+  "finished",
+  "invalid",
+];
+
+export function parseShellEvent(payload: unknown): TerminalShellEvent | null {
+  const p = record(payload);
+  if (!p || !isTerminalId(p.sessionId) || !isGeneration(p.generation)) return null;
+  if (!SIGNALS.includes(p.signal as ShellSignal)) return null;
+  const event: TerminalShellEvent = {
+    sessionId: p.sessionId,
+    generation: p.generation,
+    signal: p.signal as ShellSignal,
+  };
+  if (p.uri !== undefined) {
+    if (typeof p.uri !== "string") return null;
+    event.uri = p.uri;
+  }
+  if (p.local !== undefined) {
+    if (typeof p.local !== "boolean") return null;
+    event.local = p.local;
+  }
+  if (p.exitCode !== undefined) {
+    if (!Number.isSafeInteger(p.exitCode)) return null;
+    event.exitCode = p.exitCode as number;
+  }
+  if (event.signal === "cwd" && (event.uri === undefined || event.local === undefined)) return null;
+  return event;
+}
 
 const record = (payload: unknown): Record<string, unknown> | null =>
   payload && typeof payload === "object" && !Array.isArray(payload)
@@ -503,6 +565,10 @@ export function parseTerminalMessage(payload: unknown): TerminalEvent | null {
       const event = parseDetached(p);
       return event && { kind: "detached", ...event };
     }
+    case "shell": {
+      const event = parseShellEvent(p);
+      return event && { kind: "shell", ...event };
+    }
     default:
       return null;
   }
@@ -516,8 +582,12 @@ export interface TerminalStream {
   sessionId: TerminalId;
   generation: Generation;
   state: TerminalState;
-  /** The `seq` the next output chunk must carry. */
-  nextSeq: Sequence;
+  /**
+   * The `seq` the next output chunk must carry; `null` for a subscriber that joined mid-stream
+   * (a view attaching with replay, or a lifecycle subscriber) until its first chunk says where
+   * it starts.
+   */
+  nextSeq: Sequence | null;
 }
 
 export type StreamRejection =
@@ -539,8 +609,12 @@ export type StreamVerdict =
   | { accepted: false; reason: StreamRejection; stream: TerminalStream };
 
 /** A stream for a generation that has just been opened (`Spawning`). */
-export function openStream(sessionId: TerminalId, generation: Generation): TerminalStream {
-  return { sessionId, generation, state: "Spawning", nextSeq: FIRST_SEQUENCE };
+export function openStream(
+  sessionId: TerminalId,
+  generation: Generation,
+  { joined = false }: { joined?: boolean } = {},
+): TerminalStream {
+  return { sessionId, generation, state: "Spawning", nextSeq: joined ? null : FIRST_SEQUENCE };
 }
 
 /**
@@ -567,12 +641,19 @@ export function applyEvent(stream: TerminalStream, event: TerminalEvent): Stream
       // Output flows while the process runs and while its end drains.
       if (stream.state !== "Running" && stream.state !== "Exiting")
         return reject("illegal-transition");
+      // Joined mid-stream: the first chunk (the oldest the replay still held) sets the start.
+      if (stream.nextSeq === null) return accept({ nextSeq: (event.seq + 1) as Sequence });
       if (event.seq < stream.nextSeq) return reject("duplicate");
       if (event.seq > stream.nextSeq) return reject("gap");
       return accept({ nextSeq: (stream.nextSeq + 1) as Sequence });
     case "state":
       return canTransition(stream.state, event.state)
         ? accept({ state: event.state })
+        : reject("illegal-transition");
+    case "shell":
+      // Metadata about the running shell: only while it runs (or drains), never moving `seq`.
+      return stream.state === "Running" || stream.state === "Exiting"
+        ? accept({})
         : reject("illegal-transition");
     case "exit":
     case "error":
@@ -583,7 +664,9 @@ export function applyEvent(stream: TerminalStream, event: TerminalEvent): Stream
       // The end says how much output there was: all of it must already have arrived. (A
       // subscriber that joined mid-stream knows from its first chunk where it started.)
       const expected = event.lastSeq === null ? FIRST_SEQUENCE : event.lastSeq + 1;
-      if (expected !== stream.nextSeq)
+      // One that never saw output (a lifecycle subscriber, or a view whose replay held none)
+      // has nothing to check the count against.
+      if (stream.nextSeq !== null && expected !== stream.nextSeq)
         return reject(expected > stream.nextSeq ? "gap" : "after-end");
       return accept({ state: to });
     }

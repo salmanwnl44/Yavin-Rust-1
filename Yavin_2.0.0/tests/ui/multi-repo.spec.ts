@@ -947,8 +947,9 @@ test("switching A → B → A → B → C → A, and ten more times, leaves only
   await expect(region.locator("section[aria-label='Repositories']").getByRole("group")).toHaveCount(
     1,
   );
-  // Every workspace left closed its terminals, whatever its views were doing.
-  expect((await closedAll()) - closesBefore).toBe(sequence.length + 10);
+  // Leaving a workspace detaches its terminals' views; it does not close its terminals
+  // (TERMINAL-03): they are the workspace's, kept for its return, and end with the window.
+  expect((await closedAll()) - closesBefore).toBe(0);
 
   const timing = (await workspace()).timing;
   console.log(

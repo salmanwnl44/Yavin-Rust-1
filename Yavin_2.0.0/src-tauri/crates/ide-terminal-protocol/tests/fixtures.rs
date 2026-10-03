@@ -185,7 +185,7 @@ fn every_message_a_subscriber_receives_reads_and_writes_back_identically() {
         .collect();
     assert_eq!(
         kinds,
-        ["output", "state", "state", "exit", "error", "detached"]
+        ["output", "state", "state", "exit", "error", "detached", "shell", "shell", "shell"]
     );
     for wire in list(&f, "messages") {
         let message: TerminalMessage = round_trip(wire);

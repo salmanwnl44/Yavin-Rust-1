@@ -1,17 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { native } from "../../services/native";
 import { TerminalView } from "../terminal/TerminalView";
-import type { TerminalHandle } from "../terminal/TerminalView";
+import { TerminalProfilesDialog } from "../terminal/TerminalProfilesDialog";
+import type { TerminalKeyAction } from "../../services/terminal";
+import type { TerminalId } from "../../services/terminalProtocol";
+import { statusOf } from "../../services/terminalUi";
+import { describeReportedCwd } from "../../services/terminalShell";
 import {
-  createTerminalId,
-  nextTerminalName,
-  onTerminalRequest,
-  zoomFontSize,
-  DEFAULT_FONT_SIZE,
-  type Shell,
-  type TerminalKeyAction,
-  type TerminalSession,
-} from "../../services/terminal";
+  useTerminalSessions,
+  useTerminalUi,
+  useTerminalUiState,
+} from "../../services/terminalHooks";
 import { PANEL_VIEWS, readActiveView, saveActiveView, stepView } from "../../services/panel/views";
 import type { PanelViewId } from "../../services/panel/views";
 import { clampToViewport } from "../../services/panel/menuPosition";
@@ -125,118 +123,57 @@ export function TerminalPanel({
     setActiveTabState(id);
     saveActiveView(id);
   }, []);
-  const [sessions, setSessions] = useState<TerminalSession[]>([]);
-  const [activeId, setActiveId] = useState("");
-  const [splitId, setSplitId] = useState<string | null>(null);
-  /** Which half of a split the user is working in; always "primary" when not split. */
-  const [focusedPane, setFocusedPane] = useState<"primary" | "secondary">("primary");
-  const [splitRatio, setSplitRatio] = useState(0.5);
-  const [shells, setShells] = useState<Shell[]>([]);
+
+  // The workspace's terminals (TERMINAL-04): the sessions are its TerminalService's, how they
+  // are shown -- panes, split, focus, zoom, find, bells, notices -- is its TerminalUi's. Both
+  // outlive this panel, which is remounted per workspace and only renders them.
+  const ui = useTerminalUi();
+  const service = ui.service;
+  const sessions = useTerminalSessions(service);
+  const view = useTerminalUiState(ui);
+  const { primary, secondary, focused, splitRatio, fontSize, finding, bells } = view;
+  // How terminals can start (TERMINAL-05): the workspace's profiles, built-in and its own.
+  const profileState = useSyncExternalStore(
+    ui.profiles.subscribe,
+    ui.profiles.getSnapshot,
+    ui.profiles.getSnapshot,
+  );
+  const launchable = profileState.profiles.filter((entry) => entry.available);
+  /** No shell can be offered: no desktop application, or discovery failed. */
+  const missing = profileState.error !== null;
+
+  // What is this panel's alone, and fine to lose on a remount.
   const [shellMenu, setShellMenu] = useState(false);
-  const [status, setStatus] = useState("");
+  const [managing, setManaging] = useState(false);
   const [find, setFind] = useState("");
-  const [finding, setFinding] = useState(false);
-  const [matches, setMatches] = useState({ index: -1, count: 0 });
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [regex, setRegex] = useState(false);
-  const [missing, setMissing] = useState(false);
-  const [fontSize, setFontSize] = useState(DEFAULT_FONT_SIZE);
   const [height, setHeight] = useState(DEFAULT_HEIGHT);
-  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
-  const [renaming, setRenaming] = useState("");
-  const [bells, setBells] = useState<Set<string>>(new Set());
+  /** The context menu, and the terminal it was opened on: every item acts on that one. */
+  const [menu, setMenu] = useState<{ x: number; y: number; id: TerminalId } | null>(null);
+  const [renaming, setRenaming] = useState<TerminalId | null>(null);
 
-  const handles = useRef(new Map<string, TerminalHandle | null>());
   const tabRefs = useRef(new Map<string, HTMLButtonElement | null>());
   const findInput = useRef<HTMLInputElement>(null);
   const body = useRef<HTMLDivElement>(null);
 
-  const create = useCallback(
-    (shell: Shell | undefined, focus = true, extras: Partial<TerminalSession> = {}) => {
-      const session: TerminalSession = {
-        id: createTerminalId(),
-        name: "",
-        shell: shell?.path ?? "",
-        ...extras,
-      };
-      setSessions((previous) => {
-        session.name = nextTerminalName(
-          previous.map((one) => one.name),
-          shell?.name ?? "Terminal",
-        );
-        return [...previous, session];
-      });
-      if (focus) setActiveId(session.id);
-      return session;
-    },
-    [],
-  );
+  useEffect(() => ui.loadProfiles(), [ui]);
 
-  // Detected shells decide what New Terminal can offer; the first one opens at once.
-  useEffect(() => {
-    let cancelled = false;
-    void native("terminal_shells")
-      .then((found) => {
-        if (cancelled) return;
-        setShells(found);
-        setSessions((previous) => {
-          if (previous.length) return previous;
-          const first: TerminalSession = {
-            id: createTerminalId(),
-            name: found[0]?.name ?? "Terminal",
-            shell: found[0]?.path ?? "",
-          };
-          setActiveId(first.id);
-          return [first];
-        });
-      })
-      .catch((error) => {
-        if (cancelled) return;
-        // The browser preview has no shell; the view explains that in place.
-        setMissing(true);
-        setStatus(String(error));
-        setSessions((previous) => {
-          if (previous.length) return previous;
-          const first: TerminalSession = { id: createTerminalId(), name: "Terminal", shell: "" };
-          setActiveId(first.id);
-          return [first];
-        });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // The Terminal menu and the terminals themselves drive the panel through one
-  // channel. The handlers are read from a ref so the subscription never has to be
-  // torn down and rebuilt as sessions come and go.
-  const actions = useRef({
-    new: () => {},
-    newIn: (_cwd: string) => {},
-    split: () => {},
-    clear: () => {},
-    find: () => {},
-    kill: () => {},
-  });
-  useEffect(
-    () =>
-      onTerminalRequest((request) => {
-        // "Open in Integrated Terminal" carries the folder it wants; everything else is a
-        // bare action name.
-        if (typeof request === "object") actions.current.newIn(request.cwd);
-        else actions.current[request]();
-      }),
-    [],
-  );
-
-  // "Show Git Output" and the status bar's counts both land here. Keyed on the nonce so
-  // asking for the same view twice actually switches to it both times.
+  // "Show Git Output", the status bar's counts and the Terminal menu all land here. Keyed on
+  // the nonce so asking for the same view twice actually switches to it both times.
   const [channel, setChannel] = useState<string | undefined>(undefined);
   useEffect(() => {
     if (!request?.nonce) return;
     if (request.channel) setChannel(request.channel);
     setActiveTab(request.view ?? (request.channel ? "output" : "terminal"));
   }, [request?.nonce, request?.view, request?.channel, setActiveTab]);
+
+  // Find in Terminal, from anywhere: the terminal view, with the find box selected.
+  useEffect(() => {
+    if (!view.findRequest) return;
+    setActiveTab("terminal");
+    window.setTimeout(() => findInput.current?.select(), 0);
+  }, [view.findRequest, setActiveTab]);
 
   // Closing anything that floats above the terminal when focus moves elsewhere.
   useEffect(() => {
@@ -253,71 +190,36 @@ export function TerminalPanel({
     };
   }, [menu, shellMenu]);
 
-  const closeSession = (id: string) => {
-    handles.current.delete(id);
-    const remaining = sessions.filter((session) => session.id !== id);
-    if (splitId === id) setSplitId(null);
-    setSessions(remaining);
-    setFocusedPane("primary");
-    // Closing the last terminal used to close the whole panel, which made sense when the
-    // panel was only ever terminals. It now holds Problems, Output and Ports too, so closing
-    // it would take away views that have nothing to do with the terminal that just exited.
-    // The panel stays; the effect below starts a fresh terminal while the Terminal view is
-    // the one on screen.
-    if (remaining.length && id === activeId) {
-      // Never the other pane's session: the two halves render as `[activeId, splitId]`, so
-      // making them the same id drew one terminal at half width with dead space beside it.
-      const next =
-        remaining.filter((session) => session.id !== splitId).at(-1) ?? remaining.at(-1)!;
-      setActiveId(next.id);
-      if (next.id === splitId) setSplitId(null);
-    }
-  };
-
   /**
    * Opening the panel with no terminals starts one. Deliberately keyed on the panel becoming
-   * visible rather than on the session count reaching zero: killing your last terminal should
-   * leave the view empty with a way to start another, not immediately spawn the shell you
-   * just asked to close. (The panel itself stays open either way -- it holds Problems, Output
-   * and Ports too, and none of those should disappear because a terminal exited.)
+   * visible on the terminal view rather than on mounting or on the session count reaching zero:
+   * a hidden panel starts nothing, and killing your last terminal leaves the view empty with a
+   * way to start another rather than spawning the shell you just closed. A workspace that has
+   * terminals (a remount) starts none. (The panel itself stays open either way -- it holds
+   * Problems, Output and Ports too.)
    */
   const pendingAutoCreate = useRef(true);
+  const known = profileState.loaded;
   useEffect(() => {
     if (hidden) {
       pendingAutoCreate.current = true;
       return;
     }
     if (sessions.length) pendingAutoCreate.current = false;
-    if (!pendingAutoCreate.current || missing || sessions.length || !shells.length) return;
+    if (!pendingAutoCreate.current || sessions.length || !known) return;
     if (activeTab !== "terminal") return;
     pendingAutoCreate.current = false;
-    create(shells[0]);
-  }, [hidden, missing, sessions.length, shells, create, activeTab]);
+    // Without a shell (the browser preview) the view still explains why, in place.
+    ui.newTerminal();
+  }, [hidden, known, sessions.length, ui, activeTab]);
 
-  // A terminal that rang while it was not on screen is worth noticing.
-  useEffect(() => {
-    if (!bells.size) return;
-    setBells((previous) => {
-      const next = new Set(previous);
-      next.delete(activeId);
-      return next.size === previous.size ? previous : next;
-    });
-  }, [activeId, bells.size]);
-
-  const toggleSplit = () => {
-    setFocusedPane("primary");
-    if (splitId) return setSplitId(null);
-    const other = sessions.find((session) => session.id !== activeId);
-    setSplitId(other ? other.id : create(shells[0], false).id);
-  };
-
-  /** The terminal the toolbar acts on: the focused half of a split, else the active one. */
-  const focusedId = focusedPane === "secondary" && splitId ? splitId : activeId;
-  const active = () => handles.current.get(focusedId) ?? null;
-  const shown = splitId ? [activeId, splitId] : [activeId];
+  /** The terminal the toolbar acts on: the focused pane's. */
+  const focusedId = focused === "secondary" ? secondary : primary;
+  const handleOf = (id: TerminalId | null) => (id === null ? undefined : ui.viewOf(id));
+  const shown = secondary !== null ? [primary, secondary] : [primary];
 
   /** Per-view tab counts. Memoised on the diagnostics version: counting walks every
-   * diagnostic, and the panel re-renders on every Find keystroke and terminal status change. */
+   * diagnostic, and the panel re-renders on every Find keystroke and terminal state change. */
   const counts = useMemo(() => problemCounts(), [problemsRevision]);
   const badges: Record<PanelViewId, number> = {
     // Errors and warnings, matching VS Code's badge; informational entries are not counted.
@@ -328,79 +230,26 @@ export function TerminalPanel({
     ports: 0,
   };
 
-  const openFind = () => {
-    setActiveTab("terminal");
-    setFinding(true);
-    window.setTimeout(() => findInput.current?.select(), 0);
+  const search = (
+    query: string,
+    direction: "next" | "previous",
+    options = { caseSensitive, regex },
+  ) => handleOf(focusedId)?.search(query, direction, options);
+  const closeFind = () => {
+    ui.closeFind();
+    handleOf(focusedId)?.endSearch();
   };
-
-  const runFind = (direction: "next" | "previous") => {
-    active()?.search(find, direction, { caseSensitive, regex });
-  };
-
-  const zoom = (action: TerminalKeyAction) => setFontSize((size) => zoomFontSize(size, action));
-
-  /**
-   * Closes every terminal at once. Each session is unmounted, and `TerminalView`'s own
-   * cleanup sends `terminal_close` for it, so no shell is left running.
-   */
-  const killAll = () => {
-    handles.current.clear();
-    setSplitId(null);
-    setFocusedPane("primary");
-    setSessions([]);
-    setActiveId("");
-  };
-
-  /** Moves the focused terminal `delta` places through the tab order, wrapping. */
-  const stepTerminal = (delta: 1 | -1) => {
-    if (sessions.length < 2) return;
-    const at = sessions.findIndex((session) => session.id === activeId);
-    const next = sessions[((at === -1 ? 0 : at) + delta + sessions.length) % sessions.length];
-    setActiveId(next.id);
-    handles.current.get(next.id)?.focus();
-  };
-
-  /**
-   * Moves between the two panes of a split. It cannot just reassign `activeId`: the panes
-   * render in `[activeId, splitId]` order, so doing that would swap their positions on
-   * screen. `focusedPane` says which of the two the user is working in, and the toolbar's
-   * Clear/Find follow it -- before this they always acted on the left pane even while the
-   * user was typing in the right one.
-   */
-  const stepPane = () => {
-    if (!splitId) return;
-    setFocusedPane((current) => {
-      const next = current === "primary" ? "secondary" : "primary";
-      handles.current.get(next === "primary" ? activeId : splitId)?.focus();
-      return next;
-    });
-  };
+  /** The focused terminal's own results: another pane's never show here. */
+  const matches = (focusedId && view.matches.get(focusedId)) || { index: -1, count: 0 };
 
   const shortcut = (action: TerminalKeyAction) => {
-    if (action === "find") openFind();
-    else if (action === "new") create(shells[0]);
-    else if (action === "split") toggleSplit();
-    else if (action === "next") stepTerminal(1);
-    else if (action === "previous") stepTerminal(-1);
-    else if (action === "pane-next" || action === "pane-previous") stepPane();
-    else zoom(action);
-  };
-
-  actions.current = {
-    new: () => {
-      setActiveTab("terminal");
-      create(shells[0]);
-    },
-    // "Open in Integrated Terminal": the same shell, started in the chosen folder.
-    newIn: (cwd: string) => {
-      setActiveTab("terminal");
-      create(shells[0], true, { cwd });
-    },
-    split: toggleSplit,
-    clear: () => active()?.clear(),
-    find: openFind,
-    kill: () => activeId && closeSession(activeId),
+    if (action === "find") ui.openFind();
+    else if (action === "new") ui.newTerminal();
+    else if (action === "split") ui.toggleSplit();
+    else if (action === "next") ui.stepTerminal(1);
+    else if (action === "previous") ui.stepTerminal(-1);
+    else if (action === "pane-next" || action === "pane-previous") ui.stepPane();
+    else ui.zoom(action);
   };
 
   /** Drag the top edge of the panel, or the divider between split terminals. */
@@ -416,8 +265,7 @@ export function TerminalPanel({
         const next = startHeight + (startY - moved.clientY);
         setHeight(Math.max(MIN_HEIGHT, Math.min(next, window.innerHeight - 160)));
       } else {
-        const next = startRatio + (moved.clientX - startX) / width;
-        setSplitRatio(Math.max(0.2, Math.min(next, 0.8)));
+        ui.setSplitRatio(startRatio + (moved.clientX - startX) / width);
       }
     };
     const stop = () => {
@@ -428,25 +276,31 @@ export function TerminalPanel({
     window.addEventListener("mouseup", stop);
   };
 
-  const menuItems = [
-    { label: "Copy", run: () => active()?.copySelection(), enabled: !!active()?.hasSelection() },
-    { label: "Paste", run: () => active()?.paste(), enabled: true },
-    { label: "Select All", run: () => active()?.selectAll(), enabled: true },
-    { label: "Clear", run: () => active()?.clear(), enabled: true },
-    { label: "Find", run: openFind, enabled: true },
-    { label: "Split Terminal", run: toggleSplit, enabled: !missing },
-    {
-      label: "Rename",
-      run: () => setRenaming(focusedId),
-      enabled: true,
-    },
-    { label: "Kill Terminal", run: () => closeSession(focusedId), enabled: true },
-    {
-      label: "Kill All Terminals",
-      run: killAll,
-      enabled: sessions.length > 1,
-    },
-  ];
+  /** The context menu's items, each acting on the terminal it was opened on. */
+  const menuItems = (id: TerminalId) => {
+    const handle = ui.viewOf(id);
+    const ended = (service.get(id)?.state ?? "Exited") !== "Running";
+    return [
+      { label: "Copy", run: () => handle?.copySelection(), enabled: !!handle?.hasSelection() },
+      { label: "Paste", run: () => handle?.paste(), enabled: !ended },
+      { label: "Select All", run: () => handle?.selectAll(), enabled: true },
+      { label: "Clear", run: () => handle?.clear(), enabled: true },
+      { label: "Find", run: () => ui.openFind(), enabled: true },
+      { label: "Split Terminal", run: () => ui.toggleSplit(), enabled: !missing },
+      { label: "Rename", run: () => setRenaming(id), enabled: true },
+      { label: "Restart", run: () => ui.restart(id), enabled: true },
+      { label: "Kill Terminal", run: () => ui.close(id), enabled: true },
+      { label: "Kill All Terminals", run: () => ui.closeAll(), enabled: sessions.length > 1 },
+    ];
+  };
+  const openMenuItems = menu ? menuItems(menu.id) : [];
+
+  /** The status line: the focused terminal's own, never another's. */
+  const focusedSession = sessions.find((session) => session.sessionId === focusedId);
+  const status = statusOf(view, focusedSession);
+  // Where the shell says it is (TERMINAL-05A): only what it reported, never guessed.
+  const folder =
+    focusedSession?.state === "Running" ? describeReportedCwd(focusedSession.shell) : "";
 
   return (
     <div
@@ -526,13 +380,13 @@ export function TerminalPanel({
                 label="New Terminal"
                 path={icons.plus}
                 disabled={missing}
-                onClick={() => create(shells[0])}
+                onClick={() => ui.newTerminal()}
               />
               <div className="relative">
                 <ToolButton
                   label="Choose a shell"
                   path={icons.chevron}
-                  disabled={missing || shells.length < 2}
+                  disabled={missing}
                   active={shellMenu}
                   onClick={() => setShellMenu((open) => !open)}
                 />
@@ -543,42 +397,54 @@ export function TerminalPanel({
                     onMouseDown={(event) => event.stopPropagation()}
                     className="absolute right-0 bottom-full z-20 mb-1 min-w-[170px] rounded border border-[#222222] bg-[#0a0a0a] py-1 shadow-lg"
                   >
-                    {shells.map((shell) => (
+                    {profileState.profiles.map((entry) => (
                       <button
-                        key={shell.path}
+                        key={entry.profile.id}
                         role="menuitem"
-                        title={shell.path}
+                        disabled={!entry.available}
+                        title={entry.available ? entry.profile.executable : (entry.reason ?? "")}
                         onClick={() => {
                           setShellMenu(false);
-                          create(shell);
+                          ui.newTerminal({ profileId: entry.profile.id });
                         }}
-                        className="block w-full px-3 py-1 text-left text-[11px] text-zinc-300 hover:bg-[#161616] hover:text-white"
+                        className="block w-full px-3 py-1 text-left text-[11px] text-zinc-300 hover:bg-[#161616] hover:text-white disabled:opacity-40 disabled:hover:bg-transparent"
                       >
-                        {shell.name}
+                        {entry.profile.name}
                       </button>
                     ))}
+                    <div role="separator" className="my-1 h-px bg-[#1c1c1c]" />
+                    <button
+                      role="menuitem"
+                      onClick={() => {
+                        setShellMenu(false);
+                        setManaging(true);
+                      }}
+                      className="block w-full px-3 py-1 text-left text-[11px] text-zinc-400 hover:bg-[#161616] hover:text-white"
+                    >
+                      Manage Profiles…
+                    </button>
                   </div>
                 )}
               </div>
               <ToolButton
-                label={splitId ? "Unsplit Terminal" : "Split Terminal"}
+                label={secondary !== null ? "Unsplit Terminal" : "Split Terminal"}
                 path={icons.split}
                 disabled={missing}
-                active={!!splitId}
-                onClick={toggleSplit}
+                active={secondary !== null}
+                onClick={() => ui.toggleSplit()}
               />
               <ToolButton
                 label="Clear Terminal"
                 path={icons.clear}
                 disabled={missing}
-                onClick={() => active()?.clear()}
+                onClick={() => handleOf(focusedId)?.clear()}
               />
               <ToolButton
                 label="Find in Terminal"
                 path={icons.find}
                 disabled={missing}
                 active={finding}
-                onClick={() => (finding ? setFinding(false) : openFind())}
+                onClick={() => (finding ? closeFind() : ui.openFind())}
               />
             </>
           )}
@@ -600,53 +466,51 @@ export function TerminalPanel({
         >
           {sessions.map((session) => (
             <div
-              key={session.id}
+              key={session.sessionId}
               className={`group flex h-5 shrink-0 items-center gap-1.5 rounded px-2 text-[11px] transition-colors ${
-                shown.includes(session.id)
+                shown.includes(session.sessionId)
                   ? "bg-[#161616] text-zinc-100"
                   : "text-zinc-500 hover:text-zinc-300"
               }`}
             >
               <Icon path={icons.terminal} size={10} />
-              {renaming === session.id ? (
+              {renaming === session.sessionId ? (
                 <input
                   autoFocus
                   aria-label="Rename terminal"
-                  defaultValue={session.name}
+                  defaultValue={session.title}
                   onBlur={(event) => {
                     const name = event.target.value.trim();
-                    if (name)
-                      setSessions((previous) =>
-                        previous.map((one) => (one.id === session.id ? { ...one, name } : one)),
-                      );
-                    setRenaming("");
+                    if (name && service.get(session.sessionId)) ui.rename(session.sessionId, name);
+                    setRenaming(null);
                   }}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") event.currentTarget.blur();
-                    if (event.key === "Escape") setRenaming("");
+                    if (event.key === "Escape") setRenaming(null);
                   }}
                   className="w-24 rounded border border-indigo-500 bg-black px-1 text-[11px] text-zinc-100 outline-none"
                 />
               ) : (
                 <button
                   role="tab"
-                  aria-selected={session.id === activeId}
-                  onClick={() => setActiveId(session.id)}
-                  onDoubleClick={() => setRenaming(session.id)}
+                  aria-selected={session.sessionId === focusedId}
+                  title={`Profile: ${session.profileName ?? "the default shell"}`}
+                  onClick={() => ui.activate(session.sessionId)}
+                  onDoubleClick={() => setRenaming(session.sessionId)}
                   className="max-w-[150px] truncate"
                 >
-                  {session.name}
+                  {session.title}
                 </button>
               )}
-              {bells.has(session.id) && (
+              {bells.has(session.sessionId) && (
                 <span title="This terminal rang" className="text-amber-400">
                   •
                 </span>
               )}
               <button
-                aria-label={`Close ${session.name}`}
-                title={`Close ${session.name}`}
-                onClick={() => closeSession(session.id)}
+                aria-label={`Close ${session.title}`}
+                title={`Close ${session.title}`}
+                onClick={() => ui.close(session.sessionId)}
                 className="text-zinc-600 opacity-0 group-hover:opacity-100 hover:text-zinc-200"
               >
                 <Icon path={icons.close} size={9} />
@@ -670,14 +534,13 @@ export function TerminalPanel({
             value={find}
             onChange={(event) => {
               setFind(event.target.value);
-              active()?.search(event.target.value, "next", { caseSensitive, regex });
+              search(event.target.value, "next");
             }}
             onKeyDown={(event) => {
-              if (event.key === "Enter") runFind(event.shiftKey ? "previous" : "next");
+              if (event.key === "Enter") search(find, event.shiftKey ? "previous" : "next");
               if (event.key === "Escape") {
-                setFinding(false);
-                active()?.endSearch();
-                active()?.focus();
+                closeFind();
+                handleOf(focusedId)?.focus();
               }
             }}
             className="w-56 rounded border border-[#222222] bg-[#0a0a0a] px-2 py-0.5 text-[11px] text-zinc-100 placeholder:text-zinc-600 focus:border-indigo-500 focus:outline-none"
@@ -689,7 +552,7 @@ export function TerminalPanel({
             onClick={() => {
               const next = !caseSensitive;
               setCaseSensitive(next);
-              active()?.search(find, "next", { caseSensitive: next, regex });
+              search(find, "next", { caseSensitive: next, regex });
             }}
             className={`rounded px-1.5 py-0.5 font-mono text-[11px] ${
               caseSensitive
@@ -706,7 +569,7 @@ export function TerminalPanel({
             onClick={() => {
               const next = !regex;
               setRegex(next);
-              active()?.search(find, "next", { caseSensitive, regex: next });
+              search(find, "next", { caseSensitive, regex: next });
             }}
             className={`rounded px-1.5 py-0.5 font-mono text-[11px] ${
               regex ? "bg-indigo-950/60 text-indigo-300" : "text-zinc-500 hover:text-zinc-300"
@@ -720,7 +583,7 @@ export function TerminalPanel({
           <button
             aria-label="Previous match"
             title="Previous match"
-            onClick={() => runFind("previous")}
+            onClick={() => search(find, "previous")}
             className="rounded p-1 text-zinc-400 hover:bg-[#151515] hover:text-zinc-200"
           >
             <Icon path={icons.up} size={11} />
@@ -728,17 +591,14 @@ export function TerminalPanel({
           <button
             aria-label="Next match"
             title="Next match"
-            onClick={() => runFind("next")}
+            onClick={() => search(find, "next")}
             className="rounded p-1 text-zinc-400 hover:bg-[#151515] hover:text-zinc-200"
           >
             <Icon path={icons.down} size={11} />
           </button>
           <button
             aria-label="Close find"
-            onClick={() => {
-              setFinding(false);
-              active()?.endSearch();
-            }}
+            onClick={closeFind}
             className="ml-auto rounded p-1 text-zinc-500 hover:bg-[#151515] hover:text-zinc-200"
           >
             <Icon path={icons.close} size={10} />
@@ -765,8 +625,8 @@ export function TerminalPanel({
             >
               <p className="text-[11.5px] text-zinc-500">No terminals are running.</p>
               <button
-                onClick={() => create(shells[0])}
-                disabled={!shells.length}
+                onClick={() => ui.newTerminal()}
+                disabled={!launchable.length}
                 className="rounded bg-indigo-600 px-3 py-1 text-[11px] font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
               >
                 New Terminal
@@ -774,51 +634,41 @@ export function TerminalPanel({
             </section>
           )}
           {sessions.map((session) => {
-            const position = shown.indexOf(session.id);
+            const position = shown.indexOf(session.sessionId);
             return (
               <div
-                key={session.id}
+                key={session.sessionId}
                 hidden={position === -1}
                 // Clicking or tabbing into a pane makes it the one the toolbar acts on,
                 // so Clear and Find follow the pane the user is actually working in.
                 onFocusCapture={() =>
-                  position !== -1 && setFocusedPane(position === 0 ? "primary" : "secondary")
+                  position !== -1 && ui.focusPane(position === 0 ? "primary" : "secondary")
                 }
                 style={
-                  splitId && position !== -1
+                  secondary !== null && position !== -1
                     ? { width: `${(position === 0 ? splitRatio : 1 - splitRatio) * 100}%` }
                     : undefined
                 }
-                className={`h-full min-h-0 min-w-0 ${splitId && position !== -1 ? "" : "flex-1"}`}
+                className={`h-full min-h-0 min-w-0 ${secondary !== null && position !== -1 ? "" : "flex-1"}`}
               >
                 <TerminalView
-                  ref={(handle) => {
-                    handles.current.set(session.id, handle);
-                  }}
                   session={session}
-                  hasSplit={!!splitId}
+                  service={service}
+                  ui={ui}
+                  hasSplit={secondary !== null}
                   visible={!hidden && activeTab === "terminal" && position !== -1}
                   fontSize={fontSize}
-                  onStatus={setStatus}
-                  onBell={() =>
-                    setBells((previous) =>
-                      session.id === activeId ? previous : new Set(previous).add(session.id),
-                    )
-                  }
                   onShortcut={shortcut}
                   onContextMenu={(at) => {
-                    // Focus the pane rather than reassigning `activeId`: in a split that
-                    // would set activeId === splitId and collapse the layout onto one pane.
-                    if (position !== -1) setFocusedPane(position === 0 ? "primary" : "secondary");
-                    if (!splitId) setActiveId(session.id);
-                    setMenu(at);
+                    // The menu belongs to this terminal, whichever pane it is in.
+                    ui.activate(session.sessionId);
+                    setMenu({ ...at, id: session.sessionId });
                   }}
-                  onSearchResults={setMatches}
                 />
               </div>
             );
           })}
-          {splitId && (
+          {secondary !== null && (
             <div
               role="separator"
               aria-label="Resize split"
@@ -848,11 +698,11 @@ export function TerminalPanel({
           // Kept inside the window. The panel sits at the bottom of the screen, so a menu
           // placed at the pointer runs off the edge and its last items become unclickable --
           // which is exactly what happened when this menu gained one more entry.
-          style={clampToViewport(menu, menuItems.length)}
+          style={clampToViewport(menu, openMenuItems.length)}
           onMouseDown={(event) => event.stopPropagation()}
           className="fixed z-50 min-w-[160px] rounded border border-[#222222] bg-[#0a0a0a] py-1 shadow-xl"
         >
-          {menuItems.map((item) => (
+          {openMenuItems.map((item) => (
             <button
               key={item.label}
               role="menuitem"
@@ -869,15 +719,34 @@ export function TerminalPanel({
         </div>
       )}
 
+      {managing && (
+        <TerminalProfilesDialog
+          profiles={ui.profiles}
+          onLaunch={(profileId) => {
+            try {
+              ui.newTerminal({ profileId });
+            } catch {
+              /* The dialog only offers profiles that can start. */
+            }
+          }}
+          onClose={() => setManaging(false)}
+        />
+      )}
+
       {activeTab === "terminal" && status && (
         <p
           role="status"
           aria-live="polite"
           className={`shrink-0 truncate border-t border-[#141414] bg-[#050505] px-3 py-1 text-[10.5px] ${
-            status === "Running" ? "text-zinc-500" : "text-rose-300"
+            status.startsWith("Running") ? "text-zinc-500" : "text-rose-300"
           }`}
         >
           {status}
+          {folder && (
+            <span data-testid="terminal-folder" title={folder} className="ml-3 text-zinc-600">
+              {folder}
+            </span>
+          )}
         </p>
       )}
     </div>

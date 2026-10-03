@@ -34,14 +34,21 @@
 //!   `UNRESPONSIVE_TIMEOUT`, when it is detached (`SubscriberFailed`) so a broken view cannot hold
 //!   its terminal (and its end) for ever.
 //!
-//! This is flow-control buffering only. Nothing here is kept for replay: a subscriber sees the
-//! stream from when it subscribed, and output with no subscriber at all is not kept (TERMINAL-03
-//! owns replay). Nothing logs terminal content.
+//! Replay (TERMINAL-03) is kept apart from that flow-control buffering: a bounded ring of the
+//! most recent sealed messages (`REPLAY_BYTES` of output, the same shared messages subscribers
+//! are sent -- nothing is copied), plus the generation's `Running` message and its end. A view
+//! that attaches is sent the ring and then continues live from exactly where the ring stops, so
+//! it sees nothing twice and misses nothing the ring still holds. The ring outlives the
+//! generation's end until the session is released, so a view can attach to a session that has
+//! exited. A *lifecycle* subscriber (the workspace's TerminalService) is sent only lifecycle
+//! messages: it never holds output back and never counts as anyone's laggard. Nothing logs
+//! terminal content.
 
+use crate::terminal_shell::{host_name, OscScanner};
 use ide_terminal_protocol::{
-    Generation, Sequence, SubscriptionId, TerminalDetached, TerminalError, TerminalErrorCause,
-    TerminalErrorEvent, TerminalExit, TerminalId, TerminalMessage, TerminalOutputChunk,
-    TerminalStateChanged, FIRST_SEQUENCE,
+    Generation, LiveState, Sequence, SubscriptionId, TerminalDetached, TerminalError,
+    TerminalErrorCause, TerminalErrorEvent, TerminalExit, TerminalId, TerminalMessage,
+    TerminalOutputChunk, TerminalShellEvent, TerminalStateChanged, FIRST_SEQUENCE,
 };
 use serde::Serialize;
 use std::{
@@ -84,6 +91,10 @@ pub struct Limits {
     /// broken view cannot pause its terminal for ever. Long, so a slow (or throttled, hidden)
     /// view that is still acknowledging is never mistaken for a dead one.
     pub unresponsive_timeout: Duration,
+    /// Recent output kept for views that attach later (replay): enough to redraw a terminal's
+    /// screen and its recent scrollback, never a history. At most one subscriber window, so a
+    /// replay never has to wait on acknowledgements to be sent.
+    pub replay_bytes: usize,
 }
 
 pub const LIMITS: Limits = Limits {
@@ -96,6 +107,7 @@ pub const LIMITS: Limits = Limits {
     subscriber_low: 128 * 1024,
     stall_timeout: Duration::from_secs(5),
     unresponsive_timeout: Duration::from_secs(30),
+    replay_bytes: 256 * 1024,
 };
 
 /// Where one subscriber's messages go: its window's channel, or a test's recorder.
@@ -103,6 +115,16 @@ pub trait Sink: Send + Sync + 'static {
     /// Hands one serialized `TerminalMessage` to the transport. `false` when the transport is
     /// gone (its window closed): the subscriber is then removed, as a normal end.
     fn send(&self, message: &str) -> bool;
+}
+
+/// What a subscriber is sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// Everything: output (under flow control) and lifecycle. A view.
+    Output,
+    /// Lifecycle only -- state changes and the end. The workspace's TerminalService, which keeps
+    /// a session's state whether or not a view is attached.
+    Lifecycle,
 }
 
 /// How a generation ended.
@@ -114,17 +136,32 @@ pub enum End {
 enum Pending {
     Bytes(Vec<u8>),
     Live(TerminalStateChanged),
+    /// A shell-integration signal (TERMINAL-05A), after the bytes that carried it.
+    Shell(TerminalShellEvent),
     End(End),
 }
 
 /// What one subscriber is about to be sent, outside the lock: who, where, and the messages.
-type Delivery = (SubscriptionId, Arc<dyn Sink>, Vec<Arc<str>>);
+type Outgoing = (SubscriptionId, Arc<dyn Sink>, Vec<Arc<str>>);
 
-/// One sealed message, shared by every subscriber that has yet to be sent it.
+/// One sealed message, shared by every subscriber that has yet to be sent it (and by the replay
+/// ring).
+#[derive(Clone)]
 struct Entry {
     /// For output: its sequence number and size.
     output: Option<(u64, usize)>,
+    role: Role,
     encoded: Arc<str>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Output,
+    Running,
+    Exiting,
+    End,
+    /// Shell integration: delivered live, never replayed (the service keeps what it meant).
+    Shell,
 }
 
 struct Subscriber {
@@ -141,6 +178,9 @@ struct Subscriber {
     throttled: bool,
     /// When it last acknowledged something (or subscribed).
     last_progress: Instant,
+    lifecycle_only: bool,
+    /// Sent before anything live: the replay it attached with.
+    preamble: VecDeque<Entry>,
 }
 
 #[derive(Default)]
@@ -168,6 +208,13 @@ struct State {
     reader_paused: bool,
     paused_since: Option<Instant>,
     peak_queued: usize,
+    /// The most recent output and `Exiting`, oldest first, for views that attach later.
+    replay: VecDeque<Entry>,
+    replay_bytes: usize,
+    running: Option<Entry>,
+    end: Option<Entry>,
+    /// The session was closed: nothing more is kept or handed out.
+    released: bool,
 }
 
 impl State {
@@ -188,6 +235,8 @@ pub struct StreamStats {
     pub backpressured: bool,
     pub ended: bool,
     pub finished: bool,
+    /// Output kept for replay.
+    pub replay_bytes: usize,
     pub subscribers: Vec<SubscriberStats>,
 }
 
@@ -199,6 +248,7 @@ pub struct SubscriberStats {
     pub acked_seq: Option<u64>,
     pub in_flight_bytes: usize,
     pub throttled: bool,
+    pub lifecycle_only: bool,
 }
 
 /// One generation's output, from its reader to its subscribers.
@@ -208,6 +258,9 @@ pub struct OutputStream {
     limits: Limits,
     state: Mutex<State>,
     changed: Condvar,
+    /// Finds shell-integration sequences in the output, once, as it is pushed (only the reader
+    /// pushes, so this is never contended).
+    scanner: Mutex<OscScanner>,
 }
 
 fn encode(message: &TerminalMessage) -> Arc<str> {
@@ -223,7 +276,7 @@ impl OutputStream {
         session_id: TerminalId,
         generation: Generation,
         limits: Limits,
-        first: (SubscriptionId, Arc<dyn Sink>),
+        first: (SubscriptionId, Arc<dyn Sink>, Delivery),
     ) -> Arc<OutputStream> {
         let stream = Arc::new(OutputStream {
             session_id,
@@ -231,9 +284,10 @@ impl OutputStream {
             limits,
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
+            scanner: Mutex::new(OscScanner::new(host_name())),
         });
         stream
-            .subscribe(first.0, first.1)
+            .subscribe(first.0, first.1, first.2, false)
             .expect("a new stream takes its first subscriber");
         let pump = stream.clone();
         thread::spawn(move || pump.pump());
@@ -258,6 +312,11 @@ impl OutputStream {
     /// Takes one PTY read, waiting while the stream is at its bound. `false` once the input is
     /// closed: the reader stops.
     pub fn push(&self, bytes: &[u8]) -> bool {
+        let found = self
+            .scanner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .feed(bytes);
         let mut state = self.lock();
         while state.reader_paused && !state.input_closed {
             state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
@@ -265,11 +324,22 @@ impl OutputStream {
         if state.input_closed {
             return false;
         }
-        match state.pending.back_mut() {
-            Some(Pending::Bytes(tail)) => tail.extend_from_slice(bytes),
-            _ => state.pending.push_back(Pending::Bytes(bytes.to_vec())),
+        // The bytes, unchanged; each shell-integration signal goes right after the bytes that
+        // ended its sequence, so it is delivered in order with the output.
+        let mut from = 0;
+        for (end, signal) in found {
+            Self::append(&mut state, &bytes[from..end]);
+            from = end;
+            state.pending.push_back(Pending::Shell(TerminalShellEvent {
+                session_id: self.session_id.clone(),
+                generation: self.generation,
+                signal: signal.signal,
+                uri: signal.uri,
+                local: signal.local,
+                exit_code: signal.exit_code,
+            }));
         }
-        state.pending_bytes += bytes.len();
+        Self::append(&mut state, &bytes[from..]);
         state.pending_reads += 1;
         state.pending_since.get_or_insert_with(Instant::now);
         if state.queued() >= self.limits.ingress_high {
@@ -279,6 +349,17 @@ impl OutputStream {
         state.peak_queued = state.peak_queued.max(state.queued());
         self.changed.notify_all();
         true
+    }
+
+    fn append(state: &mut State, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        match state.pending.back_mut() {
+            Some(Pending::Bytes(tail)) => tail.extend_from_slice(bytes),
+            _ => state.pending.push_back(Pending::Bytes(bytes.to_vec())),
+        }
+        state.pending_bytes += bytes.len();
     }
 
     /// Whether the reader is waiting on subscribers (the stream is backpressured).
@@ -336,17 +417,50 @@ impl OutputStream {
 
     // --- The subscribers' side ----------------------------------------------------------------
 
-    /// Adds a subscriber, sent everything sealed from now on.
-    pub fn subscribe(&self, id: SubscriptionId, sink: Arc<dyn Sink>) -> Result<(), TerminalError> {
+    /// Adds a subscriber. With `replay`, it is first sent what the replay ring holds -- the
+    /// generation's `Running`, its recent output and `Exiting`, and its end if it has ended --
+    /// then everything sealed from now on, so it sees each message once. A session that has
+    /// ended can still be attached to: the subscriber is sent the replay and the end.
+    pub fn subscribe(
+        &self,
+        id: SubscriptionId,
+        sink: Arc<dyn Sink>,
+        delivery: Delivery,
+        replay: bool,
+    ) -> Result<(), TerminalError> {
         let mut state = self.lock();
-        if state.ended || state.finished {
+        if state.released {
             return Err(TerminalError::new(
                 TerminalErrorCause::InvalidSession,
-                "That terminal is no longer running.",
+                "That terminal has been closed.",
             ));
         }
-        if state.subscribers.iter().any(|s| s.id == id) {
+        if state.subscribers.iter().any(|s| s.id == id) || state.retired.contains(&id) {
             return Err(TerminalError::protocol("That subscription already exists."));
+        }
+        let lifecycle_only = delivery == Delivery::Lifecycle;
+        let mut preamble = VecDeque::new();
+        if replay {
+            preamble.extend(state.running.clone());
+            preamble.extend(
+                state
+                    .replay
+                    .iter()
+                    .filter(|e| !(lifecycle_only && e.role == Role::Output))
+                    .cloned(),
+            );
+            preamble.extend(state.end.clone());
+        }
+        // Over already, and its pump gone: the replay is all there is, handed over now.
+        if state.finished {
+            state.retired.push(id);
+            drop(state);
+            for entry in preamble {
+                if !sink.send(&entry.encoded) {
+                    break;
+                }
+            }
+            return Ok(());
         }
         let next = state.first_index + state.entries.len() as u64;
         state.subscribers.push(Subscriber {
@@ -359,9 +473,22 @@ impl OutputStream {
             in_flight_bytes: 0,
             throttled: false,
             last_progress: Instant::now(),
+            lifecycle_only,
+            preamble,
         });
         self.changed.notify_all();
         Ok(())
+    }
+
+    /// The session was closed: the replay is dropped and nobody can attach any more.
+    pub fn release(&self) {
+        let mut state = self.lock();
+        state.released = true;
+        state.replay.clear();
+        state.replay_bytes = 0;
+        state.running = None;
+        state.end = None;
+        self.changed.notify_all();
     }
 
     /// Removes a subscriber and everything held only for it. `false` if it was not here.
@@ -442,6 +569,7 @@ impl OutputStream {
             backpressured: state.reader_paused,
             ended: state.ended,
             finished: state.finished,
+            replay_bytes: state.replay_bytes,
             subscribers: state
                 .subscribers
                 .iter()
@@ -451,6 +579,7 @@ impl OutputStream {
                     acked_seq: s.acked_seq,
                     in_flight_bytes: s.in_flight_bytes,
                     throttled: s.throttled,
+                    lifecycle_only: s.lifecycle_only,
                 })
                 .collect(),
         }
@@ -561,12 +690,22 @@ impl OutputStream {
                         });
                         entries.push(Entry {
                             output: Some((seq, piece.len())),
+                            role: Role::Output,
                             encoded: encode(&message),
                         });
                     }
                 }
+                Pending::Shell(event) => entries.push(Entry {
+                    output: None,
+                    role: Role::Shell,
+                    encoded: encode(&TerminalMessage::Shell(event)),
+                }),
                 Pending::Live(event) => entries.push(Entry {
                     output: None,
+                    role: match event.state {
+                        LiveState::Running { .. } => Role::Running,
+                        LiveState::Exiting => Role::Exiting,
+                    },
                     encoded: encode(&TerminalMessage::State(event)),
                 }),
                 Pending::End(end) => {
@@ -589,6 +728,7 @@ impl OutputStream {
                     };
                     entries.push(Entry {
                         output: None,
+                        role: Role::End,
                         encoded: encode(&message),
                     });
                     sealed_end = true;
@@ -605,6 +745,27 @@ impl OutputStream {
             if let Some((_, len)) = entry.output {
                 state.retained_bytes += len;
             }
+            if !state.released {
+                match entry.role {
+                    Role::Running => state.running = Some(entry.clone()),
+                    Role::End => state.end = Some(entry.clone()),
+                    Role::Shell => {}
+                    Role::Output | Role::Exiting => {
+                        if let Some((_, len)) = entry.output {
+                            state.replay_bytes += len;
+                        }
+                        state.replay.push_back(entry.clone());
+                        while state.replay_bytes > self.limits.replay_bytes {
+                            let Some(old) = state.replay.pop_front() else {
+                                break;
+                            };
+                            if let Some((_, len)) = old.output {
+                                state.replay_bytes -= len;
+                            }
+                        }
+                    }
+                }
+            }
             state.entries.push_back(entry);
         }
         if sealed_end {
@@ -620,7 +781,7 @@ impl OutputStream {
         let high = self.limits.subscriber_high;
         let first = state.first_index;
         let total = first + state.entries.len() as u64;
-        let mut batches: Vec<Delivery> = Vec::new();
+        let mut batches: Vec<Outgoing> = Vec::new();
         let State {
             subscribers,
             entries,
@@ -628,8 +789,21 @@ impl OutputStream {
         } = &mut *state;
         for subscriber in subscribers.iter_mut() {
             let mut sending = Vec::new();
+            // The replay it attached with comes first; it is bounded by one window.
+            for entry in subscriber.preamble.drain(..) {
+                if let Some((seq, len)) = entry.output {
+                    subscriber.sent_seq = Some(seq);
+                    subscriber.in_flight.push_back((seq, len));
+                    subscriber.in_flight_bytes += len;
+                }
+                sending.push(entry.encoded);
+            }
             while subscriber.next < total {
                 let entry = &entries[(subscriber.next - first) as usize];
+                if subscriber.lifecycle_only && entry.output.is_some() {
+                    subscriber.next += 1;
+                    continue;
+                }
                 if let Some((seq, len)) = entry.output {
                     if subscriber.throttled || subscriber.in_flight_bytes >= high {
                         subscriber.throttled = true;
@@ -699,11 +873,13 @@ impl OutputStream {
         let paused_too_long = state
             .paused_since
             .is_some_and(|since| since.elapsed() >= stall);
-        if paused_too_long && state.subscribers.len() > 1 {
-            let furthest = state.subscribers.iter().map(|s| s.next).max().unwrap_or(0);
+        let views = state.subscribers.iter().filter(|s| !s.lifecycle_only);
+        if paused_too_long && views.clone().count() > 1 {
+            let furthest = views.map(|s| s.next).max().unwrap_or(0);
             let behind: Vec<SubscriptionId> = state
                 .subscribers
                 .iter()
+                .filter(|s| !s.lifecycle_only)
                 .filter(|s| s.next < furthest && s.last_progress.elapsed() >= stall)
                 .map(|s| s.id.clone())
                 .collect();

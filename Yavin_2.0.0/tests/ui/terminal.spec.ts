@@ -57,8 +57,16 @@ async function desktop(
     const callbacks: Record<number, (event: unknown) => void> = {};
     const listeners: Record<string, number[]> = {};
     const sequences: Record<string, number> = {};
-    /** Each launch's own channel, by `sessionId:generation`. */
-    const channels: Record<string, { onmessage: (message: unknown) => void }> = {};
+    type Channel = { onmessage: (message: unknown) => void };
+    /**
+     * Each launch, by `sessionId:generation`, as the native side keeps it: the service's
+     * lifecycle channel, each attached view's channel, and what a view attaching later is
+     * replayed (its `Running`, its output, its end).
+     */
+    const launches: Record<
+      string,
+      { lifecycle: Channel; views: Record<string, Channel>; replay: unknown[] }
+    > = {};
     let nextId = 1;
 
     Object.assign(window, {
@@ -67,13 +75,16 @@ async function desktop(
       __emit: (event: string, payload: unknown) => {
         for (const id of listeners[event] ?? []) callbacks[id]?.({ event, id, payload });
       },
-      // A terminal's output and exit as the native side sends them -- on the channel that
-      // launch was opened with, never broadcast: for its latest launch unless one is named,
-      // bytes in base64, numbered from 0 within the launch.
+      // A terminal's output and exit as the native side sends them -- output to each view
+      // attached to that launch, its end (Exiting, then the exit) to the service and the views,
+      // never broadcast: for its latest launch unless one is named, bytes in base64, numbered
+      // from 0 within the launch.
+      // A shell-integration signal (TERMINAL-05A) goes to the service and the views, live,
+      // and is never replayed.
       __terminal: (
-        kind: "output" | "exit",
+        kind: "output" | "exit" | "shell",
         sessionId: string,
-        value: string | number,
+        value: string | number | Record<string, unknown>,
         launch?: number,
       ) => {
         const generation =
@@ -82,14 +93,29 @@ async function desktop(
             ?.args.generation as number);
         const key = `${sessionId}:${generation}`;
         const next = sequences[key] ?? 0;
-        const send = (message: unknown) => channels[key]?.onmessage(message);
-        if (kind === "output") {
+        const launch_ = launches[key];
+        if (!launch_) return;
+        const toViews = (message: unknown) => {
+          launch_.replay.push(message);
+          for (const view of Object.values(launch_.views)) view.onmessage(message);
+        };
+        const toAll = (message: unknown) => {
+          toViews(message);
+          launch_.lifecycle.onmessage(message);
+        };
+        if (kind === "shell") {
+          const message = { kind, sessionId, generation, ...(value as object) };
+          for (const view of Object.values(launch_.views)) view.onmessage(message);
+          launch_.lifecycle.onmessage(message);
+        } else if (kind === "output") {
           sequences[key] = next + 1;
           const bytes = btoa(String.fromCharCode(...new TextEncoder().encode(value as string)));
-          send({ kind: "output", sessionId, generation, seq: next, bytes });
+          toViews({ kind: "output", sessionId, generation, seq: next, bytes });
         } else {
           const lastSeq = next === 0 ? null : next - 1;
-          send({ kind: "exit", sessionId, generation, exitCode: value, lastSeq });
+          toAll({ kind: "state", sessionId, generation, state: "Exiting" });
+          toAll({ kind: "exit", sessionId, generation, exitCode: value, lastSeq });
+          launch_.views = {};
         }
       },
       isTauri: true,
@@ -170,15 +196,50 @@ async function desktop(
             return { output, code: scenario.__scenarioCheckerCode ?? setup.checkerCode ?? 0 };
           }
           if (command === "stop_listening_process") return null;
+          // Discovery (TERMINAL-05): every shell looked for, one of them not installed.
           if (command === "terminal_shells")
             return [
-              { name: "Command Prompt", path: "C:\\Windows\\System32\\cmd.exe" },
-              { name: "Git Bash", path: "C:\\Program Files\\Git\\bin\\bash.exe" },
+              {
+                name: "Command Prompt",
+                path: "C:\\Windows\\System32\\cmd.exe",
+                kind: "cmd",
+                platform: "windows",
+                available: true,
+                reason: null,
+                isDefault: true,
+              },
+              {
+                name: "PowerShell",
+                path: "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                kind: "pwsh",
+                platform: "windows",
+                available: false,
+                reason: "PowerShell 7 (pwsh.exe) is not installed.",
+                isDefault: false,
+              },
+              {
+                name: "Git Bash",
+                path: "C:\\Program Files\\Git\\bin\\bash.exe",
+                kind: "bash",
+                platform: "windows",
+                available: true,
+                reason: null,
+                isDefault: false,
+              },
             ];
           if (command === "terminal_open") {
             if (setup.failOpen) throw setup.failOpen;
-            channels[`${request!.sessionId}:${args.generation}`] = raw.events as {
-              onmessage: (message: unknown) => void;
+            const running = {
+              kind: "state",
+              sessionId: request!.sessionId,
+              generation: args.generation,
+              state: "Running",
+              pid: 4242,
+            };
+            launches[`${request!.sessionId}:${args.generation}`] = {
+              lifecycle: raw.events as Channel,
+              views: {},
+              replay: [running],
             };
             // A slow start, for tests of what happens meanwhile; its end is recorded too.
             const delay = (window as unknown as { __openDelay?: number }).__openDelay;
@@ -195,6 +256,25 @@ async function desktop(
               startedAt: 0,
               exitCode: null,
             };
+          }
+          // A view attaches: replayed what its launch has said so far, then sent it live.
+          if (command === "terminal_subscribe") {
+            const subscribed = raw.request as {
+              subscriptionId: string;
+              sessionId: string;
+              generation: number;
+            };
+            const launch_ = launches[`${subscribed.sessionId}:${subscribed.generation}`];
+            if (!launch_) throw "InvalidSession: That terminal is no longer running.";
+            const view = raw.events as Channel;
+            for (const message of launch_.replay) view.onmessage(message);
+            launch_.views[subscribed.subscriptionId] = view;
+            return null;
+          }
+          if (command === "terminal_unsubscribe") {
+            const { subscriptionId } = raw.request as { subscriptionId: string };
+            for (const launch_ of Object.values(launches)) delete launch_.views[subscriptionId];
+            return null;
           }
           if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
           if (command === "git_repo_state") return "";
@@ -221,11 +301,24 @@ const calls = (page: Page, command: string) =>
 const countCalls = async (page: Page, command: string) => (await calls(page, command)).length;
 
 type TerminalEvent = (
-  kind: "output" | "exit",
+  kind: "output" | "exit" | "shell",
   id: string,
-  value: string | number,
+  value: string | number | Record<string, unknown>,
   launch?: number,
 ) => void;
+
+/** A shell-integration signal from a terminal's shell (TERMINAL-05A), as the native side found it. */
+const signal = (page: Page, id: string, fields: Record<string, unknown>, launch?: number) =>
+  page.evaluate(
+    ([sessionId, value, generation]) =>
+      (window as unknown as { __terminal: TerminalEvent }).__terminal(
+        "shell",
+        sessionId as string,
+        value as Record<string, unknown>,
+        generation as number | undefined,
+      ),
+    [id, fields, launch] as const,
+  );
 
 /** Output from a terminal's shell (its latest launch unless `launch` names another). */
 const output = (page: Page, id: string, text: string, launch?: number) =>
@@ -460,6 +553,69 @@ test("an exited shell reports its code and can be restarted", async ({ page }) =
   await expect.poll(async () => countCalls(page, "terminal_open")).toBe(opens + 1);
   // The restarted shell keeps the same identity, so its tab does not change.
   expect(await uniqueIds(page)).toEqual([id]);
+});
+
+test("a shell with integration shows where it is and how its last command ended", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("Choose a shell").click();
+  await page.getByRole("menuitem", { name: "Git Bash", exact: true }).click();
+  const [, bash] = await terminalIds(page, 2);
+  const status = page.getByRole("status").filter({ hasText: "Running" });
+  await expect(status).toHaveText("Running");
+
+  // Git Bash reports its MSYS folder; the status line shows the Windows path it names.
+  await signal(page, bash, { signal: "cwd", uri: "file://BOX/c/Users/me/my project", local: true });
+  await expect(page.getByTestId("terminal-folder")).toHaveText("C:/Users/me/my project");
+  await signal(page, bash, { signal: "prompt" });
+  await signal(page, bash, { signal: "input" });
+  await signal(page, bash, { signal: "executing" });
+  await expect(status).toContainText("Running a command");
+  await signal(page, bash, { signal: "finished", exitCode: 1 });
+  await expect(status).toContainText("Last command exited with 1");
+  // A command's failure is not the terminal's: it still runs and takes input.
+  await view(page, bash).click();
+  await page.keyboard.type("x");
+  await expect.poll(async () => countCalls(page, "terminal_write")).toBeGreaterThan(0);
+
+  // A folder on another machine is never shown as a local one.
+  await signal(page, bash, { signal: "cwd", uri: "file://build-server/home/ci", local: false });
+  await expect(page.getByTestId("terminal-folder")).toHaveText("build-server (remote)");
+});
+
+test("shell integration is per terminal and starts again on restart", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const [cmd] = await terminalIds(page);
+  await page.getByLabel("Choose a shell").click();
+  await page.getByRole("menuitem", { name: "Git Bash", exact: true }).click();
+  const [, bash] = await terminalIds(page, 2);
+
+  // The Command Prompt has no integration: the focused Git Bash's line is not its business.
+  await signal(page, bash, { signal: "cwd", uri: "file:///c/work", local: true });
+  await expect(page.getByTestId("terminal-folder")).toHaveText("C:/work");
+  await page.getByRole("tab", { name: "Command Prompt", exact: true }).click();
+  await expect(page.getByTestId("terminal-folder")).toHaveCount(0);
+  // Signals of a terminal that is not shown change only that terminal.
+  await signal(page, cmd, { signal: "invalid" });
+  await expect(page.getByRole("status").filter({ hasText: "Running" })).toContainText(
+    "unreadable sequences",
+  );
+
+  await page.getByRole("tab", { name: "Git Bash", exact: true }).click();
+  await expect(page.getByTestId("terminal-folder")).toHaveText("C:/work");
+  const before = (await calls(page, "terminal_open")).filter((c) => c.args.id === bash).length;
+  await exit(page, bash, 0);
+  await page.getByRole("button", { name: "Restart", exact: true }).click();
+  await expect
+    .poll(async () => (await calls(page, "terminal_open")).filter((c) => c.args.id === bash).length)
+    .toBe(before + 1);
+  // A new shell: nothing the old one reported is true of it.
+  await expect(page.getByRole("status").filter({ hasText: "Running" })).toHaveText("Running");
+  await expect(page.getByTestId("terminal-folder")).toHaveCount(0);
 });
 
 test("the end of a shell that was replaced is never taken for the one replacing it", async ({
@@ -874,7 +1030,11 @@ test("a shell that finishes starting after its terminal was closed is ended, not
         started.length > 0 &&
         started.every((done) => {
           const generation = done.split(":").pop();
-          return seen.slice(seen.indexOf(done) + 1).includes(`terminal_close:${generation}`);
+          const after = seen.slice(seen.indexOf(done) + 1);
+          return (
+            after.includes(`terminal_close:${generation}`) ||
+            after.includes(`terminal_kill:${generation}`)
+          );
         })
       );
     })
@@ -956,9 +1116,12 @@ test("output is acknowledged once the terminal has taken it in", async ({ page }
     .toEqual([0, 1]);
   const [ack] = await calls(page, "terminal_ack");
   const [open] = (await calls(page, "terminal_open")).slice(-1);
+  const views = await calls(page, "terminal_subscribe");
   expect(ack.args.sessionId).toBe(id);
   expect(ack.args.generation).toBe(open.args.generation);
-  expect(ack.args.subscriptionId).toBe(open.args.subscriptionId);
+  // The view's own subscription, not the service's lifecycle one.
+  expect(views.map((v) => v.args.subscriptionId)).toContain(ack.args.subscriptionId);
+  expect(ack.args.subscriptionId).not.toBe(open.args.subscriptionId);
 });
 
 test("Open in Integrated Terminal starts a shell in the chosen folder", async ({ page }) => {
@@ -1484,4 +1647,324 @@ test("a trusted window can still reach trust, and take it back", async ({ page }
   await dialog.getByRole("button", { name: "Stop trusting /work" }).click();
 
   await expect(page.getByRole("button", { name: /Restricted Mode/ })).toBeVisible();
+});
+
+test("leaving a workspace detaches its terminals; coming back finds them running, replayed", async ({
+  page,
+}) => {
+  // TERMINAL-03: switching folders is not closing their terminals.
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await output(page, id, "before leaving\r\n");
+  await expect(view(page, id)).toContainText("before leaving");
+  const openFolder = async (folder: string) => {
+    await page.evaluate((path) => {
+      (window as unknown as { __openFolder?: string }).__openFolder = path;
+    }, folder);
+    await page.getByRole("menubar").getByRole("menuitem", { name: "File", exact: true }).click();
+    await page
+      .getByRole("menu", { name: "File", exact: true })
+      .getByRole("menuitem", { name: "Open Folder…", exact: true })
+      .click();
+  };
+
+  await openFolder("/other");
+  await expect(view(page, id)).toHaveCount(0);
+  // Output while away is kept for the return.
+  await output(page, id, "while away\r\n");
+  await openFolder("/work");
+  await expect(view(page, id)).toContainText("before leaving");
+  await expect(view(page, id)).toContainText("while away");
+
+  // The same shell: never closed, never started again.
+  const forThisOne = async (command: string) =>
+    (await calls(page, command)).filter((call) => call.args.id === id).length;
+  expect(await forThisOne("terminal_close")).toBe(0);
+  expect(await forThisOne("terminal_kill")).toBe(0);
+  expect(await forThisOne("terminal_open")).toBe(1);
+  expect(await countCalls(page, "terminal_close_all")).toBe(1);
+  // Its views were detached and attached again (a view's subscription is named after it).
+  const detached = (await calls(page, "terminal_unsubscribe")).filter((call) =>
+    String(call.args.subscriptionId).startsWith(`${id}-view-`),
+  );
+  expect(detached.length).toBeGreaterThan(0);
+});
+
+// --- TERMINAL-04: the renderer as a view of the workspace's terminals ----------------------------
+
+/** Opens a folder through File › Open Folder… (the mock answers with `folder`). */
+async function openFolder(page: Page, folder: string) {
+  await page.evaluate((path) => {
+    (window as unknown as { __openFolder?: string }).__openFolder = path;
+  }, folder);
+  await page.getByRole("menubar").getByRole("menuitem", { name: "File", exact: true }).click();
+  await page
+    .getByRole("menu", { name: "File", exact: true })
+    .getByRole("menuitem", { name: "Open Folder…", exact: true })
+    .click();
+}
+
+test("a split survives leaving the workspace: both terminals come back, attached, never restarted", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("Split Terminal").click();
+  const [left, right] = await terminalIds(page, 2);
+  await expect(view(page, left)).toBeVisible();
+  await expect(view(page, right)).toBeVisible();
+
+  await openFolder(page, "/other");
+  await expect(view(page, left)).toHaveCount(0);
+  await output(page, right, "right while away\r\n");
+  await openFolder(page, "/work");
+
+  // The same two sessions, side by side again, the right one replayed.
+  await expect(view(page, left)).toBeVisible();
+  await expect(view(page, right)).toBeVisible();
+  await expect(view(page, right)).toContainText("right while away");
+  await expect(page.getByLabel("Unsplit Terminal")).toBeVisible();
+  const opens = (await calls(page, "terminal_open")).filter(
+    (call) => call.args.id === left || call.args.id === right,
+  );
+  expect(new Set(opens.map((call) => `${call.args.id}:${call.args.generation}`)).size).toBe(2);
+  expect(await countCalls(page, "terminal_close")).toBe(0);
+});
+
+test("a rename is the session's: it survives leaving the workspace and coming back", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  const tabs = page.getByRole("tablist", { name: "Terminals" });
+  await tabs.getByRole("tab").first().dblclick();
+  await page.getByLabel("Rename terminal").fill("Builds");
+  await page.getByLabel("Rename terminal").press("Enter");
+  await expect(tabs.getByRole("tab", { name: "Builds" })).toBeVisible();
+
+  await openFolder(page, "/other");
+  await openFolder(page, "/work");
+  await expect(
+    page.getByRole("tablist", { name: "Terminals" }).getByRole("tab", { name: "Builds" }),
+  ).toBeVisible();
+});
+
+test("the context menu acts on the pane it was opened on, not the one in front", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("Split Terminal").click();
+  const [left, right] = await terminalIds(page, 2);
+  // Working in the left pane; the menu is opened on the right one.
+  await view(page, left).click();
+  await view(page, right).click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Kill Terminal" }).click();
+
+  await expect
+    .poll(async () => (await calls(page, "terminal_close")).map((c) => c.args.id))
+    .toEqual([right]);
+  await expect(view(page, left)).toBeVisible();
+  await expect(page.getByLabel("Split Terminal")).toBeVisible();
+});
+
+test("a paste goes through the terminal, bracketed when the program asked for it", async ({
+  page,
+}) => {
+  await desktop(page);
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  // The program turns bracketed paste on.
+  await output(page, id, "\x1b[?2004h");
+  await page.evaluate(() => navigator.clipboard.writeText("echo one\necho two"));
+  await view(page, id).click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Paste" }).click();
+  await expect
+    .poll(async () => (await calls(page, "terminal_write")).map((c) => c.args.data).join(""))
+    .toBe("\x1b[200~echo one\recho two\x1b[201~");
+});
+
+test("a large paste reaches the shell whole, in pieces the contract allows", async ({ page }) => {
+  await desktop(page);
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  const text = "x".repeat(150_000);
+  await page.evaluate((value) => navigator.clipboard.writeText(value), text);
+  await view(page, id).click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Paste" }).click();
+  await expect
+    .poll(async () => (await calls(page, "terminal_write")).map((c) => c.args.data).join(""))
+    .toBe(text);
+  const sizes = (await calls(page, "terminal_write")).map((c) => (c.args.data as string).length);
+  expect(sizes.length).toBeGreaterThan(1);
+  expect(Math.max(...sizes)).toBeLessThanOrEqual(64 * 1024);
+});
+
+test("the status line is the focused terminal's own", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("Split Terminal").click();
+  const [left, right] = await terminalIds(page, 2);
+  // The right one exits; the left one, in front, still runs.
+  await view(page, left).click();
+  await exit(page, right, 2);
+  await expect(view(page, right)).toContainText("exited with code 2");
+  await expect(page.getByRole("status").filter({ hasText: "Running" })).toBeVisible();
+  // Its own failure shows once the right pane is the one in front.
+  await view(page, right).click();
+  await expect(page.getByRole("status").filter({ hasText: "Running" })).toHaveCount(0);
+});
+
+test("Ctrl+Shift+` starts a terminal from anywhere in the window", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  // Outside the terminal, where the app's own shortcut handling applies.
+  await page.getByTitle("Explorer (Ctrl+Shift+E)").click();
+  await page.keyboard.press("Control+Shift+Backquote");
+  await terminalIds(page, 2);
+});
+
+test("leaving the workspace or unmounting a view never closes a terminal", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("New Terminal").click();
+  await terminalIds(page, 2);
+  // Hiding the panel, switching tabs and leaving the workspace unmount or hide views.
+  await page
+    .getByRole("tablist", { name: "Panel views" })
+    .getByRole("tab", { name: "OUTPUT" })
+    .click();
+  await page
+    .getByRole("tablist", { name: "Panel views" })
+    .getByRole("tab", { name: "TERMINAL" })
+    .click();
+  await openFolder(page, "/other");
+  await openFolder(page, "/work");
+  expect(await countCalls(page, "terminal_close")).toBe(0);
+  expect(await countCalls(page, "terminal_kill")).toBe(0);
+  expect(await countCalls(page, "terminal_close_all")).toBe(1);
+  // This workspace still has exactly its two; the other folder got its own first terminal.
+  const opened = await calls(page, "terminal_open");
+  const byWorkspace = (folder: string) =>
+    new Set(
+      opened
+        .filter((call) => String(call.args.workspaceId).endsWith(folder))
+        .map((call) => call.args.id),
+    ).size;
+  expect(byWorkspace("/work")).toBe(2);
+  expect(byWorkspace("/other")).toBe(1);
+});
+
+// --- TERMINAL-05: profiles -----------------------------------------------------------------------
+
+test("the shell menu lists every profile; one that cannot start says why and starts nothing", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("Choose a shell").click();
+  const menu = page.getByRole("menu", { name: "Shells" });
+  const pwsh = menu.getByRole("menuitem", { name: "PowerShell", exact: true });
+  await expect(pwsh).toBeDisabled();
+  await expect(pwsh).toHaveAttribute("title", "PowerShell 7 (pwsh.exe) is not installed.");
+  await expect(menu.getByRole("menuitem", { name: "Manage Profiles…" })).toBeVisible();
+  const opens = await countCalls(page, "terminal_open");
+  await pwsh.click({ force: true });
+  expect(await countCalls(page, "terminal_open")).toBe(opens);
+});
+
+test("a profile made in the dialog launches with its arguments, environment, folder and login", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("Choose a shell").click();
+  await page.getByRole("menuitem", { name: "Manage Profiles…" }).click();
+  const dialog = page.getByRole("dialog", { name: "Terminal profiles" });
+  await dialog.getByRole("button", { name: "New Profile" }).click();
+  await dialog.getByLabel("Name", { exact: true }).fill("Builds");
+  await dialog.getByLabel("Shell", { exact: true }).selectOption({ label: "Git Bash" });
+  await dialog.getByLabel("Arguments").fill('--rcfile\na file & "quotes"');
+  await dialog.getByLabel("Folder").fill("tools");
+  await dialog.getByLabel("Environment").fill("BASE=/opt\nTOOLS=$BASE/tools");
+  await dialog.getByLabel("Login shell").check();
+  await dialog.getByRole("button", { name: "Save Profile" }).click();
+  await expect(dialog.getByRole("listitem", { name: "Builds" })).toBeVisible();
+  await dialog
+    .getByRole("listitem", { name: "Builds" })
+    .getByRole("button", { name: "Open" })
+    .click();
+
+  const [id] = (await terminalIds(page, 2)).slice(-1);
+  const open = (await calls(page, "terminal_open")).filter((c) => c.args.id === id)[0];
+  const profile = open.args.profile as Record<string, unknown>;
+  expect(profile).toMatchObject({
+    name: "Builds",
+    executable: BASH,
+    args: ["--rcfile", 'a file & "quotes"'],
+    cwd: "tools",
+    env: [
+      ["BASE", "/opt"],
+      ["TOOLS", "$BASE/tools"],
+    ],
+    login: true,
+  });
+  await expect(page.getByRole("tab", { name: "Builds", exact: true })).toHaveAttribute(
+    "title",
+    "Profile: Builds",
+  );
+});
+
+test("an invalid profile is refused with a reason, and a login shell is only offered where it exists", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("Choose a shell").click();
+  await page.getByRole("menuitem", { name: "Manage Profiles…" }).click();
+  const dialog = page.getByRole("dialog", { name: "Terminal profiles" });
+  await dialog.getByRole("button", { name: "New Profile" }).click();
+  // The Command Prompt has no login mode.
+  await dialog.getByLabel("Shell", { exact: true }).selectOption({ label: "Command Prompt" });
+  await expect(dialog.getByLabel("Login shell")).toBeDisabled();
+  await dialog.getByLabel("Environment").fill("A=B=C\n=nameless");
+  await dialog.getByLabel("Name", { exact: true }).fill("Broken");
+  await dialog.getByRole("button", { name: "Save Profile" }).click();
+  await expect(dialog.getByRole("alert")).toContainText("not a valid environment variable name");
+  await expect(dialog.getByRole("listitem", { name: "Broken" })).toHaveCount(0);
+  // Built-in profiles can be used and made default, never edited or deleted.
+  const builtin = dialog.getByRole("listitem", { name: "Git Bash" });
+  await expect(builtin.getByRole("button", { name: "Edit" })).toHaveCount(0);
+  await expect(builtin.getByRole("button", { name: "Delete" })).toHaveCount(0);
+});
+
+test("the default profile is what New Terminal starts", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  await terminalIds(page);
+  await page.getByLabel("Choose a shell").click();
+  await page.getByRole("menuitem", { name: "Manage Profiles…" }).click();
+  const dialog = page.getByRole("dialog", { name: "Terminal profiles" });
+  await dialog
+    .getByRole("listitem", { name: "Git Bash" })
+    .getByRole("button", { name: "Make default" })
+    .click();
+  await expect(dialog.getByRole("listitem", { name: "Git Bash" })).toContainText("Default");
+  await dialog.getByLabel("Close profiles").click();
+  await page.getByLabel("New Terminal").click();
+  const [id] = (await terminalIds(page, 2)).slice(-1);
+  const open = (await calls(page, "terminal_open")).filter((c) => c.args.id === id)[0];
+  expect(open.args.shell).toBe(BASH);
 });
