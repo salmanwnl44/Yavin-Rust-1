@@ -42,6 +42,8 @@ async function desktop(
     /** What the checker exits with. Nonzero and no diagnostics means it did not run. */
     checkerCode?: number;
     trust?: { trusted: boolean; decided: boolean; root: string | null; parent: string | null };
+    /** Discovery finds one Unix bash, the default: its folders are this POSIX workspace's. */
+    unixShell?: boolean;
   } = {},
 ) {
   await page.addInitScript((setup) => {
@@ -156,12 +158,18 @@ async function desktop(
             return nextId++;
           }
           if (command === "get_default_workspace") return "/work";
+          // One folder, for a reveal to show, and one file.
+          if (command === "list_workspace_files" && args.path === "/work/src")
+            return { path: "/work/src", name: "src", is_dir: true, children: [] };
           if (command === "list_workspace_files")
             return {
               path: "/work",
               name: "work",
               is_dir: true,
-              children: [{ path: "/work/file.ts", name: "file.ts", is_dir: false, children: null }],
+              children: [
+                { path: "/work/src", name: "src", is_dir: true, children: null },
+                { path: "/work/file.ts", name: "file.ts", is_dir: false, children: null },
+              ],
             };
           // Any file reads as 30 numbered lines, so a jump to a line can be checked.
           if (command === "read_file_content")
@@ -197,6 +205,18 @@ async function desktop(
           }
           if (command === "stop_listening_process") return null;
           // Discovery (TERMINAL-05): every shell looked for, one of them not installed.
+          if (command === "terminal_shells" && setup.unixShell)
+            return [
+              {
+                name: "Bash",
+                path: "/bin/bash",
+                kind: "bash",
+                platform: "unix",
+                available: true,
+                reason: null,
+                isDefault: true,
+              },
+            ];
           if (command === "terminal_shells")
             return [
               {
@@ -616,6 +636,220 @@ test("shell integration is per terminal and starts again on restart", async ({ p
   // A new shell: nothing the old one reported is true of it.
   await expect(page.getByRole("status").filter({ hasText: "Running" })).toHaveText("Running");
   await expect(page.getByTestId("terminal-folder")).toHaveCount(0);
+});
+
+// --- IDE integration (TERMINAL-06) ------------------------------------------------------------
+
+/** Runs a command from the palette, as a user would. */
+async function palette(page: Page, command: string) {
+  const search = page.getByRole("combobox", { name: "Search files or commands" });
+  await expect(async () => {
+    await page.keyboard.press("Control+Shift+P");
+    await expect(search).toBeVisible({ timeout: 1000 });
+  }).toPass();
+  await search.fill(`>${command}`);
+  return page.getByRole("option").filter({ hasText: command }).first();
+}
+
+test("the Explorer's root opens a terminal in the workspace root", async ({ page }) => {
+  await desktop(page);
+  // The tree's background is the workspace root's.
+  await page
+    .getByRole("tree", { name: "Files" })
+    .click({ button: "right", position: { x: 40, y: 120 } });
+  await page.getByRole("menuitem", { name: "Open in Integrated Terminal" }).click();
+  await expect
+    .poll(async () => (await calls(page, "terminal_open")).map((call) => call.args.cwd))
+    .toContain("/work");
+});
+
+test("Open Integrated Terminal Here starts in the folder of the file in the editor", async ({
+  page,
+}) => {
+  await desktop(page);
+  // Nothing in the editor: offered, but not available.
+  await expect(await palette(page, "Open Integrated Terminal Here")).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  await page.keyboard.press("Escape");
+  await page.getByText("file.ts", { exact: true }).dblclick();
+  await expect(page.getByRole("tab", { name: /file\.ts/ })).toBeVisible();
+  await (await palette(page, "Open Integrated Terminal Here")).click();
+  await expect
+    .poll(async () => (await calls(page, "terminal_open")).map((call) => call.args.cwd))
+    .toContain("/work");
+});
+
+test("an untitled document opens its terminal in the workspace root", async ({ page }) => {
+  await desktop(page);
+  await (await palette(page, "New Text File")).click();
+  await (await palette(page, "Open Integrated Terminal Here")).click();
+  await expect
+    .poll(async () => (await calls(page, "terminal_open")).map((call) => call.args.cwd))
+    .toContain("/work");
+});
+
+test("Reveal Current Folder shows the folder the shell reported, and only a local one", async ({
+  page,
+}) => {
+  await desktop(page, { unixShell: true });
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  // It has not said where it is: nothing is guessed.
+  await terminalMenu(page, "Reveal Current Folder in Explorer");
+  await expect(page.getByRole("alert")).toContainText("does not report its folder");
+
+  await signal(page, id, { signal: "cwd", uri: "file://far/home/ci", local: false });
+  await terminalMenu(page, "Reveal Current Folder in Explorer");
+  await expect(page.getByRole("alert")).toContainText("on another machine (far)");
+
+  await signal(page, id, { signal: "cwd", uri: "file:///work/src", local: true });
+  await expect(page.getByTestId("terminal-folder")).toHaveText("/work/src");
+  await terminalMenu(page, "Reveal Current Folder in Explorer");
+  await expect(page.getByRole("treeitem", { name: "src" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+});
+
+test("terminal commands are in the palette, enabled only when they have a terminal", async ({
+  page,
+}) => {
+  await desktop(page);
+  // No terminal yet.
+  for (const command of ["Kill Terminal", "Restart Terminal", "Rename Terminal…"]) {
+    await expect(await palette(page, command)).toHaveAttribute("aria-disabled", "true");
+    await page.keyboard.press("Escape");
+  }
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await expect(await palette(page, "Restart Terminal")).not.toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  await page.keyboard.press("Escape");
+  // Working in the Explorer, with the terminal still shown.
+  await page.getByText("file.ts", { exact: true }).click();
+  // Shown but not typed into: the commands that need the keyboard's terminal are not offered.
+  await expect(await palette(page, "Paste into Terminal")).toHaveAttribute("aria-disabled", "true");
+  await page.keyboard.press("Escape");
+
+  // In the terminal, the palette's own key reaches the IDE, not the shell.
+  await view(page, id).click();
+  const writes = await countCalls(page, "terminal_write");
+  const option = await palette(page, "Select All in Terminal");
+  expect(await countCalls(page, "terminal_write")).toBe(writes);
+  await expect(option).not.toHaveAttribute("aria-disabled", "true");
+  await option.click();
+
+  // Kill ends the shell and its children now; Close would end it gently.
+  await (await palette(page, "Kill Terminal")).click();
+  await expect.poll(async () => countCalls(page, "terminal_kill")).toBe(1);
+  expect(await countCalls(page, "terminal_close")).toBe(0);
+});
+
+test("Ctrl+` in a terminal hides the panel instead of reaching the shell", async ({ page }) => {
+  await desktop(page);
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await view(page, id).click();
+  const writes = await countCalls(page, "terminal_write");
+  await page.keyboard.press("Control+Backquote");
+  await expect(view(page, id)).toBeHidden();
+  expect(await countCalls(page, "terminal_write")).toBe(writes);
+});
+
+test("Focus Terminal gives the terminal the keyboard, from anywhere", async ({ page }) => {
+  await desktop(page);
+  await (await palette(page, "Focus Terminal")).click();
+  const [id] = await terminalIds(page);
+  await expect(view(page, id).locator("textarea")).toBeFocused();
+  // Typing now reaches the shell.
+  await page.keyboard.type("x");
+  await expect.poll(async () => countCalls(page, "terminal_write")).toBeGreaterThan(0);
+});
+
+test("a file path printed in a terminal opens in the editor on a click, at its line", async ({
+  page,
+}) => {
+  await desktop(page, { unixShell: true });
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await output(page, id, "/work/file.ts:12 and /etc/passwd.txt\r\n");
+  const screen = view(page, id).locator(".xterm-screen");
+  await expect(view(page, id)).toContainText("/work/file.ts:12");
+  const box = (await screen.boundingBox())!;
+  const rows = await view(page, id).locator(".xterm-rows > div").count();
+  const cell = { width: 0, height: box.height / rows };
+  // xterm measures a run of characters; one cell is that width over their number.
+  cell.width = await view(page, id).evaluate((element) => {
+    const measure = element.querySelector(".xterm-char-measure-element") as HTMLElement;
+    return measure.getBoundingClientRect().width / (measure.textContent?.length || 1);
+  });
+  const at = (column: number) => ({
+    x: box.x + cell.width * (column + 0.5),
+    y: box.y + cell.height * 0.5,
+  });
+  // Hovering only offers it; nothing opens.
+  await page.mouse.move(at(3).x, at(3).y);
+  await expect(page.getByRole("tab", { name: /file\.ts/ })).toHaveCount(0);
+  await page.mouse.click(at(3).x, at(3).y);
+  await expect(page.getByRole("tab", { name: /file\.ts/ })).toBeVisible();
+  await expect(page.getByText(/Ln 12, Col 1/)).toBeVisible();
+  // Outside the workspace: not a link, so a click opens nothing.
+  const tabs = await page.getByRole("tab").count();
+  await page.mouse.click(at(24).x, at(24).y);
+  await page.waitForTimeout(300);
+  expect(await page.getByRole("tab").count()).toBe(tabs);
+  expect((await calls(page, "read_file_content")).map((c) => c.args.path)).not.toContain(
+    "/etc/passwd.txt",
+  );
+});
+
+test("a command finishing in a terminal asks Git to refresh; its output does not", async ({
+  page,
+}) => {
+  await desktop(page, { unixShell: true });
+  await openPanel(page);
+  const [id] = await terminalIds(page);
+  await signal(page, id, { signal: "prompt" });
+  // Let Git settle after opening, then count what it is asked.
+  await page.waitForTimeout(1500);
+  const before = await countCalls(page, "git_exec");
+  for (let i = 0; i < 20; i++)
+    await output(
+      page,
+      id,
+      `building ${i}
+`,
+    );
+  await page.waitForTimeout(1000);
+  expect(await countCalls(page, "git_exec")).toBe(before);
+  await signal(page, id, { signal: "executing" });
+  await signal(page, id, { signal: "finished", exitCode: 1 });
+  // Git's own refresh, through its own commands; the terminal changes nothing in Git.
+  await expect.poll(async () => countCalls(page, "git_exec")).toBeGreaterThan(before);
+});
+
+test("after a switch, terminal commands act on the new workspace's terminals only", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openPanel(page);
+  const [a] = await terminalIds(page);
+  await openFolder(page, "/other");
+  await expect(view(page, a)).toHaveCount(0);
+  // B's panel has its own terminal; Kill Terminal ends that one, never A's.
+  const [, b] = await terminalIds(page, 2);
+  await expect(view(page, b)).toBeVisible();
+  await (await palette(page, "Kill Terminal")).click();
+  await expect
+    .poll(async () => (await calls(page, "terminal_kill")).map((call) => call.args.id))
+    .toEqual([b]);
+  await openFolder(page, "/work");
+  await expect(view(page, a)).toBeVisible();
+  expect(await countCalls(page, "terminal_close")).toBe(0);
 });
 
 test("the end of a shell that was replaced is never taken for the one replacing it", async ({
@@ -1763,7 +1997,7 @@ test("the context menu acts on the pane it was opened on, not the one in front",
   // Working in the left pane; the menu is opened on the right one.
   await view(page, left).click();
   await view(page, right).click({ button: "right" });
-  await page.getByRole("menuitem", { name: "Kill Terminal" }).click();
+  await page.getByRole("menuitem", { name: "Close Terminal" }).click();
 
   await expect
     .poll(async () => (await calls(page, "terminal_close")).map((c) => c.args.id))

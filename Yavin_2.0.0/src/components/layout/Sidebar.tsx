@@ -84,7 +84,7 @@ interface SidebarProps {
   onReveal: (path: string) => void;
   onOpenFolderDialog: () => void;
   /** Starts a terminal in a folder ("Open in Integrated Terminal"). */
-  onOpenTerminal?: (directory: string) => void;
+  onOpenTerminal?: (target: { path: string; isDir: boolean }) => void;
   /** Where the explorer was scrolled last time. */
   initialScroll?: number;
   /** Reports the explorer's state as it changes, so the session can be written. */
@@ -614,7 +614,7 @@ export function Sidebar(props: SidebarProps) {
     collapseAll: () => setExpanded(new Set(multiRoot ? [] : firstRoot ? [firstRoot.id] : [])),
     // The window starts it in the workspace's terminals; the explorer stays unaware of how
     // terminals are tracked.
-    openTerminal: (directory) => props.onOpenTerminal?.(directory),
+    openTerminal: (target) => props.onOpenTerminal?.(target),
   };
 
   // --- Keyboard ------------------------------------------------------------

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { TerminalView } from "../terminal/TerminalView";
+import { TerminalView, type TerminalViewIde } from "../terminal/TerminalView";
 import { TerminalProfilesDialog } from "../terminal/TerminalProfilesDialog";
 import type { TerminalKeyAction } from "../../services/terminal";
 import type { TerminalId } from "../../services/terminalProtocol";
@@ -94,6 +94,7 @@ export function TerminalPanel({
   onManageTrust,
   activeFile,
   onOpenProblem,
+  ide,
 }: {
   hidden: boolean;
   onClose: () => void;
@@ -111,6 +112,12 @@ export function TerminalPanel({
   activeFile?: string;
   /** Opens a file at a position, for clicking a problem. */
   onOpenProblem?: (file: string, line: number, column: number) => void;
+  /**
+   * The IDE's side of its terminals (TERMINAL-06): opening printed file paths, the IDE's own
+   * keys, and revealing a terminal's folder in the Explorer. Without it a terminal is a plain
+   * terminal.
+   */
+  ide?: TerminalViewIde & { revealFolder(id: TerminalId): void };
 }) {
   // Re-renders the tab strip as diagnostics change, so the badge stays accurate.
   const problemsRevision = useSyncExternalStore(
@@ -174,6 +181,22 @@ export function TerminalPanel({
     setActiveTab("terminal");
     window.setTimeout(() => findInput.current?.select(), 0);
   }, [view.findRequest, setActiveTab]);
+
+  // Focus Terminal, from anywhere: the terminal view, and the terminal in front takes the
+  // keyboard once it is laid out.
+  // A request made before this panel mounted (in another visit to the workspace) is not
+  // taken again: coming back must not move the keyboard.
+  const focusHandled = useRef(view.focusRequest);
+  useEffect(() => {
+    if (view.focusRequest === focusHandled.current || hidden) return;
+    focusHandled.current = view.focusRequest;
+    setActiveTab("terminal");
+    const frame = window.requestAnimationFrame(() => {
+      const id = ui.focusedId();
+      if (id) ui.viewOf(id)?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [view.focusRequest, hidden, setActiveTab, ui]);
 
   // Closing anything that floats above the terminal when focus moves elsewhere.
   useEffect(() => {
@@ -288,8 +311,14 @@ export function TerminalPanel({
       { label: "Find", run: () => ui.openFind(), enabled: true },
       { label: "Split Terminal", run: () => ui.toggleSplit(), enabled: !missing },
       { label: "Rename", run: () => setRenaming(id), enabled: true },
+      {
+        label: "Reveal Current Folder in Explorer",
+        run: () => ide?.revealFolder(id),
+        enabled: !!ide,
+      },
       { label: "Restart", run: () => ui.restart(id), enabled: true },
-      { label: "Kill Terminal", run: () => ui.close(id), enabled: true },
+      { label: "Close Terminal", run: () => ui.close(id), enabled: true },
+      { label: "Kill Terminal", run: () => ui.kill(id), enabled: true },
       { label: "Kill All Terminals", run: () => ui.closeAll(), enabled: sessions.length > 1 },
     ];
   };
@@ -659,6 +688,7 @@ export function TerminalPanel({
                   visible={!hidden && activeTab === "terminal" && position !== -1}
                   fontSize={fontSize}
                   onShortcut={shortcut}
+                  ide={ide}
                   onContextMenu={(at) => {
                     // The menu belongs to this terminal, whichever pane it is in.
                     ui.activate(session.sessionId);

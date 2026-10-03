@@ -6,6 +6,18 @@ export interface AppCommand {
   disabled?: boolean;
   reason?: string;
   checked?: boolean;
+  /**
+   * Where the shortcut is handled. `"terminal"`: the focused terminal handles the key itself
+   * (Ctrl+Shift+C there is copy, not anything the window binds), so the window's handler never
+   * runs it -- the shortcut is shown in the menus and the palette, and the command still runs
+   * from them.
+   */
+  scope?: "terminal";
+  /**
+   * The shortcut belongs to the IDE even while a terminal has the keyboard: the terminal lets
+   * it through to the window instead of sending it to the shell (the palette, the panel).
+   */
+  skipShell?: boolean;
   run: () => void | Promise<void>;
 }
 

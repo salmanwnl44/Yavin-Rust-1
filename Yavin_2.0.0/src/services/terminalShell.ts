@@ -112,6 +112,15 @@ export function initialShellState(
 }
 
 /**
+ * An MSYS (Git Bash) path's Windows spelling: `/c/x` and `/cygdrive/c/x` are `C:/x`. `null`
+ * for any other MSYS path (`/tmp`, `/usr/bin`): it has no Windows path Yavin can name.
+ */
+export function msysDrivePath(path: string): string | null {
+  const drive = /^\/(?:cygdrive\/)?([A-Za-z])(\/.*)?$/.exec(path);
+  return drive ? `${drive[1].toUpperCase()}:${drive[2] ?? "/"}` : null;
+}
+
+/**
  * What an OSC 7 URL means here; `null` when it cannot be read (the folder stays as it was).
  * `local` is the native side's verdict on the URL's host.
  */
@@ -122,10 +131,9 @@ export function cwdFromOsc7(uri: string, local: boolean, pathStyle: PathStyle): 
   if (!local) return host ? { kind: "remote", uri, host } : null;
   let path = raw;
   if (pathStyle === "msys") {
-    // `/c/...` or `/cygdrive/c/...` is the drive; any other MSYS path has no Windows path here.
-    const drive = /^\/(?:cygdrive\/)?([A-Za-z])(\/.*)?$/.exec(raw);
+    const drive = msysDrivePath(raw);
     if (!drive) return { kind: "unmapped", uri };
-    path = `/${drive[1].toUpperCase()}:${drive[2] ?? "/"}`;
+    path = `/${drive}`;
   }
   let resolved: string;
   try {

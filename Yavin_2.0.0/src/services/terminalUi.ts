@@ -26,6 +26,7 @@ import {
   zoomFontSize,
   type TerminalKeyAction,
 } from "./terminal.ts";
+import { samePathString } from "./resource.ts";
 import type { TerminalId } from "./terminalProtocol.ts";
 import type { TerminalService } from "./terminalService.ts";
 import type { WorkspaceProfiles } from "./terminalProfiles.ts";
@@ -62,11 +63,19 @@ export interface TerminalUiState {
   readonly secondary: TerminalId | null;
   /** Which pane the user is working in; always "primary" when not split. */
   readonly focused: Pane;
+  /**
+   * The terminal that has the keyboard, `null` when none does (TERMINAL-06). Not the same as
+   * the focused pane, nor as the panel being visible: a terminal is shown long before it is
+   * typed into. Its view reports it; commands that need a focused terminal read it here.
+   */
+  readonly keyboard: TerminalId | null;
   readonly splitRatio: number;
   readonly fontSize: number;
   /** The find bar is open; `findRequest` changes each time it is asked for. */
   readonly finding: boolean;
   readonly findRequest: number;
+  /** Changes each time the focused terminal is asked to take the keyboard (Focus Terminal). */
+  readonly focusRequest: number;
   /** Terminals that rang while not on screen. */
   readonly bells: ReadonlySet<TerminalId>;
   /** A message about one terminal (the clipboard refused, input failed); never another's. */
@@ -95,6 +104,14 @@ export interface TerminalUi {
    * name that cannot launch throws its `TerminalError`; nothing is started.
    */
   newTerminal(options?: { profileId?: string; cwd?: string; show?: boolean }): TerminalId;
+  /**
+   * A terminal in `cwd` for an IDE action ("Open in Integrated Terminal"): one already there
+   * -- running, its shell having reported (OSC 7) that it is in that very folder, and not busy
+   * with a command -- is shown again; otherwise a new one starts there with the default
+   * profile. A shell that does not report its folder is never assumed to still be where it
+   * started.
+   */
+  openIn(cwd: string): TerminalId;
   /** Shows `id` -- focusing its pane if it is on screen, else in the focused pane. */
   activate(id: TerminalId): void;
   focusPane(pane: Pane): void;
@@ -105,15 +122,21 @@ export interface TerminalUi {
   toggleSplit(): void;
   setSplitRatio(ratio: number): void;
   close(id: TerminalId): void;
+  /** Ends a terminal and everything it started, now (Kill Terminal). */
+  kill(id: TerminalId): void;
   closeAll(): void;
   rename(id: TerminalId, title: string): void;
   restart(id: TerminalId): void;
   zoom(action: TerminalKeyAction): void;
   openFind(): void;
+  /** Gives the focused terminal the keyboard once the panel shows it. */
+  requestFocus(): void;
   closeFind(): void;
   setMatches(id: TerminalId, matches: { index: number; count: number }): void;
   ring(id: TerminalId): void;
   notice(id: TerminalId, message: string | null): void;
+  /** A view saying its terminal took (`true`) or lost the keyboard. */
+  setKeyboard(id: TerminalId, has: boolean): void;
 
   /** A mounted view; the returned function unregisters it (only if it is still that view). */
   registerView(id: TerminalId, handle: TerminalViewHandle): () => void;
@@ -130,10 +153,12 @@ export function createTerminalUi(
     primary: null,
     secondary: null,
     focused: "primary" as Pane,
+    keyboard: null,
     splitRatio: 0.5,
     fontSize: DEFAULT_FONT_SIZE,
     finding: false,
     findRequest: 0,
+    focusRequest: 0,
     bells: new Set<TerminalId>(),
     notices: new Map<TerminalId, string>(),
     matches: new Map<TerminalId, { index: number; count: number }>(),
@@ -166,6 +191,7 @@ export function createTerminalUi(
       primary,
       secondary,
       focused,
+      keyboard: exists(next.keyboard) ? next.keyboard : null,
       bells,
       notices: keep(next.notices),
       matches: keep(next.matches),
@@ -253,6 +279,21 @@ export function createTerminalUi(
       return id;
     },
 
+    openIn(cwd) {
+      const here = service
+        .getSnapshot()
+        .sessions.find(
+          (session) =>
+            session.state === "Running" &&
+            session.shell.reported?.kind === "local" &&
+            samePathString(session.shell.reported.path, cwd) &&
+            session.shell.commandState !== "executing",
+        );
+      if (!here) return ui.newTerminal({ cwd });
+      ui.activate(here.sessionId);
+      return here.sessionId;
+    },
+
     activate(id) {
       show(id);
       unring(id);
@@ -291,6 +332,10 @@ export function createTerminalUi(
       views.delete(id);
       void service.close(id).catch(() => undefined);
     },
+    kill(id) {
+      views.delete(id);
+      void service.kill(id).catch(() => undefined);
+    },
     closeAll() {
       for (const id of sessionIds()) ui.close(id);
     },
@@ -307,6 +352,9 @@ export function createTerminalUi(
     openFind() {
       set({ finding: true, findRequest: state.findRequest + 1 });
     },
+    requestFocus() {
+      set({ focusRequest: state.focusRequest + 1 });
+    },
     closeFind() {
       set({ finding: false });
     },
@@ -319,6 +367,10 @@ export function createTerminalUi(
       // Only a terminal that is not in front is worth marking.
       if (id === focusedId() || state.bells.has(id)) return;
       set({ bells: new Set(state.bells).add(id) });
+    },
+    setKeyboard(id, has) {
+      if (has) set({ keyboard: id });
+      else if (state.keyboard === id) set({ keyboard: null });
     },
     notice(id, message) {
       if ((state.notices.get(id) ?? null) === message) return;

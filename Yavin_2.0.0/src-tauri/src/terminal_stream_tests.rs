@@ -973,16 +973,19 @@ fn shell_signals_arrive_in_order_with_the_output_and_are_not_replayed() {
     for piece in output.chunks(5) {
         assert!(stream.push(piece));
     }
-    assert!(view.wait(Duration::from_secs(2), |m| bytes_of(m).len()
-        == output.len()));
-    // The bytes themselves are untouched: the sequences stay in the output.
-    assert_eq!(view.bytes(), output);
     let shells = |r: &Recorder| -> Vec<String> {
         shape(&r.all())
             .into_iter()
             .filter(|k| k.starts_with("shell"))
             .collect()
     };
+    // Each signal follows the bytes that carried it, so the last one may arrive just after the
+    // last bytes: wait for both.
+    assert!(view.wait(Duration::from_secs(2), |m| bytes_of(m).len()
+        == output.len()
+        && shape(m).iter().filter(|k| k.starts_with("shell")).count() == 5));
+    // The bytes themselves are untouched: the sequences stay in the output.
+    assert_eq!(view.bytes(), output);
     let expected = [
         "shell Prompt",
         "shell Input",

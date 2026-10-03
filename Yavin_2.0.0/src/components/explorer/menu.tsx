@@ -40,8 +40,11 @@ export interface MenuActions {
   openFolderDialog(): void;
   refresh(): void;
   collapseAll(): void;
-  /** Starts a terminal in `directory` -- "Open in Integrated Terminal". */
-  openTerminal(directory: string): void;
+  /**
+   * "Open in Integrated Terminal" on a resource: the window works out the folder (a file's is
+   * the one holding it) through the resource rules, never the explorer.
+   */
+  openTerminal(target: { path: string; isDir: boolean }): void;
 }
 
 const divider: MenuItem = { divider: true };
@@ -117,9 +120,8 @@ function pathItems(node: FileNode, actions: MenuActions): MenuItem[] {
       icon: <TerminalIcon className="text-zinc-400" />,
       label: "Open in Integrated Terminal",
       // A file opens a terminal in the folder holding it, which is what VS Code does and
-      // what anyone asking for a terminal "here" means.
-      onClick: () =>
-        actions.openTerminal(node.is_dir ? node.path : node.path.replace(/[\\/][^\\/]*$/, "")),
+      // what anyone asking for a terminal "here" means. The window works that folder out.
+      onClick: () => actions.openTerminal({ path: node.path, isDir: node.is_dir }),
     },
   ];
 }
@@ -233,6 +235,11 @@ export function buildExplorerMenu({
         label: "Open Folder...",
         shortcut: "Ctrl+Shift+O",
         onClick: actions.openFolderDialog,
+      },
+      {
+        icon: <TerminalIcon className="text-zinc-400" />,
+        label: "Open in Integrated Terminal",
+        onClick: () => actions.openTerminal({ path: workspacePath, isDir: true }),
       },
       can("refresh")
         ? {

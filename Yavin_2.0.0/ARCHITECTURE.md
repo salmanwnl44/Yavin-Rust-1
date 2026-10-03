@@ -1103,7 +1103,196 @@ Nothing is shown for a shell that has not reported.
 - `terminalShell.test.ts`: OSC 7 mapping, the state machine, integration states, and the service's generations, restarts, detach and reattach.
 - `terminal.spec.ts`: the status line, per terminal, reset on restart.
 
-**T05A → T06.** T06 is IDE integration: using the folder and the command boundaries (Explorer's "reveal the terminal's folder", task and Run integration, command decorations, links). T05A only provides them, and it persists nothing: no command history, and no integration setting (that is TERMINAL-07).
+**T05A → T06.** T06 is IDE integration: it uses the folder and the command boundaries (revealing the terminal's folder in the Explorer, file links, Git's refresh). T05A only provides them. It persists nothing: no command history, and no integration setting (that is TERMINAL-07).
+
+### IDE integration (TERMINAL-06)
+
+The layers:
+
+- T05A: runtime shell integration.
+- **T06: ordinary IDE integration.**
+- T07: persistence and settings.
+- T08: production hardening.
+
+The terminal becomes a part of the IDE without owning any other part. It reads facts from the other subsystems and asks their owners to act; no other subsystem's state moves into the terminal.
+
+```text
+Explorer menu (a resource) ─┐                                  ┌─> TerminalUi.openIn(cwd)   reuse or new
+Editor (document)  ─────────┼─ terminalIde.ts (pure, resource.ts) ┤
+Terminal menu / palette ────┘                                  └─> TerminalUi / TerminalService
+focused terminal ── view.shell (T05A) ── revealableFolder ──> ExplorerStore.reveal (owner of selection)
+output line (hover) ── findPathLinks ── resolvePathLink ──(click)──> openLocation (DocumentService, editor)
+TerminalService ── a command finished (OSC 133) ── watchFinishedCommands ──> bumpGitRevision (Git's refresh)
+```
+
+**Ownership is unchanged.**
+
+| Owner                            | Owns                                                               |
+| -------------------------------- | ------------------------------------------------------------------ |
+| Filesystem                       | disk facts                                                         |
+| `resource.ts`                    | path identity                                                      |
+| DocumentService                  | content and dirty state                                            |
+| Git                              | Git state                                                          |
+| ExplorerProvider / ExplorerStore | projection / expansion, selection, focus                           |
+| Problems                         | diagnostics                                                        |
+| TerminalService                  | sessions and their runtime metadata                                |
+| TerminalUi                       | terminal view state, now including which terminal has the keyboard |
+
+`terminalIde.ts` holds no state. Its functions take facts and answer what they mean.
+
+**Explorer → terminal.** "Open in Integrated Terminal" on:
+
+- a folder starts in the folder;
+- a file starts in the folder holding it;
+- the tree's root, or its background, starts in the workspace root.
+
+The Explorer passes the resource (`{path, isDir}`) and nothing else. The window works out the folder with `terminalCwdFor` (`fileUri`/`dirname`), never by trimming a string, and nothing is quoted for a shell (the folder is a structured `cwd`, T05). The profile is never changed.
+
+**Editor → terminal.** "Open Integrated Terminal Here" (`terminal.openHere`) uses the folder of the document in front:
+
+- a document on disk: its own folder (`editorTerminalCwd`);
+- an untitled or proposed document: the workspace root, since it has no folder of its own (a proposed file's folder may not exist yet).
+
+It reads the document's resource, never a tab label.
+
+**Reuse.** IDE actions go through `TerminalUi.openIn(cwd)`. A terminal is shown again, rather than a new one started, when all three hold:
+
+- it is `Running`;
+- its shell has reported (OSC 7) that it is in that very folder (`samePathString`);
+- it is not running a command.
+
+A shell that never reported its folder is never assumed to still be where it started, so asking again starts another. "New Terminal" always starts one. There is no separate pool: reuse is a lookup over the service's sessions.
+
+**Terminal → Explorer.** "Reveal Current Folder in Explorer" (Terminal menu, palette, and the terminal's context menu) reveals the folder of the terminal in front, but only one its shell reported (`revealableFolder`) that is local and inside a workspace folder. It then calls `ExplorerStore.reveal`, which owns expansion and selection. Every other case shows nothing and says why:
+
+- never reported, which includes shells without integration: the folder it was started in is not used, because the shell may have left it;
+- reported remote (`host`);
+- unmapped MSYS;
+- unreadable;
+- outside the workspace.
+
+The shell's folder is session metadata. It never overwrites a profile's folder, the workspace root or any setting.
+
+**Terminal → editor (file links).** A link provider registered on xterm (`registerLinkProvider`) sits next to the existing web-link addon, which still handles URLs and is unchanged. When the pointer is over a line, `findPathLinks` reads it. It offers only:
+
+- absolute paths (`C:\x\a.ts`, `/home/a.ts`) or relative ones with a separator (`src/a.ts`, `./a.ts`, `../a.rs`);
+- whose last segment has an extension starting with a letter;
+- optionally followed by `:line` or `:line:column`.
+
+It leaves alone:
+
+- bare names (`a.ts`) and folders;
+- numbers (`100/200.5`);
+- URLs;
+- UNC paths, which could reach another host;
+- other compilers' position forms: `a.ts(3,4)` links the path without a position.
+
+`resolvePathLink` then resolves the candidate:
+
+- through `resource.ts`, relative to the terminal's folder (the shell's report, else where it started, if that was the workspace root);
+- mapping Git Bash's MSYS spellings;
+- only to a file inside a workspace folder. Anything else is not underlined.
+
+Only a click opens it, through the editor's own `openLocation`: DocumentService opens the file, and the editor selects the line. A file that is missing fails the way any open does. Output can never run, write, change the workspace or Git, or open anything outside the workspace.
+
+**Git boundary.** The terminal never runs, parses or imitates Git. Files a command changes reach Git the way any external change does: the resource watcher's batch refreshes the Explorer, DocumentService and Git (`bumpGitRevision`). Git's own files are not watched, though, so a `git commit` typed in a terminal would show only on the next refresh. So when a command finishes (OSC 133 `D`, T05A), `watchFinishedCommands` asks Git for its usual refresh:
+
+- once per finished command;
+- never per output chunk;
+- never for a shell without integration, where the watcher and window focus still cover it.
+
+**External file changes and dirty documents.** Nothing is faked or forced. The watcher reports what a command changed. DocumentService reconciles open documents as it always does: it flags an external change on a dirty document rather than overwriting it. The terminal does nothing to documents.
+
+**Problems boundary.** T06 does not turn output into diagnostics. A future, structured parser (command → parser → Problems) belongs to Problems. File links are navigation only and add nothing to Problems.
+
+**Commands.** These are the canonical `terminal.*` commands in the Terminal menu and the palette. They act through the workspace's TerminalUi and TerminalService, never the native side directly.
+
+| Command                 | Label                             | Enabled when                                                                      |
+| ----------------------- | --------------------------------- | --------------------------------------------------------------------------------- |
+| `terminal.new`          | New Terminal                      | always                                                                            |
+| `terminal.openHere`     | Open Integrated Terminal Here     | a document is in the editor                                                       |
+| `terminal.focus`        | Focus Terminal                    | always; starts a terminal if there is none                                        |
+| `terminal.toggle`       | Show / Hide Panel                 | always                                                                            |
+| `terminal.split`        | Split Terminal                    | always                                                                            |
+| `terminal.revealFolder` | Reveal Current Folder in Explorer | a terminal is in front                                                            |
+| `terminal.clear`        | Clear Terminal                    | the panel shows a terminal                                                        |
+| `terminal.find`         | Find in Terminal                  | the panel shows a terminal                                                        |
+| `terminal.copy`         | Copy Selection                    | a terminal has the keyboard                                                       |
+| `terminal.paste`        | Paste into Terminal               | a terminal has the keyboard                                                       |
+| `terminal.selectAll`    | Select All in Terminal            | a terminal has the keyboard                                                       |
+| `terminal.rename`       | Rename Terminal…                  | a terminal is in front                                                            |
+| `terminal.restart`      | Restart Terminal                  | a terminal is in front                                                            |
+| `terminal.close`        | Close Terminal                    | a terminal is in front; ends the shell gently (`terminal_close`)                  |
+| `terminal.kill`         | Kill Terminal                     | a terminal is in front; ends the shell and its process tree now (`terminal_kill`) |
+
+The id once named "Close Terminal" was `terminal.kill` but closed gently. The ids, the labels and the context menu now say what each one does.
+
+**Keyboard shortcuts** use the existing `AppCommand.shortcut` and the window's one handler. Two flags were added:
+
+- `scope: "terminal"`: the focused terminal handles the key itself (Find Ctrl+Shift+F, Copy Ctrl+Shift+C, Paste Ctrl+Shift+V). The window's handler never runs these, so outside a terminal the same keys keep their editor meaning (Search in Files, and so on). The menus and the Help list still show the key.
+- `skipShell`: the key is the IDE's even inside a terminal (the Command Palette, Ctrl+Shift+P, and the panel toggle, Ctrl+`). xterm does not handle it or send it to the shell, so it reaches the window's handler. Before this, xterm consumed both: Ctrl+` typed a NUL into the shell.
+
+Terminal keys never fire when the terminal does not have the keyboard: they live in xterm's own key handler.
+
+**Focus.** These are distinct facts:
+
+| Fact                        | Where it lives                           |
+| --------------------------- | ---------------------------------------- |
+| the panel is visible        | the window's `isTerminalOpen`            |
+| a view is mounted           | `TerminalUi.registerView`                |
+| a terminal is in front      | `TerminalUi.focusedId`, the focused pane |
+| a terminal has the keyboard | `TerminalUi.keyboard`                    |
+| a session exists            | `TerminalService`                        |
+
+`keyboard` is reported by the view that owns xterm's DOM (its textarea's focus and blur), never by another component inspecting the DOM. Opening the palette records which terminal had the keyboard, so a command chosen there (Copy, Paste) applies to it, as in any editor. "Focus Terminal" is a request (`TerminalUi.requestFocus`), on the same pattern as Find: the panel focuses the terminal in front once it is shown. A request made while the panel was mounted for another visit is not replayed.
+
+**Workspace isolation and lifecycle.**
+
+- Every command reads the workspace in the window (`useWorkspace`) and its TerminalUi. An id from another workspace is refused by its service (`InvalidWorkspace`). Signals and late answers are checked per session and generation (T03, T05A).
+- Switching workspace detaches views; the shells go on (T03), and the panel's comment now says so. The other workspace's panel starts its own terminal, and commands there reach only its terminals.
+- Unmounting the panel only detaches. `TerminalServices.dispose(id)` ends a workspace's terminals. The window's end ends them all natively: this is the application-shutdown path, unchanged.
+- A stale comment by the panel said unmounting closed the shells; the code has only detached since T03, and the comment now says so.
+
+**Notifications.** Failures of an explicit action (reveal, open, an unusable cwd) go to the window's existing error banner (`reportError`). Ordinary output never notifies. A non-zero exit is a command's result, not a failure: the status line shows it and nothing else does. `TerminalError` stays reserved for infrastructure failures.
+
+**Multi-root.** The window opens one folder today. "Inside the workspace" means inside one of `WorkspaceContext.folders`, and a relative link with no known folder is not offered. Nothing guesses which root a path belongs to.
+
+**Performance.** There is no polling and no scanning:
+
+- Links are computed only for a hovered line.
+- Git is refreshed only on a finished command.
+- React updates only on state changes (focus, sessions), never on output.
+- There is one key handler per xterm, as before, and one OSC parser, native (T05A).
+
+**Tests.**
+
+- `terminalIde.test.ts` covers:
+  - Explorer and editor folders;
+  - reveal for local, remote, unmapped, invalid, unknown and outside folders;
+  - link finding (supported and ambiguous) and resolution;
+  - Git refresh per finished command, not per output;
+  - reuse;
+  - keyboard focus;
+  - kill vs close;
+  - workspace isolation and disposal.
+- `terminal.spec.ts` covers:
+  - Explorer root and file;
+  - the editor action, with a file and with untitled;
+  - reveal (unknown, remote, local);
+  - palette enablement and keyboard context;
+  - Ctrl+` in a terminal;
+  - Focus Terminal;
+  - clicking a printed path to open it at its line, while an outside path is not a link;
+  - the Git refresh;
+  - commands after a workspace switch.
+
+**Deliberately not done.** Terminal path parsing stays at: a candidate, then an explicit click, then resource resolution, then `openLocation`. Links on wrapped lines, column offsets from wide characters, and richer diagnostic syntax are left out on purpose, so that T06 does not grow into a terminal parser.
+
+**Validation limitation (pre-existing).** On a cold dev server, the first UI test of a run can exceed its wait: the first page load compiles the editor and the terminal panel. This was seen on the multi-repo "switch 15 times" test, which fails the same way on the commit before T06, and once on a T06 test that then passed three times. It is environmental, not terminal behaviour. The final integration gate should warm the server before timing anything.
+
+**T06 → T07.** T07 persists what T06 keeps in memory: profiles and defaults, an integration on/off setting (`disabled`), and panel layout. T06 stores nothing.
+
+**T06 → AI.** There is none in T06: no tool calls, agent runs, approvals, ChangeSets or AI command history. When the AI architecture arrives, the terminal becomes a _controlled tool_ through it, with its own permissions and approvals. It is never reached directly through TerminalService.
 
 ### The contract (TERMINAL-00)
 
@@ -1296,6 +1485,7 @@ The PTY read itself is 8 KiB.
 | TERMINAL-04  | Done: the renderer as a view of the service (see "Renderer (TERMINAL-04)").          |
 | TERMINAL-05  | Done: shells and profiles (see "Shells and profiles (TERMINAL-05)").                 |
 | TERMINAL-05A | Done: shell integration, OSC 7 and OSC 133 (see "Shell integration (TERMINAL-05A)"). |
+| TERMINAL-06  | Done: IDE integration (see "IDE integration (TERMINAL-06)").                         |
 
 Later modules are listed in the Terminal roadmap.
 

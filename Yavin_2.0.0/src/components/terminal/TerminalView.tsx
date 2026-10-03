@@ -13,8 +13,25 @@ import {
   type TerminalKeyAction,
 } from "../../services/terminal";
 import { asTerminalError } from "../../services/terminalProtocol";
+import { findPathLinks, type PathLink } from "../../services/terminalIde";
 import type { TerminalService, TerminalSessionView } from "../../services/terminalService";
 import type { TerminalUi, TerminalViewHandle } from "../../services/terminalUi";
+
+/**
+ * What the IDE does with a terminal (TERMINAL-06), given by the window: the view only finds
+ * candidates and reports the user's click.
+ */
+export interface TerminalViewIde {
+  /** The file a path printed in this session names, if it is one the editor may open. */
+  resolve(link: PathLink, session: TerminalSessionView): unknown;
+  /** Opens what `resolve` answered: only ever on a click. */
+  open(target: unknown): void;
+  /**
+   * Whether a key belongs to the IDE rather than the shell (the command palette, the panel
+   * toggle): such a key is not sent to the shell, and reaches the window's shortcuts instead.
+   */
+  skipShell(event: KeyboardEvent): boolean;
+}
 
 /** How much output a terminal keeps. Beyond this the oldest lines are dropped. */
 const SCROLLBACK = 5000;
@@ -50,6 +67,7 @@ export function TerminalView({
   fontSize,
   onShortcut,
   onContextMenu,
+  ide,
 }: {
   /** The session as the service shows it. */
   session: TerminalSessionView;
@@ -62,14 +80,15 @@ export function TerminalView({
   fontSize: number;
   onShortcut: (action: TerminalKeyAction) => void;
   onContextMenu: (position: { x: number; y: number }) => void;
+  ide?: TerminalViewIde;
 }) {
   const id = session.sessionId;
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<{ term: XTerm; fit: FitAddon; search: SearchAddon } | null>(null);
 
   // Kept in refs so the effects below never re-run (and re-attach) for a callback's sake.
-  const report = useRef({ onShortcut, onContextMenu });
-  report.current = { onShortcut, onContextMenu };
+  const report = useRef({ onShortcut, onContextMenu, ide });
+  report.current = { onShortcut, onContextMenu, ide };
   /** A message about this terminal alone (`null` clears it). */
   const notice = (message: string | null) => ui.notice(id, message);
   // Read through refs because the key handler is attached once, inside the xterm effect.
@@ -168,6 +187,9 @@ export function TerminalView({
      * prompt. Anything this does not claim is passed straight through.
      */
     term.attachCustomKeyEventHandler((event) => {
+      // The IDE's own keys are not the shell's: xterm leaves them alone, and they go on to the
+      // window's shortcuts (left unprevented, so the window sees them as fresh).
+      if (report.current.ide?.skipShell(event)) return false;
       const action = terminalKeyAction(event, term.hasSelection(), !!split.current);
       if (!action) return true;
       if (event.type !== "keydown") return false;
@@ -185,6 +207,39 @@ export function TerminalView({
       else report.current.onShortcut(action);
       return false;
     });
+
+    // File paths a program printed (TERMINAL-06): only those that resolve to a workspace file
+    // are offered, found when the pointer is over a line -- never per chunk of output -- and
+    // opened only by a click. Web URLs stay with the web-link addon above.
+    const fileLinks = term.registerLinkProvider({
+      provideLinks(y, callback) {
+        const ide = report.current.ide;
+        const text = term.buffer.active.getLine(y - 1)?.translateToString(true);
+        if (!ide || !text) return callback(undefined);
+        const links = findPathLinks(text).flatMap((link) => {
+          const target = ide.resolve(link, latest.current);
+          return target
+            ? [
+                {
+                  range: { start: { x: link.start + 1, y }, end: { x: link.end, y } },
+                  text: link.text,
+                  decorations: { underline: true, pointerCursor: true },
+                  activate: () => report.current.ide?.open(target),
+                },
+              ]
+            : [];
+        });
+        callback(links.length ? links : undefined);
+      },
+    });
+
+    // Whether this terminal has the keyboard is the workspace's TerminalUi's to know; the
+    // view, which owns xterm's DOM, is what can tell.
+    const textarea = term.textarea;
+    const focusIn = () => ui.setKeyboard(id, true);
+    const focusOut = () => ui.setKeyboard(id, false);
+    textarea?.addEventListener("focus", focusIn);
+    textarea?.addEventListener("blur", focusOut);
 
     // Search results and the bell are this terminal's alone.
     const results = search.onDidChangeResults((found) =>
@@ -215,6 +270,10 @@ export function TerminalView({
       observer.disconnect();
       results.dispose();
       bell.dispose();
+      fileLinks.dispose();
+      textarea?.removeEventListener("focus", focusIn);
+      textarea?.removeEventListener("blur", focusOut);
+      ui.setKeyboard(id, false);
       typed.dispose();
       view.current = null;
       term.dispose();

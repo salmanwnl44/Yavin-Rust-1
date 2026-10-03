@@ -8,6 +8,17 @@ import type { EditorHandle, EditorState, EditorAction } from "./editor/editorTyp
 import { createEditorViews } from "./services/editorViews";
 import { matchesShortcut, shortcutLabel } from "./services/commands";
 import type { AppCommand } from "./services/commands";
+import { useTerminalUiState } from "./services/terminalHooks";
+import { terminalFolder } from "./services/terminalShell";
+import {
+  editorTerminalCwd,
+  revealableFolder,
+  resolvePathLink,
+  terminalCwdFor,
+  watchFinishedCommands,
+} from "./services/terminalIde";
+import type { TerminalId } from "./services/terminalProtocol";
+import type { TerminalSessionView } from "./services/terminalService";
 import React, {
   useState,
   useEffect,
@@ -384,6 +395,17 @@ export default function App() {
     (cwd?: string) => {
       revealTerminals();
       workspaces.current().services.terminalUi.newTerminal(cwd ? { cwd } : {});
+    },
+    [revealTerminals],
+  );
+  /**
+   * A terminal in `cwd` for an IDE action (Explorer, editor): one already there is shown again,
+   * else one starts there (`TerminalUi.openIn`).
+   */
+  const openTerminalIn = useCallback(
+    (cwd: string) => {
+      revealTerminals();
+      workspaces.current().services.terminalUi.openIn(cwd);
     },
     [revealTerminals],
   );
@@ -1143,6 +1165,17 @@ export default function App() {
   const lspRevision = useSyncExternalStore(lsp.subscribe, lsp.revision);
   /** The workspace in the window (`services/workspaces.ts`): what its services belong to. */
   const workspace = useWorkspace();
+  // The workspace's terminals (TERMINAL-06): the commands read which exist and which has the
+  // keyboard; both are the workspace's TerminalService's and TerminalUi's, never the window's.
+  const terminalUi = workspace.services.terminalUi;
+  const terminalView = useTerminalUiState(terminalUi);
+  // A command that finished in a terminal may have changed the repository in ways the file
+  // watcher does not report (Git's own files): Git's existing refresh is asked, once per
+  // finished command -- never per output.
+  useEffect(
+    () => watchFinishedCommands(workspace.services.terminals, bumpGitRevision),
+    [workspace],
+  );
   /**
    * The symbols of the document in front, for the Outline and the breadcrumbs: asked of its
    * server when it comes to the front, and again a moment after each edit.
@@ -1710,7 +1743,14 @@ export default function App() {
       })
       .catch((error) => setQuickOpen({ files: [], note: String(error) }));
   };
+  /**
+   * The terminal that had the keyboard when the palette opened: opening the palette takes the
+   * keyboard, and a command chosen there (Copy, Paste in the terminal) is about where the user
+   * was, as in any editor.
+   */
+  const paletteTerminal = useRef<TerminalId | null>(null);
   const openPalette = (mode: "files" | "commands" | "symbols" | "workspaceSymbols") => {
+    paletteTerminal.current = terminalUi.getSnapshot().keyboard;
     if (!quickOpen?.files.length) loadQuickOpen();
     setPaletteMode(mode);
     setIsCommandPaletteOpen(true);
@@ -1766,6 +1806,59 @@ export default function App() {
     const index = tabs.findIndex((tab) => tab.id === activeTabId);
     setActiveTabId(tabs[(index + direction + tabs.length) % tabs.length].id);
   };
+  // --- The terminal as part of the IDE (TERMINAL-06) -----------------------------------------
+  /** The terminal in front of the panel: what most terminal commands act on. */
+  const frontTerminal = terminalUi.focusedId();
+  /** The terminal with the keyboard (or that had it when the palette opened). */
+  const keyboardTerminal = isCommandPaletteOpen ? paletteTerminal.current : terminalView.keyboard;
+  /**
+   * Shows `id`'s folder in the Explorer: the one its shell reported, when that is a local folder
+   * of this workspace. Otherwise says why, and shows nothing -- a guess would be worse.
+   */
+  const revealTerminalFolder = (id: TerminalId) => {
+    const session = terminalUi.service.get(id);
+    if (!session) return;
+    const folder = revealableFolder(session.shell, workspace.folders);
+    if (!folder.ok) {
+      reportError(folder.reason);
+      return;
+    }
+    setActiveActivityTab("explorer");
+    setIsSidebarOpen(true);
+    void explorerStore.reveal(folder.path).then((shown) => {
+      if (!shown) reportError(`${folder.path} could not be shown in the Explorer.`);
+    });
+  };
+  /** The IDE's side of the terminals, for the panel and its views. */
+  const terminalIde = {
+    resolve: (link: Parameters<typeof resolvePathLink>[0], session: TerminalSessionView) =>
+      resolvePathLink(link, {
+        // A relative path is relative to where the shell is; a shell that never reported a
+        // folder and was started in the workspace root is still there as far as anyone knows.
+        base:
+          terminalFolder(session) ??
+          (session.shell.reported || session.profile?.cwd ? null : (workspace.folders[0] ?? null)),
+        folders: workspace.folders,
+        msys: session.shell.pathStyle === "msys",
+      }),
+    open: (target: unknown) => {
+      const { path, line, column } = target as { path: string; line?: number; column?: number };
+      const at = column ?? 1;
+      openLocation(
+        path,
+        line
+          ? { startLineNumber: line, startColumn: at, endLineNumber: line, endColumn: at }
+          : undefined,
+      );
+    },
+    skipShell: (event: KeyboardEvent) =>
+      keyContext.current.commands.some(
+        (command) =>
+          command.skipShell && command.shortcut && matchesShortcut(event, command.shortcut),
+      ),
+    revealFolder: revealTerminalFolder,
+  };
+
   const commands: AppCommand[] = [
     {
       id: "view.search",
@@ -2078,6 +2171,7 @@ export default function App() {
       menu: "View",
       label: "Command Palette…",
       shortcut: "Mod+Shift+p",
+      skipShell: true,
       run: () => openPalette("commands"),
     },
     {
@@ -2093,6 +2187,7 @@ export default function App() {
       menu: "View",
       label: "Bottom Panel",
       shortcut: "Mod+" + String.fromCharCode(96),
+      skipShell: true,
       checked: isTerminalOpen,
       run: () => showTerminal((prev) => !prev),
     },
@@ -2350,6 +2445,30 @@ export default function App() {
       run: () => openTerminal(),
     },
     {
+      // In the folder of the file in the editor; an untitled or proposed document has none,
+      // so the workspace root.
+      id: "terminal.openHere",
+      menu: "Terminal",
+      label: "Open Integrated Terminal Here",
+      disabled: !hasEditor,
+      reason: "Open a file first",
+      run: () => {
+        const cwd = editorTerminalCwd(activeDocument, workspace.folders[0] ?? null);
+        if (cwd) openTerminalIn(cwd);
+        else openTerminal();
+      },
+    },
+    {
+      id: "terminal.focus",
+      menu: "Terminal",
+      label: "Focus Terminal",
+      run: () => {
+        revealTerminals();
+        if (!frontTerminal) workspaces.current().services.terminalUi.newTerminal();
+        workspaces.current().services.terminalUi.requestFocus();
+      },
+    },
+    {
       id: "terminal.split",
       menu: "Terminal",
       label: "Split Terminal",
@@ -2359,38 +2478,121 @@ export default function App() {
       },
     },
     {
+      id: "terminal.revealFolder",
+      menu: "Terminal",
+      label: "Reveal Current Folder in Explorer",
+      disabled: !frontTerminal,
+      reason: "No terminal is open",
+      run: () => {
+        if (frontTerminal) revealTerminalFolder(frontTerminal);
+      },
+    },
+    {
       id: "terminal.clear",
       menu: "Terminal",
       label: "Clear Terminal",
-      disabled: !isTerminalOpen,
-      reason: "Show the panel first",
+      disabled: !isTerminalOpen || !frontTerminal,
+      reason: "Show a terminal first",
       run: () => {
-        const ui = workspaces.current().services.terminalUi;
-        const id = ui.focusedId();
-        if (id) ui.viewOf(id)?.clear();
+        if (frontTerminal) terminalUi.viewOf(frontTerminal)?.clear();
       },
     },
     {
       id: "terminal.find",
       menu: "Terminal",
       label: "Find in Terminal",
-      disabled: !isTerminalOpen,
-      reason: "Show the panel first",
+      shortcut: "Mod+Shift+f",
+      scope: "terminal",
+      disabled: !isTerminalOpen || !frontTerminal,
+      reason: "Show a terminal first",
       run: () => {
         revealTerminals();
-        workspaces.current().services.terminalUi.openFind();
+        terminalUi.openFind();
       },
     },
     {
-      id: "terminal.kill",
+      id: "terminal.copy",
+      menu: "Terminal",
+      label: "Copy Selection",
+      shortcut: "Mod+Shift+c",
+      scope: "terminal",
+      disabled: !keyboardTerminal,
+      reason: "Focus a terminal first",
+      run: () => {
+        if (keyboardTerminal) terminalUi.viewOf(keyboardTerminal)?.copySelection();
+      },
+    },
+    {
+      id: "terminal.paste",
+      menu: "Terminal",
+      label: "Paste into Terminal",
+      shortcut: "Mod+Shift+v",
+      scope: "terminal",
+      disabled: !keyboardTerminal,
+      reason: "Focus a terminal first",
+      run: () => {
+        if (keyboardTerminal) terminalUi.viewOf(keyboardTerminal)?.paste();
+      },
+    },
+    {
+      id: "terminal.selectAll",
+      menu: "Terminal",
+      label: "Select All in Terminal",
+      disabled: !keyboardTerminal,
+      reason: "Focus a terminal first",
+      run: () => {
+        if (keyboardTerminal) terminalUi.viewOf(keyboardTerminal)?.selectAll();
+      },
+    },
+    {
+      id: "terminal.rename",
+      menu: "Terminal",
+      label: "Rename Terminal…",
+      disabled: !frontTerminal,
+      reason: "No terminal is open",
+      run: () => {
+        const id = frontTerminal;
+        if (!id) return;
+        setDialog({
+          title: "Rename terminal",
+          input: terminalUi.service.get(id)?.title ?? "",
+          submit: (value) => {
+            if (!value.trim()) throw new Error("Enter a name.");
+            terminalUi.rename(id, value);
+          },
+        });
+      },
+    },
+    {
+      id: "terminal.restart",
+      menu: "Terminal",
+      label: "Restart Terminal",
+      disabled: !frontTerminal,
+      reason: "No terminal is open",
+      run: () => {
+        if (frontTerminal) terminalUi.restart(frontTerminal);
+      },
+    },
+    {
+      // Ends the shell the way closing its window would, and forgets the terminal.
+      id: "terminal.close",
       menu: "Terminal",
       label: "Close Terminal",
-      disabled: !isTerminalOpen,
-      reason: "Show the panel first",
+      disabled: !frontTerminal,
+      reason: "No terminal is open",
       run: () => {
-        const ui = workspaces.current().services.terminalUi;
-        const id = ui.focusedId();
-        if (id) ui.close(id);
+        if (frontTerminal) terminalUi.close(frontTerminal);
+      },
+    },
+    {
+      // Ends the shell and everything it started, now.
+      id: "terminal.kill",
+      menu: "Terminal",
+      label: "Kill Terminal",
+      disabled: !frontTerminal,
+      reason: "No terminal is open",
+      run: () => {
+        if (frontTerminal) terminalUi.kill(frontTerminal);
       },
     },
     {
@@ -2479,7 +2681,8 @@ export default function App() {
       )
         return;
       const command = commands.find(
-        (item) => item.shortcut && matchesShortcut(event, item.shortcut),
+        (item) =>
+          item.shortcut && item.scope !== "terminal" && matchesShortcut(event, item.shortcut),
       );
       if (!command) return;
       const target = event.target;
@@ -2647,7 +2850,11 @@ export default function App() {
             onMoveFile={handleMovePath}
             onReveal={handleReveal}
             onOpenFolderDialog={handleOpenFolderDialog}
-            onOpenTerminal={openTerminal}
+            onOpenTerminal={(target) => {
+              const cwd = terminalCwdFor(target);
+              if (cwd) openTerminalIn(cwd);
+              else reportError(`${target.path} cannot be opened in a terminal.`);
+            }}
             initialScroll={explorerRef.current.scroll}
             onExplorerState={rememberExplorer}
             outline={
@@ -2737,8 +2944,8 @@ export default function App() {
             {wasTerminalOpened && (
               <Suspense fallback={null}>
                 <TerminalPanel
-                  // One panel per workspace: leaving a folder closes its shells (each
-                  // terminal's cleanup ends its process) and a new one starts in the next.
+                  // One panel per workspace: leaving a folder detaches its views (its shells
+                  // keep running in its TerminalService, TERMINAL-03); coming back attaches again.
                   key={workspace.id}
                   hidden={!isTerminalOpen}
                   onClose={() => setIsTerminalOpen(false)}
@@ -2748,6 +2955,7 @@ export default function App() {
                   trusted={trust.trusted}
                   onManageTrust={() => setTrustDialog("manage")}
                   activeFile={activeTab?.path}
+                  ide={terminalIde}
                   onOpenProblem={(file, line) => {
                     // Opening is asynchronous, so the jump waits for the editor to hold the
                     // file; otherwise it would scroll whatever was open before.
