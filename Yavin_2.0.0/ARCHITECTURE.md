@@ -659,6 +659,28 @@ Problems store <- src/editor/lspMonaco.ts (LSP <-> Monaco, conversions only)
 
 **Diagnostics.** `publishDiagnostics` goes to the Problems store, per server and document (empty clears it). A publication for an older version than the server has is dropped. A document's diagnostics are cleared when it closes, is renamed or saved as another file, when its server crashes or is restarted, and when the workspace closes. The adapter draws the store as Monaco markers (squiggles, the hover, `F8`), also in read-only files; the Problems view lists them with their source.
 
+**Problems and checkers (IDE-01).**
+
+- **One file, one identity.** The store holds each diagnostic's file as its canonical path.
+  - Language servers' come from their `file:` URIs.
+  - A checker's are resolved before they are published (`problemLocations.ts`), against the folder the checker actually ran in, which `run_checker` reports as `root`. Resolution uses the resource rules (`resolveWithin`), never string concatenation.
+  - Relative, absolute, `\?\`, either separator and `file:` URIs all reach the same path.
+  - A path outside that folder is not one of the workspace's files: it is not published, and the view says how many were left out.
+- **Compared by `ResourceId`.** Markers, grouping in the view, and the "Current file" filter all compare `ResourceId` (`problemResourceId`). A language server's and a checker's diagnostics for one file are one group.
+- **Owners are never merged.** The same error from `tsc` and from the TypeScript server is listed twice, each with its source, as VS Code lists them.
+- **Hints** are kept as `info` with `hint: true`, so the counts are unchanged. They are their own kind in the view: a "hints" toggle and a fainter mark. Monaco draws them as hints.
+- **The checker service.** Running a checker is `CheckerService`'s (`panel/checkers.ts`), one per workspace (`WorkspaceServices.checkers`). The Problems view shows its state and asks it to run or stop.
+  - A newer run replaces an older one, whose late answer changes nothing.
+  - Disposing the workspace stops a run in progress and publishes nothing it returns.
+- **Run outcomes.** `run_checker` answers `{outcome, output, code, root}`.
+  - A stopped run (`cancelled`) or one past its 10-minute deadline (`timedOut`) is an outcome, said plainly ("TypeScript was stopped.", "TypeScript timed out and was stopped."), not a failure.
+  - Only a checker that cannot start, or exits non-zero with nothing to show, is a failure.
+  - The native side tells these apart through `process::capture_classified`; the string API the Git commands use is unchanged.
+  - A finished run clears the cancel slot only if the slot is still its own, so a newer run always stays stoppable.
+- **Launching.** A checker's program is found the way a language server's is (`lsp_process::resolve_program`). On Windows `npx` is the npm `npx.cmd` shim, which `Command::new("npx")` never found. Its arguments stay fixed, and it stays trust-gated and allow-listed.
+- **Navigation.** Clicking a problem goes through the editor's own `openLocation`, which waits for the file to be in front and then selects the exact line and column. The editor clamps a stale location to the nearest real position (`model.validateRange`). A file that cannot be opened is reported once, and no pending jump is left behind.
+- **Not done (deliberately).** There is no virtualisation of the list and no cap on diagnostics: markers are rebuilt from the whole store on each publish. That is unchanged and unmeasured, and belongs to a performance module if it is ever needed.
+
 **Language features.** Providers are registered per server when it first becomes ready, for the Monaco languages of its languages, and only for what its capabilities advertise -- a feature a server lacks has no provider and no command (menu items are disabled with the reason). Implemented: completion (with resolve, snippets, text edits, additional edits, commit characters, deprecated tags), hover (Markdown shown as untrusted text), definition, declaration, type definition, implementation (navigation through the window: another file opens as any file does), references (Shift+F12: a list to pick from, because Monaco's peek view cannot show files that are not open), rename (prepare, then the edit through the engine), formatting, range and on-type formatting, code actions (quick fixes, refactorings, source actions, command-backed actions), document symbols (the Outline view, the symbol breadcrumbs, `@` in the palette), workspace symbols (`#` / Ctrl+T), signature help, document links, semantic tokens (full and delta; colours in the theme; a server that counts in UTF-8 or UTF-32 has its deltas applied to the previous result and the whole result re-encoded to UTF-16 for Monaco, `semanticTokens.ts`), inlay hints, CodeLens (with resolve). Server commands run only if the server advertised them (`executeCommand`); VS Code's `editor.action.showReferences` from a lens opens the references list.
 
 **WorkspaceEdit.** `workspaceEdit.ts` is the one way an edit from a server (rename, code action, `workspace/applyEdit`) -- and later AI changes and refactorings -- is applied:

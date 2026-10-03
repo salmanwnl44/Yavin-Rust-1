@@ -1,7 +1,7 @@
 /**
  * Turning a compiler or linter's output into diagnostics.
  *
- * Yavin has no language server, so this is the other way editors get diagnostics, and the way
+ * Besides the language servers, this is the other way editors get diagnostics, and the way
  * VS Code itself does it for tasks: run the tool, match its output with a pattern, and publish
  * what comes out under an `owner`. The owner is the important part -- it lets one tool's
  * results be replaced wholesale on its next run without disturbing another's.
@@ -10,7 +10,11 @@
 export type Severity = "error" | "warning" | "info";
 
 export interface Diagnostic {
-  /** As the tool reported it: absolute, or relative to the folder the tool ran in. */
+  /**
+   * The file. A matcher yields it as the tool printed it (absolute, or relative to the folder
+   * the tool ran in); everything in the Problems store holds the canonical path instead
+   * (`problemLocations.ts`), and is compared by resource identity.
+   */
   file: string;
   /** 1-based, as every compiler reports and every editor displays. */
   line: number;

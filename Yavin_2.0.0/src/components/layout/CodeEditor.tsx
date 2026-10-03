@@ -340,9 +340,13 @@ export default function CodeEditor({
     },
     select(range) {
       const instance = editor.current;
-      if (!instance?.getModel()) return;
-      instance.setSelection(range);
-      instance.revealRangeInCenter(range);
+      const model = instance?.getModel();
+      if (!instance || !model) return;
+      // A location from a diagnostic or a search may be stale (the file changed since): it
+      // lands on the nearest real position instead of an invalid selection.
+      const valid = model.validateRange(range);
+      instance.setSelection(valid);
+      instance.revealRangeInCenter(valid);
       instance.focus();
     },
     async runAction(id) {

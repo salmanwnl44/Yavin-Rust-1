@@ -1,50 +1,44 @@
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
-import { native } from "../../../services/native";
-import { workspaces } from "../../../services/workspaces";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useWorkspace } from "../../../services/workspaces";
 import {
+  PROBLEM_KINDS,
   allProblems,
   groupByFile,
+  kindOf,
   problemsVersion,
-  publishProblems,
   subscribeProblems,
+  type ProblemKind,
 } from "../../../services/panel/problems";
-import { MATCHERS, parseProblems } from "../../../services/panel/problemMatchers";
-import type { Severity } from "../../../services/panel/problemMatchers";
+import { describeCheckerStatus } from "../../../services/panel/checkers";
 import { EmptyView } from "./EmptyView";
 
-const SEVERITY_STYLE: Record<Severity, string> = {
+const KIND_STYLE: Record<ProblemKind, string> = {
   error: "text-red-400",
   warning: "text-amber-400",
   info: "text-sky-400",
+  hint: "text-zinc-400",
 };
-const SEVERITY_MARK: Record<Severity, string> = { error: "×", warning: "!", info: "i" };
-
-/** The first line with anything on it, which is where a tool says why it could not run. */
-const firstLine = (text: string): string =>
-  text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line.length > 0) ?? "";
+const KIND_MARK: Record<ProblemKind, string> = { error: "×", warning: "!", info: "i", hint: "…" };
 
 /** What the view was showing last time it was mounted. See the comment where it is read. */
 let kept: {
   filter: string;
-  severities: Severity[];
+  severities: ProblemKind[];
   activeOnly: boolean;
   collapsed: ReadonlySet<string>;
 } = {
   filter: "",
-  severities: ["error", "warning", "info"],
+  severities: [...PROBLEM_KINDS],
   activeOnly: false,
   collapsed: new Set(),
 };
 
 /**
- * Diagnostics for the workspace.
- *
- * Yavin has no language server, so these come from running the project's own compiler or
- * linter and reading its output -- the same mechanism VS Code uses for tasks. Each tool
- * publishes under an owner, so one finishing replaces its own findings and leaves the rest.
+ * Diagnostics for the workspace: what the language servers report for open files, and what
+ * the project's own compiler or linter reports when one of its checkers is run (the same
+ * mechanism VS Code uses for tasks). Each producer publishes under an owner, so one finishing
+ * replaces its own findings and leaves the rest. Running a checker is the workspace's checker
+ * service's (IDE-01); this view shows its state and asks it to run or stop.
  */
 export function ProblemsView({
   trusted = true,
@@ -55,22 +49,27 @@ export function ProblemsView({
   /** Running a checker starts the project's own build tooling, so it needs trust. */
   trusted?: boolean;
   onManageTrust?: () => void;
-  /** Path of the file in the editor, for the "current file only" toggle. */
+  /** The file in the editor (any spelling of it), for the "current file only" toggle. */
   activeFile?: string;
-  /** Opens a file at a position, for click-to-navigate. */
+  /** Opens a file at a position (1-based line and column), for click-to-navigate. */
   onOpen?: (file: string, line: number, column: number) => void;
 }) {
   // The version is a dependency of the grouping below, not just a re-render trigger:
   // without it the memo kept returning the list from before the checker published.
   const version = useSyncExternalStore(subscribeProblems, problemsVersion, problemsVersion);
 
-  const [checkers, setCheckers] = useState<{ id: string; label: string }[]>([]);
-  const [running, setRunning] = useState("");
-  const [error, setError] = useState("");
+  const service = useWorkspace().services.checkers;
+  const { available: checkers, status } = useSyncExternalStore(
+    service.subscribe,
+    service.getSnapshot,
+    service.getSnapshot,
+  );
+  const running = status.kind === "running" ? status.id : "";
+  const notice = describeCheckerStatus(status);
   // Filters and collapse state outlive the component: it is unmounted whenever another view
   // shows, and losing a carefully typed filter on a trip to the terminal is infuriating.
   const [filter, setFilter] = useState(kept.filter);
-  const [severities, setSeverities] = useState<Severity[]>(kept.severities);
+  const [severities, setSeverities] = useState<ProblemKind[]>(kept.severities);
   const [activeOnly, setActiveOnly] = useState(kept.activeOnly);
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(kept.collapsed);
   useEffect(() => {
@@ -78,46 +77,8 @@ export function ProblemsView({
   }, [filter, severities, activeOnly, collapsed]);
 
   useEffect(() => {
-    if (!trusted) {
-      setCheckers([]);
-      return;
-    }
-    native("available_checkers")
-      .then(setCheckers)
-      // No workspace open yet is the common case, and not worth an error banner.
-      .catch(() => setCheckers([]));
-  }, [trusted]);
-
-  const run = useCallback(async (id: string, label: string) => {
-    // The workspace the check is about: if another is open by the time it answers, the answer
-    // is about files that are no longer in front, and is dropped.
-    const workspace = workspaces.current();
-    setRunning(id);
-    setError("");
-    try {
-      const result = await native("run_checker", { id });
-      if (!workspace.isActive()) return;
-      const matcher = MATCHERS[id];
-      if (!matcher) throw new Error(`No matcher for ${id}.`);
-      const found = parseProblems(matcher, result.output);
-      // A checker that finds problems exits nonzero, so a nonzero exit on its own means
-      // nothing. A nonzero exit with nothing to show, however, is a tool that did not run --
-      // `npx --no-install tsc` with no local TypeScript, a broken config, a missing binary --
-      // and reporting that as "No problems found" is the most misleading thing to say.
-      if (result.code !== 0 && found.length === 0) {
-        throw new Error(firstLine(result.output) || `${label} exited with code ${result.code}.`);
-      }
-      // Publishing an empty list is meaningful: it clears what this tool said last time.
-      publishProblems(matcher.owner, label, found);
-    } catch (reason) {
-      if (workspace.isActive()) setError(String(reason));
-    } finally {
-      setRunning("");
-    }
-  }, []);
-
-  /** Stops a checker that is still running -- a cold `cargo check` is minutes of work. */
-  const stop = useCallback(() => void native("cancel_checker").catch(() => undefined), []);
+    void service.refresh(trusted);
+  }, [service, trusted]);
 
   const files = useMemo(
     () =>
@@ -132,9 +93,9 @@ export function ProblemsView({
   const everRan = allProblems().length > 0;
   /** Whether anything is actually narrowing the list, so "no match" is not blamed on
    * filters the user has not set. */
-  const narrowed = !!filter.trim() || severities.length < 3 || activeOnly;
+  const narrowed = !!filter.trim() || severities.length < PROBLEM_KINDS.length || activeOnly;
 
-  const toggleSeverity = (severity: Severity) =>
+  const toggleSeverity = (severity: ProblemKind) =>
     setSeverities((current) =>
       current.includes(severity)
         ? current.filter((one) => one !== severity)
@@ -161,7 +122,7 @@ export function ProblemsView({
     return (
       <EmptyView
         label="Problems"
-        message="No checker was found for this project. Yavin collects diagnostics by running your project's own compiler or linter — a tsconfig.json, Cargo.toml, eslint.config.js or pyproject.toml in the workspace root enables one."
+        message="No problems have been reported. Language servers report problems in the files you open; a whole-project check needs a checker, and none applies here — a tsconfig.json, Cargo.toml, eslint.config.js or pyproject.toml in the workspace root enables one."
       />
     );
 
@@ -175,7 +136,7 @@ export function ProblemsView({
           onChange={(event) => setFilter(event.target.value)}
           className="w-56 rounded border border-[#222222] bg-[#0a0a0a] px-2 py-0.5 text-[11px] text-zinc-200 placeholder:text-zinc-600"
         />
-        {(["error", "warning", "info"] as const).map((severity) => (
+        {PROBLEM_KINDS.map((severity) => (
           <button
             key={severity}
             aria-pressed={severities.includes(severity)}
@@ -204,7 +165,7 @@ export function ProblemsView({
           {checkers.map((checker) => (
             <button
               key={checker.id}
-              onClick={() => void run(checker.id, checker.label)}
+              onClick={() => void service.run(checker.id)}
               disabled={!!running}
               title={`Run ${checker.label} and collect its diagnostics`}
               className="rounded bg-[#151515] px-2 py-0.5 text-[11px] text-zinc-300 hover:bg-[#1d1d1d] disabled:opacity-40"
@@ -214,7 +175,7 @@ export function ProblemsView({
           ))}
           {running && (
             <button
-              onClick={stop}
+              onClick={() => service.stop()}
               title="Stop the checker that is running"
               className="rounded bg-[#151515] px-2 py-0.5 text-[11px] text-amber-300 hover:bg-[#1d1d1d]"
             >
@@ -224,17 +185,23 @@ export function ProblemsView({
         </div>
       </div>
 
-      {error && (
-        <p role="alert" className="shrink-0 px-3 py-1 text-[11px] text-red-400">
-          {error}
-        </p>
-      )}
+      {notice &&
+        (status.kind === "failed" ? (
+          <p role="alert" className="shrink-0 px-3 py-1 text-[11px] text-red-400">
+            {notice}
+          </p>
+        ) : (
+          // Stopped, timed out, or results outside the workspace: said, but not as a failure.
+          <p role="status" className="shrink-0 px-3 py-1 text-[11px] text-zinc-400">
+            {notice}
+          </p>
+        ))}
 
       <div className="min-h-0 flex-1 overflow-auto py-1 text-[11px]">
         {total === 0 ? (
           <p className="px-3 py-2 text-zinc-500">
             {!everRan
-              ? "No checker has run yet. Choose one above to collect diagnostics."
+              ? "Nothing has been reported yet. Open a file, or run a checker above."
               : narrowed
                 ? "No problems match the current filters."
                 : "No problems found."}
@@ -271,10 +238,10 @@ export function ProblemsView({
                       className="flex w-full items-start gap-1.5 py-0.5 pr-3 pl-8 text-left hover:bg-[#0c0c0c]"
                     >
                       <span
-                        aria-label={problem.severity}
-                        className={`shrink-0 font-bold ${SEVERITY_STYLE[problem.severity]}`}
+                        aria-label={kindOf(problem)}
+                        className={`shrink-0 font-bold ${KIND_STYLE[kindOf(problem)]}`}
                       >
-                        {SEVERITY_MARK[problem.severity]}
+                        {KIND_MARK[kindOf(problem)]}
                       </span>
                       <span className="flex-1 text-zinc-300">{problem.message}</span>
                       <span className="shrink-0 text-zinc-600">

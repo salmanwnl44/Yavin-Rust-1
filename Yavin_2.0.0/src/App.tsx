@@ -1267,7 +1267,14 @@ export default function App() {
   const openLocation = (path: string, range?: EditorRange) => {
     const key = documents.get(path)?.key ?? path;
     setPendingLocation({ key, range });
-    void handleOpenFile(path);
+    void handleOpenFile(path).then(() => {
+      // Opened: wait for the tab the document is actually keyed by (another spelling of the
+      // path, once it loaded). Not opened (the failure is already reported): nothing waits.
+      const opened = documents.get(path)?.key;
+      setPendingLocation((pending) =>
+        pending?.key !== key ? pending : opened ? { key: opened, range } : null,
+      );
+    });
   };
   useEffect(() => {
     if (!pendingLocation || activeTabId !== pendingLocation.key || diff) return;
@@ -2966,11 +2973,16 @@ export default function App() {
                   onManageTrust={() => setTrustDialog("manage")}
                   activeFile={activeTab?.path}
                   ide={terminalIde}
-                  onOpenProblem={(file, line) => {
-                    // Opening is asynchronous, so the jump waits for the editor to hold the
-                    // file; otherwise it would scroll whatever was open before.
-                    void handleOpenFile(file).then(() => editorRef.current?.goToLine(line));
-                  }}
+                  onOpenProblem={(file, line, column) =>
+                    // The editor's own navigation: it waits for the file to be in front, then
+                    // selects the exact line and column (the editor clamps a stale location).
+                    openLocation(file, {
+                      startLineNumber: line,
+                      startColumn: column,
+                      endLineNumber: line,
+                      endColumn: column,
+                    })
+                  }
                 />
               </Suspense>
             )}

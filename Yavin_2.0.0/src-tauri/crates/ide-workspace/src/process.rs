@@ -27,6 +27,38 @@ pub fn capture(
     capture_within(command, input, cancel, DEFAULT_TIMEOUT)
 }
 
+/// What `capture_within` says when its caller cancelled the run.
+const CANCELLED: &str = "Cancelled";
+/// What `capture_within` says when the run outlived its deadline. Worded for Git, its first
+/// and busiest caller; `capture_classified` lets other callers say it their own way.
+const TIMED_OUT: &str = "Tool timed out. Refresh before retrying a Git operation.";
+
+/// Why a run did not produce output, for callers that tell a user what happened (a stopped or
+/// timed-out checker is not a failure to run it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureError {
+    /// The caller's cancel flag stopped it.
+    Cancelled,
+    /// It outlived its deadline and was ended.
+    TimedOut,
+    /// It could not be started, or its output could not be read.
+    Failed(String),
+}
+
+/// `capture_within`, with a cancelled or timed-out run told apart from a failed one.
+pub fn capture_classified(
+    command: Command,
+    input: Option<String>,
+    cancel: Arc<AtomicBool>,
+    timeout: Duration,
+) -> Result<ToolOutput, CaptureError> {
+    capture_within(command, input, cancel, timeout).map_err(|error| match error.as_str() {
+        CANCELLED => CaptureError::Cancelled,
+        TIMED_OUT => CaptureError::TimedOut,
+        _ => CaptureError::Failed(error),
+    })
+}
+
 /// `capture` with an explicit deadline, for the few commands where the default is genuinely
 /// too short -- cloning a large repository over a slow network is minutes of legitimate work,
 /// and killing it at two minutes would make the feature useless on exactly the repositories
@@ -203,10 +235,10 @@ fn stop_reason(cancelled: bool, overflowed: bool, timed_out: bool) -> Option<&'s
 /// later flip at all.
 fn outcome(kill_reason: Option<&'static str>, truncated: bool) -> Result<(), String> {
     if kill_reason == Some("cancelled") {
-        return Err("Cancelled".into());
+        return Err(CANCELLED.into());
     }
     if kill_reason == Some("timed out") && !truncated {
-        return Err("Tool timed out. Refresh before retrying a Git operation.".into());
+        return Err(TIMED_OUT.into());
     }
     Ok(())
 }
@@ -333,6 +365,63 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "cancellation should stop the process almost immediately, not wait for it \
              to run its full 30s course"
+        );
+    }
+
+    /// A command that runs for ~30 s unless stopped.
+    fn long_running() -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        }
+    }
+
+    #[test]
+    fn a_classified_run_tells_cancelled_timed_out_and_failed_apart() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::Relaxed);
+        });
+        assert_eq!(
+            capture_classified(long_running(), None, cancel, Duration::from_secs(20)).unwrap_err(),
+            CaptureError::Cancelled
+        );
+        assert_eq!(
+            capture_classified(
+                long_running(),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Duration::from_millis(300)
+            )
+            .unwrap_err(),
+            CaptureError::TimedOut
+        );
+        assert!(matches!(
+            capture_classified(
+                Command::new("yavin-no-such-program"),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Duration::from_secs(5)
+            ),
+            Err(CaptureError::Failed(_))
+        ));
+        // The string API is unchanged for its existing callers (Git words the timeout).
+        assert_eq!(
+            capture_within(
+                long_running(),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Duration::from_millis(300)
+            )
+            .unwrap_err(),
+            TIMED_OUT
         );
     }
 }

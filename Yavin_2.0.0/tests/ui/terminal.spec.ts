@@ -195,13 +195,21 @@ async function desktop(
               __scenarioCheckerOutput?: string;
               __scenarioCheckerCode?: number;
               __checkerDelay?: number;
+              __checkerOutcome?: "completed" | "cancelled" | "timedOut";
             };
             // A slow checker (a cold `cargo check`), for what happens while it runs.
             if (scenario.__checkerDelay)
               await new Promise((resolve) => setTimeout(resolve, scenario.__checkerDelay));
             const output = scenario.__scenarioCheckerOutput ?? setup.checkerOutput ?? "";
-            // A checker exits nonzero when it finds problems, so the tests say which.
-            return { output, code: scenario.__scenarioCheckerCode ?? setup.checkerCode ?? 0 };
+            // As the native side answers (IDE-01): how it ended, its output, its exit code --
+            // a checker exits nonzero when it finds problems, so the tests say which -- and the
+            // folder it ran in, which its relative paths are relative to.
+            return {
+              outcome: scenario.__checkerOutcome ?? "completed",
+              output,
+              code: scenario.__scenarioCheckerCode ?? setup.checkerCode ?? 0,
+              root: "/work",
+            };
           }
           if (command === "stop_listening_process") return null;
           // Discovery (TERMINAL-05): every shell looked for, one of them not installed.
@@ -1525,7 +1533,7 @@ test("Problems explains how diagnostics are collected when no checker applies", 
   await desktop(page, { checkers: [] });
   await showView(page, "PROBLEMS");
   await expect(page.getByRole("region", { name: "Problems" })).toContainText(
-    "running your project's own compiler or linter",
+    "a whole-project check needs a checker, and none applies here",
   );
 });
 
@@ -1597,10 +1605,11 @@ test("a problem opens its file at its line, even while another file is shown", a
   await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
   await problems.getByText(/not assignable/).click();
 
-  // The jump lands in the problem's file, not in the one that was shown before it opened.
+  // The jump lands in the problem's file, not in the one that was shown before it opened --
+  // at its line and its column (12, 7), through the editor's own navigation.
   await expect.poll(() => withEditor<string>(page, "(editor) => editor.label()")).toBe("app.ts");
   const lineStart = Array.from({ length: 11 }, (_, i) => `line ${i + 1}\n`).join("").length;
-  await expect.poll(async () => (await editorSelections(page))?.[0]?.start).toBe(lineStart);
+  await expect.poll(async () => (await editorSelections(page))?.[0]?.start).toBe(lineStart + 6);
 });
 
 test("a checker that could not run says so instead of reporting a clean project", async ({
@@ -1711,6 +1720,92 @@ test("a second run replaces that checker's earlier findings", async ({ page }) =
   await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
   // "No problems found." rather than blaming filters that were never set.
   await expect(problems.getByText("No problems found.")).toBeVisible();
+});
+
+// --- IDE-01: one identity from checker to editor ---------------------------------------------
+
+test("a checker's relative paths are the workspace's files: squiggles, Current file, exact column", async ({
+  page,
+}) => {
+  await desktop(page, {
+    checkers: [{ id: "tsc", label: "TypeScript" }],
+    checkerOutput: TSC_OUTPUT,
+    checkerCode: 2,
+  });
+  await showView(page, "PROBLEMS");
+  const problems = page.getByRole("region", { name: "Problems" });
+  await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
+  // Listed under the file's own path, resolved against the folder the checker ran in.
+  await expect(problems.getByRole("button", { name: /\/work\/src\/app\.ts/ })).toBeVisible();
+
+  await problems.getByText(/not assignable/).click();
+  await expect.poll(() => withEditor<string>(page, "(editor) => editor.label()")).toBe("app.ts");
+  // The editor draws them: the checker's file is the editor's file. (Only lines on screen are
+  // drawn, so each is checked with its line brought into view by going to it.)
+  await expect(page.locator("[data-editor=monaco] .squiggly-error")).toHaveCount(1);
+  await problems.getByText(/never read/).click();
+  await expect(page.locator("[data-editor=monaco] .squiggly-warning")).toHaveCount(1);
+
+  // "Current file" keeps this file's problems and drops the other file's.
+  await problems.getByRole("button", { name: "Current file" }).click();
+  await expect(problems.getByText(/not assignable/)).toBeVisible();
+  await expect(problems.getByText(/never read/)).toBeVisible();
+  await expect(problems.getByText(/';' expected/)).toHaveCount(0);
+  await problems.getByRole("button", { name: "Current file" }).click();
+  await expect(problems.getByText(/';' expected/)).toBeVisible();
+});
+
+test("a problem past the end of its file lands on the last line, with no error", async ({
+  page,
+}) => {
+  await desktop(page, {
+    checkers: [{ id: "tsc", label: "TypeScript" }],
+    // The harness's files have 30 lines: this location is stale.
+    checkerOutput: "src/app.ts(999,500): error TS1005: ';' expected.",
+    checkerCode: 2,
+  });
+  const failures: string[] = [];
+  page.on("pageerror", (error) => failures.push(error.message));
+  await showView(page, "PROBLEMS");
+  const problems = page.getByRole("region", { name: "Problems" });
+  await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
+  await problems.getByText(/';' expected/).click();
+  await expect.poll(() => withEditor<string>(page, "(editor) => editor.label()")).toBe("app.ts");
+  const lastLine = Array.from({ length: 29 }, (_, i) => `line ${i + 1}\n`).join("").length;
+  await expect
+    .poll(async () => (await editorSelections(page))?.[0]?.start)
+    .toBe(lastLine + "line 30".length);
+  expect(failures).toEqual([]);
+  await expect(appAlert(page)).toHaveCount(0);
+});
+
+test("Stop and a timeout are said plainly, not as a failure to run", async ({ page }) => {
+  await desktop(page, {
+    checkers: [{ id: "tsc", label: "TypeScript" }],
+    checkerOutput: TSC_OUTPUT,
+  });
+  await showView(page, "PROBLEMS");
+  const problems = page.getByRole("region", { name: "Problems" });
+  await page.evaluate(() => {
+    const scenario = window as unknown as { __checkerDelay?: number; __checkerOutcome?: string };
+    scenario.__checkerDelay = 600;
+    scenario.__checkerOutcome = "cancelled";
+  });
+  await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
+  await problems.getByRole("button", { name: "Stop" }).click();
+  await expect.poll(async () => countCalls(page, "cancel_checker")).toBe(1);
+  await expect(problems.getByRole("status")).toHaveText("TypeScript was stopped.");
+  await expect(problems.getByRole("alert")).toHaveCount(0);
+
+  await page.evaluate(() => {
+    const scenario = window as unknown as { __checkerDelay?: number; __checkerOutcome?: string };
+    scenario.__checkerDelay = 0;
+    scenario.__checkerOutcome = "timedOut";
+  });
+  await problems.getByRole("button", { name: "TypeScript", exact: true }).click();
+  await expect(problems.getByRole("status")).toHaveText("TypeScript timed out and was stopped.");
+  await expect(problems.getByRole("alert")).toHaveCount(0);
+  await expect(problems).not.toContainText("Git");
 });
 
 test("right-clicking the second pane of a split does not collapse the layout", async ({ page }) => {

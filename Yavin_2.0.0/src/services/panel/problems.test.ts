@@ -177,3 +177,66 @@ test("the snapshot is stable between changes and fresh after one", () => {
   publishProblems("eslint", "ESLint", []);
   assert.notEqual(before, allProblems());
 });
+
+// --- IDE-01: one file, one identity ------------------------------------------------------------
+
+test("a language server's and a checker's diagnostics for one file are one group", () => {
+  // The server reports the canonical path; the checker's was resolved to it (another spelling).
+  publishProblems("lsp:ts:file:///C:/p/src/app.ts", "TypeScript Server", [
+    at("C:/p/src/app.ts", 3, "error", "from the server"),
+  ]);
+  publishProblems("tsc", "TypeScript", [at("c:\\p\\src\\app.ts", 3, "error", "from tsc")]);
+  const files = groupByFile(allProblems());
+  assert.equal(files.length, 1);
+  // Owners are never merged: the same error from two producers is listed twice, by source.
+  assert.deepEqual(files[0].problems.map((problem) => problem.source).sort(), [
+    "TypeScript",
+    "TypeScript Server",
+  ]);
+});
+
+test("the current-file filter matches by identity, whatever the spelling", () => {
+  publishProblems("tsc", "TypeScript", [
+    at("C:/p/src/app.ts", 1, "error"),
+    at("C:/p/src/other.ts", 1, "error"),
+  ]);
+  for (const active of ["C:/p/src/app.ts", "c:\\p\\src\\app.ts", "\\\\?\\C:\\p\\src\\app.ts"])
+    assert.deepEqual(
+      groupByFile(allProblems(), { file: active }).map((file) => file.file),
+      ["C:/p/src/app.ts"],
+      active,
+    );
+  // Switching to another tab shows that file's; a file with none shows nothing.
+  assert.deepEqual(
+    groupByFile(allProblems(), { file: "C:/p/src/other.ts" }).map((file) => file.file),
+    ["C:/p/src/other.ts"],
+  );
+  assert.deepEqual(groupByFile(allProblems(), { file: "C:/p/src/none.ts" }), []);
+});
+
+test("hints are a kind of their own in the list, and still counted as info", () => {
+  publishProblems("lsp", "Server", [
+    { ...at("C:/p/a.ts", 1, "info", "a hint"), hint: true },
+    at("C:/p/a.ts", 2, "info", "information"),
+  ]);
+  const messages = (severities: Parameters<typeof groupByFile>[1]) =>
+    groupByFile(allProblems(), severities).flatMap((file) => file.problems.map((p) => p.message));
+  assert.deepEqual(messages({}), ["a hint", "information"]);
+  assert.deepEqual(messages({ severities: ["hint"] }), ["a hint"]);
+  assert.deepEqual(messages({ severities: ["info"] }), ["information"]);
+  assert.equal(problemCounts().info, 2);
+});
+
+test("clearing one producer leaves the other's diagnostics for the same file", () => {
+  publishProblems("lsp:x", "Server", [at("C:/p/a.ts", 1, "error")]);
+  publishProblems("tsc", "TypeScript", [at("C:/p/a.ts", 1, "error")]);
+  clearProblems("tsc");
+  const [file] = groupByFile(allProblems());
+  assert.deepEqual(
+    file.problems.map((problem) => problem.source),
+    ["Server"],
+  );
+  // A workspace's disposal clears them all.
+  clearProblems();
+  assert.deepEqual(groupByFile(allProblems()), []);
+});

@@ -2,7 +2,8 @@ import { useSyncExternalStore } from "react";
 import { Channel, isTauri } from "@tauri-apps/api/core";
 import { GitRegistry } from "./git/registry.ts";
 import { native, onLocalGitProgress } from "./native.ts";
-import { clearProblems } from "./panel/problems.ts";
+import { clearProblems, publishProblems } from "./panel/problems.ts";
+import { createCheckerService, type CheckerService } from "./panel/checkers.ts";
 import { createLocalGitService } from "./localgit/service.ts";
 import type { LocalGitService } from "./localgit/service.ts";
 import { EMPTY_WORKSPACE, createWorkspaceManager } from "./workspaceManager.ts";
@@ -43,6 +44,11 @@ export interface WorkspaceServices {
    * kept with it, so a workspace's terminals come back laid out as they were left.
    */
   terminalUi: TerminalUi;
+  /**
+   * The workspace's checkers (IDE-01): which apply, the run in progress, its outcome. Disposed
+   * with the workspace: a run still going is stopped and its answer never published.
+   */
+  checkers: CheckerService;
 }
 
 /**
@@ -141,6 +147,14 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
         localGit,
         terminals: terminalServices.forWorkspace(id),
         terminalUi: terminalUiFor(id),
+        checkers: createCheckerService(
+          {
+            available: () => native("available_checkers"),
+            run: (checker) => native("run_checker", { id: checker }),
+            cancel: () => native("cancel_checker"),
+          },
+          publishProblems,
+        ),
       };
     },
     async dispose(services) {
@@ -148,10 +162,9 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
       // Its Local Git handle is given back (the store closes, releasing its writer lock, when
       // no handle is left); anything still in flight is refused.
       await services.localGit?.close();
+      // A checker still running in the folder left is stopped, and its answer never published.
+      services.checkers.dispose();
       if (isTauri()) {
-        // A checker still running in the folder left is stopped; its answer would be dropped
-        // anyway (it checks the workspace it started in).
-        await native("cancel_checker").catch(() => undefined);
         // Its terminals are not ended: their views detach (the panel is remounted per
         // workspace) and the workspace's TerminalService keeps them for its return.
       }

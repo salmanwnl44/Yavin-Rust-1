@@ -3,6 +3,7 @@ import { editorModelOf, monacoLanguage } from "./monacoHost";
 import type { EditorModelBridge } from "../services/editorModelBridge";
 import type { TextDocument } from "../services/documents";
 import { allProblems, subscribeProblems } from "../services/panel/problems";
+import { problemResourceId } from "../services/panel/problemLocations";
 import type { LspManager } from "../services/lsp/manager";
 import { StaleResultError } from "../services/lsp/manager";
 import { CancelledError } from "../services/lsp/jsonrpc";
@@ -259,7 +260,8 @@ function refreshMarkers() {
   const byFile = new Map<string, monaco.editor.IMarkerData[]>();
   for (const owned of allProblems())
     for (const problem of owned.diagnostics) {
-      const id = lspResourceId(`file://${problem.file.startsWith("/") ? "" : "/"}${problem.file}`);
+      // The diagnostic's file by resource identity (IDE-01), however its producer spelled it.
+      const id = problemResourceId(problem.file);
       if (!id) continue;
       const list = byFile.get(id) ?? [];
       list.push({

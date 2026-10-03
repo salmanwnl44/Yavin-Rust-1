@@ -1,4 +1,5 @@
 import type { Diagnostic, Severity } from "./problemMatchers.ts";
+import { problemResourceId } from "./problemLocations.ts";
 
 /**
  * Every diagnostic currently known, grouped by the tool that produced it.
@@ -17,7 +18,31 @@ export interface OwnedDiagnostics {
   at: number;
 }
 
+/**
+ * How a problem is listed and filtered: its severity, except that a hint (LSP severity 4,
+ * kept as `info` with `hint: true` so counts stay as they were) is a kind of its own.
+ */
+export type ProblemKind = Severity | "hint";
+
+export const PROBLEM_KINDS: readonly ProblemKind[] = ["error", "warning", "info", "hint"];
+
+export function kindOf(problem: Pick<Diagnostic, "severity" | "hint">): ProblemKind {
+  return problem.hint ? "hint" : problem.severity;
+}
+
+/**
+ * Whether two diagnostic files are the same file: by resource identity (`resource.ts`), so
+ * spelling -- separators, drive-letter case, `\\?\`, a `file:` URI -- does not matter. Text
+ * that names no local file compares as text.
+ */
+export function sameProblemFile(one: string, other: string): boolean {
+  const a = problemResourceId(one);
+  const b = problemResourceId(other);
+  return a !== null && b !== null ? a === b : one === other;
+}
+
 export interface FileProblems {
+  /** The file as the first diagnostic for it spelled it (canonical for every producer). */
   file: string;
   problems: (Diagnostic & { source: string })[];
 }
@@ -114,29 +139,39 @@ export function includeProblem(file: string, message: string, filter: string): b
 
 /**
  * Diagnostics grouped by file, the way the Problems view lists them: files in path order,
- * and within a file by position. `severities` and `filter` narrow what is included -- the
- * filter matching either the path or the message, as VS Code's does.
+ * and within a file by position. `severities` (kinds: hints are their own) and `filter`
+ * narrow what is included -- the filter matching either the path or the message, as VS
+ * Code's does. Files are grouped, and `file` (the current file) matched, by resource
+ * identity: a language server's and a checker's diagnostics for one file are one group.
+ * Diagnostics from different owners are never merged -- the same error from `tsc` and from
+ * the TypeScript server is listed twice, each with its source, as VS Code lists them.
  */
 export function groupByFile(
   owned: readonly OwnedDiagnostics[],
-  options: { severities?: readonly Severity[]; filter?: string; file?: string } = {},
+  options: { severities?: readonly ProblemKind[]; filter?: string; file?: string } = {},
 ): FileProblems[] {
-  const severities = options.severities ?? ["error", "warning", "info"];
-  const byFile = new Map<string, (Diagnostic & { source: string })[]>();
+  const severities = options.severities ?? PROBLEM_KINDS;
+  const current = options.file === undefined ? undefined : problemResourceId(options.file);
+  const byFile = new Map<string, { file: string; problems: (Diagnostic & { source: string })[] }>();
 
   for (const group of owned)
     for (const problem of group.diagnostics) {
-      if (!severities.includes(problem.severity)) continue;
-      if (options.file && problem.file !== options.file) continue;
+      if (!severities.includes(kindOf(problem))) continue;
+      const id = problemResourceId(problem.file);
+      if (options.file !== undefined) {
+        const same = current && id ? current === id : problem.file === options.file;
+        if (!same) continue;
+      }
       if (options.filter && !includeProblem(problem.file, problem.message, options.filter))
         continue;
-      const list = byFile.get(problem.file) ?? [];
-      list.push({ ...problem, source: group.label });
-      byFile.set(problem.file, list);
+      const key = id ?? problem.file;
+      const entry = byFile.get(key) ?? { file: problem.file, problems: [] };
+      entry.problems.push({ ...problem, source: group.label });
+      byFile.set(key, entry);
     }
 
-  return [...byFile.entries()]
-    .map(([file, problems]) => ({
+  return [...byFile.values()]
+    .map(({ file, problems }) => ({
       file,
       problems: problems.sort((a, b) => a.line - b.line || a.column - b.column),
     }))
