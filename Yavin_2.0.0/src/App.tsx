@@ -1614,8 +1614,11 @@ export default function App() {
     : undefined;
 
   useEffect(() => {
-    if (!pendingHit || activeTabId !== pendingHit.path || diff) return;
-    const content = documents.get(pendingHit.path)?.text;
+    // The hit's file by identity: the tab is keyed by its document's key, which may be another
+    // spelling of the path ripgrep reported (`documents.get` resolves any spelling).
+    const doc = pendingHit ? documents.get(pendingHit.path) : undefined;
+    if (!pendingHit || !doc || activeTabId !== doc.key || diff) return;
+    const content = doc.text;
     if (content === undefined) return;
     // The first document opened loads the editor itself: until it is there, the hit waits.
     // Showing the document reports the editor's state, which runs this again.
@@ -2794,8 +2797,13 @@ export default function App() {
             replaceRequest={replaceRequest}
             onOpen={(hit) => {
               setPendingHit(hit);
-              void handleOpenFile(hit.path);
+              // Not opened (the failure is reported once): nothing is left waiting to jump.
+              void handleOpenFile(hit.path).then(() => {
+                if (!documents.get(hit.path))
+                  setPendingHit((pending) => (pending === hit ? null : pending));
+              });
             }}
+            modified={(path) => documents.get(path)?.dirty ?? true}
             read={(path) => {
               const doc = documents.get(path);
               return doc ? Promise.resolve(doc.text) : native("read_file_content", { path });

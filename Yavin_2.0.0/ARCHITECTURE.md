@@ -607,6 +607,71 @@ A tab switch measured inside the page takes about 90-160 ms until painted, the s
 5. A change the document makes is applied to the model only when the model does not already hold that version, so edits and displays cannot loop.
 6. Cursor, selection, scroll and undo history are editor state; the Document Model never holds them.
 
+## Search
+
+```text
+SearchPanel (UI: query, options, results, replace)      src/components/layout/SearchPanel.tsx
+   └─ searchWorkspace / replaceHits / describeSearchResult  src/services/search.ts
+        └─ search_project / cancel_search (IPC)         src-tauri/src/workbench.rs
+             └─ the bundled ripgrep (resources/search/rg.exe), via ide-workspace::process
+```
+
+**Ownership.**
+
+| Owner              | Owns                                                                 |
+| ------------------ | -------------------------------------------------------------------- |
+| UI (`SearchPanel`) | the query, its options, the results shown, replacement               |
+| `search.ts`        | one search's lifecycle: overlay, limits, cancellation                |
+| `workbench.rs`     | validating the request and running ripgrep                           |
+| DocumentService    | open documents' text; Search reads `buffers()` and never copies them |
+| Resource rules     | identity                                                             |
+| WorkspaceManager   | a search's lifetime: it is aborted with its workspace's signal       |
+
+**Native.** `search_scope` refuses:
+
+- a search for a workspace that is not the open one ("Workspace changed");
+- a scope outside the workspace or that is not a folder;
+- input over 16 KiB (query) or 10 MiB (buffer).
+
+Searches are registered by id, at most 16 at once, so `cancel_search` can reach them. ripgrep's arguments come from `search_args`, where the query and each glob are single arguments. `.git` is always excluded, after the user's globs, so no glob can bring it back. ripgrep's own rules apply: `.gitignore` inside a repository, binary files skipped, files over 10 MiB skipped.
+
+**Unsaved edits** (IDE-02). Documents that differ from their file are searched as the editor holds them. Their text goes to ripgrep on stdin, and their disk results are dropped.
+
+- A saved open document's file says the same, so its disk results stand and it is not searched again. "Open files only" still searches every open document.
+- Which documents are in scope (folder, globs, ignore rules) comes from one listing of the scope, run alongside the main search. The buffer searches run four at a time.
+- Files are matched by resource identity, so a document keyed by another spelling of its path is still the same file.
+- Measured on this machine, each ripgrep process costs about 0.3 s, mostly start-up. Before IDE-02, every open document cost one more process in sequence.
+
+**Status.** `describeSearchResult` says exactly why results are missing:
+
+- the first 10,000 shown (the match cap);
+- ripgrep's 16 MiB output limit reached;
+- some files could not be searched (locked or unreadable).
+
+A cancelled search says "Search cancelled", a failed one "Search failed: …".
+
+**Navigation.** A result opens its file and selects the exact match. The pending jump waits for the tab its document is actually keyed by (`documents.get` resolves any spelling). It reports a result whose line has changed since, and leaves nothing waiting if the file cannot be opened.
+
+**Replacement.** A result's line must still read as it did, its line ending aside, or the replacement is refused as stale.
+
+- ripgrep reports a CRLF file's lines with `\r\n`, the editor holds them with `\n`, and a closed CRLF file is rewritten in its own `\r\n`.
+- An open document is changed by one undoable edit; a closed file by a guarded write.
+- Replacement text is literal (no `$1`).
+
+**Tests.**
+
+- `workbench.rs` (`search_tests`) checks the arguments, scope refusal, job limits and cancellation, and runs searches through the real ripgrep: literal, regex, case, word, globs, hidden, ignored, `.git`, binary, stdin and listing.
+- `search.test.ts` runs `searchWorkspace` against `search.fake.ts`, an in-memory stand-in that answers in ripgrep's own formats: scopes, the overlay and its identity, limits, cancellation and replacement.
+- `tests/ui/search.spec.ts` covers navigation (across spellings, closed CRLF files, stale results), Replace and Undo, Replace All in an open CRLF document, cancellation, "Open files only", the status line, and a workspace switch.
+
+**Not done.**
+
+- ripgrep for macOS or Linux;
+- fuzzy Quick Open;
+- search history;
+- `$1` replacement;
+- an index.
+
 ## Language servers (LSP platform)
 
 Language intelligence comes from language servers, through a platform under the Monaco editor. None of it owns a document: the Document Model does.

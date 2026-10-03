@@ -1,5 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { replaceHits, searchWorkspace } from "../../services/search";
+import {
+  EMPTY_RESULT,
+  describeSearchResult,
+  replaceHits,
+  searchWorkspace,
+} from "../../services/search";
 import { workspaces } from "../../services/workspaces";
 import type { SearchHit, SearchResult } from "../../services/search";
 import type { SearchOptions } from "../../services/native";
@@ -29,6 +34,7 @@ const hitId = (h: SearchHit) => `${h.path}\0${h.line}:${h.start}`;
 export function SearchPanel({
   workspace,
   buffers,
+  modified,
   visible,
   focusRequest,
   replaceRequest = 0,
@@ -39,6 +45,11 @@ export function SearchPanel({
   workspace: string;
   /** The open documents' text, read when a search starts. */
   buffers: () => Record<string, string>;
+  /**
+   * Whether an open document differs from its file (unsaved edits): only those are searched as
+   * the editor holds them; a clean one's file says the same. Every buffer, without it.
+   */
+  modified?: (path: string) => boolean;
   visible: boolean;
   focusRequest: number;
   /** Raised by Replace in Files: the panel opens with its replace field showing. */
@@ -59,7 +70,7 @@ export function SearchPanel({
   const [exclude, setExclude] = useState("");
   const [scope, setScope] = useState("workspace");
   const [folder, setFolder] = useState("");
-  const [result, setResult] = useState<SearchResult>({ hits: [], warning: "", truncated: false });
+  const [result, setResult] = useState<SearchResult>(EMPTY_RESULT);
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
   const [writing, setWriting] = useState(false);
@@ -98,6 +109,8 @@ export function SearchPanel({
   // Read open buffers when a search starts; editing them must not re-run the search.
   const latestBuffers = useRef(buffers);
   latestBuffers.current = buffers;
+  const latestModified = useRef(modified);
+  latestModified.current = modified;
 
   useEffect(() => {
     if (visible) input.current?.focus();
@@ -108,7 +121,7 @@ export function SearchPanel({
 
   useEffect(() => {
     if (!workspace || !query) {
-      setResult({ hits: [], warning: "", truncated: false });
+      setResult(EMPTY_RESULT);
       setStatus("");
       setBusy(false);
       setActiveHitId(null);
@@ -144,23 +157,27 @@ export function SearchPanel({
         filesOnly: false,
       };
       setStatus("Searching…");
-      void searchWorkspace(workspace, options, latestBuffers.current(), scope === "open", signal)
+      void searchWorkspace(
+        workspace,
+        options,
+        latestBuffers.current(),
+        scope === "open",
+        signal,
+        latestModified.current,
+      )
         .then((next) => {
           if (signal.aborted) return;
           setResult(next);
           setSelected(new Set(next.hits.map(hitId)));
           setActiveHitId(next.hits[0] ? hitId(next.hits[0]) : null);
-          const fileCount = new Set(next.hits.map((h) => h.path)).size;
-          setStatus(
-            next.hits.length
-              ? `${next.hits.length} matches in ${fileCount} files${next.truncated ? " (capped at 10,000)" : ""}`
-              : "No matches found",
-          );
+          // Exactly why anything is missing: the match cap, ripgrep's output limit, files
+          // that could not be read -- never a blanket "capped".
+          setStatus(describeSearchResult(next));
         })
         .catch((error) => {
           if (!signal.aborted) {
-            setStatus(String(error));
-            setResult({ hits: [], warning: "", truncated: false });
+            setStatus(`Search failed: ${error instanceof Error ? error.message : String(error)}`);
+            setResult(EMPTY_RESULT);
             setActiveHitId(null);
           }
         })
@@ -239,7 +256,7 @@ export function SearchPanel({
   const clearSearch = () => {
     setQuery("");
     setReplacement("");
-    setResult({ hits: [], warning: "", truncated: false });
+    setResult(EMPTY_RESULT);
     setStatus("");
     setPreview([]);
     setActiveHitId(null);
@@ -326,7 +343,7 @@ export function SearchPanel({
       setStatus(
         `${outcome.applied.length} files ${recovering ? "restored" : "updated"}. ${outcome.errors.join(" ")}`,
       );
-      setResult({ hits: [], warning: "Search again to refresh results.", truncated: false });
+      setResult({ ...EMPTY_RESULT, warning: "Search again to refresh results." });
     } catch (error) {
       setStatus(String(error));
     } finally {
@@ -777,7 +794,7 @@ export function SearchPanel({
                   onClick={() => {
                     controller.current?.abort();
                     setBusy(false);
-                    setStatus("Cancelled");
+                    setStatus("Search cancelled");
                   }}
                   className="text-[10px] text-rose-400 hover:text-rose-300 underline"
                 >
