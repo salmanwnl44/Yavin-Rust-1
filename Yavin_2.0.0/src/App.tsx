@@ -116,6 +116,9 @@ import { EDITOR_SETTINGS } from "./editor/editorSettings";
 import { useEditorSettings } from "./editor/useEditorSettings";
 import type { SettingDefinition } from "./services/settings/settings";
 import { SettingsView } from "./components/settings/SettingsView";
+import { RunPanel } from "./components/layout/RunPanel";
+import { TaskError } from "./services/tasks/errors";
+import { isFinal, type TaskRun } from "./services/tasks/service";
 import { createOverlayTracker } from "./services/localgit/overlays";
 import { fileUri } from "./services/resource";
 import { loadMinimapPreferences, saveMinimapPreferences } from "./services/minimapPreferences";
@@ -1212,6 +1215,74 @@ export default function App() {
     show();
     return settings.onProblems(show);
   }, [reportError]);
+  // --- Tasks (IDE-04): the window's commands on the workspace's TaskService -----------------------
+  const tasks = workspace.services.tasks;
+  const taskSnapshot = useSyncExternalStore(tasks.subscribe, tasks.getSnapshot, tasks.getSnapshot);
+  /** Says why a task did not run; an untrusted folder offers the trust decision itself. */
+  const reportTaskError = useCallback(
+    (error: unknown) => {
+      if (error instanceof TaskError && error.code === "TrustDenied") setTrustDialog("manage");
+      reportError(error instanceof Error ? error.message : String(error));
+    },
+    [reportError],
+  );
+  const runTask = (taskId: string) => {
+    void tasks.run(taskId).catch(reportTaskError);
+  };
+  /** A list to choose from, when there is more than one (never an arbitrary pick). */
+  const chooseTask = (
+    title: string,
+    choices: readonly { id: string; label: string; detail: string }[],
+    then: (id: string) => void,
+  ) =>
+    setDialog({
+      title,
+      options: choices.map((choice) => ({
+        value: choice.id,
+        label: choice.label,
+        description: choice.detail,
+      })),
+      submit: (value) => then(value),
+    });
+  const runGroup = (group: "build" | "test") => {
+    if (!taskSnapshot.workspace) {
+      reportError("Open a folder to run its tasks.");
+      return;
+    }
+    const { task, candidates } = tasks.defaultTask(group);
+    if (task) runTask(task.id);
+    else if (!candidates.length)
+      reportError(
+        `There is no ${group} task. Configure Tasks adds one ("group": "${group}", "isDefault": true).`,
+      );
+    else
+      chooseTask(
+        `Run ${group === "build" ? "Build" : "Test"} Task`,
+        candidates.map((one) => ({ id: one.id, label: one.label, detail: one.command })),
+        runTask,
+      );
+  };
+  const activeRuns = taskSnapshot.runs.filter((run) => !isFinal(run.state) && run.parent === null);
+  const showTaskTerminal = (run: TaskRun) => {
+    if (!run.sessionId || !workspace.services.terminals.get(run.sessionId)) {
+      reportError(`The terminal of "${run.label}" is no longer open.`);
+      return;
+    }
+    revealTerminals();
+    workspace.services.terminalUi.activate(run.sessionId);
+  };
+  const [settingsQuery, setSettingsQuery] = useState("");
+  const configureTasks = () => {
+    setSettingsQuery("Tasks");
+    setSettingsOpen(true);
+  };
+  // A task that asks to be shown: the panel shows its terminal.
+  const taskReveal = useRef(taskSnapshot.revealRequest);
+  useEffect(() => {
+    if (taskSnapshot.revealRequest === taskReveal.current) return;
+    taskReveal.current = taskSnapshot.revealRequest;
+    revealTerminals();
+  }, [taskSnapshot.revealRequest, revealTerminals]);
   // What went wrong keeping the terminal's settings (TERMINAL-07) -- unreadable, written by a
   // newer Yavin, not saved -- is said once; the terminal works on with what could be read.
   useEffect(() => {
@@ -2318,6 +2389,76 @@ export default function App() {
       run: () => changeSetting(EDITOR_SETTINGS.zoom, 1),
     },
     {
+      id: "run.task",
+      menu: "Run",
+      label: "Run Task…",
+      disabled: !taskSnapshot.workspace,
+      reason: "Open a folder first",
+      run: () => {
+        if (!taskSnapshot.tasks.length) {
+          reportError("There are no tasks yet. Run › Configure Tasks adds them.");
+          return;
+        }
+        chooseTask(
+          "Run Task",
+          taskSnapshot.tasks.map((task) => ({
+            id: task.id,
+            label: task.label,
+            detail: `${task.command}${task.scope === "workspace" ? " (workspace)" : ""}`,
+          })),
+          runTask,
+        );
+      },
+    },
+    {
+      id: "run.build",
+      menu: "Run",
+      label: "Run Build Task",
+      shortcut: "Mod+Shift+b",
+      disabled: !taskSnapshot.workspace,
+      reason: "Open a folder first",
+      run: () => runGroup("build"),
+    },
+    {
+      id: "run.test",
+      menu: "Run",
+      label: "Run Test Task",
+      disabled: !taskSnapshot.workspace,
+      reason: "Open a folder first",
+      run: () => runGroup("test"),
+    },
+    {
+      id: "run.showRunning",
+      menu: "Run",
+      label: "Show Running Tasks",
+      run: () => {
+        setActiveActivityTab("run");
+        setIsSidebarOpen(true);
+      },
+    },
+    {
+      id: "run.stop",
+      menu: "Run",
+      label: "Stop Task",
+      disabled: !activeRuns.length,
+      reason: "No task is running",
+      run: () => {
+        if (activeRuns.length === 1) tasks.cancel(activeRuns[0].executionId);
+        else
+          chooseTask(
+            "Stop Task",
+            activeRuns.map((run) => ({ id: run.executionId, label: run.label, detail: run.state })),
+            (id) => tasks.cancel(id),
+          );
+      },
+    },
+    {
+      id: "run.configure",
+      menu: "Run",
+      label: "Configure Tasks",
+      run: configureTasks,
+    },
+    {
       id: "go.file",
       menu: "Go",
       label: "Go to File…",
@@ -2881,6 +3022,18 @@ export default function App() {
             onReveal={handleReveal}
           />
           {/* LG-08: Local History, from the workspace's Local Git service. */}
+          {/* IDE-04: the workspace's tasks and their executions. */}
+          <RunPanel
+            key={`run:${workspacePath}`}
+            service={tasks}
+            visible={isSidebarOpen && activeActivityTab === "run"}
+            hasWorkspace={!!taskSnapshot.workspace}
+            onRun={runTask}
+            onRunGroup={runGroup}
+            onStop={(id) => tasks.cancel(id)}
+            onShowTerminal={showTaskTerminal}
+            onConfigure={configureTasks}
+          />
           <LocalHistoryPanel
             key={`history:${workspacePath}`}
             service={workspace.services.localGit}
@@ -2894,7 +3047,8 @@ export default function App() {
               isSidebarOpen &&
               activeActivityTab !== "search" &&
               activeActivityTab !== "git" &&
-              activeActivityTab !== "history" // LG-08
+              activeActivityTab !== "history" && // LG-08
+              activeActivityTab !== "run" // IDE-04
             }
             activeTab={activeActivityTab}
             workspacePath={workspacePath}
@@ -2942,7 +3096,11 @@ export default function App() {
                   settings: terminalSettings,
                   profiles: terminalProfiles.forWorkspace(workspace.id),
                 }}
-                onClose={() => setSettingsOpen(false)}
+                initialQuery={settingsQuery}
+                onClose={() => {
+                  setSettingsOpen(false);
+                  setSettingsQuery("");
+                }}
               />
             ) : diff ? (
               <DiffEditor

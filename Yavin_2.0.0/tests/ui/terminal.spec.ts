@@ -2425,3 +2425,195 @@ test("settings saved by a newer Yavin are left untouched", async ({ page }) => {
   );
   expect(fontSizes).toContain(13);
 });
+
+// --- Run / Tasks (IDE-04) -------------------------------------------------------------------
+// Tasks run in the workspace's terminals: each test drives the task's shell through the same
+// native mock as the terminals above.
+
+const TASKS = [
+  {
+    id: "build",
+    label: "Build",
+    command: "npx tsc --noEmit",
+    group: "build",
+    isDefault: true,
+    problemMatcher: ["tsc"],
+  },
+  { id: "serve", label: "Serve", command: "npm run serve" },
+];
+
+/** User settings holding `tasks`, as IDE-03 keeps them, before the window loads. */
+async function withTasks(page: Page, tasks: unknown[] = TASKS) {
+  await page.addInitScript((value) => {
+    if (!localStorage.getItem("yavin.settings.user"))
+      localStorage.setItem(
+        "yavin.settings.user",
+        JSON.stringify({ version: 1, values: { "tasks.definitions": value } }),
+      );
+  }, tasks);
+}
+
+async function runView(page: Page) {
+  await page.getByTitle("Run", { exact: true }).click();
+  return page.getByRole("complementary", { name: "Run" });
+}
+
+/** The terminal a task was launched in, once it is: its session id and the profile it got. */
+async function taskLaunch(page: Page, taskId: string) {
+  let found: Call | undefined;
+  await expect
+    .poll(async () => {
+      found = (await calls(page, "terminal_open")).find(
+        (call) => (call.args.profile as { id: string } | null)?.id === `task.${taskId}`,
+      );
+      return !!found;
+    })
+    .toBe(true);
+  return {
+    id: found!.args.id as string,
+    profile: found!.args.profile as { executable: string; args: string[] },
+    cwd: found!.args.cwd,
+  };
+}
+
+const execution = (page: Page, label: string) =>
+  page.getByRole("group", { name: `Execution of ${label}`, exact: true });
+
+test("the Run view runs a task in a terminal of its own and follows it to its exit code", async ({
+  page,
+}) => {
+  await withTasks(page);
+  await desktop(page);
+  const run = await runView(page);
+  await expect(run.getByRole("group", { name: "Serve", exact: true })).toBeVisible();
+
+  await run.getByRole("button", { name: "Run Serve", exact: true }).click();
+  const launch = await taskLaunch(page, "serve");
+  // The default shell (the Command Prompt), started to run the line and end, in the root.
+  expect(launch.profile.executable).toBe(CMD);
+  expect(launch.profile.args).toEqual(["/d", "/s", "/c", "npm run serve"]);
+  expect(launch.cwd).toBe("/work");
+  await expect(execution(page, "Serve").getByTestId("task-state")).toHaveText("Running");
+  // Shown as it starts, in a terminal named for it.
+  await expect(page.getByRole("tab", { name: "Task: Serve", exact: true })).toBeVisible();
+
+  await output(page, launch.id, "listening on 5173\r\n");
+  await expect(view(page, launch.id)).toContainText("listening on 5173");
+  await exit(page, launch.id, 0);
+  await expect(execution(page, "Serve").getByTestId("task-state")).toHaveText("Succeeded (0)");
+});
+
+test("Run Build Task runs the default build task and its errors reach Problems", async ({
+  page,
+}) => {
+  await withTasks(page);
+  await desktop(page);
+  await page.getByRole("menubar").getByRole("menuitem", { name: "Run", exact: true }).click();
+  await page
+    .getByRole("menu", { name: "Run", exact: true })
+    .getByRole("menuitem", { name: "Run Build Task", exact: true })
+    .click();
+  const launch = await taskLaunch(page, "build");
+  await output(page, launch.id, TSC_OUTPUT.replace(/\n/g, "\r\n") + "\r\n");
+  await exit(page, launch.id, 2);
+
+  await runView(page);
+  await expect(execution(page, "Build").getByTestId("task-state")).toHaveText("Failed (2)");
+  // The panel is open already: the task showed its terminal there.
+  await page
+    .getByRole("tablist", { name: "Panel views" })
+    .getByRole("tab", { name: "PROBLEMS" })
+    .click();
+  const problems = page.getByRole("region", { name: "Problems" });
+  await expect(problems.getByRole("button", { name: /src\/app\.ts/ })).toBeVisible();
+  await expect(problems.getByText(/not assignable/)).toBeVisible();
+  await expect(problems.getByText(/Ln 12, Col 7/)).toBeVisible();
+});
+
+test("Stop interrupts a running task through its terminal and marks it stopped", async ({
+  page,
+}) => {
+  await withTasks(page);
+  await desktop(page);
+  const run = await runView(page);
+  await run.getByRole("button", { name: "Run Serve", exact: true }).click();
+  const launch = await taskLaunch(page, "serve");
+  await expect(execution(page, "Serve").getByTestId("task-state")).toHaveText("Running");
+
+  await run.getByRole("button", { name: "Stop Serve", exact: true }).click();
+  // Ctrl+C, written to the task's own terminal -- nothing is killed from the window.
+  await expect
+    .poll(async () =>
+      (await calls(page, "terminal_write"))
+        .filter((call) => call.args.id === launch.id)
+        .map((call) => call.args.data),
+    )
+    .toContain("\u0003");
+  await exit(page, launch.id, 130);
+  await expect(execution(page, "Serve").getByTestId("task-state")).toHaveText("Stopped");
+  await expect(run.getByRole("button", { name: "Stop Serve", exact: true })).toHaveCount(0);
+});
+
+test("a task in a restricted folder does not run and offers the trust decision", async ({
+  page,
+}) => {
+  await withTasks(page);
+  await desktop(page, {
+    trust: { trusted: false, decided: true, root: "/work", parent: "/projects" },
+  });
+  const run = await runView(page);
+  await run.getByRole("button", { name: "Run Serve", exact: true }).click();
+
+  await expect(appAlert(page)).toContainText("Workspace Trust");
+  await expect(page.getByRole("dialog")).toContainText("Workspace Trust");
+  const launched = (await calls(page, "terminal_open")).filter((call) =>
+    (call.args.profile as { id: string } | null)?.id?.startsWith("task."),
+  );
+  expect(launched).toEqual([]);
+});
+
+test("Configure Tasks edits the task list in Settings, refusing an invalid one", async ({
+  page,
+}) => {
+  await desktop(page);
+  const run = await runView(page);
+  await expect(run).toContainText("No tasks yet");
+  await run.getByRole("button", { name: "Configure Tasks", exact: true }).click();
+
+  const settings = page.getByRole("region", { name: "Settings" });
+  await expect(settings.getByRole("textbox", { name: "Search settings" })).toHaveValue("Tasks");
+  const editor = settings.getByRole("textbox", { name: "Tasks", exact: true });
+  await editor.fill('[{ "id": "lint", "label": "Lint" }]');
+  await settings.getByRole("button", { name: "Apply", exact: true }).click();
+  // Refused with why, and nothing kept.
+  await expect(settings.getByRole("alert")).toContainText("command");
+  await editor.fill('[{ "id": "lint", "label": "Lint", "command": "npm run lint" }]');
+  await settings.getByRole("button", { name: "Apply", exact: true }).click();
+  await expect(settings.getByRole("alert")).toHaveCount(0);
+
+  // The Run view, still open beside the editor, lists it at once.
+  await page.getByRole("button", { name: "Close settings" }).click();
+  await expect(run.getByRole("group", { name: "Lint", exact: true })).toBeVisible();
+});
+
+test("the Run menu holds the task commands; Stop Task waits for a running task", async ({
+  page,
+}) => {
+  await desktop(page);
+  await page.getByRole("menubar").getByRole("menuitem", { name: "Run", exact: true }).click();
+  const menu = page.getByRole("menu", { name: "Run", exact: true });
+  for (const item of [
+    "Run Task…",
+    "Run Build Task",
+    "Run Test Task",
+    "Show Running Tasks",
+    "Configure Tasks",
+  ])
+    await expect(menu.getByRole("menuitem", { name: item, exact: true })).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: "Stop Task", exact: true })).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  await menu.getByRole("menuitem", { name: "Run Build Task", exact: true }).click();
+  await expect(appAlert(page)).toContainText("There is no build task");
+});

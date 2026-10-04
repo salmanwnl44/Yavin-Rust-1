@@ -24,7 +24,7 @@ Complex features belong in TypeScript. Add a Web Worker for expensive browser-sa
 - Saves use a sibling temporary file followed by replacement, without first deleting the original. Copy rejects existing destinations, self-descendants, and symbolic links encountered during recursion.
 - Production CSP is enabled; remote font requests have been removed. Window permissions remain local.
 - TypeScript regression tests, native regression tests, formatting checks, and Windows CI provide repeatable checks.
-- The seven title menus and command search share TypeScript command definitions. Editor undo/redo, clipboard actions, find/replace, selection, and navigation run in TypeScript. See [MENUS.md](MENUS.md) for scope and verification.
+- The eight title menus and command search share TypeScript command definitions. Editor undo/redo, clipboard actions, find/replace, selection, and navigation run in TypeScript. See [MENUS.md](MENUS.md) for scope and verification.
 
 ## Preserved historical work
 
@@ -749,7 +749,7 @@ Problems are reported once through the window's error banner (`takeProblems`, `o
 
 - It has User and Workspace tabs. The Workspace tab needs an open folder and overrides the User tab.
 - A search box filters settings by title, description and id.
-- Sections are Editor, then Terminal.
+- Sections are Editor, then Tasks (a JSON list, applied with Apply), then Terminal.
 - Each row shows its description, its value, where the value comes from (default, user settings, this workspace), and a Reset for the shown scope.
 - An invalid entry is refused with its reason.
 
@@ -790,6 +790,85 @@ The Accounts button keeps its old action (the command palette); there are no acc
   - a workspace override across a switch and back, and its reset to the user value;
   - a corrupt record reported once;
   - the terminal's settings through its own store.
+
+## Run and tasks
+
+IDE-04 is the task runner: named commands that run in the workspace's terminals, in dependency order, with Workspace Trust enforced and their errors reported in Problems. It adds no way of starting a process: a task is a terminal session whose shell runs one line and ends.
+
+```text
+Run command / Run view (App.tsx, components/layout/RunPanel.tsx)
+      ▼
+TaskService            services/tasks/service.ts, one per workspace (WorkspaceServices.tasks)
+      ├─ tasks          configuredTasks(settings)                  IDE-03: tasks.definitions, user + workspace
+      ├─ plan           planTask(tasks, id)                        dependencies first, cycles refused (plan.ts)
+      ├─ trust          readTrust() before every execution        Workspace Trust, the native decision
+      ├─ prepare        profiles.resolve + taskShellArgs + cwd     every task of the plan, before any starts
+      ▼
+TerminalService.open / restart (TERMINAL-03): a dedicated session per task, its profile the task's shell line
+      ▼
+native terminal (portable-pty, ConPTY, Job Object) -> output -> Terminal UI
+                                                          └─> TaskOutputMatcher -> existing MATCHERS
+                                                                  ▼
+                                      publishProblems("task:<id>") -> Problems store -> Monaco markers
+```
+
+**Definition and execution.** A `TaskDefinition` (`tasks/model.ts`) is configuration: `id`, `label`, one-line `command`, `args`, `cwd`, `env`, `profile`, `dependsOn`, `group` (build or test), `isDefault`, `problemMatcher` and `presentation` (`reveal` always/silent/never, `clear`). A `TaskRun` is one execution of one task: its `executionId`, `state`, the execution it runs before (`parent`), its terminal session, exit code, times and error. Runs are kept in memory only, the active ones and the last 20 finished.
+
+**Ownership.**
+
+| Owner            | Owns                                                                                                                                                                   |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TaskService      | which tasks there are (read from settings), dependency planning, the trust check, run lifecycle, cancellation requests, and which diagnostics a run's output produced. |
+| SettingsRegistry | the task definitions and their persistence (`tasks.definitions`, user and workspace scope).                                                                            |
+| TerminalService  | the sessions, the native processes (through the Rust terminal), and output.                                                                                            |
+| TerminalUi       | which terminal is shown, and clearing a reused one.                                                                                                                    |
+| Problems store   | the diagnostics, by owner; the editor's markers follow it.                                                                                                             |
+| Workspace Trust  | the trust decision (`readTrust`, native).                                                                                                                              |
+
+**TaskService does not own:** PTYs, native processes or their ids, terminal output buffers, diagnostics after publishing them, editor markers, workspace identity, settings persistence or trust. It never calls a native command itself and never kills a process: Stop writes Ctrl+C to the task's terminal and, if the task is still running after 3 s, asks `TerminalService.kill` (the Job Object) to end it.
+
+**Configuration.** `tasks.definitions` is a structured setting (a JSON list), edited in Settings › Tasks (Run › Configure Tasks opens it there).
+
+- Every entry is validated by `readTask`: ids `[A-Za-z0-9._-]{1,64}` and unique, a one-line label (≤ 100) and command (≤ 4000), known dependency ids with no self-dependency or duplicates, known problem matchers (`tsc`, `eslint`, `cargo`, `ruff`), `isDefault` only with a group. An invalid list is refused with the reason and nothing changes; an invalid stored list is kept and ignored, like any setting.
+- User and workspace lists are merged by id, the workspace's task replacing the user's of the same id. Nothing is written into the project.
+
+**Shell lines.** A task runs in its profile's shell (the workspace's default when none is named), started to run the line and end (`tasks/shell.ts`):
+
+| Shell                    | Started as                | Extra arguments            |
+| ------------------------ | ------------------------- | -------------------------- |
+| bash, zsh, sh            | `-c <line>`               | `'…'`, `'` written `'\''`  |
+| fish                     | `-c <line>`               | `'…'`, `\` and `'` escaped |
+| pwsh, Windows PowerShell | `-NoLogo -Command <line>` | `'…'`, `'` written `''`    |
+| cmd                      | `/d /s /c <line>`         | plain tokens only          |
+
+The line reaches the shell as one argument (portable-pty quotes it by the Windows argv rules). cmd reads its command line raw, so a `"` in the line, or an argument that is not a plain token, is refused (`UnsupportedShell`) rather than guessed at. `terminal_tests.rs` (`a_task_line_reaches_bash_cmd_and_powershell_intact_with_its_exit_code`) proves these shapes against real shells, exit codes included. Shell startup files are not changed.
+
+**Dependencies.** `dependsOn` tasks run first, sequentially, in the order listed, each once per execution, the task itself last. A cycle (`a → b → a`), an unknown task or a bad dependency is reported before anything starts. When a dependency fails or is stopped, the tasks after it are marked failed (`Not run: "X" before it did not succeed.`) or cancelled and never start. Parallel dependencies are not supported.
+
+**Lifecycle.** `pending → starting → running → succeeded | failed | cancelled`, and no other move (`canMove`). A run's result is its shell's exit code: 0 succeeds, anything else fails. A stopped run is cancelled whatever its code. A terminal that fails, is closed or restarted under it fails the run. One execution of a task at a time (`AlreadyRunning`).
+
+**Terminals.** Each task has a dedicated terminal, "Task: <label>". A later run reuses it (restarted, and cleared unless `clear` is false) when its shell and folder are unchanged and it has ended; otherwise the old one is closed and a new one opened. `reveal: "always"` shows it as it starts; `silent` shows it only on failure; `never` never does.
+
+**Problems.** A task's output is read line by line (ANSI and OSC sequences removed, lines capped at 8 KiB) by its `problemMatcher`s, the same `MATCHERS` the checkers use. When it ends, its diagnostics are published under the owner `task:<id>`, replacing that task's last ones; paths resolve against the task's folder to canonical resources and only files inside the workspace's folders are kept (`resolveTaskDiagnostics`). A stopped run publishes nothing. Checker diagnostics are separate owners and are untouched.
+
+**Trust and no workspace.** Every execution asks Workspace Trust first; an untrusted folder runs nothing and the window opens the trust dialog (`TrustDenied`). There is no task store of its own and no second trust store. With no folder open, the Run view says so and the Run commands are disabled (`NoWorkspace`).
+
+**Workspace isolation.** Each workspace has its own TaskService, reading that workspace's settings and launching in that workspace's terminals. Closing or switching the workspace disposes it: what its tasks are running is killed and marked cancelled.
+
+**Errors** (`TaskError.code`): `NoWorkspace`, `UnknownTask`, `NoDefaultTask`, `AmbiguousDefault`, `InvalidConfiguration`, `InvalidDependency`, `DependencyCycle`, `DependencyFailed`, `AlreadyRunning`, `TrustDenied`, `ShellUnavailable`, `UnsupportedShell`, `InvalidCwd`, `TerminalFailed`, `Cancelled`. Each is shown with its message in the window's error banner.
+
+**UI and commands.** The Activity Bar's Run icon opens the Run view: Run Build Task, Run Test Task, the tasks with Run, and executions with their state, exit code, Show terminal and Stop. The Run menu holds:
+
+| Command            | Id                | Does                                                                         |
+| ------------------ | ----------------- | ---------------------------------------------------------------------------- |
+| Run Task…          | `run.task`        | a list of the tasks to choose from                                           |
+| Run Build Task     | `run.build`       | Ctrl+Shift+B: the default build task; a choice when several could be default |
+| Run Test Task      | `run.test`        | the same for test                                                            |
+| Show Running Tasks | `run.showRunning` | opens the Run view                                                           |
+| Stop Task          | `run.stop`        | stops the running task, or offers a choice; disabled when nothing runs       |
+| Configure Tasks    | `run.configure`   | opens Settings filtered to Tasks                                             |
+
+**Not in IDE-04.** Debugging, launch configurations, background or watch tasks (a task that never ends is shown running until stopped), parallel dependencies, variable substitution (`${file}`…), task auto-detection from `package.json` or `Cargo.toml`, and a `tasks.json` in the project.
 
 ## Language servers (LSP platform)
 

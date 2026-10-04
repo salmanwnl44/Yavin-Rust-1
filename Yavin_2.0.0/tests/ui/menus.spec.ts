@@ -24,8 +24,8 @@ test.beforeEach(async ({ page }) => {
   await page.goto("/");
 });
 
-test("all seven dropdowns open; Escape restores their trigger", async ({ page }) => {
-  for (const name of ["File", "Edit", "Selection", "View", "Go", "Terminal", "Help"]) {
+test("all eight dropdowns open; Escape restores their trigger", async ({ page }) => {
+  for (const name of ["File", "Edit", "Selection", "View", "Go", "Run", "Terminal", "Help"]) {
     const trigger = page.getByRole("menubar").getByRole("menuitem", { name, exact: true });
     await trigger.click();
     await expect(page.getByRole("menu", { name, exact: true })).toBeVisible();

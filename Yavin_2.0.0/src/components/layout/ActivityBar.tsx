@@ -93,8 +93,8 @@ export function ActivityBar({
       ),
     },
     {
-      id: "debug",
-      title: "Run & Debug (Ctrl+Shift+D)",
+      id: "run",
+      title: "Run",
       icon: (
         <svg
           width="20"

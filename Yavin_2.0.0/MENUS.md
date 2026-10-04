@@ -1,6 +1,6 @@
 # Menu implementation plan
 
-Read `../GEMINI.md` before planning. Scope: the seven existing application menus, Explorer context menus, and searchable commands. Keep application logic in TypeScript and reuse native filesystem validation.
+Read `../GEMINI.md` before planning. Scope: the eight existing application menus, Explorer context menus, and searchable commands. Keep application logic in TypeScript and reuse native filesystem validation.
 
 ## Audit and plan review
 
@@ -31,6 +31,6 @@ Keyboard reference: [WAI-ARIA menu and menubar pattern](https://www.w3.org/WAI/A
 
 ## Verification and limits
 
-Browser coverage includes all seven menus, keyboard/focus behavior, disabled commands, clipboard actions, find/replace, history across tabs, checked state, search, new-file validation, failed saves, and Explorer context menus. Native-mode browser cases mock IPC; the Rust workspace tests and a native compile are separate checks. OS dialogs and platform clipboard permissions still require desktop acceptance testing.
+Browser coverage includes all eight menus, keyboard/focus behavior, disabled commands, clipboard actions, find/replace, history across tabs, checked state, search, new-file validation, failed saves, and Explorer context menus. Native-mode browser cases mock IPC; the Rust workspace tests and a native compile are separate checks. OS dialogs and platform clipboard permissions still require desktop acceptance testing.
 
 Browser-created documents are temporary. Browser preview has no shell; the terminal requires the desktop application. Save As has no shortcut: Ctrl+Shift+S is Save All. There is no split editor, tab pinning or preview tabs yet.

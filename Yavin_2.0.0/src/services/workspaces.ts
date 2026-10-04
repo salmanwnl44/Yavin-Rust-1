@@ -15,6 +15,9 @@ import { createProfileRegistry } from "./terminalProfiles.ts";
 import { createTerminalSettings } from "./terminalSettings.ts";
 import { createSettingsRegistry } from "./settings/settings.ts";
 import { EDITOR_SETTING_LIST } from "../editor/editorSettings.ts";
+import { TASK_DEFINITIONS } from "./tasks/model.ts";
+import { createTaskService, type TaskService } from "./tasks/service.ts";
+import { readTrust } from "./trust.ts";
 import type { WorkspaceContext, WorkspaceId } from "./workspaceManager.ts";
 
 /**
@@ -51,6 +54,11 @@ export interface WorkspaceServices {
    * with the workspace: a run still going is stopped and its answer never published.
    */
   checkers: CheckerService;
+  /**
+   * The workspace's tasks (IDE-04): which there are and what each execution is doing. Tasks
+   * run in the workspace's terminals; disposing the workspace stops what they are running.
+   */
+  tasks: TaskService;
 }
 
 /**
@@ -81,7 +89,7 @@ const LEGACY_GIT_KEY = "yavin.git.repos";
  * subsystem it belongs to and applied there. Only the editor's for now; the terminal keeps its
  * own (`terminalSettings`, below).
  */
-export const settings = createSettingsRegistry(EDITOR_SETTING_LIST);
+export const settings = createSettingsRegistry([...EDITOR_SETTING_LIST, TASK_DEFINITIONS]);
 
 /**
  * What the terminal keeps across restarts (TERMINAL-07): profiles, defaults, the integration
@@ -164,6 +172,17 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
           },
           publishProblems,
         ),
+        tasks: createTaskService({
+          workspace: folders.length ? id : null,
+          folders,
+          settings,
+          terminals: terminalServices.forWorkspace(id),
+          ui: terminalUiFor(id),
+          profiles: terminalProfiles.forWorkspace(id),
+          // Workspace Trust, asked of the native side before every execution.
+          trusted: () => readTrust().then((trust) => trust.trusted),
+          publish: publishProblems,
+        }),
       };
     },
     async dispose(services) {
@@ -173,6 +192,8 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
       await services.localGit?.close();
       // A checker still running in the folder left is stopped, and its answer never published.
       services.checkers.dispose();
+      // What its tasks are running is ended: they ran for its folders.
+      services.tasks.dispose();
       if (isTauri()) {
         // Its terminals are not ended: their views detach (the panel is remounted per
         // workspace) and the workspace's TerminalService keeps them for its return.

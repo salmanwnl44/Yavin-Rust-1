@@ -21,7 +21,7 @@ export interface AppCommand {
   run: () => void | Promise<void>;
 }
 
-export const menuNames = ["File", "Edit", "Selection", "View", "Go", "Terminal", "Help"];
+export const menuNames = ["File", "Edit", "Selection", "View", "Go", "Run", "Terminal", "Help"];
 
 /**
  * The physical key of each punctuation shortcut key. With Shift held, `event.key` is the

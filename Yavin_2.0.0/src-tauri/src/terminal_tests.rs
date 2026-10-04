@@ -1929,3 +1929,76 @@ fn several_shells_at_once_keep_their_output_apart_and_all_end() {
         assert!(terminals.registry().sessions.is_empty());
     }
 }
+
+// --- IDE-04: the launch shapes the task layer uses, through this native terminal ----------------
+
+/// Runs `shell` (by kind) with `args` as a terminal session, answering ConPTY's cursor query,
+/// until it ends: its text and exit code. `None` when this machine has no such shell.
+fn run_task_shape(kind: ShellKind, session: &str, args: &[&str]) -> Option<(String, Option<i32>)> {
+    let shell = available_shells().into_iter().find(|s| s.kind == kind)?;
+    let terminals = Terminals::default();
+    let mut request = request(session, 1);
+    request.profile = Some(profile(&shell.path, args, false));
+    let recorder = open_recorded_with(&terminals, request, launch()).unwrap();
+    answer_cursor_query(&terminals, &recorder, session);
+    assert!(
+        recorder.wait(Duration::from_secs(60), Recorder::ended),
+        "{kind:?} never ended; saw {:?}",
+        recorder.text()
+    );
+    let events = recorder.snapshot();
+    let Some(Event::Exit(exit)) = events.last() else {
+        panic!("{kind:?} ended without an exit: {events:?}");
+    };
+    Some((recorder.text(), exit.exit_code))
+}
+
+#[test]
+fn a_task_line_reaches_bash_cmd_and_powershell_intact_with_its_exit_code() {
+    // POSIX shells: `-c <line>`; extra arguments single-quoted, `'` written as `'\''`.
+    if let Some((text, code)) = run_task_shape(
+        ShellKind::Bash,
+        "t-task-bash",
+        &["-c", "printf '[%s]' 'a b' 'it'\\''s' \"x;y\"; exit 7"],
+    ) {
+        assert!(text.contains("[a b][it's][x;y]"), "{text:?}");
+        assert_eq!(code, Some(7));
+    } else {
+        eprintln!("SKIPPED: no bash on this machine");
+    }
+    // cmd: `/d /s /c <line>`. The line is passed as one argument (quoted by the PTY's argv
+    // rules because it has spaces); /s strips exactly those outer quotes.
+    if cfg!(windows) {
+        let (text, code) = run_task_shape(
+            ShellKind::Cmd,
+            "t-task-cmd",
+            &["/d", "/s", "/c", "echo one two & exit 3"],
+        )
+        .expect("cmd is always there on Windows");
+        assert!(text.contains("one two"), "{text:?}");
+        assert_eq!(code, Some(3));
+    }
+    // PowerShell: `-NoLogo -Command <line>`; arguments single-quoted, `'` doubled.
+    for (kind, session) in [
+        (ShellKind::Pwsh, "t-task-pwsh"),
+        (ShellKind::PowerShell, "t-task-ps"),
+    ] {
+        let Some((text, code)) = run_task_shape(
+            kind,
+            session,
+            &[
+                "-NoLogo",
+                "-Command",
+                "Write-Output '[a b]' '[it''s]'; exit 5",
+            ],
+        ) else {
+            eprintln!("SKIPPED: no {kind:?} on this machine");
+            continue;
+        };
+        assert!(
+            text.contains("[a b]") && text.contains("[it's]"),
+            "{text:?}"
+        );
+        assert_eq!(code, Some(5));
+    }
+}

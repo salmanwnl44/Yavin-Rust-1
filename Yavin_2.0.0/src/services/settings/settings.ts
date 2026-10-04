@@ -43,12 +43,16 @@ export interface SettingDefinition<T> {
   readonly scopes: readonly SettingScope[];
   /** The value, if `value` is a valid one; `undefined` otherwise. Never trusts its input. */
   parse(value: unknown): T | undefined;
+  /** Why `value` is not valid, for a structured setting whose reasons are worth saying. */
+  explain?(value: unknown): string | undefined;
   /** How the Settings view edits it. */
   readonly control:
     | { kind: "boolean" }
     | { kind: "number"; min: number; max: number; step: number }
     | { kind: "string"; maxLength: number }
-    | { kind: "enum"; options: readonly { value: T; label: string }[] };
+    | { kind: "enum"; options: readonly { value: T; label: string }[] }
+    /** A structured value (a list of records), edited as JSON. */
+    | { kind: "json"; example: string };
 }
 
 /** A setting's state in one workspace, for the Settings view. */
@@ -121,6 +125,26 @@ export function stringSetting(
         ? value
         : undefined,
     control: { kind: "string" as const, maxLength: spec.maxLength },
+  });
+}
+
+/**
+ * A structured setting -- a list of records, say -- whose definition validates the whole value
+ * (`parse`) and says what is wrong with an invalid one (`explain`).
+ */
+export function structuredSetting<T>(
+  spec: Described & {
+    default: T;
+    parse(value: unknown): T | undefined;
+    explain(value: unknown): string | undefined;
+    example: string;
+  },
+): SettingDefinition<T> {
+  const { example, ...rest } = spec;
+  return Object.freeze({
+    scopes: BOTH,
+    ...rest,
+    control: { kind: "json" as const, example },
   });
 }
 
@@ -369,7 +393,8 @@ export function createSettingsRegistry(
       const parsed = definition.parse(value);
       if (parsed === undefined)
         throw new SettingsError(
-          `${JSON.stringify(value)} is not a valid value for "${definition.id}".`,
+          definition.explain?.(value) ??
+            `${JSON.stringify(value)} is not a valid value for "${definition.id}".`,
         );
       change(definition as SettingDefinition<unknown>, scope, workspace, (layer) =>
         layer.values.set(definition.id, parsed),

@@ -90,3 +90,57 @@ export function resolveCheckerDiagnostics(
   }
   return { diagnostics: resolved, outside };
 }
+
+/**
+ * A task's diagnostics (IDE-04): printed paths resolved against the folder the task ran in,
+ * and published only when they name a file inside one of the workspace's folders (a task may
+ * run in a subfolder and report `../lib/a.ts`). Same resource rules as a checker's.
+ */
+export function resolveTaskDiagnostics(
+  diagnostics: readonly Diagnostic[],
+  cwd: string,
+  folders: readonly string[],
+): { diagnostics: Diagnostic[]; outside: number } {
+  const inside = (path: string) =>
+    folders.some((folder) => {
+      try {
+        resolveWithin(fileUri(folder), path);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  const resolve = (file: string): string | null => {
+    const printed = file.trim();
+    if (!printed) return null;
+    try {
+      const uri = /^file:/i.test(printed) ? parseUri(printed) : fileUri(printed, fileUri(cwd));
+      const path = fsPath(uri);
+      return inside(path) ? path : null;
+    } catch {
+      return null;
+    }
+  };
+  const resolved: Diagnostic[] = [];
+  let outside = 0;
+  for (const diagnostic of diagnostics) {
+    const file = resolve(diagnostic.file);
+    if (!file) {
+      outside += 1;
+      continue;
+    }
+    resolved.push({
+      ...diagnostic,
+      file,
+      ...(diagnostic.related
+        ? {
+            related: diagnostic.related.flatMap((related) => {
+              const at = resolve(related.file);
+              return at ? [{ ...related, file: at }] : [];
+            }),
+          }
+        : {}),
+    });
+  }
+  return { diagnostics: resolved, outside };
+}

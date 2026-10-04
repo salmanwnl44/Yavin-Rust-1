@@ -21,6 +21,7 @@ export function SettingsView({
   workspace,
   workspaceName,
   terminal,
+  initialQuery,
   onClose,
 }: {
   registry: SettingsRegistry;
@@ -28,10 +29,16 @@ export function SettingsView({
   workspace: WorkspaceId | null;
   workspaceName?: string;
   terminal?: { settings: TerminalSettingsStore; profiles: WorkspaceProfiles };
+  /** What the search starts as (e.g. "Tasks" for Run › Configure Tasks). */
+  initialQuery?: string;
   onClose: () => void;
 }) {
   const [scope, setScope] = useState<SettingScope>("user");
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(initialQuery ?? "");
+  // Asked again while open (Configure Tasks from the Run view): the search follows.
+  useEffect(() => {
+    if (initialQuery) setQuery(initialQuery);
+  }, [initialQuery]);
   const [, refresh] = useReducer((n: number) => n + 1, 0);
   // Any change in what the user level or this workspace resolves to redraws the view.
   useEffect(() => {
@@ -191,6 +198,16 @@ function SettingRow({
             {error}
           </p>
         )}
+        {control.kind === "json" && (
+          <JsonDraft
+            label={label}
+            disabled={!allowed}
+            value={state.value}
+            example={control.example}
+            onCommit={(value) => commit(value)}
+            onInvalid={setError}
+          />
+        )}
       </div>
       <div className="flex items-center gap-2 self-center">
         {control.kind === "boolean" && (
@@ -259,6 +276,78 @@ function SettingRow({
         >
           Reset
         </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A structured setting edited as JSON (IDE-04's task list): applied with Apply, refused -- with
+ * the setting's own explanation -- when it is not JSON or not a valid value; the stored value
+ * is untouched until then.
+ */
+function JsonDraft({
+  label,
+  value,
+  disabled,
+  example,
+  onCommit,
+  onInvalid,
+}: {
+  label: string;
+  value: unknown;
+  disabled: boolean;
+  example: string;
+  onCommit: (value: unknown) => void;
+  onInvalid: (message: string) => void;
+}) {
+  const shown = JSON.stringify(value, null, 2);
+  const [draft, setDraft] = useState<string | null>(null);
+  const apply = () => {
+    if (draft === null) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(draft);
+    } catch (reason) {
+      onInvalid(`Not valid JSON: ${reason instanceof Error ? reason.message : String(reason)}`);
+      return;
+    }
+    onCommit(parsed);
+    setDraft(null);
+  };
+  return (
+    <div className="mt-1.5">
+      <textarea
+        aria-label={label}
+        disabled={disabled}
+        spellCheck={false}
+        rows={Math.min(18, Math.max(4, (draft ?? shown).split("\n").length + 1))}
+        value={draft ?? shown}
+        onChange={(event) => setDraft(event.target.value)}
+        className="w-full rounded border border-[#2a2a2a] bg-[#0b0b0b] px-2 py-1 font-mono text-[11px] text-zinc-200"
+      />
+      <div className="mt-1 flex items-center gap-2">
+        <button
+          disabled={disabled || draft === null}
+          onClick={apply}
+          className="rounded bg-indigo-950/70 px-2 py-0.5 text-[11px] text-indigo-200 disabled:opacity-40"
+        >
+          Apply
+        </button>
+        <button
+          disabled={draft === null}
+          onClick={() => {
+            setDraft(null);
+            onInvalid("");
+          }}
+          className="rounded px-2 py-0.5 text-[11px] text-zinc-500 hover:text-zinc-200 disabled:opacity-40"
+        >
+          Discard
+        </button>
+        <details className="text-[10px] text-zinc-600">
+          <summary className="cursor-pointer">Example</summary>
+          <pre className="mt-1 whitespace-pre-wrap">{example}</pre>
+        </details>
       </div>
     </div>
   );

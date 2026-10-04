@@ -224,9 +224,9 @@ test("a long tree is drawn in full, where it was, after another view was shown",
   await expect(row(page, "file00150.ts")).toBeVisible();
   const drawn = await tree(page).getByRole("treeitem").count();
 
-  // The Search view, and one of the views that are not built yet, each hide the Explorer.
-  for (const view of ["Search (Ctrl+Shift+F)", "Run & Debug (Ctrl+Shift+D)"]) {
-    await page.getByTitle(view).click();
+  // The Search view and the Run view each hide the Explorer.
+  for (const view of ["Search (Ctrl+Shift+F)", "Run"]) {
+    await page.getByTitle(view, { exact: true }).click();
     await expect(tree(page)).toBeHidden();
     await page.getByTitle("Explorer (Ctrl+Shift+E)").click();
     // Every row of the window is drawn again, not the few drawn before it was measured...
