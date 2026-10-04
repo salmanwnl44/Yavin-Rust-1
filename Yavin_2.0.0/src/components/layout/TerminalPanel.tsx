@@ -18,6 +18,7 @@ import { ProblemsView } from "../panel/views/ProblemsView";
 import { problemCounts, problemsVersion, subscribeProblems } from "../../services/panel/problems";
 import { OutputView } from "../panel/views/OutputView";
 import { DebugConsoleView } from "../panel/views/DebugConsoleView";
+import type { DebugService } from "../../services/debug/service";
 import { PortsView } from "../panel/views/PortsView";
 
 const MIN_HEIGHT = 120;
@@ -94,6 +95,7 @@ export function TerminalPanel({
   activeFile,
   onOpenProblem,
   ide,
+  debugService,
 }: {
   hidden: boolean;
   onClose: () => void;
@@ -117,6 +119,8 @@ export function TerminalPanel({
    * terminal.
    */
   ide?: TerminalViewIde & { revealFolder(id: TerminalId): void };
+  /** The workspace's debugger, for the Debug Console (IDE-05). */
+  debugService?: DebugService;
 }) {
   // Re-renders the tab strip as diagnostics change, so the badge stays accurate.
   const problemsRevision = useSyncExternalStore(
@@ -718,7 +722,7 @@ export function TerminalPanel({
           />
         )}
         {!hidden && activeTab === "output" && <OutputView initialChannel={channel} />}
-        {!hidden && activeTab === "debug" && <DebugConsoleView />}
+        {!hidden && activeTab === "debug" && <DebugConsoleView service={debugService} />}
         {!hidden && activeTab === "ports" && <PortsView />}
       </div>
 

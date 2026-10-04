@@ -749,7 +749,7 @@ Problems are reported once through the window's error banner (`takeProblems`, `o
 
 - It has User and Workspace tabs. The Workspace tab needs an open folder and overrides the User tab.
 - A search box filters settings by title, description and id.
-- Sections are Editor, then Tasks (a JSON list, applied with Apply), then Terminal.
+- Sections are Editor, then Tasks and Debug (JSON lists, applied with Apply), then Terminal.
 - Each row shows its description, its value, where the value comes from (default, user settings, this workspace), and a Reset for the shown scope.
 - An invalid entry is refused with its reason.
 
@@ -869,6 +869,69 @@ The line reaches the shell as one argument (portable-pty quotes it by the Window
 | Configure Tasks    | `run.configure`   | opens Settings filtered to Tasks                                             |
 
 **Not in IDE-04.** Debugging, launch configurations, background or watch tasks (a task that never ends is shown running until stopped), parallel dependencies, variable substitution (`${file}`…), task auto-detection from `package.json` or `Cargo.toml`, and a `tasks.json` in the project.
+
+## Debug / DAP
+
+IDE-05 is the debugger foundation: real debugging over the Debug Adapter Protocol. Yavin speaks DAP to a debug adapter, and the adapter debugs the program. There is no language-specific debugging logic in Yavin and no scraping of terminal output.
+
+```text
+Run › Start Debugging / Debug view / gutter / Debug Console     (App.tsx, DebugPanel, CodeEditor, DebugConsoleView)
+      ▼
+DebugService           services/debug/service.ts, one per workspace (WorkspaceServices.debug)
+      ├─ configurations   debug.configurations, debug.python       IDE-03 settings (config.ts)
+      ├─ breakpoints      the workspace's set, by ResourceId        breakpoints.ts (window-level registry)
+      ├─ trust            readTrust() before anything starts        Workspace Trust
+      ├─ preLaunchTask    TaskService.run (IDE-04)                  optional, per configuration
+      ▼
+DapConnection          services/debug/connection.ts: seq, request_seq correlation, events, reverse requests, cancel, timeouts
+      ▼
+AdapterTransport       services/debug/nativeTransport.ts: dap_start / dap_send / dap_stop, dap-message / dap-exit events by session number
+      ▼
+native dap.rs          allow-listed adapters, trust-gated, on ide_workspace::lsp_process::ServerProcess
+      ▼                (Content-Length framing in lsp_framing.rs; Job Object; kill_tree; exit report)
+debug adapter (debugpy) ─► debuggee
+```
+
+**Ownership.**
+
+| Owner                             | Owns                                                                                                                                                                                                   |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| DebugService                      | debugger orchestration: the session and its lifecycle, threads, the selected stack, scopes, variables fetched one level at a time, the Debug Console, breakpoint sync, and where the editor should be. |
+| DapConnection                     | the protocol over whole messages: numbering, matching, events, the adapter's own requests, cancellation, malformed messages.                                                                           |
+| native `dap.rs` + `ServerProcess` | the adapter's process: start (allow-list, trust), stdin/stdout framing, its end, and ending it and everything it started.                                                                              |
+| The debug adapter                 | debugging itself: launching or attaching to the program, breakpoints, stepping, evaluation.                                                                                                            |
+| Breakpoints (`breakpoints.ts`)    | the workspace's breakpoints by canonical resource, enabled or not, and the adapter's verdict as the session reports it.                                                                                |
+| `editor/debugMonaco.ts`           | the gutter: breakpoint glyphs and the paused line as Monaco decorations, by the model's document's ResourceId.                                                                                         |
+
+**DebugService does not own:** processes or their handles (the native host does, and the renderer never sees one), terminals (TerminalService), tasks (TaskService: it asks it to run a preLaunchTask), diagnostics (Problems: no stack frame, variable or breakpoint is ever published there), language intelligence (LSP), editor models or decorations, workspace identity or lifecycle (WorkspaceManager), settings persistence (SettingsRegistry) or trust. There is no global event bus: views subscribe to the service and to the breakpoint set.
+
+**No second process system.** A debug adapter runs on the same process host as the language servers (`ServerProcess`): DAP's base protocol is LSP's (`Content-Length` header, JSON body), so the framing is shared and already handles a message split across reads, several messages in one read, a malformed header (the session ends: the stream cannot be resynchronized) and an end in the middle of a message. The adapter and everything it starts, the debuggee included, is in the servers' Job Object, so nothing outlives Yavin. The `ide-dap` crate predates this module and stays an unused, excluded placeholder; the transport did not need a crate of its own.
+
+**Adapters (allow-list).** `dap.rs` knows each adapter by id with a fixed command line, as `lsp.rs` knows its servers: the renderer never names a program. The one adapter today is **debugpy** (`python -m debugpy.adapter`), the standard stdio DAP adapter for Python, a language Yavin already supports (pyright, pylsp, ruff). It was chosen after an audit of this machine and the repository: no other stdio adapter (gdb, lldb-dap, codelldb, dlv, netcoredbg, a standalone js-debug) was present, and debugpy was (bundled with the VS Code Python debugger extension, and installable with `pip install debugpy`). The one thing the user may choose is which Python runs it (`debug.python`), and only an existing interpreter named `python…` or `py` is accepted. `adapters.ts` turns the adapter-neutral configuration into the adapter's `launch` / `attach` arguments; nothing else is adapter-specific.
+
+**Configurations** are the structured setting `debug.configurations` (user and workspace, a workspace entry replacing the user's of the same id; Settings › Debug, Run › Configure Debugging): `id`, `name`, `adapter`, `request` (`launch` / `attach`), `program`, `cwd` (relative to the workspace root or absolute inside it), `env`, `args`, `stopOnEntry`, `port` (attach to a debuggee on this machine) and `preLaunchTask`. Every field is validated, with the reason for an invalid entry. There is no `launch.json` and no `.yavin/` file.
+
+**Lifecycle.** `created → starting → initializing → running ⇄ stopped → terminating → terminated`, with `failed` from any live state; no other move (`canMove`). Starting is the protocol's own sequence: `initialize` (capabilities), `launch` / `attach` sent, the `initialized` event awaited (before or after the launch is answered: debugpy answers `launch` only after configuration), then `setBreakpoints` per file, `setExceptionBreakpoints` (no filter chosen), `configurationDone`, and the `launch` answer. Each session has a generation: an event, answer or close of a session that is no longer the current one changes nothing.
+
+**Stopped state.** On `stopped` the service records the reason, asks for `threads`, selects the stopped thread, asks for its `stackTrace`, selects the first frame with a file (not one the adapter de-emphasized), shows it in the editor through the window's `openLocation` (by path, resolved to the document by resource identity), asks for that frame's `scopes`, and fetches the first inexpensive scope's variables, one level. Children are fetched only when expanded, once per stop, and a request already on its way is shared. Each stop and resume bumps an epoch: a stack, scope or variable answer for a stop that is over is dropped, so a slow answer can never show a frame as current after the program continued. On `continued`, or once `continue` / a step is answered, the frames, scopes, variables and the paused line are cleared.
+
+**Commands.** Continue, Step Over (`next`), Step Into (`stepIn`), Step Out (`stepOut`) and Pause are DAP base requests every adapter has; they are enabled by state (paused, or running for Pause). Restart is offered only when the adapter has `supportsRestartRequest`. Stop sends `terminate` when the adapter supports it and the session launched its program, then `disconnect` (`terminateDebuggee` for a launch), then ends the adapter's process, whatever it answered. Run menu: Start Debugging (F5; Continue when paused), Stop Debugging (Shift+F5), Restart Debugging (Ctrl+Shift+F5), Continue, Pause (F6), Step Over (F10), Step Into (F11), Step Out (Shift+F11), Toggle Breakpoint (F9), Remove All Breakpoints, Configure Debugging.
+
+**Breakpoints.** Identified by `ResourceId` (never a path string) and line, with an optional column, enabled or not, and `verified` as the adapter last said (`null` with no session). The set is per workspace and lives as long as the window: switching file or workspace and back keeps it. A click in the editor's glyph margin (or F9) toggles one; the Debug view lists them with enable, remove and Remove All. During a session each change sends `setBreakpoints` for that file only, its enabled breakpoints in order; a newer request for the file makes an older answer void. The adapter's verdict, and its later `breakpoint` events, mark each one verified or not. The gutter shows a set breakpoint as a red dot, one the adapter refused as a hollow ring (its reason on hover), and a disabled one dimmed. Breakpoints are not kept across restarts of Yavin yet.
+
+**Debug Console.** The session's output (DAP `output` events: stdout, stderr, the adapter's console; telemetry is ignored), joined into lines as the stream arrives, and expressions evaluated with `evaluate` (`context: "repl"`) in the selected frame, only while paused. It is not a terminal: nothing reaches a shell.
+
+**Trust boundary.** Debugging runs the project's code, so it is gated twice: the service asks Workspace Trust before anything starts (no task, no adapter, no program), and the window opens the trust dialog when it is refused; `dap_start` refuses an untrusted folder natively as well. There is no trust store of its own.
+
+**Workspace lifecycle.** Each workspace has its own DebugService; disposing the workspace (closing it or switching away) ends its session: `disconnect`, then the adapter's process, which takes the debuggee with it. `enter_workspace` also ends every native adapter, and a reloaded page ends its predecessor's (`dap_stop_all`). Yavin exiting ends them all.
+
+**Terminal and task boundary.** The debugger does not use terminals: the program's output arrives through the adapter (`console: "internalConsole"`), and the adapter's `runInTerminal` request is answered as unsupported. A configuration's `preLaunchTask` is run by TaskService, in its terminal, to its end; only a task that succeeded lets the session start. The two services stay separate: DebugService only asks TaskService to run a task.
+
+**Problems / LSP boundary.** Debugger state is execution state and stays in the Debug view and the gutter: nothing is published to Problems, and language servers are not involved.
+
+**Errors** (`DebugError.code`): `NoWorkspace`, `AdapterUnavailable`, `AdapterFailedToStart`, `MalformedMessage`, `InitializeFailed`, `LaunchFailed`, `AttachFailed`, `UnsupportedCapability`, `InvalidConfiguration`, `TrustDenied`, `SessionTerminated`, `EvaluateFailed`, `StaleSession`, `AlreadyRunning`, `NotStopped`, `PreLaunchTaskFailed`, `RequestFailed`, `Cancelled`, `Timeout`. Native errors arrive as `Code: message` and keep their code. Each is shown as a sentence; raw protocol is never put in front of the user.
+
+**Not in IDE-05.** Remote debugging (attach is to this machine only), conditional breakpoints, logpoints, function and data breakpoints, an exception-breakpoint UI, watch expressions, setting variables, multiple simultaneous sessions, `runInTerminal`, breakpoints kept across restarts, and adapters other than debugpy.
 
 ## Language servers (LSP platform)
 

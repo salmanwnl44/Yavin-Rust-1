@@ -88,6 +88,14 @@ interface Commands {
   lsp_send: { args: { session: number; message: string }; result: void };
   lsp_stop: { args: { session: number }; result: void };
   lsp_stop_all: { args: Record<string, never>; result: void };
+  /** Debug adapters (IDE-05, `src-tauri/src/dap.rs`): by id from the native allow-list. */
+  dap_start: {
+    args: { adapter: string; root: string; python: string | null };
+    result: { session: number; program: string };
+  };
+  dap_send: { args: { session: number; message: string }; result: void };
+  dap_stop: { args: { session: number }; result: void };
+  dap_stop_all: { args: Record<string, never>; result: void };
   create_file: { args: { path: string }; result: void };
   /** Exclusive: fails if anything is there. Resolves to the operation's id (Module 03). */
   create_file_with_content: { args: { path: string; content: string }; result: number };

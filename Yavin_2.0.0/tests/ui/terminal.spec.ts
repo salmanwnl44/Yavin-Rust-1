@@ -304,6 +304,187 @@ async function desktop(
             for (const launch_ of Object.values(launches)) delete launch_.views[subscriptionId];
             return null;
           }
+          // A debug adapter (IDE-05), as `dap.rs` hands one to the window: DAP messages out as
+          // `dap-message` events, its end as `dap-exit`. It debugs a pretend program -- the
+          // launched file's lines in order, stopping at breakpoints -- like debugpy (`initialized`
+          // after `launch`, `launch` answered after `configurationDone`).
+          if (command.startsWith("dap_")) {
+            const scenario = window as unknown as {
+              __emit: (event: string, payload: unknown) => void;
+              __dap?: {
+                session: number;
+                seq: number;
+                line: number;
+                epoch: number;
+                program: string;
+                breakpoints: number[];
+                launch: number | null;
+                ended: boolean;
+              };
+              __dapRunsForever?: boolean;
+              __dapCapabilities?: Record<string, unknown>;
+            };
+            const say = (body: Record<string, unknown>) => {
+              const state = scenario.__dap!;
+              const session = state.session;
+              const message = JSON.stringify({ seq: state.seq++, ...body });
+              setTimeout(() => scenario.__emit("dap-message", { session, message }), 0);
+            };
+            const end = () => {
+              const state = scenario.__dap;
+              if (!state || state.ended) return;
+              state.ended = true;
+              const session = state.session;
+              setTimeout(() => scenario.__emit("dap-exit", { session, code: 0, error: null }), 0);
+            };
+            if (command === "dap_stop_all") return null;
+            if (command === "dap_stop") {
+              end();
+              return null;
+            }
+            if (command === "dap_start") {
+              const session = (scenario.__dap?.session ?? 0) + 1;
+              scenario.__dap = {
+                session,
+                seq: 1,
+                line: 0,
+                epoch: 0,
+                program: "",
+                breakpoints: [],
+                launch: null,
+                ended: false,
+              };
+              return { session, program: "/usr/bin/python3" };
+            }
+            // dap_send: one request.
+            const state = scenario.__dap!;
+            const request = JSON.parse((raw as { message: string }).message) as {
+              seq: number;
+              command: string;
+              arguments?: Record<string, unknown>;
+            };
+            const ok = (body?: unknown, seq = request.seq, name = request.command) =>
+              say({ type: "response", request_seq: seq, command: name, success: true, body });
+            const event = (name: string, body?: unknown) =>
+              say({ type: "event", event: name, body });
+            const stopAt = (line: number, reason: string) => {
+              state.line = line;
+              state.epoch++;
+              event("stopped", { reason, threadId: 1, allThreadsStopped: true });
+            };
+            const run = () => {
+              const next = state.breakpoints
+                .filter((line) => line > state.line)
+                .sort((a, b) => a - b)[0];
+              if (next !== undefined) stopAt(next, "breakpoint");
+              else if (!scenario.__dapRunsForever) {
+                event("output", { category: "stdout", output: "done\n" });
+                event("exited", { exitCode: 0 });
+                event("terminated");
+              }
+            };
+            const args = request.arguments ?? {};
+            switch (request.command) {
+              case "initialize":
+                ok({
+                  supportsConfigurationDoneRequest: true,
+                  supportsTerminateRequest: true,
+                  ...scenario.__dapCapabilities,
+                });
+                break;
+              case "launch":
+                state.program = String(args.program);
+                state.launch = request.seq;
+                event("initialized");
+                break;
+              case "setBreakpoints": {
+                const lines = (args.breakpoints as { line: number }[]).map((bp) => bp.line);
+                state.breakpoints = lines;
+                ok({ breakpoints: lines.map((line, i) => ({ id: 10 + i, verified: true, line })) });
+                break;
+              }
+              case "configurationDone":
+                ok();
+                ok(undefined, state.launch!, "launch");
+                run();
+                break;
+              case "threads":
+                ok({ threads: [{ id: 1, name: "MainThread" }] });
+                break;
+              case "stackTrace": {
+                const source = { path: state.program, name: state.program.split("/").pop() };
+                ok({
+                  stackFrames: [
+                    { id: state.epoch * 10 + 1, name: "work", source, line: state.line, column: 1 },
+                    { id: state.epoch * 10 + 2, name: "<module>", source, line: 1, column: 1 },
+                  ],
+                });
+                break;
+              }
+              case "scopes":
+                ok({
+                  scopes: [
+                    { name: "Locals", variablesReference: 1000 + state.epoch, expensive: false },
+                  ],
+                });
+                break;
+              case "variables":
+                ok({
+                  variables:
+                    (args.variablesReference as number) >= 2000
+                      ? [
+                          { name: "0", value: "1", variablesReference: 0 },
+                          { name: "1", value: "2", variablesReference: 0 },
+                        ]
+                      : [
+                          {
+                            name: "line",
+                            value: String(state.line),
+                            type: "int",
+                            variablesReference: 0,
+                          },
+                          {
+                            name: "items",
+                            value: "[1, 2]",
+                            type: "list",
+                            variablesReference: 2000 + state.epoch,
+                          },
+                        ],
+                });
+                break;
+              case "continue":
+                ok({ allThreadsContinued: true });
+                run();
+                break;
+              case "next":
+              case "stepIn":
+                ok();
+                stopAt(state.line + 1, "step");
+                break;
+              case "stepOut":
+                ok();
+                stopAt(state.line + 2, "step");
+                break;
+              case "pause":
+                ok();
+                stopAt(state.line || 1, "pause");
+                break;
+              case "evaluate":
+                ok({ result: `${String(args.expression)} = ${state.line}`, variablesReference: 0 });
+                break;
+              case "terminate":
+                ok();
+                event("terminated");
+                break;
+              case "disconnect":
+                ok();
+                end();
+                break;
+              default:
+                ok();
+            }
+            return null;
+          }
           if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
           if (command === "git_repo_state") return "";
           if (command === "git_exec")
@@ -2616,4 +2797,193 @@ test("the Run menu holds the task commands; Stop Task waits for a running task",
   );
   await menu.getByRole("menuitem", { name: "Run Build Task", exact: true }).click();
   await expect(appAlert(page)).toContainText("There is no build task");
+});
+
+// --- Debug / DAP (IDE-05) ---------------------------------------------------------------------
+// The debugger over the mock's debug adapter (above): DAP requests out through `dap_send`,
+// responses and events back as `dap-message`.
+
+const DEBUG_CONFIGS = [{ id: "main", name: "Main", adapter: "debugpy", program: "file.ts" }];
+
+/** User settings holding debug configurations, before the window loads. */
+async function withDebugConfigs(page: Page, configs: unknown[] = DEBUG_CONFIGS) {
+  await page.addInitScript((value) => {
+    if (!localStorage.getItem("yavin.settings.user"))
+      localStorage.setItem(
+        "yavin.settings.user",
+        JSON.stringify({ version: 1, values: { "debug.configurations": value } }),
+      );
+  }, configs);
+}
+
+async function debugView(page: Page) {
+  await page.getByTitle("Run and Debug", { exact: true }).click();
+  return page.getByRole("complementary", { name: "Debug" });
+}
+
+async function runMenu(page: Page, item: string) {
+  await page.getByRole("menubar").getByRole("menuitem", { name: "Run", exact: true }).click();
+  await page
+    .getByRole("menu", { name: "Run", exact: true })
+    .getByRole("menuitem", { name: item, exact: true })
+    .click();
+}
+
+async function openFileTs(page: Page) {
+  await page.getByText("file.ts", { exact: true }).dblclick();
+  await expect(page.getByRole("tab", { name: /file\.ts/ })).toBeVisible();
+  await expect(page.locator("[data-editor=monaco] .view-line").first()).toBeVisible();
+}
+
+/** A click in the editor's glyph margin, on `line`. */
+async function clickGutter(page: Page, line: number) {
+  const editor = page.locator("[data-editor=monaco]");
+  const number = editor.locator(".line-numbers").filter({ hasText: new RegExp(`^${line}$`) });
+  const row = (await number.first().boundingBox())!;
+  const margin = (await editor.locator(".margin").first().boundingBox())!;
+  await page.mouse.click(margin.x + 8, row.y + row.height / 2);
+}
+
+const dapRequests = async (page: Page, name: string) =>
+  (await calls(page, "dap_send"))
+    .map(
+      (call) => JSON.parse(call.args.message as string) as { command: string; arguments?: unknown },
+    )
+    .filter((request) => request.command === name);
+
+test("a breakpoint set in the gutter stops the program there: stack, variables, console, stepping", async ({
+  page,
+}) => {
+  // One long scenario, start to end: more than the default 30 s on a busy machine.
+  test.setTimeout(90_000);
+  await withDebugConfigs(page);
+  await desktop(page);
+  await openFileTs(page);
+  await clickGutter(page, 3);
+  await expect(page.locator(".yavin-breakpoint")).toHaveCount(1);
+  const view = await debugView(page);
+  await expect(view.getByRole("group", { name: "Breakpoint file.ts:3" })).toBeVisible();
+
+  await runMenu(page, "Start Debugging");
+  await expect
+    .poll(async () => (await calls(page, "dap_start")).map((call) => call.args.adapter))
+    .toEqual(["debugpy"]);
+  // The adapter was told about the breakpoint, by the file's path.
+  await expect
+    .poll(async () => (await dapRequests(page, "setBreakpoints")).at(-1)?.arguments)
+    .toMatchObject({ source: { path: "/work/file.ts" }, breakpoints: [{ line: 3 }] });
+
+  // Paused at it: status, call stack, the paused line in the editor, the locals.
+  await expect(view.getByTestId("debug-status")).toHaveText("Paused on breakpoint");
+  const top = view.getByRole("button", { name: "Frame work file.ts:3" });
+  await expect(top).toHaveAttribute("aria-current", "true");
+  await expect(page.locator(".yavin-debug-current-line")).toHaveCount(1);
+  const variables = view.getByRole("region", { name: "Variables" });
+  await expect(variables.getByRole("treeitem", { name: "line" })).toContainText("3");
+  // Children are fetched only when a variable is expanded.
+  const items = variables.getByRole("treeitem", { name: "items" });
+  await expect(items).toHaveAttribute("aria-expanded", "false");
+  expect((await dapRequests(page, "variables")).length).toBe(1);
+  await items.getByRole("button").first().click();
+  await expect(items.getByRole("treeitem", { name: "1" })).toContainText("2");
+  expect((await dapRequests(page, "variables")).length).toBe(2);
+
+  // The Debug Console evaluates in the paused frame.
+  const debugConsole = page.getByRole("region", { name: "Debug Console" });
+  await expect(debugConsole).toBeVisible();
+  await debugConsole.getByRole("textbox", { name: "Evaluate expression" }).fill("total");
+  await debugConsole.getByRole("textbox", { name: "Evaluate expression" }).press("Enter");
+  await expect(debugConsole.getByRole("log")).toContainText("total = 3");
+
+  // Step Over: the next line, a fresh stack. The other frame can be chosen.
+  await view.getByRole("button", { name: "Step Over" }).click();
+  await expect(view.getByRole("button", { name: "Frame work file.ts:4" })).toHaveAttribute(
+    "aria-current",
+    "true",
+  );
+  await view.getByRole("button", { name: "Frame <module> file.ts:1" }).click();
+  await expect
+    .poll(async () => (await dapRequests(page, "scopes")).at(-1)?.arguments)
+    .toEqual({ frameId: 22 });
+
+  // Continue: nothing more to stop at; the program ends, its output in the console.
+  await view.getByRole("button", { name: "Continue" }).click();
+  await expect(view.getByTestId("debug-status")).toHaveText(
+    /^Ended: The program exited with code 0\./,
+  );
+  await expect(debugConsole.getByRole("log")).toContainText("done");
+  await expect(page.locator(".yavin-debug-current-line")).toHaveCount(0);
+  await expect(page.locator(".yavin-breakpoint")).toHaveCount(1);
+  await expect(view.getByRole("button", { name: "Continue" })).toBeDisabled();
+});
+
+test("Stop ends a running session; only the adapter's own capabilities are offered", async ({
+  page,
+}) => {
+  await withDebugConfigs(page);
+  await page.addInitScript(() => {
+    (window as unknown as { __dapRunsForever: boolean }).__dapRunsForever = true;
+  });
+  await desktop(page);
+  const view = await debugView(page);
+  await view.getByRole("button", { name: "Start Debugging: Main" }).click();
+  await expect(view.getByTestId("debug-status")).toHaveText("Running");
+  // No restart capability: no Restart.
+  await expect(view.getByRole("button", { name: "Restart" })).toHaveCount(0);
+  await expect(view.getByRole("button", { name: "Step Over" })).toBeDisabled();
+  await view.getByRole("button", { name: "Stop" }).click();
+  await expect(view.getByTestId("debug-status")).toHaveText("Ended: Stopped.");
+  expect((await dapRequests(page, "terminate")).length).toBe(1);
+  expect((await dapRequests(page, "disconnect")).length).toBe(1);
+  await expect(view.getByRole("button", { name: "Start Debugging: Main" })).toBeEnabled();
+});
+
+test("debugging a restricted folder starts no adapter and offers the trust decision", async ({
+  page,
+}) => {
+  await withDebugConfigs(page);
+  await desktop(page, {
+    trust: { trusted: false, decided: true, root: "/work", parent: "/projects" },
+  });
+  const view = await debugView(page);
+  await view.getByRole("button", { name: "Start Debugging: Main" }).click();
+  await expect(appAlert(page)).toContainText("not trusted");
+  await expect(page.getByRole("dialog")).toContainText("Workspace Trust");
+  expect(await calls(page, "dap_start")).toEqual([]);
+});
+
+test("breakpoints: F9 toggles at the cursor; the Breakpoints list disables and removes them", async ({
+  page,
+}) => {
+  await desktop(page);
+  await openFileTs(page);
+  await page.locator("[data-editor=monaco] .view-line").first().click();
+  await page.keyboard.press("F9");
+  await expect(page.locator(".yavin-breakpoint")).toHaveCount(1);
+  const view = await debugView(page);
+  const mark = view.getByRole("group", { name: "Breakpoint file.ts:1" });
+  await mark.getByRole("checkbox", { name: "Enable file.ts:1" }).uncheck();
+  await expect(page.locator(".yavin-breakpoint-disabled")).toHaveCount(1);
+  await mark.getByRole("button", { name: "Remove file.ts:1" }).click();
+  await expect(page.locator(".yavin-breakpoint, .yavin-breakpoint-disabled")).toHaveCount(0);
+  await expect(view).toContainText("Click left of a line number");
+});
+
+test("with no configuration the Debug view says so and Configure Debugging opens Settings", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await debugView(page);
+  await expect(view).toContainText("No debug configurations yet");
+  await view.getByRole("button", { name: "Configure Debugging", exact: true }).click();
+  const settingsView = page.getByRole("region", { name: "Settings" });
+  await expect(settingsView.getByRole("textbox", { name: "Search settings" })).toHaveValue("Debug");
+  await expect(
+    settingsView.getByRole("textbox", { name: "Debug configurations", exact: true }),
+  ).toBeVisible();
+  // The Debug Console has nothing to evaluate in without a session.
+  await showView(page, "DEBUG CONSOLE");
+  const debugConsole = page.getByRole("region", { name: "Debug Console" });
+  await expect(debugConsole).toContainText("No debug session");
+  await expect(debugConsole.getByRole("textbox", { name: "Evaluate expression" })).toBeDisabled();
 });

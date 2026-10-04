@@ -105,6 +105,7 @@ import type { EditorRange } from "./editor/editorTypes";
 import type { PaletteSymbol, SymbolScope } from "./components/command-palette/CommandPalette";
 import { clearProblems, publishProblems } from "./services/panel/problems";
 import {
+  breakpoints,
   currentGit,
   settings,
   terminalSettings,
@@ -117,6 +118,9 @@ import { useEditorSettings } from "./editor/useEditorSettings";
 import type { SettingDefinition } from "./services/settings/settings";
 import { SettingsView } from "./components/settings/SettingsView";
 import { RunPanel } from "./components/layout/RunPanel";
+import { DebugPanel } from "./components/layout/DebugPanel";
+import { DebugError } from "./services/debug/errors";
+import type { ResourceUri } from "./services/resource";
 import { TaskError } from "./services/tasks/errors";
 import { isFinal, type TaskRun } from "./services/tasks/service";
 import { createOverlayTracker } from "./services/localgit/overlays";
@@ -1283,6 +1287,98 @@ export default function App() {
     taskReveal.current = taskSnapshot.revealRequest;
     revealTerminals();
   }, [taskSnapshot.revealRequest, revealTerminals]);
+  // --- Debugging (IDE-05): the window's commands on the workspace's DebugService ------------------
+  const debug = workspace.services.debug;
+  const debugSnapshot = useSyncExternalStore(debug.subscribe, debug.getSnapshot, debug.getSnapshot);
+  const debugControls = debug.controls();
+  const workspaceBreakpoints = useMemo(
+    () => (workspace.folders.length ? breakpoints.forWorkspace(workspace.id) : null),
+    [workspace],
+  );
+  /** Says why debugging did not happen; an untrusted folder offers the trust decision. */
+  const reportDebugError = useCallback(
+    (error: unknown) => {
+      if (error instanceof DebugError && error.code === "TrustDenied") setTrustDialog("manage");
+      reportError(error instanceof Error ? error.message : String(error));
+    },
+    [reportError],
+  );
+  const configureDebugging = () => {
+    setSettingsQuery("Debug");
+    setSettingsOpen(true);
+  };
+  const showDebugView = () => {
+    setActiveActivityTab("debug");
+    setIsSidebarOpen(true);
+  };
+  const startDebugging = (configurationId?: string) => {
+    if (!debugSnapshot.workspace) {
+      reportError("Open a folder to debug its programs.");
+      return;
+    }
+    const configs = debugSnapshot.configurations;
+    if (!configs.length) {
+      reportError("There is no debug configuration yet. Run › Configure Debugging adds one.");
+      configureDebugging();
+      return;
+    }
+    const go = (id: string) => {
+      showDebugView();
+      // The session's output and the console are in the panel.
+      showTerminal(true);
+      showPanelView("debug");
+      void debug.start(id).catch(reportDebugError);
+    };
+    if (configurationId) go(configurationId);
+    else if (configs.length === 1) go(configs[0].id);
+    else
+      chooseTask(
+        "Start Debugging",
+        configs.map((one) => ({
+          id: one.id,
+          label: one.name,
+          detail: one.program ?? `attach to port ${one.port}`,
+        })),
+        go,
+      );
+  };
+  const debugCommand = (
+    command: "continue" | "pause" | "stepOver" | "stepInto" | "stepOut" | "restart" | "stop",
+  ) => {
+    void debug[command]().catch(reportDebugError);
+  };
+  const toggleBreakpointAt = (uri: ResourceUri, line: number) => {
+    if (!workspaceBreakpoints) {
+      reportError("Open a folder to set breakpoints.");
+      return;
+    }
+    workspaceBreakpoints.toggle(uri, line);
+  };
+  const editorDebug = useMemo(
+    () => ({
+      breakpoints: workspaceBreakpoints,
+      service: debug,
+      onToggleBreakpoint: (uri: ResourceUri, line: number) =>
+        toggleBreakpointAtRef.current(uri, line),
+    }),
+    [workspaceBreakpoints, debug],
+  );
+  const toggleBreakpointAtRef = useRef(toggleBreakpointAt);
+  toggleBreakpointAtRef.current = toggleBreakpointAt;
+  // The paused frame (or a frame chosen in the call stack) is shown in the editor, through the
+  // editor's own navigation -- once per request.
+  const debugFocus = useRef(debugSnapshot.focus?.nonce ?? 0);
+  useEffect(() => {
+    const focus = debugSnapshot.focus;
+    if (!focus || focus.nonce === debugFocus.current) return;
+    debugFocus.current = focus.nonce;
+    openLocationRef.current(focus.path, {
+      startLineNumber: focus.line,
+      startColumn: focus.column,
+      endLineNumber: focus.line,
+      endColumn: focus.column,
+    });
+  }, [debugSnapshot.focus]);
   // What went wrong keeping the terminal's settings (TERMINAL-07) -- unreadable, written by a
   // newer Yavin, not saved -- is said once; the terminal works on with what could be read.
   useEffect(() => {
@@ -2458,6 +2554,111 @@ export default function App() {
       label: "Configure Tasks",
       run: configureTasks,
     },
+    // Debugging (IDE-05). F5 starts a session, or continues a paused one.
+    {
+      id: "debug.start",
+      menu: "Run",
+      label: "Start Debugging",
+      shortcut: "F5",
+      disabled: !(debugControls.start || debugControls.continue),
+      reason: debugSnapshot.workspace ? "A debug session is running" : "Open a folder first",
+      run: () => (debugControls.continue ? debugCommand("continue") : startDebugging()),
+    },
+    {
+      id: "debug.stop",
+      menu: "Run",
+      label: "Stop Debugging",
+      shortcut: "Shift+F5",
+      disabled: !debugControls.stop,
+      reason: "No debug session",
+      run: () => debugCommand("stop"),
+    },
+    {
+      id: "debug.restart",
+      menu: "Run",
+      label: "Restart Debugging",
+      shortcut: "Mod+Shift+F5",
+      disabled: !debugControls.restart,
+      reason: debugSnapshot.session
+        ? "This debug adapter cannot restart a session"
+        : "No debug session",
+      run: () => debugCommand("restart"),
+    },
+    {
+      id: "debug.continue",
+      menu: "Run",
+      label: "Continue",
+      disabled: !debugControls.continue,
+      reason: "The program is not paused",
+      run: () => debugCommand("continue"),
+    },
+    {
+      id: "debug.pause",
+      menu: "Run",
+      label: "Pause",
+      shortcut: "F6",
+      disabled: !debugControls.pause,
+      reason: "No program is running",
+      run: () => debugCommand("pause"),
+    },
+    {
+      id: "debug.stepOver",
+      menu: "Run",
+      label: "Step Over",
+      shortcut: "F10",
+      disabled: !debugControls.stepOver,
+      reason: "The program is not paused",
+      run: () => debugCommand("stepOver"),
+    },
+    {
+      id: "debug.stepInto",
+      menu: "Run",
+      label: "Step Into",
+      shortcut: "F11",
+      disabled: !debugControls.stepInto,
+      reason: "The program is not paused",
+      run: () => debugCommand("stepInto"),
+    },
+    {
+      id: "debug.stepOut",
+      menu: "Run",
+      label: "Step Out",
+      shortcut: "Shift+F11",
+      disabled: !debugControls.stepOut,
+      reason: "The program is not paused",
+      run: () => debugCommand("stepOut"),
+    },
+    {
+      id: "debug.toggleBreakpoint",
+      menu: "Run",
+      label: "Toggle Breakpoint",
+      shortcut: "F9",
+      disabled: !workspaceBreakpoints || !activeTab?.path,
+      reason: "Open a file of the workspace",
+      run: () => {
+        const uri = activeTab?.path ? documents.get(activeTab.path)?.uri : undefined;
+        const line = cursorStatus.get()?.line;
+        if (!uri || !line) {
+          reportError("Put the cursor on a line of a file to toggle its breakpoint.");
+          return;
+        }
+        toggleBreakpointAt(uri, line);
+      },
+    },
+    {
+      id: "debug.removeAllBreakpoints",
+      menu: "Run",
+      label: "Remove All Breakpoints",
+      disabled: !workspaceBreakpoints,
+      reason: "Open a folder first",
+      run: () => workspaceBreakpoints?.clear(),
+    },
+    {
+      id: "debug.configure",
+      menu: "Run",
+      label: "Configure Debugging",
+      run: configureDebugging,
+    },
     {
       id: "go.file",
       menu: "Go",
@@ -3034,6 +3235,26 @@ export default function App() {
             onShowTerminal={showTaskTerminal}
             onConfigure={configureTasks}
           />
+          {/* IDE-05: the workspace's debug session and breakpoints. */}
+          <DebugPanel
+            key={`debug:${workspacePath}`}
+            service={debug}
+            breakpoints={workspaceBreakpoints}
+            visible={isSidebarOpen && activeActivityTab === "debug"}
+            hasWorkspace={!!debugSnapshot.workspace}
+            onStart={startDebugging}
+            onCommand={debugCommand}
+            onConfigure={configureDebugging}
+            onOpenBreakpoint={(path, line) =>
+              openLocation(path, {
+                startLineNumber: line,
+                startColumn: 1,
+                endLineNumber: line,
+                endColumn: 1,
+              })
+            }
+            onError={reportDebugError}
+          />
           <LocalHistoryPanel
             key={`history:${workspacePath}`}
             service={workspace.services.localGit}
@@ -3048,7 +3269,8 @@ export default function App() {
               activeActivityTab !== "search" &&
               activeActivityTab !== "git" &&
               activeActivityTab !== "history" && // LG-08
-              activeActivityTab !== "run" // IDE-04
+              activeActivityTab !== "run" && // IDE-04
+              activeActivityTab !== "debug" // IDE-05
             }
             activeTab={activeActivityTab}
             workspacePath={workspacePath}
@@ -3177,6 +3399,7 @@ export default function App() {
                 wordWrap={wordWrap}
                 zoom={zoom}
                 editorSettings={editorView.settings}
+                debug={editorDebug}
               />
             )}
 
@@ -3195,6 +3418,7 @@ export default function App() {
                   onManageTrust={() => setTrustDialog("manage")}
                   activeFile={activeTab?.path}
                   ide={terminalIde}
+                  debugService={debug}
                   onOpenProblem={(file, line, column) =>
                     // The editor's own navigation: it waits for the file to be in front, then
                     // selects the exact line and column (the editor clamps a stale location).

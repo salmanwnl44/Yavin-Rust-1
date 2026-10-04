@@ -14,6 +14,7 @@ use std::{env, path::Path, sync::Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 mod checkers;
 mod config;
+mod dap;
 mod external;
 mod git;
 mod localgit;
@@ -28,6 +29,7 @@ mod terminal_stream;
 mod trust;
 mod workbench;
 use checkers::{available_checkers, cancel_checker, run_checker, Checks};
+use dap::{dap_send, dap_start, dap_stop, dap_stop_all, DapSessions};
 use external::open_external_url;
 use git::{
     git_cancel_repo, git_clone_repo, git_close_repo, git_exec, git_init_repo, git_open_repo,
@@ -502,6 +504,9 @@ fn enter_workspace(
         .ok()
         .map(|spec| spec.workspace_id);
     app.state::<LocalGit>().revoke_except(now.as_deref());
+    // A debug session belongs to the workspace it debugs: the renderer ends it on leaving, and
+    // whatever adapter (and debuggee) is left is ended here rather than outliving it (IDE-05).
+    dap::stop_all(&app.state::<DapSessions>());
     // Its terminals are not: switching workspace detaches their views and the workspace's
     // TerminalService keeps them (TERMINAL-03); the page and the application end them.
     watch_workspace(app, watch, &watched);
@@ -667,6 +672,7 @@ pub fn run() {
         .manage(Sessions::default())
         .manage(Checks::default())
         .manage(LspSessions::default())
+        .manage(DapSessions::default())
         .manage(Recovery::default())
         .manage(LocalGit::default())
         .setup(|app| {
@@ -803,6 +809,10 @@ pub fn run() {
             lsp_send,
             lsp_stop,
             lsp_stop_all,
+            dap_start,
+            dap_send,
+            dap_stop,
+            dap_stop_all,
         ])
         .build(tauri::generate_context!())
         .map(|app| {
@@ -817,6 +827,8 @@ pub fn run() {
                     // Language servers too: the renderer shuts them down politely when it
                     // can, and whatever is left is ended here rather than orphaned.
                     lsp::stop_all(&handle.state::<LspSessions>());
+                    // Debug adapters, and the programs they debug (IDE-05).
+                    dap::stop_all(&handle.state::<DapSessions>());
                     // A checker is a child process too, and a cold `cargo check` outlives
                     // the window by minutes if nothing stops it.
                     checkers::cancel_running(&handle.state::<Checks>());

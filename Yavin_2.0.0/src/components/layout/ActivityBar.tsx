@@ -111,6 +111,25 @@ export function ActivityBar({
       ),
     },
     {
+      id: "debug",
+      title: "Run and Debug",
+      icon: (
+        <svg
+          width="20"
+          height="20"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.75"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <rect x="8" y="6" width="8" height="14" rx="4" />
+          <path d="M12 20v-9M8 11H4M20 11h-4M8 16H5M19 16h-3M9 7 7 4M15 7l2-3" />
+        </svg>
+      ),
+    },
+    {
       id: "extensions",
       title: "Extensions & Plugins (Ctrl+Shift+X)",
       icon: (

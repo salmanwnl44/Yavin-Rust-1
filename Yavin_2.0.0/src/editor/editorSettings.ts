@@ -208,6 +208,8 @@ export function editorOptions(
     smoothScrolling: settings.smoothScrolling,
     stickyScroll: { enabled: settings.stickyScroll },
     folding: settings.folding,
+    // Where breakpoints are set and the paused frame is marked (IDE-05, `debugMonaco.ts`).
+    glyphMargin: true,
     // The window lays the editor out; Monaco follows its container's size.
     automaticLayout: true,
     // Language intelligence comes from language servers (`lspMonaco.ts`); with none for a

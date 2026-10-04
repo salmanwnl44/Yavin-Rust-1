@@ -12,6 +12,10 @@ import type { EditorViews } from "../../services/editorViews";
 import type { EditorHandle, EditorState, LanguageFeatures } from "../../editor/editorTypes";
 import { addReferencesAction, installLanguageFeatures } from "../../editor/lspMonaco";
 import { createDiffView } from "../../editor/diff";
+import { attachDebugDecorations } from "../../editor/debugMonaco";
+import type { Breakpoints } from "../../services/debug/breakpoints";
+import type { DebugService } from "../../services/debug/service";
+import type { ResourceUri } from "../../services/resource";
 import type { EditorDecoration } from "../../services/editorModelBridge";
 import type { CursorStatusStore } from "../../services/cursorStatus";
 import type { MinimapPreferences } from "../../services/minimapPreferences";
@@ -81,6 +85,7 @@ export default function CodeEditor({
   onMinimapChange,
   languageFeatures,
   editorSettings = DEFAULT_EDITOR_SETTINGS,
+  debug,
 }: {
   documentKey: string;
   documents: DocumentService;
@@ -104,6 +109,15 @@ export default function CodeEditor({
    * they change -- the editor is never recreated for a setting.
    */
   editorSettings?: EditorSettings;
+  /**
+   * The workspace's debugger (IDE-05): breakpoints and the paused line shown in the glyph
+   * margin, and a click there toggling a breakpoint of the document's file.
+   */
+  debug?: {
+    breakpoints: Breakpoints | null;
+    service: DebugService;
+    onToggleBreakpoint: (uri: ResourceUri, line: number) => void;
+  };
 }) {
   const container = useRef<HTMLDivElement>(null);
   const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -125,8 +139,18 @@ export default function CodeEditor({
     cursorStatus,
     onCommandPalette,
     settings,
+    debug,
   });
-  latest.current = { onState, readOnly, wordWrap, zoom, cursorStatus, onCommandPalette, settings };
+  latest.current = {
+    onState,
+    readOnly,
+    wordWrap,
+    zoom,
+    cursorStatus,
+    onCommandPalette,
+    settings,
+    debug,
+  };
 
   /** The cursor and indentation for the status bar; none while no document is shown. */
   const publishCursor = () => {
@@ -189,6 +213,14 @@ export default function CodeEditor({
     shown.current = null;
   };
 
+  // The debugger's decorations, for the workspace's breakpoints and session (IDE-05).
+  const debugService = debug?.service;
+  const debugBreakpoints = debug?.breakpoints ?? null;
+  useEffect(() => {
+    if (!debugService) return;
+    return attachDebugDecorations(bridge, debugBreakpoints, debugService);
+  }, [bridge, debugService, debugBreakpoints]);
+
   // The one Monaco editor.
   useEffect(() => {
     const element = container.current;
@@ -227,6 +259,14 @@ export default function CodeEditor({
       }),
       instance.onDidBlurEditorText(() => {
         if (shown.current) views.setFocused(shown.current.key, false);
+      }),
+      // A click in the glyph margin toggles a breakpoint on that line of the document's file.
+      instance.onMouseDown((event) => {
+        if (event.target.type !== monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) return;
+        const line = event.target.position?.lineNumber;
+        const uri = shown.current?.doc.uri;
+        if (!line || !uri) return;
+        latest.current.debug?.onToggleBreakpoint(uri, line);
       }),
     ];
     // Development builds only: the UI tests read and drive the editor through this, since

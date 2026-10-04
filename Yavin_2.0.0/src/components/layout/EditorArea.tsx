@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode, Ref } from "react";
+import type { ComponentProps, ReactNode, Ref } from "react";
 import type { EditorHandle, EditorState, LanguageFeatures } from "../../editor/editorTypes";
 import type { DocumentService } from "../../services/documents";
 import type { EditorViews } from "../../services/editorViews";
@@ -84,6 +84,7 @@ export function EditorArea({
   readOnly = false,
   minimap,
   editorSettings,
+  debug,
   onMinimapChange,
   markdownMode,
   onMarkdownMode,
@@ -133,6 +134,8 @@ export function EditorArea({
   minimap?: MinimapPreferences;
   /** The editor's settings as they resolve for the workspace (IDE-03). */
   editorSettings?: EditorSettings;
+  /** The workspace's debugger: breakpoints and the paused line in the gutter (IDE-05). */
+  debug?: ComponentProps<typeof import("./CodeEditor").default>["debug"];
   onMinimapChange?: (change: Partial<MinimapPreferences>) => void;
   /** Set for a Markdown document: how it is shown, and the buttons that change it. */
   markdownMode?: MarkdownMode;
@@ -470,6 +473,7 @@ export function EditorArea({
                       onCommandPalette={onOpenCommandPalette}
                       minimap={minimap}
                       editorSettings={editorSettings}
+                      debug={debug}
                       onMinimapChange={onMinimapChange}
                       languageFeatures={languageFeatures}
                     />

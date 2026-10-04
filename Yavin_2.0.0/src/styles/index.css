@@ -325,3 +325,45 @@ body,
   background-color: rgba(249, 115, 22, 0.85);
   color: #000000;
 }
+
+/* The debugger in the editor's glyph margin (IDE-05, `editor/debugMonaco.ts`). A breakpoint is
+   a filled red dot; one the debug adapter could not set is a hollow grey ring; a disabled one a
+   dim dot. The paused frame's line is highlighted, with an arrow in the margin. */
+.yavin-breakpoint,
+.yavin-breakpoint-unverified,
+.yavin-breakpoint-disabled {
+  cursor: pointer;
+}
+.yavin-breakpoint::before,
+.yavin-breakpoint-unverified::before,
+.yavin-breakpoint-disabled::before {
+  content: "";
+  display: block;
+  width: 9px;
+  height: 9px;
+  margin: 6px auto 0;
+  border-radius: 50%;
+}
+.yavin-breakpoint::before {
+  background: #e51400;
+}
+.yavin-breakpoint-unverified::before {
+  border: 1.5px solid #8b8b8b;
+  box-sizing: border-box;
+}
+.yavin-breakpoint-disabled::before {
+  background: #6b3a35;
+}
+.yavin-debug-current-frame::before {
+  content: "";
+  display: block;
+  width: 0;
+  height: 0;
+  margin: 5px auto 0;
+  border-top: 6px solid transparent;
+  border-bottom: 6px solid transparent;
+  border-left: 8px solid #ffcc00;
+}
+.yavin-debug-current-line {
+  background: rgba(255, 204, 0, 0.14);
+}

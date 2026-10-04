@@ -18,6 +18,10 @@ import { EDITOR_SETTING_LIST } from "../editor/editorSettings.ts";
 import { TASK_DEFINITIONS } from "./tasks/model.ts";
 import { createTaskService, type TaskService } from "./tasks/service.ts";
 import { readTrust } from "./trust.ts";
+import { createBreakpointRegistry } from "./debug/breakpoints.ts";
+import { DEBUG_SETTING_LIST } from "./debug/config.ts";
+import { createNativeAdapterTransport } from "./debug/nativeTransport.ts";
+import { createDebugService, type DebugService } from "./debug/service.ts";
 import type { WorkspaceContext, WorkspaceId } from "./workspaceManager.ts";
 
 /**
@@ -59,6 +63,11 @@ export interface WorkspaceServices {
    * run in the workspace's terminals; disposing the workspace stops what they are running.
    */
   tasks: TaskService;
+  /**
+   * The workspace's debugger (IDE-05): its debug session, over a debug adapter the native side
+   * runs. Disposing the workspace ends the session, the adapter and the program it debugs.
+   */
+  debug: DebugService;
 }
 
 /**
@@ -89,7 +98,17 @@ const LEGACY_GIT_KEY = "yavin.git.repos";
  * subsystem it belongs to and applied there. Only the editor's for now; the terminal keeps its
  * own (`terminalSettings`, below).
  */
-export const settings = createSettingsRegistry([...EDITOR_SETTING_LIST, TASK_DEFINITIONS]);
+export const settings = createSettingsRegistry([
+  ...EDITOR_SETTING_LIST,
+  TASK_DEFINITIONS,
+  ...DEBUG_SETTING_LIST,
+]);
+
+/**
+ * The window's breakpoints (IDE-05), one set per workspace by resource identity: kept while the
+ * window lives, so switching file or workspace and back keeps them.
+ */
+export const breakpoints = createBreakpointRegistry();
 
 /**
  * What the terminal keeps across restarts (TERMINAL-07): profiles, defaults, the integration
@@ -159,6 +178,17 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
               { onProgress: onLocalGitProgress },
             )
           : null;
+      const tasks = createTaskService({
+        workspace: folders.length ? id : null,
+        folders,
+        settings,
+        terminals: terminalServices.forWorkspace(id),
+        ui: terminalUiFor(id),
+        profiles: terminalProfiles.forWorkspace(id),
+        // Workspace Trust, asked of the native side before every execution.
+        trusted: () => readTrust().then((trust) => trust.trusted),
+        publish: publishProblems,
+      });
       return {
         git,
         localGit,
@@ -172,16 +202,18 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
           },
           publishProblems,
         ),
-        tasks: createTaskService({
+        tasks,
+        debug: createDebugService({
           workspace: folders.length ? id : null,
           folders,
           settings,
-          terminals: terminalServices.forWorkspace(id),
-          ui: terminalUiFor(id),
-          profiles: terminalProfiles.forWorkspace(id),
-          // Workspace Trust, asked of the native side before every execution.
+          breakpoints: folders.length ? breakpoints.forWorkspace(id) : null,
+          transport: createNativeAdapterTransport(),
+          // Workspace Trust, asked of the native side before every session.
           trusted: () => readTrust().then((trust) => trust.trusted),
-          publish: publishProblems,
+          // A configuration's preLaunchTask runs as any task does (IDE-04), to its end.
+          runTask: (taskId) =>
+            tasks.run(taskId).then((run) => ({ state: run.state, error: run.error })),
         }),
       };
     },
@@ -194,6 +226,8 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
       services.checkers.dispose();
       // What its tasks are running is ended: they ran for its folders.
       services.tasks.dispose();
+      // Its debug session ends, and the adapter and the program it debugs with it.
+      services.debug.dispose();
       if (isTauri()) {
         // Its terminals are not ended: their views detach (the panel is remounted per
         // workspace) and the workspace's TerminalService keeps them for its return.
