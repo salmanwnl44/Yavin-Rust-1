@@ -4,6 +4,7 @@ import { monaco } from "../../editor/monaco";
 import { TEST_HOOKS } from "../../editor/testHooks";
 import { monacoHost, monacoNaming, textModelOf } from "../../editor/monacoHost";
 import { DEFAULT_EDITOR_SETTINGS, editorOptions } from "../../editor/editorSettings";
+import type { EditorSettings } from "../../editor/editorSettings";
 import { createEditorModelBridge } from "../../services/editorModelBridge";
 import type { EditorModel, EditorModelBridge } from "../../services/editorModelBridge";
 import type { DocumentService, TextDocument } from "../../services/documents";
@@ -79,6 +80,7 @@ export default function CodeEditor({
   minimap = DEFAULT_EDITOR_SETTINGS.minimap,
   onMinimapChange,
   languageFeatures,
+  editorSettings = DEFAULT_EDITOR_SETTINGS,
 }: {
   documentKey: string;
   documents: DocumentService;
@@ -97,6 +99,11 @@ export default function CodeEditor({
   onMinimapChange?: (change: Partial<MinimapPreferences>) => void;
   /** Language servers: connected to the engine here, and nothing more (see `lspMonaco.ts`). */
   languageFeatures?: LanguageFeatures;
+  /**
+   * The editor's settings as they resolve for the workspace (IDE-03); applied in place when
+   * they change -- the editor is never recreated for a setting.
+   */
+  editorSettings?: EditorSettings;
 }) {
   const container = useRef<HTMLDivElement>(null);
   const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -109,7 +116,7 @@ export default function CodeEditor({
   const focusDecision = useRef<{ key: string; take: boolean } | null>(null);
   const bridge = bridgeFor(documents);
   const [minimapMenu, setMinimapMenu] = useState<{ x: number; y: number } | null>(null);
-  const settings = { ...DEFAULT_EDITOR_SETTINGS, minimap };
+  const settings = { ...editorSettings, minimap };
   const latest = useRef({
     onState,
     readOnly,
@@ -280,7 +287,8 @@ export default function CodeEditor({
     publishCursor();
   }, [documentKey]);
 
-  // The window's word wrap and zoom, and read-only documents.
+  // The settings (font, tabs, theme...), the window's word wrap and zoom, and read-only
+  // documents: applied to the editor in place.
   useEffect(() => {
     editor.current?.updateOptions(
       editorOptions(settings, {
@@ -290,7 +298,7 @@ export default function CodeEditor({
         ariaLabel: documents.get(documentKey)?.name ?? "",
       }),
     );
-  }, [wordWrap, zoom, readOnly, minimap]);
+  }, [wordWrap, zoom, readOnly, minimap, editorSettings]);
 
   const chooseMinimap = (change: Partial<MinimapPreferences>) => onMinimapChange?.(change);
   // VS Code's minimap menu; its two submenus are shown inline, each choice checked.

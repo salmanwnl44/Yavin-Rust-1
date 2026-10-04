@@ -104,7 +104,18 @@ import type { LanguageFeaturesHost } from "./editor/lspMonaco";
 import type { EditorRange } from "./editor/editorTypes";
 import type { PaletteSymbol, SymbolScope } from "./components/command-palette/CommandPalette";
 import { clearProblems, publishProblems } from "./services/panel/problems";
-import { currentGit, terminalSettings, useWorkspace, workspaces } from "./services/workspaces";
+import {
+  currentGit,
+  settings,
+  terminalSettings,
+  terminalProfiles,
+  useWorkspace,
+  workspaces,
+} from "./services/workspaces";
+import { EDITOR_SETTINGS } from "./editor/editorSettings";
+import { useEditorSettings } from "./editor/useEditorSettings";
+import type { SettingDefinition } from "./services/settings/settings";
+import { SettingsView } from "./components/settings/SettingsView";
 import { createOverlayTracker } from "./services/localgit/overlays";
 import { fileUri } from "./services/resource";
 import { loadMinimapPreferences, saveMinimapPreferences } from "./services/minimapPreferences";
@@ -250,8 +261,8 @@ export default function App() {
     }
     return key;
   };
-  const [wordWrap, setWordWrap] = useState(false);
-  const [zoom, setZoom] = useState(1);
+  /** The Settings view (IDE-03) is shown in the editor's place. */
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteMode, setPaletteMode] = useState<
     "files" | "commands" | "symbols" | "workspaceSymbols"
   >("files");
@@ -828,6 +839,7 @@ export default function App() {
   const handleOpenFile = (path: string) =>
     run(async () => {
       setDiff(null);
+      setSettingsOpen(false);
       if (path === "welcome") {
         // Its tab may have been closed -- Help > Welcome is how it comes back -- and
         // selecting a tab that is not there leaves the strip with nothing selected.
@@ -1176,6 +1188,30 @@ export default function App() {
     () => watchFinishedCommands(workspace.services.terminals, bumpGitRevision),
     [workspace],
   );
+  // The editor's settings as they resolve in this workspace (IDE-03): word wrap and zoom
+  // included, so there is one store for each, not window state beside a setting.
+  const settingsWorkspace = workspace.folders.length ? workspace.id : null;
+  const editorView = useEditorSettings(settings, settingsWorkspace, minimap);
+  const { wordWrap, zoom } = editorView;
+  /** A View-menu toggle writes where the value comes from: this workspace if it set one. */
+  const changeSetting = <T,>(definition: SettingDefinition<T>, value: T) => {
+    const scope =
+      settingsWorkspace !== null &&
+      definition.scopes.includes("workspace") &&
+      settings.inspect(definition, settingsWorkspace).workspace !== undefined
+        ? "workspace"
+        : "user";
+    settings.set(definition, scope, value, settingsWorkspace);
+  };
+  // Settings that could not be read (corrupt, invalid, from a newer Yavin) are said once.
+  useEffect(() => {
+    const show = () => {
+      const problems = settings.takeProblems();
+      if (problems.length) reportError(problems.join(" "));
+    };
+    show();
+    return settings.onProblems(show);
+  }, [reportError]);
   // What went wrong keeping the terminal's settings (TERMINAL-07) -- unreadable, written by a
   // newer Yavin, not saved -- is said once; the terminal works on with what could be read.
   useEffect(() => {
@@ -2066,6 +2102,13 @@ export default function App() {
       run: () => handleReveal(activeTabId),
     },
     {
+      id: "file.settings",
+      menu: "File",
+      label: "Settings",
+      shortcut: "Mod+,",
+      run: () => setSettingsOpen(true),
+    },
+    {
       // The status bar only carries a trust entry point while restricted, so this is the way
       // back to the decision once a folder is trusted -- otherwise trust could never be revoked.
       id: "file.trust",
@@ -2224,7 +2267,7 @@ export default function App() {
       label: "Word Wrap",
       shortcut: "Alt+z",
       checked: wordWrap,
-      run: () => setWordWrap((prev) => !prev),
+      run: () => changeSetting(EDITOR_SETTINGS.wordWrap, !wordWrap),
     },
     {
       id: "view.markdownPreview",
@@ -2257,7 +2300,7 @@ export default function App() {
       label: "Zoom In",
       shortcut: "Mod+=",
       disabled: zoom >= 2,
-      run: () => setZoom((prev) => Math.min(2, prev + 0.1)),
+      run: () => changeSetting(EDITOR_SETTINGS.zoom, Math.min(2, Math.round(zoom * 10 + 1) / 10)),
     },
     {
       id: "view.zoomOut",
@@ -2265,14 +2308,14 @@ export default function App() {
       label: "Zoom Out",
       shortcut: "Mod+-",
       disabled: zoom <= 0.7,
-      run: () => setZoom((prev) => Math.max(0.7, prev - 0.1)),
+      run: () => changeSetting(EDITOR_SETTINGS.zoom, Math.max(0.7, Math.round(zoom * 10 - 1) / 10)),
     },
     {
       id: "view.zoomReset",
       menu: "View",
       label: "Reset Zoom",
       shortcut: "Mod+0",
-      run: () => setZoom(1),
+      run: () => changeSetting(EDITOR_SETTINGS.zoom, 1),
     },
     {
       id: "go.file",
@@ -2784,7 +2827,8 @@ export default function App() {
                 setIsSidebarOpen(true);
               }
             }}
-            onOpenSettings={() => openPalette("commands")}
+            onOpenSettings={() => setSettingsOpen(true)}
+            onOpenAccounts={() => openPalette("commands")}
           />
 
           {/* Dynamic File Tree Explorer */}
@@ -2889,7 +2933,18 @@ export default function App() {
 
           {/* Center: Editor + Bottom Terminal Panel */}
           <div className="flex flex-1 flex-col min-w-0 bg-[#000000]">
-            {diff ? (
+            {settingsOpen ? (
+              <SettingsView
+                registry={settings}
+                workspace={settingsWorkspace}
+                workspaceName={workspacePath.split(/[\\/]/).filter(Boolean).pop()}
+                terminal={{
+                  settings: terminalSettings,
+                  profiles: terminalProfiles.forWorkspace(workspace.id),
+                }}
+                onClose={() => setSettingsOpen(false)}
+              />
+            ) : diff ? (
               <DiffEditor
                 key={diff.path + diff.title + diff.text}
                 document={diff}
@@ -2963,6 +3018,7 @@ export default function App() {
                 onEditorState={setEditorState}
                 wordWrap={wordWrap}
                 zoom={zoom}
+                editorSettings={editorView.settings}
               />
             )}
 

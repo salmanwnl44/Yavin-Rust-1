@@ -5,6 +5,7 @@ import type { DocumentService } from "../../services/documents";
 import type { EditorViews } from "../../services/editorViews";
 import type { CursorStatusStore } from "../../services/cursorStatus";
 import type { MinimapPreferences } from "../../services/minimapPreferences";
+import type { EditorSettings } from "../../editor/editorSettings";
 import type { MarkdownLink } from "../../services/markdownLinks";
 import type { MarkdownPreviewHandle } from "./MarkdownPreview";
 import type { EditorTab, RecentFile } from "../../types";
@@ -82,6 +83,7 @@ export function EditorArea({
   cursorStatus,
   readOnly = false,
   minimap,
+  editorSettings,
   onMinimapChange,
   markdownMode,
   onMarkdownMode,
@@ -129,6 +131,8 @@ export function EditorArea({
   /** The document in front cannot be typed into (a file read-only on disk). */
   readOnly?: boolean;
   minimap?: MinimapPreferences;
+  /** The editor's settings as they resolve for the workspace (IDE-03). */
+  editorSettings?: EditorSettings;
   onMinimapChange?: (change: Partial<MinimapPreferences>) => void;
   /** Set for a Markdown document: how it is shown, and the buttons that change it. */
   markdownMode?: MarkdownMode;
@@ -465,6 +469,7 @@ export function EditorArea({
                       readOnly={readOnly}
                       onCommandPalette={onOpenCommandPalette}
                       minimap={minimap}
+                      editorSettings={editorSettings}
                       onMinimapChange={onMinimapChange}
                       languageFeatures={languageFeatures}
                     />

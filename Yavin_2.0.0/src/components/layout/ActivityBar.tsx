@@ -3,11 +3,15 @@ export function ActivityBar({
   gitBadge = "",
   onSelectTab,
   onOpenSettings,
+  onOpenAccounts = onOpenSettings,
 }: {
   activeTab: string;
   gitBadge?: string;
   onSelectTab: (tab: string) => void;
+  /** The gear: the Settings view (Ctrl+,). */
   onOpenSettings: () => void;
+  /** The account button; there are no accounts yet. */
+  onOpenAccounts?: () => void;
 }) {
   const topTabs = [
     {
@@ -166,7 +170,7 @@ export function ActivityBar({
       {/* Bottom Profile & Settings */}
       <div className="mt-auto flex flex-col items-center gap-1.5 w-full">
         <button
-          onClick={onOpenSettings}
+          onClick={onOpenAccounts}
           title="Accounts"
           className="group relative flex size-10 items-center justify-center rounded-lg text-ink-3 hover:text-ink-2 hover:bg-[#080808] transition-all"
         >

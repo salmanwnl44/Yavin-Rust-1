@@ -13,6 +13,8 @@ import { createTerminalUi } from "./terminalUi.ts";
 import type { TerminalUi } from "./terminalUi.ts";
 import { createProfileRegistry } from "./terminalProfiles.ts";
 import { createTerminalSettings } from "./terminalSettings.ts";
+import { createSettingsRegistry } from "./settings/settings.ts";
+import { EDITOR_SETTING_LIST } from "../editor/editorSettings.ts";
 import type { WorkspaceContext, WorkspaceId } from "./workspaceManager.ts";
 
 /**
@@ -73,6 +75,13 @@ export const terminalServices = createTerminalServices({
 export const gitStorageKey = (id: WorkspaceId) => `yavin.git.repos:${id}`;
 /** Where they were remembered for every folder at once, before workspaces had their own. */
 const LEGACY_GIT_KEY = "yavin.git.repos";
+
+/**
+ * The window's settings (IDE-03): user and per-workspace preferences, each defined by the
+ * subsystem it belongs to and applied there. Only the editor's for now; the terminal keeps its
+ * own (`terminalSettings`, below).
+ */
+export const settings = createSettingsRegistry(EDITOR_SETTING_LIST);
 
 /**
  * What the terminal keeps across restarts (TERMINAL-07): profiles, defaults, the integration

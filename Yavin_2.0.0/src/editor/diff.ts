@@ -26,6 +26,11 @@ export function createDiffView(
     modified: EditorModel;
     /** The modified side too, when the view is a review rather than an editor. */
     readOnly?: boolean;
+    /**
+     * A theme to switch to. Without one the diff shows in the theme already in use: Monaco's
+     * theme is the whole window's, and it is the editor's theme setting (IDE-03).
+     */
+    theme?: string;
   },
 ): DiffView {
   const modified = textModelOf(options.modified);
@@ -39,7 +44,7 @@ export function createDiffView(
     originalEditable: false,
     readOnly: options.readOnly ?? false,
     renderSideBySide: true,
-    theme: "yavin-dark",
+    ...(options.theme ? { theme: options.theme } : {}),
   });
   editor.setModel({ original, modified });
   return {

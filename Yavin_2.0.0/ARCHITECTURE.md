@@ -544,7 +544,7 @@ Filesystem -> resource-changes (Module 02) -> DocumentService.applyResourceChang
 
 **Languages** are mapped from the Document Model's language id (`monacoLanguage` in `editor/monacoHost.ts`): TypeScript and TSX to `typescript`, JavaScript and JSX to `javascript`, TOML, ignore files and properties to `ini`, shell scripts to `shell`, C and C++ to `cpp`, the rest by name, otherwise `plaintext`. A rename that changes the extension changes the model's language. JSON is registered as its own id and coloured with the JavaScript tokenizer: Monaco's JSON language feature starts a language service and needs contributions this build leaves out. Completion, hover, signature help and the rest come from language servers ([Language servers](#language-servers-lsp-platform)); with none for a document, nothing pretends to be one.
 
-**Settings and themes.** `editor/editorSettings.ts` is the one place editor options are made (`editorOptions(settings, view)`), from `DEFAULT_EDITOR_SETTINGS` plus the window's word wrap, zoom and read-only state, and the minimap's look. That one is changed from the minimap's right-click menu or View › Minimap and remembered on this computer (`services/minimapPreferences.ts`: browser storage, validated field by field, failures ignored). The editor's own right-click menu is Monaco's editing menu with Command Palette added last. The themes `yavin-dark` and `yavin-light` are defined in `editor/monaco.ts`.
+**Settings and themes.** `editor/editorSettings.ts` is the one place editor options are made (`editorOptions(settings, view)`), from the editor's settings (IDE-03, see "Settings": font, size, tabs, line numbers, word wrap, theme, zoom, as they resolve for the workspace) over `DEFAULT_EDITOR_SETTINGS`, plus read-only state and the minimap's look. That one is changed from the minimap's right-click menu or View › Minimap and remembered on this computer (`services/minimapPreferences.ts`: browser storage, validated field by field, failures ignored). The editor's own right-click menu is Monaco's editing menu with Command Palette added last. The themes `yavin-dark` and `yavin-light` are defined in `editor/monaco.ts`.
 
 **Decorations.** `bridge.setDecorations(key, owner, decorations)` replaces one owner's decorations on one document (offset ranges, a class name, whole-line, a plain-text hover); other owners' are untouched. They live on the model, so they follow renames. Hover text is never treated as HTML or as a trusted link.
 
@@ -671,6 +671,125 @@ A cancelled search says "Search cancelled", a failed one "Search failed: …".
 - search history;
 - `$1` replacement;
 - an index.
+
+## Settings
+
+IDE-03 is the general settings foundation: user and workspace preferences, kept, validated, resolved and announced by one registry. What a setting _does_ stays with the subsystem it belongs to.
+
+```text
+SettingDefinition<T>   defined by its subsystem: id, title, description, default, scopes, parse (validation), control
+      │                (editor/editorSettings.ts: EDITOR_SETTINGS)
+SettingsRegistry       services/settings/settings.ts, one per window (`settings` in workspaces.ts)
+      ├─ user values        yavin.settings.user                        {version: 1, values: {id: value}}
+      └─ workspace values   yavin.settings.workspace:<WorkspaceId>     same shape
+      resolve(definition, workspace) = workspace value ?? user value ?? default
+      subscribe(workspace, listener) -> SettingChange {id, workspace, previous, value, source}
+      ▼
+owning subsystem applies it: the editor (useEditorSettings -> CodeEditor.updateOptions, in place)
+SettingsView           components/settings/SettingsView.tsx: a view of the registry (and the terminal's store)
+```
+
+**Ownership.**
+
+| Owner          | Owns                                                                                                                                                                                                                      |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The registry   | the framework: storage, validation by the definitions, resolution, change events, reset. It knows no setting and no component.                                                                                            |
+| Each subsystem | its own definitions and their effect. The editor defines `EDITOR_SETTINGS` and applies them (`resolveEditorSettings`, `useEditorSettings`).                                                                               |
+| The terminal   | its own settings, still (`terminalSettings.ts`, TERMINAL-07). The Settings view shows its shell-integration setting and default profile and changes them through that store and the profile registry, never copying them. |
+
+Git's repository lists, the session file and Workspace Trust remain their owners' too.
+
+**Scopes.** Each definition says where it may be set:
+
+- `user`: everywhere;
+- `workspace`: one workspace, by `WorkspaceId`, never its name. A workspace value overrides the user's.
+
+Zoom is the window's, so it is user-only. With no folder open there is no workspace scope.
+
+**Resolution and reset.** A setting resolves to the workspace value, else the user value, else the default. Resetting a scope removes its value, so the next one applies again: with default 14, user 18 and workspace 20, resetting the workspace gives 18, and then resetting the user gives 14.
+
+**Validation.** Every value is validated at runtime by its definition, never by its TypeScript type alone: boolean, bounded or integer number, enum, or a one-line string of bounded length.
+
+- A runtime value that is invalid throws `SettingsError` and changes nothing.
+- An invalid stored value is ignored, reported once, and **kept** in the record, never silently deleted. The next scope or the default applies, and its valid siblings stand.
+- A stored value for a setting this version does not know is kept as well.
+
+**Persistence** follows T07's rules, implemented once in the registry:
+
+- an unreadable record (not JSON, truncated, no version) is copied to `<key>.corrupt` before anything is written over it, and the defaults apply;
+- a record from a newer version is not read and never written over;
+- storage that is blocked or full still lets settings apply for the window.
+
+Problems are reported once through the window's error banner (`takeProblems`, `onProblems`). Writes are immediate: settings change rarely. Version 1 is the first; a later version migrates on read, and an older Yavin leaves it alone.
+
+**Change events.** There is no bus. A listener subscribes for one workspace, or for the user level, and hears only changes that move what _that_ workspace resolves to, with the previous and new values and their source.
+
+- A user change reaches every workspace without an override. A workspace's change reaches only that workspace.
+- Unsubscribing with nothing left drops the workspace's listener set.
+- `useEditorSettings` subscribes for the workspace in the window, re-renders only for the editor's own settings, and hands `CodeEditor` a stable object, which applies it with `updateOptions`. Nothing is reloaded, no editor is recreated, and the terminal, Git and LSP are untouched.
+
+**Editor settings.**
+
+| Setting               | Values                                                     | Default                                       |
+| --------------------- | ---------------------------------------------------------- | --------------------------------------------- |
+| `editor.fontFamily`   | one line, at most 300 characters                           |                                               |
+| `editor.fontSize`     | 6–48, integer                                              | 13. Lines are 22/13 times as tall, as before. |
+| `editor.tabSize`      | 1–16                                                       |                                               |
+| `editor.insertSpaces` | boolean                                                    |                                               |
+| `editor.lineNumbers`  | on, relative, off                                          |                                               |
+| `editor.wordWrap`     | boolean                                                    |                                               |
+| `editor.theme`        | `yavin-dark`, `yavin-light` (the two themes Yavin defines) |                                               |
+| `editor.zoom`         | 0.7–2, user only                                           |                                               |
+
+- With nothing set, the editor is exactly as before.
+- View › Word Wrap and Zoom In/Out/Reset write these settings, to the workspace if it holds a value, else to the user's. They were window state lost on restart, and there is still one store for each.
+- Monaco's theme is the window's, so a diff follows it (`createDiffView` no longer forces the dark theme).
+
+**Settings view.** The gear and Ctrl+, (File › Settings) open it in the editor's place, and opening a file closes it.
+
+- It has User and Workspace tabs. The Workspace tab needs an open folder and overrides the User tab.
+- A search box filters settings by title, description and id.
+- Sections are Editor, then Terminal.
+- Each row shows its description, its value, where the value comes from (default, user settings, this workspace), and a Reset for the shown scope.
+- An invalid entry is refused with its reason.
+
+The Accounts button keeps its old action (the command palette); there are no accounts.
+
+**Not settings.** Open tabs and the active tab (session), terminal sessions and their output, Git state, diagnostics, LSP runtime state and Explorer expansion are session or runtime state with their own owners. Nothing in Settings is written into a project: there is no `.yavin/`.
+
+**Existing islands.**
+
+| Island                                                                    | Decision                                                                              |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Terminal settings, profiles and layout                                    | keep: owned by `terminalSettings`                                                     |
+| Session file, Workspace Trust                                             | keep: native, and not preferences                                                     |
+| Git repository lists                                                      | keep: Git's                                                                           |
+| Local Git `maxBlobBytes`                                                  | keep: the store's own format                                                          |
+| Commit drafts                                                             | keep: data, not preferences                                                           |
+| Minimap look; panel view; SCM sort, tree, grouped, sections; Outline open | migrate later: view preferences with their own menus and tests, low value to move now |
+
+**Deferred:** custom keybindings (Keyboard Shortcuts stays a read-only list), File › Preferences submenus, project `.yavin/` settings, and syncing.
+
+**Tests.**
+
+- `services/settings/settings.test.ts` covers:
+  - resolution, override and reset;
+  - workspace isolation;
+  - runtime validation;
+  - persistence across a restart;
+  - an invalid stored value kept, with its siblings surviving;
+  - malformed and truncated records, the `.corrupt` copy, a newer version, failing storage;
+  - events (previous, value, source), isolation and unsubscribing.
+- `services/settings/editorSettings.test.ts` covers the defaults matching the old editor, each setting reaching Monaco's options, validation, workspace isolation and a restart.
+- `tests/ui/settings.spec.ts` covers:
+  - the gear and Ctrl+,;
+  - live application, restart and reset;
+  - invalid input;
+  - the theme;
+  - Word Wrap and Zoom remembered;
+  - a workspace override across a switch and back, and its reset to the user value;
+  - a corrupt record reported once;
+  - the terminal's settings through its own store.
 
 ## Language servers (LSP platform)
 
