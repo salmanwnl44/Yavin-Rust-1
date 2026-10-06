@@ -85,6 +85,7 @@ export function EditorArea({
   minimap,
   editorSettings,
   debug,
+  extensions,
   onMinimapChange,
   markdownMode,
   onMarkdownMode,
@@ -136,6 +137,8 @@ export function EditorArea({
   editorSettings?: EditorSettings;
   /** The workspace's debugger: breakpoints and the paused line in the gutter (IDE-05). */
   debug?: ComponentProps<typeof import("./CodeEditor").default>["debug"];
+  /** Extensions in the editor (IDE-08). */
+  extensions?: ComponentProps<typeof import("./CodeEditor").default>["extensions"];
   onMinimapChange?: (change: Partial<MinimapPreferences>) => void;
   /** Set for a Markdown document: how it is shown, and the buttons that change it. */
   markdownMode?: MarkdownMode;
@@ -474,6 +477,7 @@ export function EditorArea({
                       minimap={minimap}
                       editorSettings={editorSettings}
                       debug={debug}
+                      extensions={extensions}
                       onMinimapChange={onMinimapChange}
                       languageFeatures={languageFeatures}
                     />

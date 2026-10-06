@@ -13,6 +13,12 @@ import type { EditorHandle, EditorState, LanguageFeatures } from "../../editor/e
 import { addReferencesAction, installLanguageFeatures } from "../../editor/lspMonaco";
 import { createDiffView } from "../../editor/diff";
 import { attachDebugDecorations } from "../../editor/debugMonaco";
+import { attachExtensionEditor } from "../../editor/extensionMonaco";
+import type {
+  DecorationStore,
+  DocumentInfo,
+  ProviderRegistry,
+} from "../../services/extensions/window";
 import type { Breakpoints } from "../../services/debug/breakpoints";
 import type { DebugService } from "../../services/debug/service";
 import type { ResourceUri } from "../../services/resource";
@@ -86,6 +92,7 @@ export default function CodeEditor({
   languageFeatures,
   editorSettings = DEFAULT_EDITOR_SETTINGS,
   debug,
+  extensions,
 }: {
   documentKey: string;
   documents: DocumentService;
@@ -118,6 +125,21 @@ export default function CodeEditor({
     service: DebugService;
     onToggleBreakpoint: (uri: ResourceUri, line: number) => void;
   };
+  /**
+   * Extensions in the editor (IDE-08): their language providers and decorations, and their
+   * `editor/context` menu items (those whose `when` matches the document in front).
+   */
+  extensions?: {
+    providers: ProviderRegistry;
+    decorations: DecorationStore;
+    infoOf: (doc: TextDocument) => DocumentInfo;
+    contextCommands: readonly {
+      command: string;
+      title: string;
+      when: { key: "resourceExtname" | "resourceLangId"; value: string } | null;
+    }[];
+    onRunCommand: (command: string) => void;
+  };
 }) {
   const container = useRef<HTMLDivElement>(null);
   const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -140,6 +162,7 @@ export default function CodeEditor({
     onCommandPalette,
     settings,
     debug,
+    extensions,
   });
   latest.current = {
     onState,
@@ -150,6 +173,7 @@ export default function CodeEditor({
     onCommandPalette,
     settings,
     debug,
+    extensions,
   };
 
   /** The cursor and indentation for the status bar; none while no document is shown. */
@@ -220,6 +244,20 @@ export default function CodeEditor({
     if (!debugService) return;
     return attachDebugDecorations(bridge, debugBreakpoints, debugService);
   }, [bridge, debugService, debugBreakpoints]);
+
+  // Extensions' providers and decorations (IDE-08), once for the window's one editor.
+  const extensionProviders = extensions?.providers;
+  const extensionDecorationStore = extensions?.decorations;
+  const extensionInfo = extensions?.infoOf;
+  useEffect(() => {
+    if (!extensionProviders || !extensionDecorationStore || !extensionInfo) return;
+    return attachExtensionEditor(
+      bridge,
+      extensionProviders,
+      extensionDecorationStore,
+      extensionInfo,
+    );
+  }, [bridge, extensionProviders, extensionDecorationStore, extensionInfo]);
 
   // The one Monaco editor.
   useEffect(() => {
@@ -295,6 +333,34 @@ export default function CodeEditor({
       if (TEST_HOOKS) removeTestHook(instance);
     };
   }, []);
+
+  // Extensions' editor/context items for the document in front (IDE-08): those whose `when`
+  // matches it, as the editor's own context-menu actions, run through the command registry.
+  const contextCommands = extensions?.contextCommands;
+  useEffect(() => {
+    const instance = editor.current;
+    const doc = documents.get(documentKey);
+    if (!instance || !doc || !contextCommands?.length) return;
+    const extension = (doc.name.match(/\.[^./\\]+$/)?.[0] ?? "").toLowerCase();
+    const actions = contextCommands
+      .filter(
+        (item) =>
+          !item.when ||
+          (item.when.key === "resourceExtname"
+            ? item.when.value.toLowerCase() === extension
+            : item.when.value === doc.languageId),
+      )
+      .map((item, order) =>
+        instance.addAction({
+          id: `yavin.ext.${item.command}`,
+          label: item.title,
+          contextMenuGroupId: "9_extensions",
+          contextMenuOrder: order,
+          run: () => latest.current.extensions?.onRunCommand(item.command),
+        }),
+      );
+    return () => actions.forEach((action) => action.dispose());
+  }, [contextCommands, documentKey, documents]);
 
   // The document shown.
   useEffect(() => {

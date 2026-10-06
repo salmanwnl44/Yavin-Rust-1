@@ -9,7 +9,7 @@
  */
 
 /** The extension API this Yavin provides. Bumped on a breaking change to `api.ts`. */
-export const EXTENSION_API = "1.0.0";
+export const EXTENSION_API = "2.0.0";
 /** The manifest formats this Yavin reads. */
 export const MANIFEST_VERSION = 1;
 /** The manifest's file name in an extension's folder. */
@@ -55,7 +55,25 @@ export interface ViewContribution {
   /** `<extensionId>.<name>`. */
   id: string;
   name: string;
-  location: "sidebar" | "panel";
+  /**
+   * `sidebar`: the Extensions side bar; `panel`: a tab of the bottom panel; `container`: its
+   * own Activity Bar container (`container` names it).
+   */
+  location: "sidebar" | "panel" | "container";
+  container: string | null;
+}
+
+/** An Activity Bar entry of an extension's own, holding its `container` views. */
+export interface ViewContainerContribution {
+  /** `<extensionId>.<name>`. */
+  id: string;
+  title: string;
+}
+
+/** When a menu item applies: one equality on what the menu is about. */
+export interface WhenClause {
+  key: "resourceExtname" | "resourceLangId";
+  value: string;
 }
 
 export type MenuLocation = "commandPalette" | "view/title" | "editor/context" | "explorer/context";
@@ -67,6 +85,8 @@ export interface MenuContribution {
   view: string | null;
   /** `commandPalette`: false hides the command from the palette (it still runs from elsewhere). */
   visible: boolean;
+  /** `editor/context`, `explorer/context`: shown only for what this matches (null: always). */
+  when: WhenClause | null;
 }
 
 export interface Contributions {
@@ -74,6 +94,7 @@ export interface Contributions {
   keybindings: KeybindingContribution[];
   settings: SettingContribution[];
   views: ViewContribution[];
+  viewContainers: ViewContainerContribution[];
   menus: MenuContribution[];
 }
 
@@ -94,6 +115,8 @@ export interface ExtensionManifest {
   contributes: Contributions;
   /** Runs its code in an untrusted folder (`capabilities.untrustedWorkspaces: true`). */
   untrustedWorkspaces: boolean;
+  /** Extensions that must be enabled, compatible and active first (`extensionDependencies`). */
+  dependencies: string[];
 }
 
 /** One thing wrong with a manifest. `field` is a JSON path into it. */
@@ -153,7 +176,14 @@ export function satisfies(version: string, range: string): boolean | null {
 }
 
 /** The contribution points this Yavin understands; anything else is reported, not fatal. */
-const CONTRIBUTION_POINTS = new Set(["commands", "keybindings", "configuration", "views", "menus"]);
+const CONTRIBUTION_POINTS = new Set([
+  "commands",
+  "keybindings",
+  "configuration",
+  "views",
+  "viewsContainers",
+  "menus",
+]);
 const MENU_LOCATIONS = new Set<MenuLocation>([
   "commandPalette",
   "view/title",
@@ -225,11 +255,24 @@ export function readManifest(value: unknown): ManifestResult {
   )
     error("main", "Must be a path inside the extension's folder.");
 
-  if (Array.isArray(raw.extensionDependencies) && raw.extensionDependencies.length)
-    error(
-      "extensionDependencies",
-      "Extensions that depend on other extensions are not supported yet.",
-    );
+  const dependencies: string[] = [];
+  if (raw.extensionDependencies !== undefined) {
+    if (!Array.isArray(raw.extensionDependencies))
+      error("extensionDependencies", "Must be a list of extension ids.");
+    else
+      raw.extensionDependencies.forEach((dependency, index) => {
+        const field = `extensionDependencies[${index}]`;
+        if (
+          typeof dependency !== "string" ||
+          !/^[a-z0-9][a-z0-9-]{0,49}\.[a-z0-9][a-z0-9-]{0,49}$/.test(dependency)
+        )
+          return error(field, "Must be an extension id (publisher.name).");
+        if (dependency === id) return error(field, "An extension cannot depend on itself.");
+        if (dependencies.includes(dependency))
+          return error(field, `"${dependency}" is listed twice.`);
+        dependencies.push(dependency);
+      });
+  }
 
   const capabilities = (raw.capabilities ?? {}) as Record<string, unknown>;
   const untrustedWorkspaces = capabilities.untrustedWorkspaces === true;
@@ -267,6 +310,7 @@ export function readManifest(value: unknown): ManifestResult {
     keybindings: [],
     settings: [],
     views: [],
+    viewContainers: [],
     menus: [],
   };
   const rawContributes = (raw.contributes ?? {}) as Record<string, unknown>;
@@ -407,6 +451,29 @@ export function readManifest(value: unknown): ManifestResult {
         }
     }
 
+    const containerIds = new Set<string>();
+    const containers = rawContributes.viewsContainers as Record<string, unknown> | undefined;
+    if (containers !== undefined) {
+      const activitybar = containers?.activitybar;
+      if (!Array.isArray(activitybar))
+        error("contributes.viewsContainers.activitybar", "Must be a list of containers.");
+      else
+        activitybar.forEach((entry, index) => {
+          const field = `contributes.viewsContainers.activitybar[${index}]`;
+          const container = entry as Record<string, unknown>;
+          if (!container || typeof container !== "object")
+            return error(field, "Must be an object.");
+          if (!owned(container.id))
+            return error(`${field}.id`, `Must be "${id ?? "publisher.name"}.<name>".`);
+          if (containerIds.has(container.id))
+            return error(`${field}.id`, `"${container.id}" is contributed twice.`);
+          if (!oneLine(container.title, 60))
+            return error(`${field}.title`, "Needs a one-line title.");
+          containerIds.add(container.id);
+          contributes.viewContainers.push({ id: container.id, title: container.title });
+        });
+    }
+
     const viewIds = new Set<string>();
     list("views").forEach((entry, index) => {
       const field = `contributes.views[${index}]`;
@@ -416,11 +483,17 @@ export function readManifest(value: unknown): ManifestResult {
         return error(`${field}.id`, `Must be "${id ?? "publisher.name"}.<name>".`);
       if (viewIds.has(view.id)) return error(`${field}.id`, `"${view.id}" is contributed twice.`);
       if (!oneLine(view.name, 60)) return error(`${field}.name`, "Needs a one-line name.");
-      const location = view.location ?? "sidebar";
-      if (location !== "sidebar" && location !== "panel")
-        return error(`${field}.location`, 'Must be "sidebar" or "panel".');
+      const location = view.location ?? (view.container !== undefined ? "container" : "sidebar");
+      if (location !== "sidebar" && location !== "panel" && location !== "container")
+        return error(`${field}.location`, 'Must be "sidebar", "panel" or "container".');
+      let container: string | null = null;
+      if (location === "container") {
+        if (typeof view.container !== "string" || !containerIds.has(view.container))
+          return error(`${field}.container`, "Must be one of this extension's view containers.");
+        container = view.container;
+      }
       viewIds.add(view.id);
-      contributes.views.push({ id: view.id, name: view.name, location });
+      contributes.views.push({ id: view.id, name: view.name, location, container });
     });
 
     const menus = rawContributes.menus;
@@ -450,11 +523,37 @@ export function readManifest(value: unknown): ManifestResult {
                 return error(`${at}.view`, "Must be one of this extension's views.");
               view = item.view;
             }
+            let when: WhenClause | null = null;
+            if (
+              (location === "editor/context" || location === "explorer/context") &&
+              item.when !== undefined
+            ) {
+              const match =
+                typeof item.when === "string"
+                  ? /^(resourceExtname|resourceLangId) == ([A-Za-z0-9._+#-]{1,40})$/.exec(
+                      item.when.trim(),
+                    )
+                  : null;
+              if (!match)
+                return error(
+                  `${at}.when`,
+                  'Must be "resourceExtname == .ext" or "resourceLangId == id" (no other conditions are supported).',
+                );
+              when = { key: match[1] as WhenClause["key"], value: match[2] };
+            }
+            const duplicate = contributes.menus.some(
+              (existing) =>
+                existing.location === location &&
+                existing.command === item.command &&
+                existing.view === view,
+            );
+            if (duplicate) return error(at, `"${item.command}" is in this menu twice.`);
             contributes.menus.push({
               location: location as MenuLocation,
               command: item.command,
               view,
               visible: item.when !== "false" && item.when !== false,
+              when,
             });
           });
         }
@@ -507,6 +606,7 @@ export function readManifest(value: unknown): ManifestResult {
       main: main as string | null,
       contributes,
       untrustedWorkspaces,
+      dependencies,
     },
   };
 }

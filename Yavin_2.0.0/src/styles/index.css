@@ -367,3 +367,21 @@ body,
 .yavin-debug-current-line {
   background: rgba(255, 204, 0, 0.14);
 }
+
+/* Extension decorations (IDE-08, `editor/extensionMonaco.ts`): a fixed set of styles -- an
+   extension names one, it never supplies CSS. */
+.yavin-ext-highlight {
+  background: rgba(99, 102, 241, 0.22);
+}
+.yavin-ext-underline-info {
+  text-decoration: underline wavy rgba(96, 165, 250, 0.9);
+}
+.yavin-ext-underline-warning {
+  text-decoration: underline wavy rgba(251, 191, 36, 0.9);
+}
+.yavin-ext-underline-error {
+  text-decoration: underline wavy rgba(248, 113, 113, 0.9);
+}
+.yavin-ext-dimmed {
+  opacity: 0.5;
+}

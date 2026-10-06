@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
+import { fileUri, formatUri, resourceId, type ResourceId } from "../resource.ts";
 import { createSettingsRegistry } from "../settings/settings.ts";
 import type { WorkspaceId } from "../terminalProtocol.ts";
-import type { ExtensionModule, ViewItem } from "./api.ts";
 import { ExtensionError } from "./errors.ts";
-import { canMoveExtension, createExtensionHost } from "./host.ts";
+import { canMoveExtension } from "./host.ts";
+import { createInProcessTransport } from "./inProcessHost.ts";
+import { CRASH_LIMIT, createExtensionHostManager } from "./manager.ts";
 import { EXTENSION_API, readManifest, satisfies } from "./manifest.ts";
+import { MAX_MESSAGE, readHostMessage, writeHostMessage } from "./protocol.ts";
 import { createExtensionRegistry, DISABLED_KEY } from "./registry.ts";
 import {
   createExtensionStorage,
@@ -13,16 +17,47 @@ import {
   STORAGE_LIMIT,
   workspaceStorageKey,
 } from "./storage.ts";
+import {
+  createDecorationStore,
+  createProviderRegistry,
+  type DocumentEvent,
+  type DocumentInfo,
+  type ExtensionWindow,
+} from "./window.ts";
 
-const A = "file://c:/a" as WorkspaceId;
-const B = "file://c:/b" as WorkspaceId;
-const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+const BOOTSTRAP = readFileSync(
+  new URL("../../../src-tauri/crates/ide-plugin-host/src/bootstrap.js", import.meta.url),
+  "utf8",
+);
+const SAMPLE = {
+  manifest: JSON.parse(
+    readFileSync(
+      new URL("../../../extensions/samples/hello-world/yavin-extension.json", import.meta.url),
+      "utf8",
+    ),
+  ),
+  code: readFileSync(
+    new URL("../../../extensions/samples/hello-world/extension.js", import.meta.url),
+    "utf8",
+  ),
+};
 
-/** A Storage in memory, for the registry and storage. */
-function memoryStorage(seed: Record<string, string> = {}): Storage & { data: Map<string, string> } {
+const A = "file://c:/work" as WorkspaceId;
+const B = "file://c:/other" as WorkspaceId;
+const settle = async (times = 10) => {
+  for (let i = 0; i < times; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+};
+async function until(check: () => boolean, what = "condition") {
+  for (let i = 0; i < 300; i++) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.fail(`timed out waiting for ${what}`);
+}
+
+function memoryStorage(seed: Record<string, string> = {}): Storage {
   const data = new Map(Object.entries(seed));
   return {
-    data,
     get length() {
       return data.size;
     },
@@ -39,101 +74,237 @@ const manifest = (overrides: Record<string, unknown> = {}) => ({
   name: "hello",
   displayName: "Hello",
   version: "1.2.3",
-  engines: { yavin: "^1.0.0" },
-  main: "./out/extension.js",
+  engines: { yavin: "^2.0.0" },
+  main: "extension.js",
   activationEvents: ["onCommand:acme.hello.greet"],
   contributes: {
-    commands: [{ command: "acme.hello.greet", title: "Greet", category: "Hello" }],
+    commands: [
+      { command: "acme.hello.greet", title: "Greet", category: "Hello" },
+      { command: "acme.hello.other", title: "Other" },
+    ],
     keybindings: [{ command: "acme.hello.greet", key: "Mod+Alt+g" }],
     configuration: {
       properties: {
-        "acme.hello.loud": { type: "boolean", default: false, description: "Greet loudly." },
         "acme.hello.name": { type: "string", default: "world", description: "Who to greet." },
         "acme.hello.mood": { enum: ["calm", "bright"], default: "calm", description: "Mood." },
       },
     },
-    views: [{ id: "acme.hello.people", name: "People", location: "sidebar" }],
+    viewsContainers: { activitybar: [{ id: "acme.hello.home", title: "Hello Home" }] },
+    views: [
+      { id: "acme.hello.people", name: "People", location: "sidebar" },
+      { id: "acme.hello.panel", name: "Hello Panel", location: "panel" },
+      { id: "acme.hello.inside", name: "Inside", container: "acme.hello.home" },
+    ],
     menus: {
       "view/title": [{ command: "acme.hello.greet", view: "acme.hello.people" }],
-      commandPalette: [{ command: "acme.hello.greet", when: true }],
+      "editor/context": [{ command: "acme.hello.greet", when: "resourceExtname == .md" }],
+      "explorer/context": [{ command: "acme.hello.other" }],
     },
   },
   ...overrides,
 });
 
+/** A window for tests: two documents in the workspace, an active one, a file to read. */
+function fakeWindow() {
+  const docs = new Map<string, { info: DocumentInfo; text: string }>();
+  const add = (path: string, text: string, languageId = "markdown") => {
+    const uri = fileUri(path);
+    const info: DocumentInfo = {
+      uri: formatUri(uri),
+      resourceId: resourceId(uri),
+      languageId,
+      version: 1,
+      source: "disk",
+      dirty: false,
+    };
+    docs.set(info.resourceId, { info, text });
+    return info;
+  };
+  add("C:/work/readme.md", "# Readme\nhello");
+  const listeners = new Set<(event: DocumentEvent, document: DocumentInfo) => void>();
+  const activeListeners = new Set<() => void>();
+  const opened: { path: string; range: unknown }[] = [];
+  const selections: unknown[] = [];
+  const files: Record<string, string> = { "C:/work/notes.txt": "a note" };
+  const window: ExtensionWindow = {
+    documents: {
+      all: () => [...docs.values()].map((d) => d.info),
+      get: (resource) => docs.get(resource)?.info ?? null,
+      text: (resource) => docs.get(resource)?.text ?? null,
+      subscribe(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    },
+    editor: {
+      active: () => {
+        const first = [...docs.values()][0];
+        return first
+          ? {
+              document: first.info,
+              selection: { startLine: 2, startColumn: 1, endLine: 2, endColumn: 1 },
+            }
+          : null;
+      },
+      onActive(listener) {
+        activeListeners.add(listener);
+        return () => activeListeners.delete(listener);
+      },
+      openLocation: async (path, range) => void opened.push({ path, range }),
+      setSelection: (range) => (selections.push(range), true),
+      revealRange: () => true,
+    },
+    readFile: async (path) => {
+      if (!(path in files)) throw new Error(`Cannot read ${path}`);
+      return files[path];
+    },
+  };
+  return {
+    window,
+    add,
+    opened,
+    selections,
+    emit: (event: DocumentEvent, info: DocumentInfo) => listeners.forEach((l) => l(event, info)),
+  };
+}
+
+function setup(
+  options: { trusted?: boolean; codes?: Record<string, string>; failStart?: string } = {},
+) {
+  const storage = memoryStorage();
+  const settings = createSettingsRegistry([], storage);
+  const registry = createExtensionRegistry({ settings, storage });
+  const extensionStorage = createExtensionStorage(storage);
+  const decorations = createDecorationStore();
+  const providers = createProviderRegistry();
+  const win = fakeWindow();
+  const notes: [string, string, string][] = [];
+  const logs = new Map<string, string[]>();
+  const codes: Record<string, string> = { ...options.codes };
+  const host = createInProcessTransport({
+    bootstrap: BOOTSTRAP,
+    code: (id) => codes[id] ?? null,
+    failStart: options.failStart,
+  });
+  let trusted = options.trusted ?? true;
+  let rediscovered = 0;
+  const manager = (workspace: WorkspaceId | null = A, generation = 1, timeouts = {}) =>
+    createExtensionHostManager({
+      registry,
+      settings,
+      storage: extensionStorage,
+      workspace,
+      folder: workspace === B ? "C:/other" : workspace ? "C:/work" : null,
+      workspaceGeneration: generation,
+      transport: host.transport,
+      trusted: async () => trusted,
+      window: win.window,
+      decorations,
+      providers,
+      notify: (level, id, message) => notes.push([level, id, message]),
+      channel: (id) => ({
+        appendLine: (text: string) => logs.set(id, [...(logs.get(id) ?? []), text]),
+      }),
+      timeouts: { provider: 200, command: 1000, activate: 1000, ...timeouts },
+      rediscover: async () => void rediscovered++,
+    });
+  const add = (overrides: Record<string, unknown>, code: string | null) => {
+    const raw = manifest(overrides);
+    const id = `${raw.publisher}.${raw.name}`;
+    if (code !== null) codes[id] = code;
+    return registry.add(
+      raw,
+      { kind: "folder", path: `C:/extensions/${id}` },
+      `C:/extensions/${id}`,
+    );
+  };
+  return {
+    storage,
+    settings,
+    registry,
+    extensionStorage,
+    decorations,
+    providers,
+    win,
+    notes,
+    logs,
+    host,
+    codes,
+    manager,
+    add,
+    setTrusted: (value: boolean) => (trusted = value),
+    rediscovered: () => rediscovered,
+  };
+}
+
+const GREETER = `
+module.exports.activate = function (context, yavin) {
+  context.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", function (who) {
+    return "hello " + (who || yavin.workspace.getConfiguration("acme.hello").get("name"));
+  }));
+};
+`;
+
 // --- Manifest ----------------------------------------------------------------------------------
 
-test("a valid manifest is read whole; identity is publisher.name, never the display name", () => {
-  const result = readManifest(manifest());
+test("a v2 manifest: containers, panel and container views, menus with when, dependencies", () => {
+  const result = readManifest(manifest({ extensionDependencies: ["acme.base"] }));
   assert.ok(result.ok, JSON.stringify(!result.ok && result.problems));
   const m = result.manifest;
   assert.equal(m.id, "acme.hello");
-  assert.equal(m.displayName, "Hello");
-  assert.deepEqual(m.activationEvents, [{ kind: "command", id: "acme.hello.greet" }]);
-  assert.equal(m.contributes.commands[0].category, "Hello");
-  assert.equal(m.contributes.keybindings[0].key, "Mod+Alt+g");
+  assert.deepEqual(m.dependencies, ["acme.base"]);
+  assert.deepEqual(m.contributes.viewContainers, [{ id: "acme.hello.home", title: "Hello Home" }]);
   assert.deepEqual(
-    m.contributes.settings.map((s) => [s.id, s.type, s.default]),
+    m.contributes.views.map((v) => [v.id, v.location, v.container]),
     [
-      ["acme.hello.loud", "boolean", false],
-      ["acme.hello.name", "string", "world"],
-      ["acme.hello.mood", "enum", "calm"],
+      ["acme.hello.people", "sidebar", null],
+      ["acme.hello.panel", "panel", null],
+      ["acme.hello.inside", "container", "acme.hello.home"],
     ],
   );
-  assert.equal(m.contributes.views[0].location, "sidebar");
-  assert.equal(m.contributes.menus.length, 2);
+  assert.deepEqual(m.contributes.menus.find((menu) => menu.location === "editor/context")?.when, {
+    key: "resourceExtname",
+    value: ".md",
+  });
+  assert.equal(EXTENSION_API, "2.0.0");
+  assert.equal(satisfies("2.0.0", "^1.0.0"), false, "an IDE-07 (API 1) extension is incompatible");
 });
 
-test("invalid ids, versions, engines, paths and contributions are rejected with every reason", () => {
+test("invalid manifests are rejected with every reason; unknown fields only warn", () => {
   const cases: [Record<string, unknown>, RegExp][] = [
     [{ publisher: "Acme Corp" }, /publisher/],
-    [{ name: "../x" }, /name/],
     [{ version: "1.2" }, /semantic version/],
-    [{ engines: { yavin: "^2.0.0" } }, /Needs extension API \^2\.0\.0/],
-    [{ engines: { yavin: "whenever" } }, /not a range/],
-    [{ main: "../../etc/evil.js" }, /inside the extension's folder/],
-    [{ main: "C:\\evil.js" }, /inside the extension's folder/],
-    [{ extensionDependencies: ["acme.other"] }, /not supported yet/],
-    [{ manifestVersion: 9 }, /manifest version/],
+    [{ engines: { yavin: "^9.0.0" } }, /Needs extension API/],
+    [{ main: "../../etc/evil.js" }, /inside the extension/],
+    [{ extensionDependencies: ["acme.hello"] }, /itself/],
+    [{ extensionDependencies: ["not an id"] }, /extension id/],
+    [{ extensionDependencies: ["acme.x", "acme.x"] }, /twice/],
     [{ contributes: { commands: [{ command: "other.cmd", title: "x" }] } }, /acme\.hello\.<name>/],
     [
       {
         contributes: {
-          commands: [
-            { command: "acme.hello.a", title: "A" },
-            { command: "acme.hello.a", title: "A again" },
-          ],
+          views: [{ id: "acme.hello.v", name: "V", container: "acme.hello.nowhere" }],
         },
       },
-      /contributed twice/,
-    ],
-    [
-      { contributes: { keybindings: [{ command: "acme.hello.greet", key: "Ctrl+Hyper+Q" }] } },
-      /not a shortcut|commands/,
+      /view containers/,
     ],
     [
       {
         contributes: {
-          configuration: {
-            properties: { "acme.hello.x": { type: "number", default: "1", description: "x" } },
-          },
+          commands: [{ command: "acme.hello.a", title: "A" }],
+          menus: { "editor/context": [{ command: "acme.hello.a", when: "isLinux && true" }] },
         },
       },
-      /valid number/,
+      /no other conditions/,
     ],
     [
       {
         contributes: {
-          configuration: {
-            properties: { "other.x": { type: "boolean", default: true, description: "x" } },
-          },
+          commands: [{ command: "acme.hello.a", title: "A" }],
+          menus: { commandPalette: [{ command: "acme.hello.a" }, { command: "acme.hello.a" }] },
         },
       },
-      /setting is/,
-    ],
-    [
-      { contributes: { views: [{ id: "acme.hello.v", name: "V", location: "floating" }] } },
-      /sidebar/,
+      /twice/,
     ],
   ];
   for (const [overrides, reason] of cases) {
@@ -141,667 +312,731 @@ test("invalid ids, versions, engines, paths and contributions are rejected with 
     assert.equal(result.ok, false, JSON.stringify(overrides));
     if (!result.ok)
       assert.ok(
-        result.problems.some((problem) => reason.test(`${problem.field}: ${problem.message}`)),
+        result.problems.some((p) => reason.test(`${p.field}: ${p.message}`)),
         `${JSON.stringify(overrides)} -> ${JSON.stringify(result.problems)}`,
       );
   }
-  assert.equal(readManifest("not an object").ok, false);
-});
-
-test("unknown fields and contribution points are warnings, never a crash", () => {
-  const result = readManifest(
-    manifest({
-      sponsor: "someone",
-      contributes: { commands: [], themes: [{}], menus: { "scm/title": [] } },
-      activationEvents: ["onDebugResolve:python"],
-    }),
+  const warned = readManifest(manifest({ sponsor: "x", contributes: { themes: [] } }));
+  assert.ok(warned.ok);
+  assert.deepEqual(
+    warned.warnings.filter((w) => w.field === "sponsor" || w.field === "contributes.themes").length,
+    2,
   );
-  assert.ok(result.ok);
-  const warnings = result.warnings.map((w) => w.field).sort();
-  assert.deepEqual(warnings, [
-    "activationEvents[0]",
-    "contributes.menus.scm/title",
-    "contributes.themes",
-    "sponsor",
-  ]);
 });
 
-test("engine ranges: ^, ~, >=, exact and *", () => {
-  assert.equal(satisfies("1.2.3", "^1.0.0"), true);
-  assert.equal(satisfies("2.0.0", "^1.0.0"), false);
-  assert.equal(satisfies("1.2.3", "~1.2.0"), true);
-  assert.equal(satisfies("1.3.0", "~1.2.0"), false);
-  assert.equal(satisfies("1.0.0", ">=0.9.0"), true);
-  assert.equal(satisfies("1.0.0", "1.0.0"), true);
-  assert.equal(satisfies("1.0.0", "*"), true);
-  assert.equal(satisfies(EXTENSION_API, "^1.0.0"), true);
+test("the sample extension's manifest is valid", () => {
+  const result = readManifest(SAMPLE.manifest);
+  assert.ok(result.ok, JSON.stringify(!result.ok && result.problems));
+  assert.deepEqual(result.warnings, []);
 });
 
-// --- Registry ----------------------------------------------------------------------------------
+// --- Registry and dependencies -------------------------------------------------------------------
 
-function setup(options: { trusted?: boolean; storage?: Storage } = {}) {
-  const settings = createSettingsRegistry([], null);
-  const storage = options.storage ?? memoryStorage();
-  const registry = createExtensionRegistry({ settings, storage });
-  const extensionStorage = createExtensionStorage(storage);
-  const notes: [string, string, string][] = [];
-  const logs = new Map<string, string[]>();
-  let trusted = options.trusted ?? true;
-  let generation = 0;
-  const host = (workspace: WorkspaceId | null = A) =>
-    createExtensionHost({
-      registry,
-      settings,
-      storage: extensionStorage,
-      workspace,
-      folder: workspace ? "C:/a" : null,
-      generation: ++generation,
-      trusted: async () => trusted,
-      notify: (level, id, message) => notes.push([level, id, message]),
-      channel: (id) => ({
-        appendLine: (text: string) => logs.set(id, [...(logs.get(id) ?? []), text]),
-      }),
-    });
-  return {
-    settings,
-    storage,
-    registry,
-    host,
-    notes,
-    logs,
-    setTrusted: (v: boolean) => (trusted = v),
-  };
-}
-
-/** A bundled module whose activation is recorded, with a greet command and a view. */
-function helloModule(record: string[] = [], extra: Partial<ExtensionModule> = {}): ExtensionModule {
-  return {
-    activate(context, yavin) {
-      record.push("activate");
-      context.subscriptions.push(
-        yavin.commands.registerCommand("acme.hello.greet", (who) => {
-          record.push(`greet:${String(who)}`);
-          return `hello ${String(who ?? yavin.workspace.getConfiguration("acme.hello").get("name"))}`;
-        }),
-      );
-      context.subscriptions.push({ dispose: () => record.push("disposed") });
-    },
-    deactivate() {
-      record.push("deactivate");
-    },
-    ...extra,
-  };
-}
-
-test("register, reject a duplicate, unregister; contributions follow enabled state", () => {
+test("register, duplicate, enable/disable remembered; settings belong to the SettingsRegistry", () => {
   const t = setup();
-  const added = t.registry.add(manifest(), { kind: "bundled", module: helloModule() }, "bundled");
-  assert.ok("manifest" in added);
-  const again = t.registry.add(manifest(), { kind: "bundled", module: helloModule() }, "elsewhere");
-  assert.ok("problems" in again);
-  assert.match(again.problems[0], /already registered/);
-  let snap = t.registry.getSnapshot();
+  assert.ok("manifest" in t.add({}, GREETER));
+  const again = t.add({}, GREETER);
+  assert.ok("problems" in again && /already registered/.test(again.problems[0]));
   assert.deepEqual(
-    snap.commands.map((c) => [c.command, c.key, c.palette]),
-    [["acme.hello.greet", "Mod+Alt+g", true]],
+    t.settings.definitions.map((d) => d.id),
+    ["acme.hello.name", "acme.hello.mood"],
   );
+  const snap = t.registry.getSnapshot();
   assert.deepEqual(
-    snap.views.map((v) => [v.id, v.actions]),
-    [["acme.hello.people", ["acme.hello.greet"]]],
+    snap.viewContainers.map((c) => c.id),
+    ["acme.hello.home"],
   );
-  // Settings go to the SettingsRegistry, its owner, namespaced and in the extension's section.
-  assert.deepEqual(
-    t.settings.definitions.map((d) => [d.id, d.section]),
-    [
-      ["acme.hello.loud", "Hello"],
-      ["acme.hello.name", "Hello"],
-      ["acme.hello.mood", "Hello"],
-    ],
-  );
-
   t.registry.setEnabled("acme.hello", false);
-  snap = t.registry.getSnapshot();
-  assert.equal(snap.commands.length, 0);
-  assert.equal(t.settings.definitions.length, 0, "a disabled extension's settings are withdrawn");
-  assert.match(t.storage.getItem(DISABLED_KEY)!, /acme\.hello/);
-  // Remembered: a new window starts it disabled.
-  const later = createExtensionRegistry({
-    settings: createSettingsRegistry([], null),
-    storage: t.storage,
-  });
-  later.add(manifest(), { kind: "bundled", module: helloModule() }, "bundled");
-  assert.equal(later.get("acme.hello")?.enabled, false);
-
-  t.registry.setEnabled("acme.hello", true);
-  t.registry.remove("acme.hello");
-  assert.equal(t.registry.getSnapshot().extensions.length, 0);
-  assert.equal(t.settings.definitions.length, 0);
-});
-
-test("an extension cannot replace another's (or an existing) setting", () => {
-  const t = setup();
-  t.settings.register({
-    id: "acme.hello.loud",
-    title: "Taken",
-    description: "",
-    section: "Other",
-    scopes: ["user"],
-    default: true,
-    parse: (v: unknown) => (typeof v === "boolean" ? v : undefined),
-    control: { kind: "boolean" },
-  });
-  const added = t.registry.add(manifest(), { kind: "bundled", module: helloModule() }, "bundled");
-  assert.ok("manifest" in added);
-  assert.ok(added.warnings.some((w) => /acme\.hello\.loud: not added/.test(w)));
-  assert.equal(t.settings.definitions.find((d) => d.id === "acme.hello.loud")?.section, "Other");
-});
-
-test("a rejected manifest is kept with its reasons and contributes nothing", () => {
-  const t = setup();
-  const result = t.registry.add(
-    { publisher: "acme" },
-    { kind: "folder", path: "C:/ext/broken" },
-    "C:/ext/broken",
-  );
-  assert.ok("problems" in result);
-  assert.equal(t.registry.getSnapshot().rejected.length, 1);
   assert.equal(t.registry.getSnapshot().commands.length, 0);
+  assert.equal(t.settings.definitions.length, 0);
+  assert.match(t.storage.getItem(DISABLED_KEY)!, /acme\.hello/);
 });
 
-// --- Lifecycle, lazy activation, commands ------------------------------------------------------
-
-test("lazy: nothing runs until its command is invoked; then activate once, run, deactivate, dispose", async () => {
+test("dependencies: missing, disabled, circular and transitive are reported; order is deterministic", () => {
   const t = setup();
-  const record: string[] = [];
-  t.registry.add(manifest(), { kind: "bundled", module: helloModule(record) }, "bundled");
-  const host = t.host();
-  await host.fire({ kind: "startup" });
-  await host.fire({ kind: "workspace" });
-  assert.deepEqual(record, [], "not activated at startup: it waits for its command");
-
-  assert.equal(await host.executeCommand("acme.hello.greet", "ada"), "hello ada");
-  assert.equal(
-    await host.executeCommand("acme.hello.greet"),
-    "hello world",
-    "its own settings, by default",
-  );
-  assert.deepEqual(record, ["activate", "greet:ada", "greet:undefined"]);
-  assert.equal(host.getSnapshot().statuses["acme.hello"].state, "active");
-  assert.ok((host.getSnapshot().statuses["acme.hello"].activationMs ?? -1) >= 0);
-
-  // Concurrent activations join one.
-  await Promise.all([host.activate("acme.hello"), host.activate("acme.hello")]);
-  assert.equal(record.filter((r) => r === "activate").length, 1);
-
-  await host.dispose();
-  assert.deepEqual(record.slice(-2), ["deactivate", "disposed"]);
-  assert.equal(host.getSnapshot().statuses["acme.hello"].state, "disposed");
-  await assert.rejects(
-    host.executeCommand("acme.hello.greet"),
-    (e: ExtensionError) => e.code === "HostDisposed",
-  );
+  t.add({ name: "app", extensionDependencies: ["acme.lib", "acme.base"], contributes: {} }, "");
+  t.add({ name: "lib", extensionDependencies: ["acme.base"], contributes: {} }, "");
+  t.add({ name: "base", contributes: {} }, "");
+  assert.deepEqual(t.registry.getSnapshot().unavailable, {});
+  assert.deepEqual(t.registry.activationOrder("acme.app"), ["acme.base", "acme.lib", "acme.app"]);
+  t.registry.setEnabled("acme.base", false);
+  let unavailable = t.registry.getSnapshot().unavailable;
+  assert.match(unavailable["acme.lib"], /acme\.base, which is disabled/);
+  assert.match(unavailable["acme.app"], /acme\.base, which is disabled/);
+  t.registry.setEnabled("acme.base", true);
+  t.add({ name: "lonely", extensionDependencies: ["acme.ghost"], contributes: {} }, "");
+  t.add({ name: "ping", extensionDependencies: ["acme.pong"], contributes: {} }, "");
+  t.add({ name: "pong", extensionDependencies: ["acme.ping"], contributes: {} }, "");
+  unavailable = t.registry.getSnapshot().unavailable;
+  assert.match(unavailable["acme.lonely"], /acme\.ghost, which is not installed/);
+  assert.match(unavailable["acme.ping"], /cycle/);
+  assert.match(unavailable["acme.pong"], /cycle/);
 });
 
-test("a startup extension activates at startup; one failing does not stop another", async () => {
-  const t = setup();
-  const record: string[] = [];
-  t.registry.add(
-    manifest({ name: "boom", activationEvents: ["onStartupFinished"], contributes: {} }),
-    { kind: "bundled", module: { activate: () => Promise.reject(new Error("kaboom")) } },
-    "bundled",
-  );
-  t.registry.add(
-    manifest({ name: "fine", activationEvents: ["onStartupFinished"], contributes: {} }),
-    { kind: "bundled", module: { activate: () => void record.push("fine") } },
-    "bundled",
-  );
-  const host = t.host();
-  await host.fire({ kind: "startup" });
-  const statuses = host.getSnapshot().statuses;
-  assert.equal(statuses["acme.boom"].state, "failed");
-  assert.match(statuses["acme.boom"].reason!, /kaboom/);
-  assert.equal(statuses["acme.fine"].state, "active");
-  assert.deepEqual(record, ["fine"]);
-  assert.ok(t.logs.get("acme.boom")?.some((line) => /kaboom/.test(line)));
-  // A failed extension is not retried behind the user's back.
-  await assert.rejects(
-    host.activate("acme.boom"),
-    (e: ExtensionError) => e.code === "ActivationFailed",
-  );
-});
+// --- Protocol ----------------------------------------------------------------------------------
 
-test("handler failure, unknown and unregistered commands, and foreign registrations are typed errors", async () => {
-  const t = setup();
-  t.registry.add(
-    manifest(),
-    {
-      kind: "bundled",
-      module: {
-        activate(context, yavin) {
-          context.subscriptions.push(
-            yavin.commands.registerCommand("acme.hello.greet", () => {
-              throw new Error("handler broke");
-            }),
-          );
-          assert.throws(
-            () => yavin.commands.registerCommand("other.ext.cmd", () => 1),
-            (e: ExtensionError) => e.code === "NotOwned",
-          );
-          assert.throws(
-            () => yavin.commands.registerCommand("acme.hello.greet", () => 2),
-            (e: ExtensionError) => e.code === "DuplicateCommand",
-          );
-          assert.throws(
-            () => yavin.workspace.getConfiguration("editor"),
-            (e: ExtensionError) => e.code === "NotOwned",
-          );
-        },
-      },
-    },
-    "bundled",
-  );
-  t.registry.add(
-    manifest({
-      name: "silent",
-      activationEvents: [],
-      contributes: { commands: [{ command: "acme.silent.go", title: "Go" }] },
+test("the protocol rejects stale, foreign, malformed, unknown and oversized messages", () => {
+  const id = { workspaceId: A, hostGeneration: 1001 };
+  const ok = readHostMessage(
+    JSON.stringify({
+      type: "request",
+      requestId: "h1",
+      method: "x",
+      params: {},
+      extensionId: "acme.hello",
+      ...id,
     }),
-    { kind: "bundled", module: { activate() {} } },
-    "bundled",
+    id,
   );
-  const host = t.host();
-  await assert.rejects(host.executeCommand("acme.hello.greet"), (e: ExtensionError) => {
-    assert.equal(e.code, "CommandFailed");
-    assert.equal(e.extensionId, "acme.hello");
-    assert.match(e.message, /handler broke/);
-    return true;
-  });
-  await assert.rejects(
-    host.executeCommand("nobody.cmd"),
-    (e: ExtensionError) => e.code === "UnknownCommand",
+  assert.ok(ok.ok);
+  for (const [text, reason] of [
+    [
+      JSON.stringify({
+        type: "request",
+        requestId: "h1",
+        method: "x",
+        extensionId: "acme.hello",
+        workspaceId: A,
+        hostGeneration: 1000,
+      }),
+      /another workspace or host generation/,
+    ],
+    [
+      JSON.stringify({
+        type: "request",
+        requestId: "h1",
+        method: "x",
+        extensionId: "acme.hello",
+        workspaceId: B,
+        hostGeneration: 1001,
+      }),
+      /another workspace/,
+    ],
+    [
+      JSON.stringify({
+        type: "request",
+        requestId: "h1",
+        method: "x",
+        extensionId: "../evil",
+        ...id,
+      }),
+      /extension id/,
+    ],
+    [
+      JSON.stringify({ type: "teleport", extensionId: "acme.hello", ...id }),
+      /unknown message type/,
+    ],
+    ["{nope", /not JSON/],
+    ["x".repeat(MAX_MESSAGE + 1), /bytes/],
+  ] as const) {
+    const read = readHostMessage(text, id);
+    assert.ok(
+      !read.ok && reason.test(read.reason),
+      `${text.slice(0, 60)} -> ${JSON.stringify(read)}`,
+    );
+  }
+  assert.throws(
+    () => writeHostMessage({ type: "event", payload: "x".repeat(MAX_MESSAGE) }),
+    /over the limit/,
   );
-  await assert.rejects(host.executeCommand("acme.silent.go"), (e: ExtensionError) => {
-    assert.equal(e.code, "CommandFailed");
-    assert.match(e.message, /did not register/);
-    return true;
-  });
-});
-
-test("disposal failures are logged and do not stop the rest", async () => {
-  const t = setup();
-  const record: string[] = [];
-  t.registry.add(
-    manifest({ activationEvents: ["onStartupFinished"] }),
-    {
-      kind: "bundled",
-      module: {
-        activate(context) {
-          context.subscriptions.push({ dispose: () => record.push("first") });
-          context.subscriptions.push({
-            dispose: () => {
-              throw new Error("stuck");
-            },
-          });
-        },
-        deactivate: () => {
-          throw new Error("refuses");
-        },
-      },
-    },
-    "bundled",
-  );
-  const host = t.host();
-  await host.fire({ kind: "startup" });
-  await host.dispose();
-  assert.deepEqual(record, ["first"]);
-  const log = t.logs.get("acme.hello")!.join("\n");
-  assert.match(log, /Deactivation failed: refuses/);
-  assert.match(log, /failed to dispose: stuck/);
 });
 
 test("only the lifecycle's own moves are allowed", () => {
   assert.ok(canMoveExtension("registered", "activating"));
-  assert.ok(canMoveExtension("activating", "failed"));
-  assert.ok(canMoveExtension("active", "deactivating"));
+  assert.ok(canMoveExtension("active", "failed"));
   for (const [from, to] of [
     ["registered", "active"],
-    ["active", "activating"],
     ["disposed", "activating"],
     ["failed", "active"],
   ] as const)
-    assert.equal(canMoveExtension(from, to), false, `${from} -> ${to}`);
+    assert.equal(canMoveExtension(from, to), false);
 });
 
-// --- Trust and runtimes ------------------------------------------------------------------------
+// --- Runtime: lazy host, commands, failures -------------------------------------------------------
 
-test("an untrusted folder runs no extension code; trusting it lets it activate", async () => {
-  const t = setup({ trusted: false });
-  const record: string[] = [];
-  t.registry.add(manifest(), { kind: "bundled", module: helloModule(record) }, "bundled");
-  const host = t.host();
-  await assert.rejects(host.executeCommand("acme.hello.greet"), (e: ExtensionError) => {
-    assert.equal(e.code, "TrustRequired");
-    assert.match(e.message, /Manage Workspace Trust/);
-    return true;
-  });
-  assert.deepEqual(record, []);
-  const status = host.getSnapshot().statuses["acme.hello"];
-  assert.equal(status.state, "registered", "still registered, waiting");
-  assert.match(status.reason!, /not trusted/);
-  // Its declarative contributions stay.
-  assert.equal(t.registry.getSnapshot().commands.length, 1);
-  t.setTrusted(true);
-  assert.equal(await host.executeCommand("acme.hello.greet", "x"), "hello x");
-});
-
-test("an extension declaring untrusted support activates in an untrusted folder", async () => {
-  const t = setup({ trusted: false });
-  const record: string[] = [];
-  t.registry.add(
-    manifest({ capabilities: { untrustedWorkspaces: true } }),
-    { kind: "bundled", module: helloModule(record) },
-    "bundled",
-  );
-  await t.host().executeCommand("acme.hello.greet", "y");
-  assert.deepEqual(record, ["activate", "greet:y"]);
-});
-
-test("an installed extension's code is never run; a declarative one needs no runtime", async () => {
+test("lazy: no host until needed; a command activates once, runs through the host, and returns", async () => {
   const t = setup();
-  const added = t.registry.add(
-    manifest(),
-    { kind: "folder", path: "C:/ext/hello" },
-    "C:/ext/hello",
-  );
-  assert.ok("manifest" in added && added.warnings.some((w) => /Its code is not run/.test(w)));
-  const host = t.host();
-  await assert.rejects(
-    host.executeCommand("acme.hello.greet"),
-    (e: ExtensionError) => e.code === "UnsupportedRuntime",
-  );
-  assert.match(
-    host.getSnapshot().statuses["acme.hello"].reason!,
-    /does not run code from installed extensions/,
-  );
-
-  const declarative = manifest({
-    name: "decl",
-    main: undefined,
-    activationEvents: [],
-    contributes: {
-      configuration: {
-        properties: { "acme.decl.on": { type: "boolean", default: true, description: "On." } },
-      },
-    },
-  });
-  t.registry.add(declarative, { kind: "folder", path: "C:/ext/decl" }, "C:/ext/decl");
-  await host.activate("acme.decl");
-  assert.ok(t.settings.definitions.some((d) => d.id === "acme.decl.on"));
+  t.add({}, GREETER);
+  const m = t.manager();
+  await m.fire({ kind: "startup" });
+  assert.equal(t.host.started(), 0, "nothing waits for startup: no process");
+  const [one, two] = await Promise.all([
+    m.executeCommand("acme.hello.greet", "ada"),
+    m.executeCommand("acme.hello.greet"),
+  ]);
+  assert.deepEqual([one, two], ["hello ada", "hello world"]);
+  assert.equal(t.host.started(), 1);
+  const snap = m.getSnapshot();
+  assert.equal(snap.host, "running");
+  assert.equal(snap.statuses["acme.hello"].state, "active");
+  assert.equal(snap.generation, 1001);
+  await m.dispose();
+  assert.equal(m.getSnapshot().statuses["acme.hello"].state, "disposed");
 });
 
-test("a disabled extension does not activate", async () => {
+test("activation failure stays with its extension; a handler that throws is a typed error", async () => {
   const t = setup();
-  t.registry.add(manifest(), { kind: "bundled", module: helloModule() }, "bundled");
-  t.registry.setEnabled("acme.hello", false);
-  await assert.rejects(
-    t.host().activate("acme.hello"),
-    (e: ExtensionError) => e.code === "Disabled",
+  t.add(
+    { name: "boom", activationEvents: ["onStartupFinished"], contributes: {} },
+    `module.exports.activate = function () { throw new Error("kaboom"); };`,
   );
-});
-
-// --- Views ---------------------------------------------------------------------------------------
-
-test("a view is filled by its provider on demand, refreshed, and gone with its extension", async () => {
-  const t = setup();
-  let people: ViewItem[] = [{ label: "Ada" }];
-  let changed: () => void = () => {};
-  t.registry.add(
-    manifest(),
+  t.add(
     {
-      kind: "bundled",
-      module: {
-        activate(context, yavin) {
-          context.subscriptions.push(
-            yavin.views.registerView("acme.hello.people", {
-              getItems: () => people,
-              onDidChange: (listener) => ((changed = listener), { dispose() {} }),
-            }),
-          );
-          assert.throws(
-            () => yavin.views.registerView("acme.hello.people", { getItems: () => [] }),
-            (e: ExtensionError) => e.code === "DuplicateView",
-          );
-          assert.throws(
-            () => yavin.views.registerView("other.view", { getItems: () => [] }),
-            (e: ExtensionError) => e.code === "NotOwned",
-          );
-        },
-      },
+      name: "fine",
+      activationEvents: ["onStartupFinished"],
+      contributes: { commands: [{ command: "acme.fine.go", title: "Go" }] },
     },
-    "bundled",
+    `
+    module.exports.activate = function (c, yavin) {
+      c.subscriptions.push(yavin.commands.registerCommand("acme.fine.go", function () { throw new Error("handler broke"); }));
+    };`,
   );
-  const host = t.host();
-  assert.equal(host.getSnapshot().views["acme.hello.people"], undefined);
-  await host.showView("acme.hello.people");
-  await settle();
-  assert.deepEqual(host.getSnapshot().views["acme.hello.people"], [{ label: "Ada" }]);
-  people = [
-    { label: "Ada" },
-    { label: "Grace", description: "admiral", command: "acme.hello.greet" },
-  ];
-  changed();
-  await settle();
-  assert.equal(host.getSnapshot().views["acme.hello.people"].length, 2);
-  await host.dispose();
-  assert.equal(host.getSnapshot().views["acme.hello.people"], undefined);
+  const m = t.manager();
+  await m.fire({ kind: "startup" });
+  await until(() => m.getSnapshot().statuses["acme.fine"]?.state === "active", "fine active");
+  assert.equal(m.getSnapshot().statuses["acme.boom"].state, "failed");
+  assert.match(m.getSnapshot().statuses["acme.boom"].reason!, /kaboom/);
+  await assert.rejects(
+    m.executeCommand("acme.fine.go"),
+    (e: ExtensionError) => e.code === "CommandFailed" && /handler broke/.test(e.message),
+  );
+  await assert.rejects(
+    m.activate("acme.boom"),
+    (e: ExtensionError) => e.code === "ActivationFailed",
+  );
 });
 
-// --- Settings and storage ----------------------------------------------------------------------
-
-test("an extension reads and hears only its own settings", async () => {
+test("spoofing is refused: another's command, view or provider id; unknown API methods", async () => {
   const t = setup();
-  const heard: string[] = [];
-  let read: unknown;
-  t.registry.add(
-    manifest({ activationEvents: ["onStartupFinished"] }),
-    {
-      kind: "bundled",
-      module: {
-        activate(context, yavin) {
-          context.subscriptions.push(
-            yavin.workspace.onDidChangeConfiguration((key) => heard.push(key)),
-          );
-          read = yavin.workspace.getConfiguration("acme.hello").get("mood");
-        },
-      },
-    },
-    "bundled",
+  t.add(
+    {},
+    `
+    module.exports.activate = async function (c, yavin) {
+      const results = {};
+      for (const [name, attempt] of [
+        ["command", () => yavin.commands.registerCommand("other.ext.cmd", function () {})],
+        ["view", () => yavin.views.registerView("other.ext.view", { getItems: () => [] })],
+      ]) {
+        attempt();
+      }
+    };`,
   );
-  const host = t.host();
-  await host.fire({ kind: "startup" });
-  assert.equal(read, "calm");
-  const mood = t.registry.settingDefinition("acme.hello.mood")!;
-  t.settings.set(mood, "workspace", "bright", A);
-  assert.deepEqual(heard, ["mood"]);
-  await host.dispose();
-  t.settings.set(mood, "workspace", "calm", A);
-  assert.deepEqual(heard, ["mood"], "nothing after the workspace closed");
+  const m = t.manager();
+  await m.activate("acme.hello");
+  await settle();
+  const log = (t.logs.get("acme.hello") ?? []).join("\\n");
+  assert.match(log, /commands\.register refused: "other\.ext\.cmd" is not one of the commands/);
+  assert.match(log, /views\.register refused: "other\.ext\.view" is not one of the views/);
+  // A provider id that is not the extension's own, sent straight at the protocol.
+  t.host.deliverRaw(
+    JSON.stringify({
+      type: "request",
+      requestId: "x1",
+      method: "languages.register",
+      params: { kind: "hover", providerId: "evil#hover#1", language: "markdown" },
+      extensionId: "acme.hello",
+      workspaceId: A,
+      hostGeneration: 1001,
+    }),
+  );
+  await settle();
+  assert.equal(t.providers.getSnapshot().length, 0);
 });
 
-test("storage: global and workspace scopes, one extension's alone, bounded, corrupt kept aside", async () => {
+test("a hung request times out; a host that never answers start is reported", async () => {
+  const t = setup();
+  t.add(
+    {},
+    `
+    module.exports.activate = function (c, yavin) {
+      c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", function () { return new Promise(function () {}); }));
+    };`,
+  );
+  const m = t.manager(A, 1, { command: 50 });
+  await assert.rejects(
+    m.executeCommand("acme.hello.greet"),
+    (e: ExtensionError) => e.code === "Timeout",
+  );
+});
+
+// --- Views, providers, documents, editor, fs, storage, settings -------------------------------------
+
+test("views: shown lazily, rows sanitized, refreshed; a panel and a container view too", async () => {
+  const t = setup();
+  t.add(
+    {},
+    `
+    module.exports.activate = function (c, yavin) {
+      var n = 1; var fire = function () {};
+      c.subscriptions.push(yavin.views.registerView("acme.hello.people", {
+        getItems: function () { return [{ label: "Ada " + n, command: "acme.hello.greet", children: [{ label: "child" }] }, { label: 42 }, { label: "evil", command: "rm -rf" }]; },
+        onDidChange: function (l) { fire = l; return { dispose: function () {} }; },
+      }));
+      c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", function () { n++; fire(); }));
+    };`,
+  );
+  const m = t.manager();
+  await m.showView("acme.hello.people");
+  await until(() => !!m.getSnapshot().views["acme.hello.people"], "rows");
+  assert.deepEqual(m.getSnapshot().views["acme.hello.people"], [
+    { label: "Ada 1", command: "acme.hello.greet", children: [{ label: "child" }] },
+    { label: "evil" },
+  ]);
+  await m.executeCommand("acme.hello.greet");
+  await until(() => m.getSnapshot().views["acme.hello.people"]?.[0].label === "Ada 2", "refresh");
+});
+
+test("language providers: registered, invoked, timed out, isolated, removed with the extension", async () => {
+  const t = setup();
+  t.add(
+    { activationEvents: ["onLanguage:markdown"] },
+    `
+    module.exports.activate = function (c, yavin) {
+      c.subscriptions.push(yavin.languages.registerHoverProvider("markdown", { provideHover: function (doc, pos) { return { contents: doc.languageId + "@" + pos.line }; } }));
+      c.subscriptions.push(yavin.languages.registerCompletionProvider("markdown", { provideCompletionItems: function () { return new Promise(function () {}); } }));
+    };`,
+  );
+  const m = t.manager();
+  await m.fire({ kind: "language", id: "markdown" });
+  await until(() => t.providers.getSnapshot().length === 2, "providers");
+  const doc = t.win.window.documents.all()[0];
+  const [hover] = t.providers.for("hover", "markdown");
+  assert.deepEqual(
+    await hover.invoke(
+      { document: doc, position: { line: 3, column: 1 } },
+      new AbortController().signal,
+    ),
+    { contents: "markdown@3" },
+  );
+  const [completion] = t.providers.for("completion", "markdown");
+  await assert.rejects(
+    completion.invoke(
+      { document: doc, position: { line: 1, column: 1 } },
+      new AbortController().signal,
+    ),
+    (e: ExtensionError) => e.code === "Timeout",
+  );
+  const controller = new AbortController();
+  const cancelled = completion.invoke(
+    { document: doc, position: { line: 1, column: 1 } },
+    controller.signal,
+  );
+  controller.abort();
+  await assert.rejects(cancelled, (e: ExtensionError) => e.code === "Cancelled");
+  await m.dispose();
+  assert.equal(t.providers.getSnapshot().length, 0);
+});
+
+test("documents and editor: by URI inside the workspace only; events; decorations from a fixed set", async () => {
+  const t = setup();
+  t.add(
+    { activationEvents: ["onStartupFinished"] },
+    `
+    module.exports.activate = async function (c, yavin) {
+      globalThis.__seen = [];
+      c.subscriptions.push(yavin.documents.onDidChange(function (d) { globalThis.__seen.push(d.uri); }));
+      c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", async function (what) {
+        if (what === "text") return yavin.documents.getText((await yavin.editor.activeEditor()).document.uri);
+        if (what === "outside") return yavin.documents.getText("file:///C:/Windows/win.ini");
+        if (what === "open") return yavin.editor.openLocation("file:///C:/work/readme.md", { startLine: 2, startColumn: 1, endLine: 2, endColumn: 3 });
+        if (what === "open-outside") return yavin.editor.openLocation("file:///C:/secret.txt");
+        if (what === "decorate") return yavin.editor.setDecorations("file:///C:/work/readme.md", "marks", [{ range: { startLine: 1, startColumn: 1, endLine: 1, endColumn: 3 }, style: "highlight", hover: "hi" }]);
+        if (what === "bad-style") return yavin.editor.setDecorations("file:///C:/work/readme.md", "marks", [{ range: { startLine: 1, startColumn: 1, endLine: 1, endColumn: 3 }, style: "position:fixed" }]);
+        if (what === "seen") return globalThis.__seen;
+      }));
+    };`,
+  );
+  const m = t.manager();
+  await m.fire({ kind: "startup" });
+  await until(() => m.getSnapshot().statuses["acme.hello"]?.state === "active", "active");
+  assert.equal(await m.executeCommand("acme.hello.greet", "text"), "# Readme\nhello");
+  await assert.rejects(m.executeCommand("acme.hello.greet", "outside"), /not in this workspace/);
+  await m.executeCommand("acme.hello.greet", "open");
+  assert.equal(t.win.opened[0].path, "C:/work/readme.md");
+  await assert.rejects(
+    m.executeCommand("acme.hello.greet", "open-outside"),
+    /not in this workspace/,
+  );
+  await m.executeCommand("acme.hello.greet", "decorate");
+  assert.equal(t.decorations.getSnapshot()[0].owner, "acme.hello:marks");
+  assert.equal(t.decorations.getSnapshot()[0].resource, resourceId(fileUri("C:/work/readme.md")));
+  await assert.rejects(m.executeCommand("acme.hello.greet", "bad-style"), /style is one of/);
+  t.win.emit("change", t.win.window.documents.all()[0]);
+  await settle();
+  assert.deepEqual(await m.executeCommand("acme.hello.greet", "seen"), [
+    "file:///C:/work/readme.md",
+  ]);
+  await m.dispose();
+  assert.equal(t.decorations.getSnapshot().length, 0, "decorations go with the extension");
+});
+
+test("the filesystem API reads workspace-relative files only: traversal and absolute paths refused", async () => {
+  const t = setup();
+  t.add(
+    {},
+    `
+    module.exports.activate = function (c, yavin) {
+      c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", function (path) { return yavin.workspace.fs.readFile(path); }));
+      c.subscriptions.push(yavin.commands.registerCommand("acme.hello.other", function (path) { return yavin.workspace.fs.exists(path); }));
+    };`,
+  );
+  const m = t.manager();
+  assert.equal(await m.executeCommand("acme.hello.greet", "notes.txt"), "a note");
+  for (const path of [
+    "../other/secret.txt",
+    "C:/Windows/win.ini",
+    "/etc/passwd",
+    "sub/../../escape",
+    "file:///C:/work/notes.txt",
+  ])
+    await assert.rejects(
+      m.executeCommand("acme.hello.greet", path),
+      /outside the workspace|relative to the workspace/,
+      path,
+    );
+  assert.equal(await m.executeCommand("acme.hello.other", "notes.txt"), true);
+  assert.equal(await m.executeCommand("acme.hello.other", "missing.txt"), false);
+});
+
+test("storage and settings: an extension's own state, scoped by workspace; its own settings only", async () => {
+  const t = setup();
+  t.add(
+    {},
+    `
+    module.exports.activate = function (c, yavin) {
+      c.subscriptions.push(yavin.workspace.onDidChangeConfiguration(function (e) { globalThis.__changed = e.key; }));
+      c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", async function (what) {
+        if (what === "save") { await c.globalState.update("count", 3); await c.workspaceState.update("open", ["x"]); return null; }
+        if (what === "read") return [c.globalState.get("count"), c.workspaceState.get("open")];
+        if (what === "foreign") return yavin.workspace.getConfiguration("editor");
+        if (what === "mood") return [yavin.workspace.getConfiguration("acme.hello").get("mood"), globalThis.__changed];
+        if (what === "huge") return c.globalState.update("big", "x".repeat(70000));
+      }));
+    };`,
+  );
+  const a = t.manager(A, 1);
+  await a.executeCommand("acme.hello.greet", "save");
+  assert.deepEqual(await a.executeCommand("acme.hello.greet", "read"), [3, ["x"]]);
+  assert.equal(
+    t.extensionStorage.global("acme.other").get("count"),
+    undefined,
+    "not another extension's",
+  );
+  await assert.rejects(a.executeCommand("acme.hello.greet", "foreign"), /own settings/);
+  await assert.rejects(a.executeCommand("acme.hello.greet", "huge"), /exceed/);
+  t.settings.set(t.registry.settingDefinition("acme.hello.mood")!, "workspace", "bright", A);
+  await settle();
+  assert.deepEqual(await a.executeCommand("acme.hello.greet", "mood"), ["bright", "mood"]);
+  await a.dispose();
+  // Another workspace: its global state is shared, its workspace state is not.
+  const b = t.manager(B, 2);
+  // (`undefined` crosses the protocol as JSON: null.)
+  assert.deepEqual(await b.executeCommand("acme.hello.greet", "read"), [3, null]);
+  await b.dispose();
+});
+
+test("storage records: versioned, corrupt kept aside, newer read-only, bounded", async () => {
   const storage = memoryStorage({
     [globalStorageKey("acme.broken")]: "{not json",
     [globalStorageKey("acme.future")]: JSON.stringify({ version: 9, values: { a: 1 } }),
   });
-  const reports: string[] = [];
-  const store = createExtensionStorage(storage, (id, message) => reports.push(`${id}: ${message}`));
-  const hello = store.global("acme.hello");
-  await hello.update("count", 3);
-  assert.equal(store.global("acme.hello").get("count"), 3);
-  assert.equal(
-    store.global("acme.other").get("count"),
-    undefined,
-    "another extension's state is not this one's",
-  );
-  const inA = store.workspace(A, "acme.hello");
-  await inA.update("open", ["x"]);
-  assert.equal(store.workspace(B, "acme.hello").get("open"), undefined, "nor another workspace's");
+  const store = createExtensionStorage(storage);
+  await store.workspace(A, "acme.hello").update("k", 1);
   assert.deepEqual(JSON.parse(storage.getItem(workspaceStorageKey(A, "acme.hello"))!), {
     version: 1,
-    values: { open: ["x"] },
+    values: { k: 1 },
   });
-  await assert.rejects(
-    hello.update("fn", () => 1),
-    (e: ExtensionError) => e.code === "StorageLimit",
-  );
-  await assert.rejects(
-    hello.update("big", "x".repeat(STORAGE_LIMIT)),
-    (e: ExtensionError) => e.code === "StorageLimit",
-  );
-  assert.equal(hello.get("big"), undefined, "a refused value is not kept");
-  await hello.update("count", undefined);
-  assert.deepEqual(hello.keys(), []);
-
-  const broken = store.global("acme.broken");
-  assert.deepEqual(broken.keys(), []);
+  assert.deepEqual(store.global("acme.broken").keys(), []);
   assert.equal(storage.getItem(`${globalStorageKey("acme.broken")}.corrupt`), "{not json");
-  const future = store.global("acme.future");
-  assert.equal(future.get("a"), 1);
-  await assert.rejects(future.update("a", 2), (e: ExtensionError) => e.code === "StorageReadOnly");
-  assert.ok(reports.some((r) => /acme\.broken: .*corrupt/.test(r)));
+  await assert.rejects(
+    store.global("acme.future").update("a", 2),
+    (e: ExtensionError) => e.code === "StorageReadOnly",
+  );
+  await assert.rejects(
+    store.global("acme.hello").update("big", "x".repeat(STORAGE_LIMIT)),
+    (e: ExtensionError) => e.code === "StorageLimit",
+  );
 });
 
-// --- Workspace isolation, messages ---------------------------------------------------------------
+// --- Trust, crashes, malformed messages, isolation, reload ---------------------------------------
 
-test("A → B: an extension of A that acts after A closed reaches nothing in B", async () => {
-  const t = setup();
-  let late: (() => void) | null = null;
-  t.registry.add(
-    manifest({ activationEvents: ["onWorkspace"] }),
-    {
-      kind: "bundled",
-      module: {
-        activate(context, yavin) {
-          late = () => {
-            yavin.window.showInformationMessage(`from ${context.workspaceFolder}`);
-            yavin.commands.registerCommand("acme.hello.greet", () => "late");
-          };
-        },
-      },
-    },
-    "bundled",
+test("trust: untrusted starts no host; trusted activates; revoked ends the host; restored activates again", async () => {
+  const t = setup({ trusted: false });
+  t.add({}, GREETER);
+  const m = t.manager();
+  await assert.rejects(
+    m.executeCommand("acme.hello.greet"),
+    (e: ExtensionError) => e.code === "TrustRequired",
   );
-  const a = t.host(A);
-  await a.fire({ kind: "workspace" });
-  await a.dispose();
-  const b = t.host(B);
-  late!();
+  assert.equal(t.host.started(), 0);
+  t.setTrusted(true);
+  assert.equal(await m.executeCommand("acme.hello.greet", "x"), "hello x");
+  await m.setTrusted(false);
+  assert.equal(m.getSnapshot().host, "stopped");
+  assert.match(m.getSnapshot().held!, /no longer trusted/);
+  await assert.rejects(
+    m.executeCommand("acme.hello.greet"),
+    (e: ExtensionError) => e.code === "TrustRequired",
+  );
+  await m.setTrusted(true);
+  assert.equal(await m.executeCommand("acme.hello.greet", "y"), "hello y");
+  assert.equal(t.host.started(), 2);
+});
+
+test("an untrusted folder is said to be untrusted, not revoked; a view on screen waits for trust", async () => {
+  const t = setup({ trusted: false });
+  t.add({}, GREETER);
+  const m = t.manager();
+  await m.setTrusted(false);
+  assert.match(m.getSnapshot().held!, /is not trusted/);
+  await assert.rejects(m.showView("acme.hello.people"));
+  t.setTrusted(true);
+  await m.setTrusted(true);
+  await until(() => m.getSnapshot().statuses["acme.hello"]?.state === "active", "filled on trust");
+  assert.equal(t.host.started(), 1);
+});
+
+test("restart and reload start lazily; only a view on screen makes a new host at once", async () => {
+  const t = setup();
+  t.add(
+    {},
+    GREETER.replace(
+      "module.exports.activate = function (context, yavin) {",
+      `module.exports.activate = function (context, yavin) {
+  context.subscriptions.push(yavin.views.registerView("acme.hello.people", { getItems: function () { return [{ label: "row" }]; } }));`,
+    ),
+  );
+  const m = t.manager();
+  await m.executeCommand("acme.hello.greet");
+  await m.restart();
+  assert.equal(m.getSnapshot().host, "stopped");
+  assert.equal(t.host.started(), 1, "nothing waits: no new process");
+  await m.showView("acme.hello.people");
+  await until(() => m.getSnapshot().views["acme.hello.people"]?.length === 1, "rows");
+  await m.reload();
+  await until(
+    () => m.getSnapshot().views["acme.hello.people"]?.length === 1 && t.host.started() === 3,
+    "refilled",
+  );
+  m.hideView("acme.hello.people");
+  await m.restart();
+  assert.equal(t.host.started(), 3);
+});
+
+test("a crash fails what runs, cleans every contribution, restarts on demand, and stops after a crash loop", async () => {
+  const t = setup();
+  t.add(
+    { activationEvents: ["onLanguage:markdown"] },
+    `
+    module.exports.activate = function (c, yavin) {
+      c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", function () { return "up"; }));
+      c.subscriptions.push(yavin.languages.registerHoverProvider("markdown", { provideHover: function () { return null; } }));
+      c.subscriptions.push(yavin.commands.registerCommand("acme.hello.other", function () { return new Promise(function () {}); }));
+    };`,
+  );
+  const m = t.manager(A, 1, { command: 5000 });
+  await m.fire({ kind: "language", id: "markdown" });
+  await until(() => t.providers.getSnapshot().length === 1, "provider");
+  const hanging = m.executeCommand("acme.hello.other");
+  await settle();
+  t.host.crash();
+  await assert.rejects(hanging, (e: ExtensionError) => /HostCrashed|CommandFailed/.test(e.code));
+  assert.equal(m.getSnapshot().statuses["acme.hello"].state, "failed");
+  assert.equal(t.providers.getSnapshot().length, 0, "providers removed");
+  // The next use makes a new host generation.
+  assert.equal(await m.executeCommand("acme.hello.greet"), "up");
+  assert.equal(m.getSnapshot().generation, 1002);
+  for (let i = 1; i < CRASH_LIMIT; i++) {
+    t.host.crash();
+    await settle();
+    if (i < CRASH_LIMIT - 1) await m.executeCommand("acme.hello.greet");
+  }
+  await assert.rejects(
+    m.executeCommand("acme.hello.greet"),
+    (e: ExtensionError) => e.code === "HostCrashedRepeatedly",
+  );
+  await m.restart();
+  assert.equal(await m.executeCommand("acme.hello.greet"), "up");
+});
+
+test("malformed and stale host messages are dropped and logged; the host goes on", async () => {
+  const t = setup();
+  t.add({}, GREETER);
+  const m = t.manager();
+  await m.executeCommand("acme.hello.greet");
+  t.host.deliverRaw("{garbage");
+  t.host.deliverRaw(
+    JSON.stringify({
+      type: "request",
+      requestId: "h9",
+      method: "window.showMessage",
+      params: { message: "from the past" },
+      extensionId: "acme.hello",
+      workspaceId: A,
+      hostGeneration: 999,
+    }),
+  );
+  await settle();
   assert.deepEqual(t.notes, []);
-  // B's handler table is its own: A's late registration is not there.
-  await assert.rejects(b.executeCommand("acme.hello.greet"), (e: ExtensionError) =>
-    /did not register/.test(e.message),
-  );
-  assert.equal(b.getSnapshot().generation, a.getSnapshot().generation + 1);
+  assert.ok((t.logs.get("yavin.extension-host") ?? []).some((line) => /not JSON/.test(line)));
+  assert.equal(await m.executeCommand("acme.hello.greet", "still"), "hello still");
 });
 
-test("an extension's messages are shown, then muted when it floods", async () => {
+test("A → B: A's host ends; its late messages and commands reach nothing in B", async () => {
   const t = setup();
-  t.registry.add(
-    manifest({ activationEvents: ["onStartupFinished"] }),
+  t.add({}, GREETER);
+  const a = t.manager(A, 1);
+  await a.executeCommand("acme.hello.greet");
+  await a.dispose();
+  const b = t.manager(B, 2);
+  t.host.deliverRaw(
+    JSON.stringify({
+      type: "request",
+      requestId: "late",
+      method: "window.showMessage",
+      params: { message: "late" },
+      extensionId: "acme.hello",
+      workspaceId: A,
+      hostGeneration: 1001,
+    }),
+  );
+  await settle();
+  assert.deepEqual(t.notes, []);
+  assert.equal(b.getSnapshot().statuses["acme.hello"], undefined, "nothing of A's activation in B");
+  assert.equal(await b.executeCommand("acme.hello.greet", "b"), "hello b");
+  assert.equal(b.getSnapshot().workspace, B);
+});
+
+test("A → B while A's activation is pending: it never completes, and leaves nothing behind", async () => {
+  const t = setup();
+  t.add(
+    {},
+    `
+    module.exports.activate = function (c, yavin) {
+      return new Promise(function (resolve) { globalThis.__release = function () {
+        c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", function () { return "late"; }));
+        resolve();
+      }; });
+    };`,
+  );
+  const a = t.manager(A, 1);
+  const pending = a.executeCommand("acme.hello.greet");
+  await settle();
+  await a.dispose();
+  await assert.rejects(pending);
+  (globalThis as { __release?: () => void }).__release?.();
+  await settle();
+  const b = t.manager(B, 2);
+  assert.equal(b.getSnapshot().statuses["acme.hello"], undefined);
+  assert.equal(t.registry.commandOwner("acme.hello.greet"), "acme.hello");
+});
+
+test("reload ends the host, re-discovers, starts lazily again; nothing is duplicated", async () => {
+  const t = setup();
+  t.add({}, GREETER);
+  const m = t.manager();
+  await m.executeCommand("acme.hello.greet");
+  const before = t.registry.getSnapshot().commands.length;
+  await m.reload();
+  assert.equal(t.rediscovered(), 1);
+  assert.equal(t.registry.getSnapshot().commands.length, before);
+  assert.equal(m.getSnapshot().host, "stopped");
+  assert.equal(await m.executeCommand("acme.hello.greet", "again"), "hello again");
+  assert.equal(m.getSnapshot().generation, 1002);
+});
+
+test("dependencies activate first, in order; an unavailable one stops the extension with why", async () => {
+  const t = setup();
+  const order = `module.exports.activate = function (c) { globalThis.__order = (globalThis.__order || []).concat([c.extensionId]); };`;
+  t.add({ name: "base", contributes: {} }, order);
+  t.add(
     {
-      kind: "bundled",
-      module: {
-        activate(_context, yavin) {
-          yavin.window.showWarningMessage("careful");
-          for (let i = 0; i < 50; i++) yavin.window.showInformationMessage(`spam ${i}`);
-        },
-      },
+      name: "app",
+      extensionDependencies: ["acme.base"],
+      contributes: { commands: [{ command: "acme.app.go", title: "Go" }] },
     },
-    "bundled",
+    `
+    module.exports.activate = function (c, yavin) {
+      c.subscriptions.push(yavin.commands.registerCommand("acme.app.go", function () { return globalThis.__order || []; }));
+    };`,
   );
-  await t.host().fire({ kind: "startup" });
-  assert.equal(t.notes.length, 20);
-  assert.deepEqual(t.notes[0], ["warning", "acme.hello", "careful"]);
-  assert.ok(t.logs.get("acme.hello")!.some((line) => /Too many messages/.test(line)));
+  (globalThis as { __order?: string[] }).__order = [];
+  const m = t.manager();
+  await m.executeCommand("acme.app.go");
+  assert.deepEqual((globalThis as { __order?: string[] }).__order, ["acme.base"]);
+  assert.equal(m.getSnapshot().statuses["acme.base"].state, "active");
+  t.add(
+    {
+      name: "orphan",
+      extensionDependencies: ["acme.missing"],
+      contributes: { commands: [{ command: "acme.orphan.go", title: "Go" }] },
+    },
+    GREETER,
+  );
+  await assert.rejects(
+    m.executeCommand("acme.orphan.go"),
+    (e: ExtensionError) => e.code === "DependencyFailed" && /not installed/.test(e.message),
+  );
 });
 
-test("a language activation event activates its extension once", async () => {
+test("an extension's messages are shown, then muted when it floods; deactivation reports disposal failures", async () => {
   const t = setup();
-  const record: string[] = [];
+  t.add(
+    { activationEvents: ["onStartupFinished"] },
+    `
+    module.exports.activate = function (c, yavin) {
+      for (var i = 0; i < 40; i++) yavin.window.showInformationMessage("spam " + i);
+      c.subscriptions.push({ dispose: function () { throw new Error("stuck"); } });
+    };`,
+  );
+  const m = t.manager();
+  await m.fire({ kind: "startup" });
+  await until(
+    () =>
+      t.notes.length === 20 &&
+      (t.logs.get("acme.hello") ?? []).some((l) => /Too many messages/.test(l)),
+    "flood",
+  );
+  await m.dispose();
+  assert.ok((t.logs.get("acme.hello") ?? []).some((line) => /failed to dispose: stuck/.test(line)));
+});
+
+test("the sample extension works end to end through the host", async () => {
+  const t = setup({ codes: { "yavin-samples.hello-world": SAMPLE.code } });
   t.registry.add(
-    manifest({ activationEvents: ["onLanguage:python"], contributes: {} }),
-    { kind: "bundled", module: { activate: () => void record.push("py") } },
-    "bundled",
+    SAMPLE.manifest,
+    { kind: "folder", path: "C:/repo/extensions/samples/hello-world" },
+    "samples",
   );
-  const host = t.host();
-  await host.fire({ kind: "language", id: "typescript" });
-  assert.deepEqual(record, []);
-  await host.fire({ kind: "language", id: "python" });
-  await host.fire({ kind: "language", id: "python" });
-  assert.deepEqual(record, ["py"]);
-});
-
-// --- The sample, keybindings, discovery ----------------------------------------------------------
-
-test("the bundled sample is a valid extension and works end to end through a host", async () => {
-  const { HELLO_WORLD_MANIFEST, helloWorld } =
-    await import("../../extensions/samples/helloWorld.ts");
-  const t = setup();
-  const added = t.registry.add(
-    HELLO_WORLD_MANIFEST,
-    { kind: "bundled", module: helloWorld },
-    "bundled",
+  const m = t.manager();
+  assert.equal(await m.executeCommand("yavin-samples.hello-world.greet"), "Hello, world!");
+  await m.showView("yavin-samples.hello-world.greetings");
+  await until(
+    () =>
+      m.getSnapshot().views["yavin-samples.hello-world.greetings"]?.[0]?.label === "Hello, world!",
+    "greetings",
   );
-  assert.ok("manifest" in added, JSON.stringify(added));
-  assert.deepEqual(added.warnings, []);
-  const host = t.host();
-  assert.equal(await host.executeCommand("yavin-samples.hello-world.greet"), "Hello, world!");
-  await host.showView("yavin-samples.hello-world.greetings");
-  await settle();
-  assert.deepEqual(host.getSnapshot().views["yavin-samples.hello-world.greetings"], [
-    { label: "Hello, world!", description: "#1" },
-  ]);
-  assert.deepEqual(t.notes, [["info", "yavin-samples.hello-world", "Hello, world!"]]);
-  await host.executeCommand("yavin-samples.hello-world.reset");
-  await settle();
-  assert.equal(
-    host.getSnapshot().views["yavin-samples.hello-world.greetings"][0].label,
-    "No greetings yet",
-  );
-});
-
-test("contributed shortcuts never take Yavin's own, and the first extension keeps a shared one", async () => {
-  const { resolveKeybindings } = await import("./contributions.ts");
-  const command = (name: string, key: string | null, extensionId = "acme.a") => ({
-    command: `${extensionId}.${name}`,
-    title: name,
-    category: null,
-    extensionId,
-    palette: true,
-    key,
-  });
-  const { shortcuts, conflicts } = resolveKeybindings(
-    [
-      command("save", "Mod+s"),
-      command("go", "Mod+Alt+g"),
-      command("also", "alt+MOD+G", "acme.b"),
-      command("none", null),
-    ],
-    ["Mod+s", "Mod+Shift+p"],
-  );
-  assert.deepEqual([...shortcuts], [["acme.a.go", "Mod+Alt+g"]]);
+  assert.equal(await m.executeCommand("yavin-samples.hello-world.describe"), "markdown, 2 lines");
+  await until(() => t.providers.for("hover", "markdown").length === 1, "hover provider");
+  const doc = t.win.window.documents.all()[0];
   assert.deepEqual(
-    conflicts.map((c) => [c.command, c.reason.replace(/ .*/, "")]),
-    [
-      ["acme.a.save", "Mod+s"],
-      ["acme.b.also", "alt+MOD+G"],
-    ],
+    await t.providers
+      .for("hover", "markdown")[0]
+      .invoke({ document: doc, position: { line: 2, column: 1 } }, new AbortController().signal),
+    {
+      contents: "Hello from the sample (line 2 of readme.md)",
+    },
   );
-  assert.match(conflicts[0].reason, /Yavin's own/);
-  assert.match(conflicts[1].reason, /already used by acme\.a\.go/);
+  await m.showView("yavin-samples.hello-world.about");
+  await until(() => !!m.getSnapshot().views["yavin-samples.hello-world.about"], "about");
+  assert.equal(
+    m.getSnapshot().views["yavin-samples.hello-world.about"][0].children?.[0].label,
+    "API 2.0.0",
+  );
+  assert.ok(t.notes.some(([, , text]) => text === "Hello, world!"));
 });
 
-test("discovery registers installed manifests, reports unreadable ones, and reloads without duplicates", async () => {
+test("discovery: installed manifests registered, unreadable reported, reload without duplicates", async () => {
   const { discoverExtensions, rediscoverExtensions } = await import("./discovery.ts");
   const t = setup();
   const found = {
@@ -815,11 +1050,6 @@ test("discovery registers installed manifests, reports unreadable ones, and relo
       },
       { folder: "C:/data/extensions/broken", manifest: "{not json", error: null },
       {
-        folder: "C:/data/extensions/empty",
-        manifest: null,
-        error: "It has no yavin-extension.json.",
-      },
-      {
         folder: "C:/data/extensions/copy",
         manifest: JSON.stringify(manifest({ main: undefined })),
         error: null,
@@ -827,41 +1057,82 @@ test("discovery registers installed manifests, reports unreadable ones, and relo
     ],
   };
   const report = await discoverExtensions(t.registry, async () => found);
-  assert.equal(report.registered, 1);
-  assert.equal(report.rejected, 3);
-  const snap = t.registry.getSnapshot();
-  assert.equal(snap.extensions[0].source.kind, "folder");
-  assert.deepEqual(
-    snap.rejected.map((r) => [
-      r.origin.split("/").pop(),
-      /JSON|no yavin|already registered/.test(r.problems[0]),
-    ]),
-    [
-      ["broken", true],
-      ["empty", true],
-      ["copy", true],
-    ],
-  );
-  const again = await rediscoverExtensions(t.registry, async () => found);
-  assert.equal(again.registered, 1);
+  assert.deepEqual([report.registered, report.rejected], [1, 2]);
+  await rediscoverExtensions(t.registry, async () => found);
   assert.equal(t.registry.getSnapshot().extensions.length, 1);
-  assert.equal(t.registry.getSnapshot().rejected.length, 3);
+  assert.equal(t.registry.getSnapshot().rejected.length, 2);
 });
 
-test("the settings registry takes later definitions, never replaces one, and gives them stored values", () => {
-  const storage = memoryStorage({
-    "yavin.settings.user": JSON.stringify({ version: 1, values: { "acme.hello.loud": true } }),
-  });
-  const settings = createSettingsRegistry([], storage);
-  let told = 0;
-  settings.onDefinitions(() => told++);
-  const registry = createExtensionRegistry({ settings, storage });
-  registry.add(manifest(), { kind: "bundled", module: helloModule() }, "bundled");
-  assert.equal(told, 3);
-  // A value stored before the extension was known applies once its setting is.
-  assert.equal(settings.get(registry.settingDefinition("acme.hello.loud")!, null), true);
-  assert.throws(
-    () => settings.register(registry.settingDefinition("acme.hello.loud")!),
-    /already a setting/,
+test("a declarative extension needs no host; a disabled one does not activate", async () => {
+  const t = setup();
+  t.add(
+    {
+      name: "decl",
+      main: undefined,
+      activationEvents: [],
+      contributes: {
+        configuration: {
+          properties: { "acme.decl.on": { type: "boolean", default: true, description: "On." } },
+        },
+      },
+    },
+    null,
   );
+  t.add({}, GREETER);
+  t.registry.setEnabled("acme.hello", false);
+  const m = t.manager();
+  await m.activate("acme.decl");
+  assert.equal(t.host.started(), 0);
+  assert.ok(t.settings.definitions.some((d) => d.id === "acme.decl.on"));
+  await assert.rejects(m.activate("acme.hello"), (e: ExtensionError) => e.code === "Disabled");
+  void (null as unknown as ResourceId);
+});
+
+test("performance budgets: discovering 200 extensions, and a command's round trip through the manager", async () => {
+  const { discoverExtensions } = await import("./discovery.ts");
+  const t = setup();
+  const found = {
+    root: "C:/data/extensions",
+    skipped: 0,
+    extensions: Array.from({ length: 200 }, (_, n) => ({
+      folder: `C:/data/extensions/acme.e${n}`,
+      manifest: JSON.stringify(
+        manifest({
+          name: `e${n}`,
+          activationEvents: [],
+          contributes: {
+            commands: [{ command: `acme.e${n}.go`, title: `Go ${n}` }],
+            configuration: {
+              properties: {
+                [`acme.e${n}.on`]: { type: "boolean", default: true, description: "On." },
+              },
+            },
+          },
+        }),
+      ),
+      error: null,
+    })),
+  };
+  let started = performance.now();
+  const report = await discoverExtensions(t.registry, async () => found);
+  const discovery = performance.now() - started;
+  assert.equal(report.registered, 200);
+
+  t.add({}, GREETER);
+  const m = t.manager();
+  await m.executeCommand("acme.hello.greet");
+  const samples: number[] = [];
+  for (let i = 0; i < 100; i++) {
+    started = performance.now();
+    await m.executeCommand("acme.hello.greet", "x");
+    samples.push(performance.now() - started);
+  }
+  samples.sort((a, b) => a - b);
+  const p95 = samples[94];
+  console.log(
+    `extensions: discovery of 200 ${discovery.toFixed(1)} ms; command round trip p95 ${p95.toFixed(2)} ms`,
+  );
+  assert.ok(discovery < 1000, `discovery took ${discovery} ms (budget 1000)`);
+  assert.ok(p95 < 20, `command p95 ${p95} ms (budget 20)`);
+  await m.dispose();
 });

@@ -36,3 +36,5 @@ Thumbs.db
 src-tauri/resources/search/rg.exe
 src-tauri/resources/search/ripgrep-*/
 src-tauri/resources/search/*.zip
+src-tauri/resources/extension-host/yavin-extension-host
+src-tauri/resources/extension-host/yavin-extension-host.exe

@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/ide-workspace", "crates/ide-localgit", "crates/ide-terminal-protocol"]
-exclude = ["crates/ide-core", "crates/ide-config", "crates/ide-syntax", "crates/ide-lsp", "crates/ide-dap", "crates/ide-plugin-host"]
+members = ["crates/ide-workspace", "crates/ide-localgit", "crates/ide-terminal-protocol", "crates/ide-plugin-host"]
+exclude = ["crates/ide-core", "crates/ide-config", "crates/ide-syntax", "crates/ide-lsp", "crates/ide-dap"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

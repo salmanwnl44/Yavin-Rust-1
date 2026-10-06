@@ -18,6 +18,7 @@ import {
 } from "../ui/Icons";
 import { cleanPath, containingDir, getRelativePath } from "./paths";
 import type { ExplorerAction } from "./actions";
+import { languageFor } from "../../services/language";
 
 /** A menu entry, present only if the provider supports what it does (`undefined` drops it). */
 type Maybe = MenuItem | undefined;
@@ -191,7 +192,7 @@ function tidy(items: Maybe[]): MenuItem[] {
  * folder, or a file. Every entry is offered only if `can` says the provider supports it for
  * what the menu is about -- the targets, or the folder things would be created in.
  */
-export function buildExplorerMenu({
+function explorerMenu({
   node,
   isRoot,
   workspacePath,
@@ -311,4 +312,39 @@ export function pathsToCopy(nodes: FileNode[], workspacePath: string, relative: 
   return nodes
     .map((node) => (relative ? getRelativePath(node.path, workspacePath) : cleanPath(node.path)))
     .join("\n");
+}
+
+/** An extension's `explorer/context` item (IDE-08). */
+export interface ExtensionMenuItem {
+  title: string;
+  when: { key: "resourceExtname" | "resourceLangId"; value: string } | null;
+  run(target: string): void;
+}
+
+/**
+ * The Explorer's context menu: Yavin's own items, then extensions' `explorer/context` items for
+ * the entries their `when` matches (IDE-08), run through the command registry.
+ */
+export function buildExplorerMenu(
+  options: Parameters<typeof explorerMenu>[0] & { extensionItems?: readonly ExtensionMenuItem[] },
+): MenuItem[] {
+  const own = explorerMenu(options);
+  const target = options.isRoot ? null : options.node;
+  const name = target?.name ?? "";
+  const extension = (name.match(/\.[^.]+$/)?.[0] ?? "").toLowerCase();
+  const items = (options.extensionItems ?? [])
+    .filter(
+      (item) =>
+        !item.when ||
+        (!!target &&
+          !target.is_dir &&
+          (item.when.key === "resourceExtname"
+            ? item.when.value.toLowerCase() === extension
+            : item.when.value === languageFor(name))),
+    )
+    .map((item) => ({
+      label: item.title,
+      onClick: () => item.run(target?.path ?? options.workspacePath),
+    }));
+  return items.length ? [...own, divider, ...items] : own;
 }

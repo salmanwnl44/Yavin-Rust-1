@@ -1,9 +1,11 @@
 //! Extension discovery (IDE-07): the manifests of the extensions installed for this user.
 //!
-//! There is exactly one place extensions are found: `<app local data>/extensions/<folder>/`
-//! `yavin-extension.json` -- Yavin's own data directory, never the open project (a project's
-//! files are the project's, and untrusted) and never the network (there is no marketplace,
-//! download or update). Only the manifest is read; no code is read, loaded or run from here.
+//! Extensions are found in `<app local data>/extensions/<folder>/yavin-extension.json` --
+//! Yavin's own data directory, never the open project (a project's files are the project's,
+//! and untrusted) and never the network (there is no marketplace, download or update) -- and,
+//! in development builds only, in the repository's `extensions/samples`. Discovery reads
+//! manifests only. An extension's code is read by `extension_host.rs` alone, when its host
+//! loads it (`read_main`), from the folder discovery found.
 //! Everything is bounded: the number of folders, a manifest's size, and nothing is followed
 //! through a link. Validating a manifest is the renderer's (`src/services/extensions`).
 
@@ -103,15 +105,107 @@ pub fn discover(root: &Path) -> Discovery {
     }
 }
 
-/// The extensions installed for this user (manifests only).
-#[tauri::command(async)]
-pub fn extensions_list(app: AppHandle) -> Result<Discovery, String> {
-    let root = app
+/// The largest entry point read.
+const MAX_MAIN: u64 = 2 * 1024 * 1024;
+
+/// Where extensions are found: the user's installed extensions, and (development builds only)
+/// the repository's samples.
+pub fn roots(app: &AppHandle) -> Result<Vec<PathBuf>, String> {
+    let mut roots = vec![app
         .path()
         .app_local_data_dir()
         .map_err(|e| format!("Cannot find Yavin's data folder: {e}"))?
-        .join("extensions");
-    Ok(discover(&root))
+        .join("extensions")];
+    if cfg!(debug_assertions) {
+        roots.push(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("extensions")
+                .join("samples"),
+        );
+    }
+    Ok(roots)
+}
+
+/// The extensions found (manifests only), the user's first.
+#[tauri::command(async)]
+pub fn extensions_list(app: AppHandle) -> Result<Discovery, String> {
+    let roots = roots(&app)?;
+    let mut all = discover(&roots[0]);
+    for root in &roots[1..] {
+        let more = discover(root);
+        all.extensions.extend(more.extensions);
+        all.skipped += more.skipped;
+    }
+    Ok(all)
+}
+
+/// `publisher.name` of a manifest's text, if it has one.
+fn manifest_id(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    Some(format!(
+        "{}.{}",
+        value.get("publisher")?.as_str()?,
+        value.get("name")?.as_str()?
+    ))
+}
+
+/// The folder of extension `id` and its manifest's `main`, from discovery's roots.
+pub fn locate(roots: &[PathBuf], id: &str) -> Result<(PathBuf, String), String> {
+    for root in roots {
+        for found in discover(root).extensions {
+            let Some(text) = found.manifest else { continue };
+            if manifest_id(&text).as_deref() != Some(id) {
+                continue;
+            }
+            let main = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|value| value.get("main")?.as_str().map(str::to_string))
+                .ok_or_else(|| format!("UnsupportedRuntime: {id} has no code (no \"main\")."))?;
+            return Ok((PathBuf::from(found.folder), main));
+        }
+    }
+    Err(format!("UnknownExtension: {id} is not installed."))
+}
+
+/// An extension's entry point: inside its folder (no `..`, no absolute path, no link out of
+/// it), a plain file, at most 2 MiB, UTF-8.
+pub fn read_main(folder: &Path, main: &str) -> Result<String, String> {
+    let relative = Path::new(main);
+    if relative.is_absolute()
+        || relative.components().any(|part| {
+            !matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(format!(
+            "InvalidManifest: \"{main}\" is not a path inside the extension."
+        ));
+    }
+    let base = folder
+        .canonicalize()
+        .map_err(|e| format!("LoadFailed: {e}"))?;
+    let file = folder.join(relative);
+    let metadata = fs::symlink_metadata(&file)
+        .map_err(|_| format!("LoadFailed: {main} does not exist in the extension."))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("LoadFailed: {main} is not a plain file."));
+    }
+    let real = file
+        .canonicalize()
+        .map_err(|e| format!("LoadFailed: {e}"))?;
+    if !real.starts_with(&base) {
+        return Err(format!("LoadFailed: {main} is outside the extension."));
+    }
+    if metadata.len() > MAX_MAIN {
+        return Err(format!(
+            "LoadFailed: {main} is larger than {} MiB.",
+            MAX_MAIN / 1024 / 1024
+        ));
+    }
+    fs::read_to_string(&real).map_err(|e| format!("LoadFailed: {main} could not be read: {e}"))
 }
 
 #[cfg(test)]
@@ -182,12 +276,54 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// No code is read from an extension's folder: discovery returns its manifest only.
+    /// Discovery returns manifests; code is read only by `read_main`, and nothing here runs.
     #[test]
-    fn only_the_manifest_is_read_never_code() {
+    fn discovery_reads_manifests_and_only_read_main_reads_code() {
         let source = include_str!("extensions.rs");
         let code = source.split("#[cfg(test)]").next().unwrap();
-        assert_eq!(code.matches("fs::read_to_string(").count(), 1);
+        assert_eq!(code.matches("fs::read_to_string(").count(), 2);
         assert!(!code.contains("Command::new"));
+    }
+
+    #[test]
+    fn an_extension_is_located_by_id_and_its_main_read_only_from_inside_it() {
+        let root = temp("locate");
+        let folder = root.join("hello");
+        fs::create_dir_all(folder.join("out")).unwrap();
+        fs::write(
+            folder.join(MANIFEST_FILE),
+            r#"{"publisher":"acme","name":"hello","main":"out/extension.js"}"#,
+        )
+        .unwrap();
+        fs::write(
+            folder.join("out").join("extension.js"),
+            "module.exports = {};",
+        )
+        .unwrap();
+        fs::write(root.join("secret.txt"), "not yours").unwrap();
+
+        let (found, main) = locate(std::slice::from_ref(&root), "acme.hello").unwrap();
+        assert_eq!(read_main(&found, &main).unwrap(), "module.exports = {};");
+        assert!(locate(std::slice::from_ref(&root), "acme.nobody")
+            .unwrap_err()
+            .starts_with("UnknownExtension"));
+        for escape in ["../secret.txt", r"..\secret.txt", "out/../../secret.txt"] {
+            assert!(
+                read_main(&folder, escape)
+                    .unwrap_err()
+                    .starts_with("InvalidManifest"),
+                "{escape}"
+            );
+        }
+        let absolute = root.join("secret.txt");
+        assert!(read_main(&folder, absolute.to_str().unwrap()).is_err());
+        assert!(read_main(&folder, "missing.js")
+            .unwrap_err()
+            .starts_with("LoadFailed"));
+        fs::write(folder.join("big.js"), "x".repeat((MAX_MAIN + 1) as usize)).unwrap();
+        assert!(read_main(&folder, "big.js")
+            .unwrap_err()
+            .contains("larger than"));
+        let _ = fs::remove_dir_all(&root);
     }
 }

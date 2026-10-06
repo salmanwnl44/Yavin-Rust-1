@@ -16,7 +16,6 @@ import {
   type SettingDefinition,
   type SettingsRegistry,
 } from "../settings/settings.ts";
-import type { ExtensionModule } from "./api.ts";
 import { ExtensionError } from "./errors.ts";
 import {
   readManifest,
@@ -25,18 +24,21 @@ import {
   type ManifestProblem,
   type MenuContribution,
   type SettingContribution,
+  type ViewContainerContribution,
   type ViewContribution,
 } from "./manifest.ts";
 
-/** Where an extension's code comes from. */
-export type ExtensionSource =
-  { kind: "bundled"; module: ExtensionModule } | { kind: "folder"; path: string };
+/**
+ * Where an extension was found: its folder. Its code (if any) is read from there by the native
+ * side and runs in the workspace's extension host process (IDE-08) -- never in the window.
+ */
+export type ExtensionSource = { kind: "folder"; path: string };
 
 export interface RegisteredExtension {
   id: string;
   manifest: ExtensionManifest;
   source: ExtensionSource;
-  /** Where it was found, for messages: "bundled" or its folder. */
+  /** Where it was found, for messages: its folder. */
   origin: string;
   enabled: boolean;
   /** Manifest warnings, and contributions that could not be applied (with why). */
@@ -69,7 +71,13 @@ export interface RegistrySnapshot {
   /** Enabled extensions' contributions only. */
   commands: readonly ContributedCommand[];
   views: readonly ContributedView[];
+  viewContainers: readonly (ViewContainerContribution & { extensionId: string })[];
   menus: readonly (MenuContribution & { extensionId: string })[];
+  /**
+   * Enabled extensions that cannot activate because of their dependencies (missing, disabled,
+   * themselves unavailable, or in a cycle), with why. Their declarative contributions still apply.
+   */
+  unavailable: Readonly<Record<string, string>>;
 }
 
 export const DISABLED_KEY = "yavin.extensions.disabled";
@@ -156,7 +164,34 @@ export function createExtensionRegistry(options: {
     rejected: [],
     commands: [],
     views: [],
+    viewContainers: [],
     menus: [],
+    unavailable: {},
+  };
+
+  /** Why each enabled extension's dependencies keep it from activating (cycles included). */
+  const dependencyProblems = (): Record<string, string> => {
+    const problems: Record<string, string> = {};
+    const reason = (id: string, path: string[]): string | null => {
+      if (id in problems) return problems[id];
+      const entry = extensions.get(id)!;
+      for (const dependency of [...entry.manifest.dependencies].sort()) {
+        if (path.includes(dependency))
+          return `Its dependencies form a cycle: ${[...path, dependency].join(" → ")}.`;
+        const found = extensions.get(dependency);
+        if (!found) return `It needs ${dependency}, which is not installed.`;
+        if (!found.enabled) return `It needs ${dependency}, which is disabled.`;
+        const deeper = reason(dependency, [...path, dependency]);
+        if (deeper) return `It needs ${dependency}, which cannot activate: ${deeper}`;
+      }
+      return null;
+    };
+    for (const id of [...extensions.keys()].sort()) {
+      if (!extensions.get(id)!.enabled) continue;
+      const found = reason(id, [id]);
+      if (found) problems[id] = found;
+    }
+    return problems;
   };
 
   const build = (): RegistrySnapshot => {
@@ -193,7 +228,14 @@ export function createExtensionRegistry(options: {
             .map((menu) => menu.command),
         })),
       ),
+      viewContainers: enabled.flatMap((one) =>
+        one.manifest.contributes.viewContainers.map((container) => ({
+          ...container,
+          extensionId: one.id,
+        })),
+      ),
       menus,
+      unavailable: dependencyProblems(),
     };
   };
   const publish = () => {
@@ -272,10 +314,6 @@ export function createExtensionRegistry(options: {
         enabled: !disabled.has(manifest.id),
         warnings: result.warnings.map(describe),
       };
-      if (source.kind === "folder" && manifest.main)
-        entry.warnings.push(
-          "Its code is not run: Yavin does not yet run code from installed extensions (only bundled ones). Its declarative contributions apply.",
-        );
       extensions.set(manifest.id, entry);
       if (entry.enabled) applySettings(entry);
       publish();
@@ -322,6 +360,24 @@ export function createExtensionRegistry(options: {
     reject(origin: string, problem: string) {
       rejected = [...rejected, { id: null, origin, problems: [problem] }];
       publish();
+    },
+    /**
+     * The order to activate `id` in: its dependencies first (each before what needs it,
+     * alphabetically among equals), then itself. Deterministic; cycles are refused earlier
+     * (`unavailable`).
+     */
+    activationOrder(id: string): string[] {
+      const order: string[] = [];
+      const visit = (one: string, path: Set<string>) => {
+        if (order.includes(one) || path.has(one)) return;
+        path.add(one);
+        for (const dependency of [...(extensions.get(one)?.manifest.dependencies ?? [])].sort())
+          visit(dependency, path);
+        path.delete(one);
+        order.push(one);
+      };
+      visit(id, new Set());
+      return order;
     },
     /** Forgets the rejected list (a new discovery). */
     clearRejected() {

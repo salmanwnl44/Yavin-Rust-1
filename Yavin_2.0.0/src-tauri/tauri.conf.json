@@ -4,9 +4,9 @@
   "version": "2.0.0",
   "identifier": "com.yavin.ide",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "node scripts/build-extension-host.mjs && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "node scripts/build-extension-host.mjs --release && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -27,7 +27,7 @@
     }
   },
   "bundle": {
-    "resources": ["resources/search/rg.exe", "resources/search/COPYING", "resources/search/LICENSE-MIT", "resources/search/UNLICENSE", "resources/search/VERSION.txt"],
+    "resources": ["resources/search/rg.exe", "resources/search/COPYING", "resources/search/LICENSE-MIT", "resources/search/UNLICENSE", "resources/search/VERSION.txt", "resources/extension-host/*"],
     "active": true,
     "targets": "all",
     "icon": [

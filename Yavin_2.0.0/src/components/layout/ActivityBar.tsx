@@ -4,8 +4,11 @@ export function ActivityBar({
   onSelectTab,
   onOpenSettings,
   onOpenAccounts = onOpenSettings,
+  extensionTabs = [],
 }: {
   activeTab: string;
+  /** Extensions' own Activity Bar containers (IDE-08): `ext:<containerId>` tabs, a generic icon. */
+  extensionTabs?: readonly { id: string; title: string }[];
   gitBadge?: string;
   onSelectTab: (tab: string) => void;
   /** The gear: the Settings view (Ctrl+,). */
@@ -156,7 +159,28 @@ export function ActivityBar({
     <aside className="flex w-12 flex-col items-center border-r border-[#151515] bg-[#000000] py-3 select-none shrink-0 z-10">
       {/* Top Nav Buttons */}
       <div className="flex flex-col items-center gap-1.5 w-full">
-        {topTabs.map((tab) => {
+        {[
+          ...topTabs,
+          ...extensionTabs.map((tab) => ({
+            id: tab.id,
+            title: tab.title,
+            badge: undefined as string | undefined,
+            icon: (
+              <svg
+                width="20"
+                height="20"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.75"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M10 3h4v3a2 2 0 1 0 4 0V3h3v7h-3a2 2 0 1 0 0 4h3v7h-7v-3a2 2 0 1 0-4 0v3H3v-7h3a2 2 0 1 0 0-4H3V3h7z" />
+              </svg>
+            ),
+          })),
+        ].map((tab) => {
           const isActive = activeTab === tab.id;
           return (
             <button

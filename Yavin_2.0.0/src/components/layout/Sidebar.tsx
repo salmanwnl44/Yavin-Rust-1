@@ -20,7 +20,13 @@ import { ContextMenu } from "../ui/ContextMenu";
 import { ChevronIcon } from "../ui/FileIcons";
 import { CollapseIcon, MoreIcon, PlusIcon, FolderPlusIcon, RefreshIcon } from "../ui/Icons";
 import { allowed, INTO_FOLDER, type ExplorerAction } from "../explorer/actions";
-import { buildExplorerMenu, pathsToCopy, type Clipboard, type MenuActions } from "../explorer/menu";
+import {
+  buildExplorerMenu,
+  pathsToCopy,
+  type Clipboard,
+  type ExtensionMenuItem,
+  type MenuActions,
+} from "../explorer/menu";
 import { cleanPath, containingDir } from "../explorer/paths";
 import { CreateRow, ROW_HEIGHT, StatusRow, TreeRow, type RowApi } from "../explorer/TreeRow";
 
@@ -96,6 +102,8 @@ interface SidebarProps {
   }) => void;
   /** The Outline section, under the tree. */
   outline?: React.ReactNode;
+  /** Extensions' Explorer context-menu items (IDE-08). */
+  extensionMenuItems?: readonly ExtensionMenuItem[];
 }
 
 export function Sidebar(props: SidebarProps) {
@@ -1055,6 +1063,7 @@ export function Sidebar(props: SidebarProps) {
               count: contextMenu.node ? targetsFor(contextMenu.node).length : 1,
               can: (action) => can(action, contextMenu.node),
               actions: menuActions,
+              extensionItems: props.extensionMenuItems,
             })}
           />
         )}

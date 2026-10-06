@@ -1,6 +1,27 @@
+import { readFileSync } from "node:fs";
 import { test, expect } from "@playwright/test";
 import type { Locator, Page } from "@playwright/test";
 import { appAlert, editorSelections, withEditor } from "./editor-harness";
+
+/**
+ * The extension host's real API (`bootstrap.js`) and the sample extension, read here and run by
+ * the mock's in-page host (IDE-08) -- the same code the native QuickJS host runs.
+ */
+const EXTENSION_HOST = {
+  bootstrap: readFileSync(
+    new URL("../../src-tauri/crates/ide-plugin-host/src/bootstrap.js", import.meta.url),
+    "utf8",
+  ),
+  sampleManifest: readFileSync(
+    new URL("../../extensions/samples/hello-world/yavin-extension.json", import.meta.url),
+    "utf8",
+  ),
+  sampleCode: readFileSync(
+    new URL("../../extensions/samples/hello-world/extension.js", import.meta.url),
+    "utf8",
+  ),
+};
+const SAMPLE_FOLDER = "/repo/extensions/samples/hello-world";
 
 interface Call {
   command: string;
@@ -46,461 +67,652 @@ async function desktop(
     unixShell?: boolean;
     /** Installed extensions' folders and manifest texts (IDE-07 discovery). */
     extensions?: { folder: string; manifest: string | null; error: string | null }[];
+    /** Installed extensions' code, by extension id, as the native side reads it (IDE-08). */
+    extensionCode?: Record<string, string>;
   } = {},
 ) {
-  await page.addInitScript((setup) => {
-    const calls: Call[] = [];
-    // Trust is stateful, like the native side: a decision made in the dialog must change
-    // what later calls see, or the test can never observe the effect of trusting.
-    let trust = setup.trust ?? {
-      trusted: true,
-      decided: true,
-      root: "/work",
-      parent: "/",
-    };
-    const callbacks: Record<number, (event: unknown) => void> = {};
-    const listeners: Record<string, number[]> = {};
-    const sequences: Record<string, number> = {};
-    type Channel = { onmessage: (message: unknown) => void };
-    /**
-     * Each launch, by `sessionId:generation`, as the native side keeps it: the service's
-     * lifecycle channel, each attached view's channel, and what a view attaching later is
-     * replayed (its `Running`, its output, its end).
-     */
-    const launches: Record<
-      string,
-      { lifecycle: Channel; views: Record<string, Channel>; replay: unknown[] }
-    > = {};
-    let nextId = 1;
+  await page.addInitScript(
+    (setup) => {
+      const calls: Call[] = [];
+      // Trust is stateful, like the native side: a decision made in the dialog must change
+      // what later calls see, or the test can never observe the effect of trusting.
+      let trust = setup.trust ?? {
+        trusted: true,
+        decided: true,
+        root: "/work",
+        parent: "/",
+      };
+      const callbacks: Record<number, (event: unknown) => void> = {};
+      const listeners: Record<string, number[]> = {};
+      const sequences: Record<string, number> = {};
+      type Channel = { onmessage: (message: unknown) => void };
+      /**
+       * Each launch, by `sessionId:generation`, as the native side keeps it: the service's
+       * lifecycle channel, each attached view's channel, and what a view attaching later is
+       * replayed (its `Running`, its output, its end).
+       */
+      const launches: Record<
+        string,
+        { lifecycle: Channel; views: Record<string, Channel>; replay: unknown[] }
+      > = {};
+      let nextId = 1;
 
-    Object.assign(window, {
-      __calls: calls,
-      // Delivers a native event to every listener registered for it.
-      __emit: (event: string, payload: unknown) => {
-        for (const id of listeners[event] ?? []) callbacks[id]?.({ event, id, payload });
-      },
-      // A terminal's output and exit as the native side sends them -- output to each view
-      // attached to that launch, its end (Exiting, then the exit) to the service and the views,
-      // never broadcast: for its latest launch unless one is named, bytes in base64, numbered
-      // from 0 within the launch.
-      // A shell-integration signal (TERMINAL-05A) goes to the service and the views, live,
-      // and is never replayed.
-      __terminal: (
-        kind: "output" | "exit" | "shell",
-        sessionId: string,
-        value: string | number | Record<string, unknown>,
-        launch?: number,
-      ) => {
-        const generation =
-          launch ??
-          (calls.filter((c) => c.command === "terminal_open" && c.args.id === sessionId).at(-1)
-            ?.args.generation as number);
-        const key = `${sessionId}:${generation}`;
-        const next = sequences[key] ?? 0;
-        const launch_ = launches[key];
-        if (!launch_) return;
-        const toViews = (message: unknown) => {
-          launch_.replay.push(message);
-          for (const view of Object.values(launch_.views)) view.onmessage(message);
-        };
-        const toAll = (message: unknown) => {
-          toViews(message);
-          launch_.lifecycle.onmessage(message);
-        };
-        if (kind === "shell") {
-          const message = { kind, sessionId, generation, ...(value as object) };
-          for (const view of Object.values(launch_.views)) view.onmessage(message);
-          launch_.lifecycle.onmessage(message);
-        } else if (kind === "output") {
-          sequences[key] = next + 1;
-          const bytes = btoa(String.fromCharCode(...new TextEncoder().encode(value as string)));
-          toViews({ kind: "output", sessionId, generation, seq: next, bytes });
-        } else {
-          const lastSeq = next === 0 ? null : next - 1;
-          toAll({ kind: "state", sessionId, generation, state: "Exiting" });
-          toAll({ kind: "exit", sessionId, generation, exitCode: value, lastSeq });
-          launch_.views = {};
+      // --- The extension host (IDE-08), as the native side and the QuickJS host behave -----------
+      type Identity = {
+        workspaceId: string;
+        hostGeneration: number;
+        workspaceFolder: string | null;
+        apiVersion: string;
+      };
+      const hosts: Record<
+        number,
+        {
+          identity: Identity | null;
+          extensions: Map<string, (text: string) => void>;
+          ended: boolean;
         }
-      },
-      isTauri: true,
-      __TAURI_INTERNALS__: {
-        metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
-        transformCallback: (callback: (event: unknown) => void) => {
-          const id = nextId++;
-          callbacks[id] = callback;
-          return id;
+      > = {};
+      let nextHostSession = 1;
+      const emit = (event: string, payload: unknown) =>
+        (window as unknown as { __emit: (event: string, payload: unknown) => void }).__emit(
+          event,
+          payload,
+        );
+      const hostOut = (session: number, message: Record<string, unknown>) =>
+        setTimeout(() => {
+          if (!hosts[session]?.ended)
+            emit("ext-host-message", { session, message: JSON.stringify(message) });
+        }, 0);
+      const endHost = (session: number, code: number) => {
+        const one = hosts[session];
+        if (!one || one.ended) return;
+        one.ended = true;
+        setTimeout(() => emit("ext-host-exit", { session, code, error: null }), 0);
+      };
+      const sampleId = (() => {
+        const manifest = JSON.parse(setup.host.sampleManifest) as {
+          publisher: string;
+          name: string;
+        };
+        return `${manifest.publisher}.${manifest.name}`;
+      })();
+      const codeOf = (id: string) =>
+        id === sampleId ? setup.host.sampleCode : (setup.extensionCode?.[id] ?? null);
+      const hostHandle = (session: number, text: string) => {
+        const one = hosts[session];
+        if (!one || one.ended) return;
+        const message = JSON.parse(text);
+        if (message.type === "init") {
+          one.identity = message;
+          hostOut(session, { type: "ready" });
+          return;
+        }
+        if (message.type === "shutdown") return endHost(session, 0);
+        const identity = one.identity;
+        if (
+          !identity ||
+          message.workspaceId !== identity.workspaceId ||
+          message.hostGeneration !== identity.hostGeneration
+        )
+          return hostOut(session, {
+            type: "error",
+            error: { code: "StaleGeneration", message: "stale" },
+          });
+        const id = message.extensionId as string;
+        const ids = {
+          extensionId: id,
+          workspaceId: identity.workspaceId,
+          hostGeneration: identity.hostGeneration,
+        };
+        if (message.type === "load") {
+          const code = codeOf(id);
+          if (code === null)
+            return hostOut(session, {
+              type: "error",
+              ...ids,
+              error: { code: "LoadFailed", message: `${id} has no code.` },
+            });
+          const realm: Record<string, unknown> = {
+            // Everything the extension sends carries its real identity, as the native host stamps it.
+            __yavin_send: (out: string) => hostOut(session, { ...JSON.parse(out), ...ids }),
+          };
+          const init = JSON.stringify({
+            ...ids,
+            workspaceFolder: identity.workspaceFolder,
+            extensionPath: `/extensions/${id}`,
+            apiVersion: identity.apiVersion,
+          });
+          try {
+            new Function("globalThis", setup.host.bootstrap.replaceAll("__YAVIN_INIT__", init))(
+              realm,
+            );
+            const receive = realm.__yavin_receive as (text: string) => void;
+            (realm.__yavin_load as (source: string) => void)(code);
+            one.extensions.set(id, receive);
+            hostOut(session, { type: "loaded", ...ids });
+          } catch (error) {
+            hostOut(session, {
+              type: "error",
+              ...ids,
+              error: { code: "LoadFailed", message: String((error as Error).message) },
+            });
+          }
+          return;
+        }
+        if (message.type === "unload") {
+          one.extensions.delete(id);
+          return hostOut(session, { type: "unloaded", ...ids });
+        }
+        const receive = one.extensions.get(id);
+        if (!receive)
+          return hostOut(session, {
+            type: "response",
+            requestId: message.requestId,
+            ok: false,
+            error: { code: "NotLoaded", message: "not loaded" },
+            ...ids,
+          });
+        try {
+          receive(text);
+        } catch (error) {
+          if (message.type === "request")
+            hostOut(session, {
+              type: "response",
+              requestId: message.requestId,
+              ok: false,
+              error: { code: "ExtensionFailed", message: String((error as Error).message) },
+              ...ids,
+            });
+        }
+      };
+      // The live host process dies (exit code 3), as a crash would end it.
+      Object.assign(window, {
+        __crashExtensionHost: () => {
+          for (const key of Object.keys(hosts))
+            if (!hosts[Number(key)].ended) endHost(Number(key), 3);
         },
-        unregisterCallback: (id: number) => delete callbacks[id],
-        invoke: async (command: string, raw: Record<string, unknown> = {}) => {
-          // Terminal commands take one contract request; it is recorded flat, with the
-          // session id as `id`, the shell as `shell` and the size as `cols`/`rows`.
-          const request = raw.request as
-            | {
-                sessionId: string;
-                profile?: { executable: string; cwd: string | null } | null;
-                cwd?: string | null;
-                dimensions?: { cols: number; rows: number };
-              }
-            | undefined;
-          const args: Record<string, unknown> = request
-            ? {
-                ...request,
-                id: request.sessionId,
-                shell: request.profile?.executable ?? "",
-                cwd: request.cwd ?? request.profile?.cwd ?? undefined,
-                cols: request.dimensions?.cols,
-                rows: request.dimensions?.rows,
-                ...(raw.subscriptionId ? { subscriptionId: raw.subscriptionId } : {}),
-              }
-            : raw;
-          calls.push({ command, args });
-          if (command === "plugin:event|listen") {
-            const event = args.event as string;
-            (listeners[event] ??= []).push(args.handler as number);
-            return nextId++;
+      });
+
+      Object.assign(window, {
+        __calls: calls,
+        // Delivers a native event to every listener registered for it.
+        __emit: (event: string, payload: unknown) => {
+          for (const id of listeners[event] ?? []) callbacks[id]?.({ event, id, payload });
+        },
+        // A terminal's output and exit as the native side sends them -- output to each view
+        // attached to that launch, its end (Exiting, then the exit) to the service and the views,
+        // never broadcast: for its latest launch unless one is named, bytes in base64, numbered
+        // from 0 within the launch.
+        // A shell-integration signal (TERMINAL-05A) goes to the service and the views, live,
+        // and is never replayed.
+        __terminal: (
+          kind: "output" | "exit" | "shell",
+          sessionId: string,
+          value: string | number | Record<string, unknown>,
+          launch?: number,
+        ) => {
+          const generation =
+            launch ??
+            (calls.filter((c) => c.command === "terminal_open" && c.args.id === sessionId).at(-1)
+              ?.args.generation as number);
+          const key = `${sessionId}:${generation}`;
+          const next = sequences[key] ?? 0;
+          const launch_ = launches[key];
+          if (!launch_) return;
+          const toViews = (message: unknown) => {
+            launch_.replay.push(message);
+            for (const view of Object.values(launch_.views)) view.onmessage(message);
+          };
+          const toAll = (message: unknown) => {
+            toViews(message);
+            launch_.lifecycle.onmessage(message);
+          };
+          if (kind === "shell") {
+            const message = { kind, sessionId, generation, ...(value as object) };
+            for (const view of Object.values(launch_.views)) view.onmessage(message);
+            launch_.lifecycle.onmessage(message);
+          } else if (kind === "output") {
+            sequences[key] = next + 1;
+            const bytes = btoa(String.fromCharCode(...new TextEncoder().encode(value as string)));
+            toViews({ kind: "output", sessionId, generation, seq: next, bytes });
+          } else {
+            const lastSeq = next === 0 ? null : next - 1;
+            toAll({ kind: "state", sessionId, generation, state: "Exiting" });
+            toAll({ kind: "exit", sessionId, generation, exitCode: value, lastSeq });
+            launch_.views = {};
           }
-          if (command === "get_default_workspace") return "/work";
-          // One folder, for a reveal to show, and one file.
-          if (command === "list_workspace_files" && args.path === "/work/src")
-            return { path: "/work/src", name: "src", is_dir: true, children: [] };
-          if (command === "list_workspace_files")
-            return {
-              path: "/work",
-              name: "work",
-              is_dir: true,
-              children: [
-                { path: "/work/src", name: "src", is_dir: true, children: null },
-                { path: "/work/file.ts", name: "file.ts", is_dir: false, children: null },
-              ],
-            };
-          // Any file reads as 30 numbered lines, so a jump to a line can be checked.
-          if (command === "read_file_content")
-            return Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n");
-          if (command === "list_listening_ports") return setup.ports ?? [];
-          if (command === "workspace_trust") return trust;
-          if (command === "set_workspace_trust") {
-            trust = { ...trust, trusted: (args as { trusted: boolean }).trusted, decided: true };
-            return trust;
-          }
-          if (command === "trusted_folders") return trust.trusted ? [trust.root] : [];
-          if (command === "forget_trusted_folder") {
-            trust = { ...trust, trusted: false, decided: false };
-            return trust;
-          }
-          // A restricted folder is offered no checkers, matching the native side.
-          if (command === "available_checkers") return trust.trusted ? (setup.checkers ?? []) : [];
-          // Open Folder… answers with whatever the test put in `__openFolder`.
-          if (command === "open_folder_dialog")
-            return (window as unknown as { __openFolder?: string }).__openFolder ?? null;
-          if (command === "run_checker") {
-            const scenario = window as unknown as {
-              __scenarioCheckerOutput?: string;
-              __scenarioCheckerCode?: number;
-              __checkerDelay?: number;
-              __checkerOutcome?: "completed" | "cancelled" | "timedOut";
-            };
-            // A slow checker (a cold `cargo check`), for what happens while it runs.
-            if (scenario.__checkerDelay)
-              await new Promise((resolve) => setTimeout(resolve, scenario.__checkerDelay));
-            const output = scenario.__scenarioCheckerOutput ?? setup.checkerOutput ?? "";
-            // As the native side answers (IDE-01): how it ended, its output, its exit code --
-            // a checker exits nonzero when it finds problems, so the tests say which -- and the
-            // folder it ran in, which its relative paths are relative to.
-            return {
-              outcome: scenario.__checkerOutcome ?? "completed",
-              output,
-              code: scenario.__scenarioCheckerCode ?? setup.checkerCode ?? 0,
-              root: "/work",
-            };
-          }
-          if (command === "stop_listening_process") return null;
-          // Discovery (TERMINAL-05): every shell looked for, one of them not installed.
-          if (command === "terminal_shells" && setup.unixShell)
-            return [
-              {
-                name: "Bash",
-                path: "/bin/bash",
-                kind: "bash",
-                platform: "unix",
-                available: true,
-                reason: null,
-                isDefault: true,
-              },
-            ];
-          if (command === "terminal_shells")
-            return [
-              {
-                name: "Command Prompt",
-                path: "C:\\Windows\\System32\\cmd.exe",
-                kind: "cmd",
-                platform: "windows",
-                available: true,
-                reason: null,
-                isDefault: true,
-              },
-              {
-                name: "PowerShell",
-                path: "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
-                kind: "pwsh",
-                platform: "windows",
-                available: false,
-                reason: "PowerShell 7 (pwsh.exe) is not installed.",
-                isDefault: false,
-              },
-              {
-                name: "Git Bash",
-                path: "C:\\Program Files\\Git\\bin\\bash.exe",
-                kind: "bash",
-                platform: "windows",
-                available: true,
-                reason: null,
-                isDefault: false,
-              },
-            ];
-          if (command === "terminal_open") {
-            if (setup.failOpen) throw setup.failOpen;
-            const running = {
-              kind: "state",
-              sessionId: request!.sessionId,
-              generation: args.generation,
-              state: "Running",
-              pid: 4242,
-            };
-            launches[`${request!.sessionId}:${args.generation}`] = {
-              lifecycle: raw.events as Channel,
-              views: {},
-              replay: [running],
-            };
-            // A slow start, for tests of what happens meanwhile; its end is recorded too.
-            const delay = (window as unknown as { __openDelay?: number }).__openDelay;
-            if (delay) {
-              await new Promise((resolve) => setTimeout(resolve, delay));
-              calls.push({ command: "terminal_open:done", args });
+        },
+        isTauri: true,
+        __TAURI_INTERNALS__: {
+          metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
+          transformCallback: (callback: (event: unknown) => void) => {
+            const id = nextId++;
+            callbacks[id] = callback;
+            return id;
+          },
+          unregisterCallback: (id: number) => delete callbacks[id],
+          invoke: async (command: string, raw: Record<string, unknown> = {}) => {
+            // Terminal commands take one contract request; it is recorded flat, with the
+            // session id as `id`, the shell as `shell` and the size as `cols`/`rows`.
+            const request = raw.request as
+              | {
+                  sessionId: string;
+                  profile?: { executable: string; cwd: string | null } | null;
+                  cwd?: string | null;
+                  dimensions?: { cols: number; rows: number };
+                }
+              | undefined;
+            const args: Record<string, unknown> = request
+              ? {
+                  ...request,
+                  id: request.sessionId,
+                  shell: request.profile?.executable ?? "",
+                  cwd: request.cwd ?? request.profile?.cwd ?? undefined,
+                  cols: request.dimensions?.cols,
+                  rows: request.dimensions?.rows,
+                  ...(raw.subscriptionId ? { subscriptionId: raw.subscriptionId } : {}),
+                }
+              : raw;
+            calls.push({ command, args });
+            if (command === "plugin:event|listen") {
+              const event = args.event as string;
+              (listeners[event] ??= []).push(args.handler as number);
+              return nextId++;
             }
-            // The session as the native side answers it: already running.
-            return {
-              ...request,
-              generation: args.generation,
-              state: "Running",
-              pid: 4242,
-              startedAt: 0,
-              exitCode: null,
-            };
-          }
-          // A view attaches: replayed what its launch has said so far, then sent it live.
-          if (command === "terminal_subscribe") {
-            const subscribed = raw.request as {
-              subscriptionId: string;
-              sessionId: string;
-              generation: number;
-            };
-            const launch_ = launches[`${subscribed.sessionId}:${subscribed.generation}`];
-            if (!launch_) throw "InvalidSession: That terminal is no longer running.";
-            const view = raw.events as Channel;
-            for (const message of launch_.replay) view.onmessage(message);
-            launch_.views[subscribed.subscriptionId] = view;
-            return null;
-          }
-          if (command === "terminal_unsubscribe") {
-            const { subscriptionId } = raw.request as { subscriptionId: string };
-            for (const launch_ of Object.values(launches)) delete launch_.views[subscriptionId];
-            return null;
-          }
-          // A debug adapter (IDE-05), as `dap.rs` hands one to the window: DAP messages out as
-          // `dap-message` events, its end as `dap-exit`. It debugs a pretend program -- the
-          // launched file's lines in order, stopping at breakpoints -- like debugpy (`initialized`
-          // after `launch`, `launch` answered after `configurationDone`).
-          if (command.startsWith("dap_")) {
-            const scenario = window as unknown as {
-              __emit: (event: string, payload: unknown) => void;
-              __dap?: {
-                session: number;
-                seq: number;
-                line: number;
-                epoch: number;
-                program: string;
-                breakpoints: number[];
-                launch: number | null;
-                ended: boolean;
+            if (command === "get_default_workspace") return "/work";
+            // One folder, for a reveal to show, and one file.
+            if (command === "list_workspace_files" && args.path === "/work/src")
+              return { path: "/work/src", name: "src", is_dir: true, children: [] };
+            if (command === "list_workspace_files")
+              return {
+                path: "/work",
+                name: "work",
+                is_dir: true,
+                children: [
+                  { path: "/work/src", name: "src", is_dir: true, children: null },
+                  { path: "/work/file.ts", name: "file.ts", is_dir: false, children: null },
+                ],
               };
-              __dapRunsForever?: boolean;
-              __dapCapabilities?: Record<string, unknown>;
-            };
-            const say = (body: Record<string, unknown>) => {
-              const state = scenario.__dap!;
-              const session = state.session;
-              const message = JSON.stringify({ seq: state.seq++, ...body });
-              setTimeout(() => scenario.__emit("dap-message", { session, message }), 0);
-            };
-            const end = () => {
-              const state = scenario.__dap;
-              if (!state || state.ended) return;
-              state.ended = true;
-              const session = state.session;
-              setTimeout(() => scenario.__emit("dap-exit", { session, code: 0, error: null }), 0);
-            };
-            if (command === "dap_stop_all") return null;
-            if (command === "dap_stop") {
-              end();
+            // Any file reads as 30 numbered lines, so a jump to a line can be checked.
+            if (command === "read_file_content")
+              return Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n");
+            if (command === "list_listening_ports") return setup.ports ?? [];
+            if (command === "workspace_trust") return trust;
+            if (command === "set_workspace_trust") {
+              trust = { ...trust, trusted: (args as { trusted: boolean }).trusted, decided: true };
+              return trust;
+            }
+            if (command === "trusted_folders") return trust.trusted ? [trust.root] : [];
+            if (command === "forget_trusted_folder") {
+              trust = { ...trust, trusted: false, decided: false };
+              return trust;
+            }
+            // A restricted folder is offered no checkers, matching the native side.
+            if (command === "available_checkers")
+              return trust.trusted ? (setup.checkers ?? []) : [];
+            // Open Folder… answers with whatever the test put in `__openFolder`.
+            if (command === "open_folder_dialog")
+              return (window as unknown as { __openFolder?: string }).__openFolder ?? null;
+            if (command === "run_checker") {
+              const scenario = window as unknown as {
+                __scenarioCheckerOutput?: string;
+                __scenarioCheckerCode?: number;
+                __checkerDelay?: number;
+                __checkerOutcome?: "completed" | "cancelled" | "timedOut";
+              };
+              // A slow checker (a cold `cargo check`), for what happens while it runs.
+              if (scenario.__checkerDelay)
+                await new Promise((resolve) => setTimeout(resolve, scenario.__checkerDelay));
+              const output = scenario.__scenarioCheckerOutput ?? setup.checkerOutput ?? "";
+              // As the native side answers (IDE-01): how it ended, its output, its exit code --
+              // a checker exits nonzero when it finds problems, so the tests say which -- and the
+              // folder it ran in, which its relative paths are relative to.
+              return {
+                outcome: scenario.__checkerOutcome ?? "completed",
+                output,
+                code: scenario.__scenarioCheckerCode ?? setup.checkerCode ?? 0,
+                root: "/work",
+              };
+            }
+            if (command === "stop_listening_process") return null;
+            // Discovery (TERMINAL-05): every shell looked for, one of them not installed.
+            if (command === "terminal_shells" && setup.unixShell)
+              return [
+                {
+                  name: "Bash",
+                  path: "/bin/bash",
+                  kind: "bash",
+                  platform: "unix",
+                  available: true,
+                  reason: null,
+                  isDefault: true,
+                },
+              ];
+            if (command === "terminal_shells")
+              return [
+                {
+                  name: "Command Prompt",
+                  path: "C:\\Windows\\System32\\cmd.exe",
+                  kind: "cmd",
+                  platform: "windows",
+                  available: true,
+                  reason: null,
+                  isDefault: true,
+                },
+                {
+                  name: "PowerShell",
+                  path: "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                  kind: "pwsh",
+                  platform: "windows",
+                  available: false,
+                  reason: "PowerShell 7 (pwsh.exe) is not installed.",
+                  isDefault: false,
+                },
+                {
+                  name: "Git Bash",
+                  path: "C:\\Program Files\\Git\\bin\\bash.exe",
+                  kind: "bash",
+                  platform: "windows",
+                  available: true,
+                  reason: null,
+                  isDefault: false,
+                },
+              ];
+            if (command === "terminal_open") {
+              if (setup.failOpen) throw setup.failOpen;
+              const running = {
+                kind: "state",
+                sessionId: request!.sessionId,
+                generation: args.generation,
+                state: "Running",
+                pid: 4242,
+              };
+              launches[`${request!.sessionId}:${args.generation}`] = {
+                lifecycle: raw.events as Channel,
+                views: {},
+                replay: [running],
+              };
+              // A slow start, for tests of what happens meanwhile; its end is recorded too.
+              const delay = (window as unknown as { __openDelay?: number }).__openDelay;
+              if (delay) {
+                await new Promise((resolve) => setTimeout(resolve, delay));
+                calls.push({ command: "terminal_open:done", args });
+              }
+              // The session as the native side answers it: already running.
+              return {
+                ...request,
+                generation: args.generation,
+                state: "Running",
+                pid: 4242,
+                startedAt: 0,
+                exitCode: null,
+              };
+            }
+            // A view attaches: replayed what its launch has said so far, then sent it live.
+            if (command === "terminal_subscribe") {
+              const subscribed = raw.request as {
+                subscriptionId: string;
+                sessionId: string;
+                generation: number;
+              };
+              const launch_ = launches[`${subscribed.sessionId}:${subscribed.generation}`];
+              if (!launch_) throw "InvalidSession: That terminal is no longer running.";
+              const view = raw.events as Channel;
+              for (const message of launch_.replay) view.onmessage(message);
+              launch_.views[subscribed.subscriptionId] = view;
               return null;
             }
-            if (command === "dap_start") {
-              const session = (scenario.__dap?.session ?? 0) + 1;
-              scenario.__dap = {
-                session,
-                seq: 1,
-                line: 0,
-                epoch: 0,
-                program: "",
-                breakpoints: [],
-                launch: null,
-                ended: false,
+            if (command === "terminal_unsubscribe") {
+              const { subscriptionId } = raw.request as { subscriptionId: string };
+              for (const launch_ of Object.values(launches)) delete launch_.views[subscriptionId];
+              return null;
+            }
+            // A debug adapter (IDE-05), as `dap.rs` hands one to the window: DAP messages out as
+            // `dap-message` events, its end as `dap-exit`. It debugs a pretend program -- the
+            // launched file's lines in order, stopping at breakpoints -- like debugpy (`initialized`
+            // after `launch`, `launch` answered after `configurationDone`).
+            if (command.startsWith("dap_")) {
+              const scenario = window as unknown as {
+                __emit: (event: string, payload: unknown) => void;
+                __dap?: {
+                  session: number;
+                  seq: number;
+                  line: number;
+                  epoch: number;
+                  program: string;
+                  breakpoints: number[];
+                  launch: number | null;
+                  ended: boolean;
+                };
+                __dapRunsForever?: boolean;
+                __dapCapabilities?: Record<string, unknown>;
               };
-              return { session, program: "/usr/bin/python3" };
-            }
-            // dap_send: one request.
-            const state = scenario.__dap!;
-            const request = JSON.parse((raw as { message: string }).message) as {
-              seq: number;
-              command: string;
-              arguments?: Record<string, unknown>;
-            };
-            const ok = (body?: unknown, seq = request.seq, name = request.command) =>
-              say({ type: "response", request_seq: seq, command: name, success: true, body });
-            const event = (name: string, body?: unknown) =>
-              say({ type: "event", event: name, body });
-            const stopAt = (line: number, reason: string) => {
-              state.line = line;
-              state.epoch++;
-              event("stopped", { reason, threadId: 1, allThreadsStopped: true });
-            };
-            const run = () => {
-              const next = state.breakpoints
-                .filter((line) => line > state.line)
-                .sort((a, b) => a - b)[0];
-              if (next !== undefined) stopAt(next, "breakpoint");
-              else if (!scenario.__dapRunsForever) {
-                event("output", { category: "stdout", output: "done\n" });
-                event("exited", { exitCode: 0 });
-                event("terminated");
-              }
-            };
-            const args = request.arguments ?? {};
-            switch (request.command) {
-              case "initialize":
-                ok({
-                  supportsConfigurationDoneRequest: true,
-                  supportsTerminateRequest: true,
-                  ...scenario.__dapCapabilities,
-                });
-                break;
-              case "launch":
-                state.program = String(args.program);
-                state.launch = request.seq;
-                event("initialized");
-                break;
-              case "setBreakpoints": {
-                const lines = (args.breakpoints as { line: number }[]).map((bp) => bp.line);
-                state.breakpoints = lines;
-                ok({ breakpoints: lines.map((line, i) => ({ id: 10 + i, verified: true, line })) });
-                break;
-              }
-              case "configurationDone":
-                ok();
-                ok(undefined, state.launch!, "launch");
-                run();
-                break;
-              case "threads":
-                ok({ threads: [{ id: 1, name: "MainThread" }] });
-                break;
-              case "stackTrace": {
-                const source = { path: state.program, name: state.program.split("/").pop() };
-                ok({
-                  stackFrames: [
-                    { id: state.epoch * 10 + 1, name: "work", source, line: state.line, column: 1 },
-                    { id: state.epoch * 10 + 2, name: "<module>", source, line: 1, column: 1 },
-                  ],
-                });
-                break;
-              }
-              case "scopes":
-                ok({
-                  scopes: [
-                    { name: "Locals", variablesReference: 1000 + state.epoch, expensive: false },
-                  ],
-                });
-                break;
-              case "variables":
-                ok({
-                  variables:
-                    (args.variablesReference as number) >= 2000
-                      ? [
-                          { name: "0", value: "1", variablesReference: 0 },
-                          { name: "1", value: "2", variablesReference: 0 },
-                        ]
-                      : [
-                          {
-                            name: "line",
-                            value: String(state.line),
-                            type: "int",
-                            variablesReference: 0,
-                          },
-                          {
-                            name: "items",
-                            value: "[1, 2]",
-                            type: "list",
-                            variablesReference: 2000 + state.epoch,
-                          },
-                        ],
-                });
-                break;
-              case "continue":
-                ok({ allThreadsContinued: true });
-                run();
-                break;
-              case "next":
-              case "stepIn":
-                ok();
-                stopAt(state.line + 1, "step");
-                break;
-              case "stepOut":
-                ok();
-                stopAt(state.line + 2, "step");
-                break;
-              case "pause":
-                ok();
-                stopAt(state.line || 1, "pause");
-                break;
-              case "evaluate":
-                ok({ result: `${String(args.expression)} = ${state.line}`, variablesReference: 0 });
-                break;
-              case "terminate":
-                ok();
-                event("terminated");
-                break;
-              case "disconnect":
-                ok();
+              const say = (body: Record<string, unknown>) => {
+                const state = scenario.__dap!;
+                const session = state.session;
+                const message = JSON.stringify({ seq: state.seq++, ...body });
+                setTimeout(() => scenario.__emit("dap-message", { session, message }), 0);
+              };
+              const end = () => {
+                const state = scenario.__dap;
+                if (!state || state.ended) return;
+                state.ended = true;
+                const session = state.session;
+                setTimeout(() => scenario.__emit("dap-exit", { session, code: 0, error: null }), 0);
+              };
+              if (command === "dap_stop_all") return null;
+              if (command === "dap_stop") {
                 end();
-                break;
-              default:
-                ok();
+                return null;
+              }
+              if (command === "dap_start") {
+                const session = (scenario.__dap?.session ?? 0) + 1;
+                scenario.__dap = {
+                  session,
+                  seq: 1,
+                  line: 0,
+                  epoch: 0,
+                  program: "",
+                  breakpoints: [],
+                  launch: null,
+                  ended: false,
+                };
+                return { session, program: "/usr/bin/python3" };
+              }
+              // dap_send: one request.
+              const state = scenario.__dap!;
+              const request = JSON.parse((raw as { message: string }).message) as {
+                seq: number;
+                command: string;
+                arguments?: Record<string, unknown>;
+              };
+              const ok = (body?: unknown, seq = request.seq, name = request.command) =>
+                say({ type: "response", request_seq: seq, command: name, success: true, body });
+              const event = (name: string, body?: unknown) =>
+                say({ type: "event", event: name, body });
+              const stopAt = (line: number, reason: string) => {
+                state.line = line;
+                state.epoch++;
+                event("stopped", { reason, threadId: 1, allThreadsStopped: true });
+              };
+              const run = () => {
+                const next = state.breakpoints
+                  .filter((line) => line > state.line)
+                  .sort((a, b) => a - b)[0];
+                if (next !== undefined) stopAt(next, "breakpoint");
+                else if (!scenario.__dapRunsForever) {
+                  event("output", { category: "stdout", output: "done\n" });
+                  event("exited", { exitCode: 0 });
+                  event("terminated");
+                }
+              };
+              const args = request.arguments ?? {};
+              switch (request.command) {
+                case "initialize":
+                  ok({
+                    supportsConfigurationDoneRequest: true,
+                    supportsTerminateRequest: true,
+                    ...scenario.__dapCapabilities,
+                  });
+                  break;
+                case "launch":
+                  state.program = String(args.program);
+                  state.launch = request.seq;
+                  event("initialized");
+                  break;
+                case "setBreakpoints": {
+                  const lines = (args.breakpoints as { line: number }[]).map((bp) => bp.line);
+                  state.breakpoints = lines;
+                  ok({
+                    breakpoints: lines.map((line, i) => ({ id: 10 + i, verified: true, line })),
+                  });
+                  break;
+                }
+                case "configurationDone":
+                  ok();
+                  ok(undefined, state.launch!, "launch");
+                  run();
+                  break;
+                case "threads":
+                  ok({ threads: [{ id: 1, name: "MainThread" }] });
+                  break;
+                case "stackTrace": {
+                  const source = { path: state.program, name: state.program.split("/").pop() };
+                  ok({
+                    stackFrames: [
+                      {
+                        id: state.epoch * 10 + 1,
+                        name: "work",
+                        source,
+                        line: state.line,
+                        column: 1,
+                      },
+                      { id: state.epoch * 10 + 2, name: "<module>", source, line: 1, column: 1 },
+                    ],
+                  });
+                  break;
+                }
+                case "scopes":
+                  ok({
+                    scopes: [
+                      { name: "Locals", variablesReference: 1000 + state.epoch, expensive: false },
+                    ],
+                  });
+                  break;
+                case "variables":
+                  ok({
+                    variables:
+                      (args.variablesReference as number) >= 2000
+                        ? [
+                            { name: "0", value: "1", variablesReference: 0 },
+                            { name: "1", value: "2", variablesReference: 0 },
+                          ]
+                        : [
+                            {
+                              name: "line",
+                              value: String(state.line),
+                              type: "int",
+                              variablesReference: 0,
+                            },
+                            {
+                              name: "items",
+                              value: "[1, 2]",
+                              type: "list",
+                              variablesReference: 2000 + state.epoch,
+                            },
+                          ],
+                  });
+                  break;
+                case "continue":
+                  ok({ allThreadsContinued: true });
+                  run();
+                  break;
+                case "next":
+                case "stepIn":
+                  ok();
+                  stopAt(state.line + 1, "step");
+                  break;
+                case "stepOut":
+                  ok();
+                  stopAt(state.line + 2, "step");
+                  break;
+                case "pause":
+                  ok();
+                  stopAt(state.line || 1, "pause");
+                  break;
+                case "evaluate":
+                  ok({
+                    result: `${String(args.expression)} = ${state.line}`,
+                    variablesReference: 0,
+                  });
+                  break;
+                case "terminate":
+                  ok();
+                  event("terminated");
+                  break;
+                case "disconnect":
+                  ok();
+                  end();
+                  break;
+                default:
+                  ok();
+              }
+              return null;
             }
+            // The sample (as a development build finds it) and the installed extensions.
+            if (command === "extensions_list")
+              return {
+                root: "/data/extensions",
+                extensions: [
+                  {
+                    folder: setup.host.sampleFolder,
+                    manifest: setup.host.sampleManifest,
+                    error: null,
+                  },
+                  ...(setup.extensions ?? []),
+                ],
+                skipped: 0,
+              };
+            // The extension host (IDE-08), in the page: the real `bootstrap.js` and extension code,
+            // the native contract around them -- start refused unless trusted, a `load` filled
+            // with the extension's code, messages and the end as events by session.
+            if (command === "ext_host_start") {
+              if (!trust.trusted) throw "TrustRequired: This folder is not trusted.";
+              const session = nextHostSession++;
+              hosts[session] = { identity: null, extensions: new Map(), ended: false };
+              return session;
+            }
+            if (command === "ext_host_send") {
+              const session = args.session as number;
+              const one = hosts[session];
+              if (!one || one.ended) throw "HostStopped: The extension host has stopped.";
+              const text = args.message as string;
+              setTimeout(() => hostHandle(session, text), 0);
+              return null;
+            }
+            if (command === "ext_host_stop") {
+              endHost(args.session as number, 0);
+              return null;
+            }
+            if (command === "ext_host_stop_all") {
+              const live = Object.keys(hosts).filter((key) => !hosts[Number(key)].ended);
+              for (const key of live) endHost(Number(key), 0);
+              return live.length;
+            }
+            if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
+            if (command === "git_repo_state") return "";
+            if (command === "git_exec")
+              return setup.failGit
+                ? { stdout: "", stderr: setup.failGit, code: 128, truncated: false }
+                : { stdout: "", stderr: "", code: 0, truncated: false };
             return null;
-          }
-          if (command === "extensions_list")
-            return { root: "/data/extensions", extensions: setup.extensions ?? [], skipped: 0 };
-          if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
-          if (command === "git_repo_state") return "";
-          if (command === "git_exec")
-            return setup.failGit
-              ? { stdout: "", stderr: setup.failGit, code: 128, truncated: false }
-              : { stdout: "", stderr: "", code: 0, truncated: false };
-          return null;
+          },
         },
-      },
-      __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => {} },
-    });
-  }, options);
+        __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => {} },
+      });
+    },
+    { ...options, host: { ...EXTENSION_HOST, sampleFolder: SAMPLE_FOLDER } },
+  );
   await page.goto("/");
 }
 
@@ -2992,9 +3204,10 @@ test("with no configuration the Debug view says so and Configure Debugging opens
   await expect(debugConsole.getByRole("textbox", { name: "Evaluate expression" })).toBeDisabled();
 });
 
-// --- Extensions (IDE-07) ------------------------------------------------------------------------
-// The sample extension (bundled in development builds) and installed manifests from the mock's
-// discovery.
+// --- Extensions (IDE-07/08) ---------------------------------------------------------------------
+// The sample extension (found in the repository by development builds) and installed manifests
+// from the mock's discovery; their code runs in the mock's extension host, through the real
+// extension API (`bootstrap.js`) and the native start/send/stop contract.
 
 async function extensionsView(page: Page) {
   await page.getByTitle("Extensions & Plugins (Ctrl+Shift+X)", { exact: true }).click();
@@ -3084,7 +3297,7 @@ test("a broken manifest is reported and breaks nothing; a declarative one contri
   });
   const view = await extensionsView(page);
   await expect(view.getByRole("group", { name: "Tidy", exact: true })).toContainText(
-    "acme.tidy · 0.1.0 · installed · declarative",
+    "acme.tidy · 0.1.0 · declarative",
   );
   await expect(
     view.getByRole("group", { name: "Not loaded: /data/extensions/broken" }),
@@ -3129,4 +3342,125 @@ test("an extension's view and state are its workspace's: switching folders leaks
   const next = page.getByRole("complementary", { name: "Extensions" });
   await expect(next.getByRole("region", { name: "Greetings" })).toContainText("No greetings yet");
   await expect(next.getByRole("region", { name: "Greetings" })).not.toContainText("Hello, world!");
+});
+
+const BROKEN = {
+  publisher: "acme",
+  name: "broken",
+  displayName: "Broken",
+  version: "1.0.0",
+  engines: { yavin: "^2.0.0" },
+  main: "extension.js",
+  activationEvents: ["onCommand:acme.broken.go"],
+  contributes: { commands: [{ command: "acme.broken.go", title: "Go", category: "Broken" }] },
+};
+
+test("an extension that fails to activate is reported and breaks nothing else", async ({
+  page,
+}) => {
+  await desktop(page, {
+    extensions: [
+      { folder: "/data/extensions/acme.broken", manifest: JSON.stringify(BROKEN), error: null },
+    ],
+    extensionCode: {
+      "acme.broken": 'module.exports.activate = function () { throw new Error("kaboom"); };',
+    },
+  });
+  await (await palette(page, "Broken: Go")).click();
+  await expect(appAlert(page)).toContainText("kaboom");
+  const view = await extensionsView(page);
+  await expect(
+    view.getByRole("group", { name: "Broken", exact: true }).getByTestId("extension-state"),
+  ).toContainText("kaboom");
+  // The sample, in the same host, still works.
+  await (await palette(page, "Hello World: Say Hello")).click();
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
+    "Hello, world!",
+  );
+});
+
+/** The extension host's generation as the Extensions view shows it. */
+async function hostGeneration(view: Locator) {
+  const text = (await view.getByTestId("extension-host").textContent()) ?? "";
+  return Number(/generation (\d+)/.exec(text)?.[1]);
+}
+
+test("a crashed extension host is reported; Restart starts a new one and the extension works again", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await (await palette(page, "Hello World: Say Hello")).click();
+  await expect(sampleState(view)).toHaveText(/^Active/);
+  await expect(view.getByTestId("extension-host")).toContainText("Host running");
+  const first = await hostGeneration(view);
+  await page.evaluate(() =>
+    (window as unknown as { __crashExtensionHost: () => void }).__crashExtensionHost(),
+  );
+  await expect(view.getByTestId("extension-host")).toContainText("1 crash");
+  await expect(sampleState(view)).not.toHaveText(/^Active/);
+  await view.getByRole("button", { name: "Restart", exact: true }).click();
+  // Its view is on screen: the new host starts at once to fill it, with what it remembered.
+  await expect(view.getByRole("region", { name: "Greetings" })).toContainText("Hello, world!");
+  await expect(sampleState(view)).toHaveText(/^Active/);
+  expect(await hostGeneration(view)).toBeGreaterThan(first);
+  await (await palette(page, "Hello World: Say Hello")).click();
+  await expect(
+    view
+      .getByRole("region", { name: "Greetings" })
+      .getByRole("treeitem", { name: "Hello, world!" }),
+  ).toHaveCount(2);
+});
+
+test("Reload ends the host and finds the extensions again, without duplicating anything", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await (await palette(page, "Hello World: Say Hello")).click();
+  await expect(sampleState(view)).toHaveText(/^Active/);
+  const first = await hostGeneration(view);
+  await view.getByRole("button", { name: "Reload", exact: true }).click();
+  await expect.poll(() => hostGeneration(view)).toBeGreaterThan(first);
+  await expect(view.getByRole("group", { name: "Hello World (sample)" })).toHaveCount(1);
+  await expect(view.getByRole("group", { name: /^Not loaded/ })).toHaveCount(0);
+  // Its view, on screen, is filled again by the new host: one greeting, not two.
+  const greetings = view.getByRole("region", { name: "Greetings" });
+  await expect(greetings.getByRole("treeitem", { name: "Hello, world!" })).toHaveCount(1);
+  await palette(page, "Hello World: Say Hello");
+  await expect(page.getByRole("option").filter({ hasText: "Hello World: Say Hello" })).toHaveCount(
+    1,
+  );
+  await page.keyboard.press("Escape");
+});
+
+test("an extension's Activity Bar container shows its views", async ({ page }) => {
+  await desktop(page);
+  await page.getByTitle("Hello World", { exact: true }).click();
+  const container = page.getByRole("complementary", { name: "Hello World" });
+  const about = container.getByRole("region", { name: "About" });
+  await expect(about).toContainText("A sample extension");
+  await expect(about).toContainText("API 2.0.0");
+});
+
+test("extension menus: a view's title action and the Explorer's context menu run its commands", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  const greetings = view.getByRole("region", { name: "Greetings" });
+  await expect(greetings).toContainText("No greetings yet");
+  // Explorer: the extension's item follows Yavin's own.
+  await page.getByTitle("Explorer (Ctrl+Shift+E)", { exact: true }).click();
+  await page.getByText("file.ts", { exact: true }).click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Say Hello", exact: true }).click();
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
+    "Hello, world!",
+  );
+  // The view's title action.
+  const again = await extensionsView(page);
+  const list = again.getByRole("region", { name: "Greetings" });
+  await expect(list).toContainText("Hello, world!");
+  await list.getByRole("button", { name: "Reset Greetings", exact: true }).click();
+  await expect(list).toContainText("No greetings yet");
 });

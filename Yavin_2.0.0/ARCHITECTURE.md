@@ -28,7 +28,7 @@ Complex features belong in TypeScript. Add a Web Worker for expensive browser-sa
 
 ## Preserved historical work
 
-The six excluded crates (`ide-core`, `ide-config`, `ide-syntax`, `ide-lsp`, `ide-dap`, `ide-plugin-host`) and the inactive `search.rs`/`watcher.rs` are pre-existing, uncommitted work retained for reference. They are not compiled, linked, or maintained as part of the active application. Their old Cargo inheritance is not a supported standalone build. Do not extend them or reconnect complex Rust logic. Port useful behavior into TypeScript only when the corresponding feature is implemented. A seventh, `ide-terminal`, was an empty PTY placeholder and was removed in TERMINAL-00; the terminal's contract crate is `ide-terminal-protocol` (see [Terminal](#terminal)).
+The five excluded crates (`ide-core`, `ide-config`, `ide-syntax`, `ide-lsp`, `ide-dap`) and the inactive `search.rs`/`watcher.rs` are pre-existing, uncommitted work retained for reference. They are not compiled, linked, or maintained as part of the active application. Their old Cargo inheritance is not a supported standalone build. Do not extend them or reconnect complex Rust logic. Port useful behavior into TypeScript only when the corresponding feature is implemented. `ide-plugin-host`, once excluded too, was rebuilt in IDE-08 as the extension host (see [Extensions](#extensions)). Another, `ide-terminal`, was an empty PTY placeholder and was removed in TERMINAL-00; the terminal's contract crate is `ide-terminal-protocol` (see [Terminal](#terminal)).
 
 ## Remaining product and release work
 
@@ -1193,67 +1193,115 @@ Application
 
 ## Extensions
 
-IDE-07 is the extension foundation: the contracts and the isolation layer that extensions (and later Yavin's AI features) build on. It is not a marketplace and not a second application architecture: extensions contribute to the IDE's own registries and act only through a small API, and the IDE's services stay their owners.
+IDE-07 laid the extension contracts (manifest, registry, contributions, storage, trust). IDE-08 makes extensions a platform: their code runs in a separate extension host process, reaches Yavin only through a typed message protocol, and contributes to the IDE's own registries -- commands, views, menus, settings, language features, decorations. It is not a marketplace and not a second application architecture; Yavin's services stay the owners of everything an extension touches.
 
 ```text
-installed: <app local data>/extensions/<folder>/yavin-extension.json   (native extensions.rs: manifests only)
-bundled:   code shipped in Yavin's own bundle (dev/test builds: the sample)
-      ▼
-ExtensionRegistry (window)    manifest validation, identity, enabled state, contribution indexes
-      │  settings ──────────► SettingsRegistry.register (owner: Settings)
-      │  commands, keybindings ► the window's command list and shortcut handling (commands.ts)
-      │  views, menus ───────► the Extensions view (side bar), view/title actions
-      ▼
-ExtensionHost (workspace)     lifecycle, lazy activation, trust gate, contexts, the API
-      ▼
-extension.activate(context, yavin)  ── yavin.commands / window / workspace / views ──► IDE services
+ <app local data>/extensions/<folder>/          (+ repo extensions/samples, debug builds only)
+   yavin-extension.json, extension.js
+        | native extensions.rs: manifests (discovery); a load's code, contained, <= 2 MiB
+        v
+ +--------------------------- Yavin window (renderer) ---------------------------+
+ | ExtensionRegistry (window) -- manifests, identity, enabled, dependencies,     |
+ |   |                           contribution indexes                            |
+ |   +- settings ---------> SettingsRegistry          (owner: Settings)          |
+ |   +- commands, keys ---> CommandRegistry           (core first, then ext.)    |
+ |   +- views, containers, menus -> Activity Bar / side bar / panel / menus      |
+ | ExtensionHostManager (per workspace) -- generations, crashes, restart, trust  |
+ |   +- ExtensionHost (one generation) -- lifecycle, capability dispatcher,      |
+ |        |                               ownership checks, pending requests     |
+ |        +- ExtensionWindow adapter --> DocumentService, editor (no Monaco),    |
+ |        |                              read_file_content (workspace-relative)  |
+ |        +- ProviderRegistry / DecorationStore --> extensionMonaco.ts --> Monaco|
+ +--------+----------------------------------------------------------------------+
+          | ext_host_start (trust-gated) / ext_host_send / ext_host_stop
+          | ext-host-message / ext-host-exit events, by session number
+ +--------v------- native (extension_host.rs, ServerProcess Job Object) --------+
+ | child stdin/stdout, Content-Length frames <= 1 MiB                            |
+ +--------+----------------------------------------------------------------------+
+ +--------v------- yavin-extension-host process (ide-plugin-host) --------------+
+ | per extension: QuickJS runtime + context (memory limit, interrupt deadlines)  |
+ |   bootstrap.js (the `yavin` API) -- extension.js                              |
+ | every outgoing message stamped with extensionId, workspaceId, hostGeneration  |
+ +-------------------------------------------------------------------------------+
 ```
+
+**Runtime decision (audit).** The candidates were weighed against the requirement that third-party code cannot reach the window, the native commands, the filesystem, the network or processes:
+
+| Candidate                                        | Verdict                                                                                                                                                                                                                     |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| In the window (IDE-07)                           | Rejected for third-party code: the same realm as React, `__TAURI_INTERNALS__` and the DOM; the CSP forbids it anyway.                                                                                                       |
+| Web Worker                                       | Rejected: same origin, `fetch`/WebSocket available; the CSP would need `blob:`/`worker-src`; no memory limit, and no hard stop of a hung script short of killing the worker.                                                |
+| Electron utility process                         | Not applicable: Yavin is Tauri.                                                                                                                                                                                             |
+| Node.js child process                            | Rejected: full `fs`, `net`, `child_process` unless a policy layer is bolted on; a Node runtime to ship.                                                                                                                     |
+| Wasmtime (the old `ide-plugin-host` placeholder) | Rejected for now: extensions would have to be compiled to WASM, or a JavaScript engine compiled to WASM run inside it -- QuickJS with an extra layer.                                                                       |
+| **QuickJS (rquickjs) in a separate process**     | **Chosen.** No `std`/`os` modules (default features off): the engine has no file, network, process or timer API at all; a memory limit and an interrupt deadline per extension; a crash ends one process, never the window. |
+
+**Security boundary -- what is isolated and what is not.**
+
+- _Isolated by construction:_ extension code sees only the ECMAScript built-ins and `yavin` (from `bootstrap.js`). It has no module loading, filesystem, network, process, timers, DOM, Tauri IPC or Monaco. Each extension has its own QuickJS runtime and context: no shared globals. Its identity is not its to claim: the host stamps `extensionId`, `workspaceId` and `hostGeneration` on everything it sends (`__yavin_send` is captured and deleted before extension code runs).
+- _Limited:_ memory per extension (64 MiB default), a deadline per load (5 s) and per call (2 s) enforced by the interrupt handler -- a hung or greedy extension fails with an error, the host and the others carry on. Yavin bounds pending requests (256), waits per kind (command 30 s, view 5 s, provider 1.5 s, activation 10 s), messages (1 MiB), notifications (20 per extension), view rows (1000, 3 levels).
+- _Mediated:_ every capability is a method on Yavin's side that checks ownership (an extension registers only its own contributed commands and views, and providers under its own id) and scope (documents by URI inside the workspace, files workspace-relative, its own settings, its own storage).
+- _Not isolated:_ the host **process is not sandboxed by the operating system** -- no AppContainer, no restricted token. The isolation is QuickJS's: an engine bug that escaped it would run with the user's rights. The host is a child in Yavin's ServerProcess Job Object, so it dies with Yavin. Cancellation means Yavin stops waiting; a pending promise inside the host is not interrupted (a running call is, by its deadline).
+
+**Protocol** (`protocol.rs`, `protocol.ts`). JSON, one message per Content-Length frame, at most 1 MiB. Yavin to host: `init` (identity, limits), `load` (code filled in natively from the extension's folder), `unload`, `request`, `response`, `event`, `shutdown`. Host to Yavin: `ready`, `loaded`, `unloaded`, `request`, `response`, `log`, `error`. Every extension message carries `extensionId`, `workspaceId`, `hostGeneration`, and requests and responses a `requestId`. Both sides refuse a message of another workspace or generation (stale), malformed, oversized, of an unknown type or with an invalid id; each refusal is logged, and a host sending too many malformed messages is ended.
+
+**Hosts, workspaces, generations** (`manager.ts`, `host.ts`). The manager is the workspace's (`WorkspaceServices.extensions`); disposing the workspace disposes it and its host. Host generation = workspace generation × 1000 + n. Switching A → B ends A's host before B's starts (natively too, in `enter_workspace`); late messages of A carry A's generation and are refused, and an activation of A still pending is rejected and leaves nothing behind. Lazy: no process runs until an extension must activate (its command, its view, an activation event); restart and reload start lazily too -- at once only to fill a view on screen.
+
+**Crashes.** A host exit Yavin did not ask for fails everything pending (`HostCrashed`), marks its extensions failed, and removes every run-time contribution (command handlers, views' rows, providers, decorations). The next use makes a new generation. Three crashes within 60 s hold extensions off until Restart (`HostCrashedRepeatedly`).
+
+**Trust.** The native `ext_host_start` refuses an untrusted folder (`TrustRequired`), whatever the renderer asks. Revoking trust ends the host at once; granting it lets extensions activate on their next event, and refills views on screen. An extension declaring `capabilities.untrustedWorkspaces` still needs a trusted folder to run code in IDE-08: the native gate is per folder.
+
+**API v2** (`api.ts`, implemented by `bootstrap.js`; `EXTENSION_API` = 2.0.0; API 1 extensions are incompatible):
+
+| Namespace   | Surface                                                                                                                                                      |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `commands`  | `registerCommand` (own contributed commands), `executeCommand` (extension commands)                                                                          |
+| `window`    | `showInformationMessage`/`Warning`/`Error`, `createOutputChannel`                                                                                            |
+| `workspace` | `getWorkspaceFolder`, `getConfiguration(<own id>)`, `onDidChangeConfiguration`, `fs.readFile`/`exists` (workspace-relative paths only; no write, no listing) |
+| `views`     | `registerView` (own views; rows: label, description, tooltip, command, children)                                                                             |
+| `documents` | `get`/`getText`/`all` by URI inside the workspace, `onDidOpen`/`onDidChange`/`onDidClose`                                                                    |
+| `editor`    | `activeEditor`, `openLocation`, `setSelection`, `revealRange`, `setDecorations` (a fixed set of styles), `onDidChangeActiveEditor` -- never Monaco objects   |
+| `languages` | completion, hover, definition, references and document symbol providers -- separate from LSP, merged by Monaco, cancellable and timeout-bounded              |
+| context     | `extensionId`, `extensionPath`, `workspaceFolder`, `environment`, `globalState`/`workspaceState` (mementos), `subscriptions`, `log`                          |
+
+Not exposed: network, processes, shells, terminals, tasks, debugging, Git, LSP internals, secrets, arbitrary filesystem access, React, Monaco, Tauri IPC.
+
+**Contributions** (manifest v2). `commands`; `keybindings` (CommandRegistry precedence: Yavin's own, then extensions in order of id; conflicts reported, never taken); `configuration` (SettingsRegistry); `viewsContainers.activitybar` (an Activity Bar tab); `views` (`sidebar` in the Extensions side bar, `panel` as a bottom panel tab, `container` in its Activity Bar container); `menus` (`commandPalette`, `view/title`, `editor/context`, `explorer/context`; `when` limited to `resourceExtname == .ext` and `resourceLangId == id`); `extensionDependencies`.
+
+**Dependencies.** Validated by the registry: a missing, disabled or circular dependency makes the extension _unavailable_ with the reason (shown in the Extensions view; `DependencyFailed` on use). Activation follows `activationOrder` -- dependencies first, depth-first in declared order, deterministic.
+
+**Reload.** Ends the host, re-discovers the installed extensions (the registry replaces by id: nothing duplicated), and starts lazily again.
 
 **Ownership.**
 
-| Owner                                                                   | Owns                                                                                                                    |
-| ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| ExtensionRegistry (`registry.ts`)                                       | known extensions by identity, manifest validation, enabled/disabled (remembered), compatibility, what each contributes  |
-| ExtensionHost (`host.ts`)                                               | per workspace: activation state and events, ordering, failure, disposal, contexts, the API, handlers and view providers |
-| Extension storage (`storage.ts`)                                        | each extension's own global and workspace state                                                                         |
-| SettingsRegistry                                                        | extension settings (registered into it, persisted by it)                                                                |
-| The window (`App.tsx`, `commands.ts`)                                   | the command list, palette, shortcuts: extension commands are appended, never replacing Yavin's                          |
-| WorkspaceManager, Trust, Terminal, Tasks, Debug, Problems, LSP, Session | unchanged; extensions cannot reach them                                                                                 |
+| Owner                                           | Owns                                                                                               |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| ExtensionRegistry (`registry.ts`)               | known extensions, validation, enabled state, dependencies, contribution indexes                    |
+| ExtensionHostManager (`manager.ts`)             | per workspace: the current host generation, crash accounting, restart and reload, trust            |
+| ExtensionHost (`host.ts`)                       | one generation: lifecycle, the capability dispatcher, pending requests, views' rows                |
+| CommandRegistry (`commandRegistry.ts`)          | the window's commands, core and extension, and shortcut precedence                                 |
+| ProviderRegistry, DecorationStore (`window.ts`) | extensions' language providers and decorations, by owner; Monaco reads them (`extensionMonaco.ts`) |
+| Native (`extension_host.rs`, `extensions.rs`)   | discovery, starting and stopping hosts (trust-gated), reading code contained in its folder         |
+| `ide-plugin-host`                               | the process: QuickJS runtimes, the API (`bootstrap.js`), identity stamping, limits                 |
+| `App.tsx`                                       | wiring only: the ExtensionWindow adapter, panels, menus                                            |
 
-**Manifest** (`manifest.ts`, `manifestVersion: 1`): `publisher`, `name`, `version` (semver), `displayName`, `description`, `engines.yavin` (a range against the extension API version, `EXTENSION_API` = 1.0.0), `activationEvents`, `main`, `contributes`, `capabilities.untrustedWorkspaces`. Validation is strict and every reason is reported: ids, semver, the engine range, `main` inside the extension's folder, each contribution. `extensionDependencies` is rejected as unsupported. Unknown fields, contribution points, menu locations and activation events are warnings, never a crash; an invalid manifest is rejected whole with its reasons and contributes nothing; a second extension with an id already registered is rejected.
+**Storage** is unchanged from IDE-07: `globalState` and `workspaceState` per extension, versioned records, 64 KiB, corrupt records kept aside. The host gets a snapshot at activation; writes go through `storage.update`.
 
-**Identity** is `publisher.name` (lower case), never the display name, and every contribution is namespaced by it: commands `<id>.<name>`, settings `<id>.<name>`, views `<id>.<name>`. The same id keys its activation, storage, output channel (`Extension: <displayName>`) and errors (`ExtensionError.extensionId`).
+**Packaging.** The host ships with Yavin as a bundle resource, as the search tool does: `src-tauri/resources/extension-host/yavin-extension-host(.exe)` (built, never committed), put there by `scripts/build-extension-host.mjs`, which the Tauri build runs first (`beforeBuildCommand`, release; `beforeDevCommand`, debug) -- an installer cannot be built without it. Installed, Yavin looks only at `<resources>/resources/extension-host/`; a development build looks beside its own executable (the Cargo target folder), then in the source tree's resource folder; `YAVIN_EXTENSION_HOST` overrides both (`host_candidates`, unit-tested). A missing host is `HostUnavailable`, naming where it looked; the IDE is otherwise unaffected.
 
-**Contributions.**
+**Tests of the real host.** Three levels, none with a stand-in for the host:
 
-| Point                                      | Where it goes                                                                                                                                                                                   |
-| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `commands`                                 | the command palette, under the command's category; run through the host (activating its extension)                                                                                              |
-| `keybindings`                              | the command's shortcut -- only if no Yavin command has it, and the first extension keeps a shared one; conflicts are shown in the Extensions view                                               |
-| `configuration`                            | SettingsRegistry definitions (boolean, number with bounds, string, enum; user or both scopes), in a Settings section named after the extension; values stored before the extension loaded apply |
-| `views` (`sidebar`)                        | sections of the Extensions side bar, filled by the extension's provider                                                                                                                         |
-| `views` (`panel`)                          | registered; not rendered yet (the panel's views are fixed)                                                                                                                                      |
-| `menus.commandPalette`                     | `when: false` hides a command from the palette                                                                                                                                                  |
-| `menus.view/title`                         | actions on the extension's own view                                                                                                                                                             |
-| `menus.editor/context`, `explorer/context` | validated and indexed; not rendered yet                                                                                                                                                         |
+| Level                                                                       | What runs                                                                                                                                                                                                                                                                                                                                    |
+| --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The process (`crates/ide-plugin-host/tests/host.rs`)                        | the built binary over its framed protocol: boundary (no fs/net/process/timers, no shared globals, no identity forgery), limits, stale/malformed/oversized messages, disposal, shutdown, the sample, performance budgets                                                                                                                      |
+| Yavin's native layer (`src/extension_host_real_tests.rs`)                   | `ExtHostSessions` -- the code the commands run -- with the built binary and code read natively from extension folders: the Hello World sample from start to shutdown, a missing host, a crash and a restart, a malformed handshake, an activation failure, a hung command, stale generations, closing the workspace, load containment        |
+| The installed application (`tests/real`, `npm run test:real-host`, Windows) | the release MSI built with a test identifier (`com.yavin.ide.e2e`: its own profile), extracted (`msiexec /a`), launched and driven through WebView2's DevTools protocol: the packaged host found and run as Yavin's child, Hello World end to end, a failing extension, a crash and Restart, A → B → A, a missing host, exit ending the host |
 
-**Lifecycle.** Registry: discovered → validated → registered (or rejected). Host, per extension: registered → activating → active, or → failed; active → deactivating → disposed (`canMoveExtension`). An extension is activated at most once per host (concurrent requests share one activation), never eagerly: by `onStartupFinished`/`*`, `onWorkspace`, `onCommand:<id>`, `onView:<id>`, `onLanguage:<id>` -- and always by one of its own commands or views being used. A failed activation is logged, its status says why, it is not retried behind the user's back, and other extensions are unaffected. Deactivation calls `deactivate`, then disposes its subscriptions newest first; each failure is logged and the rest still run.
+The renderer's own tests (`extensions.test.ts`, the UI suite) run the real `bootstrap.js` in an in-process double of the host; they test Yavin's side of the protocol, not the process.
 
-**API** (`api.ts`): `commands.registerCommand` (its own contributed commands only) and `executeCommand` (extension commands); `window.showInformationMessage`/`Warning`/`Error` (shown in the window, at most 20 per extension per workspace, then only logged); `workspace.getWorkspaceFolder`, `getConfiguration(<its id>)` and `onDidChangeConfiguration` (its own settings only); `views.registerView` (its own views). Registrations return disposables. `ExtensionContext`: `extensionId`, `extensionPath`, `workspaceFolder`, `globalState`, `workspaceState`, `subscriptions`, `log` (its output channel, at most 500 lines per workspace). Nothing else is reachable through it: no native IPC, processes, PTYs, files, Git, documents, terminals, tasks, debugging, Problems, React, Monaco, the DOM or secrets.
+**Performance** (debug build, development machine): host startup 34 ms; the sample's load and activation 14 ms; command, view and provider round trips in the host p95 2.2 / 0.8 / 1.0 ms; shutdown 4 ms; discovering 200 manifests 42 ms; a command through the manager (in-process host) p95 0.2 ms. Budgets are asserted in `tests/host.rs` and `extensions.test.ts`.
 
-**Storage.** `globalState` (`yavin.extensions.global:<id>`) and `workspaceState` (`yavin.extensions.workspace:<WorkspaceId>:<id>`): one record per extension and scope, `{version: 1, values}`, JSON values only, at most 64 KiB, an unreadable record copied to `.corrupt` and started empty, one from a newer Yavin read but never written. An extension can open only its own. It is extension state, not a settings system.
-
-**Trust.** No extension code runs in a folder that is not trusted (Workspace Trust, asked before each activation) unless its manifest declares `capabilities.untrustedWorkspaces: true`. A blocked extension stays registered, its declarative contributions apply, its status explains why, the window offers the trust decision, and trusting the folder lets it activate.
-
-**Execution boundary -- and its limits.** The host runs only code bundled in Yavin's own build, in the window's JavaScript context. That code is not sandboxed; the boundary is the API it is handed. The code of installed extensions is never read or run: discovery reads manifests only, and the window's content security policy (`script-src 'self'`) admits no code from outside the bundle. Installed extensions are therefore declarative today -- settings, and contributions referring to commands that exist. Running third-party code needs a real boundary -- a WASM runtime (`ide-plugin-host`, still a placeholder) or a separate worker/process host under an explicit policy -- which is future work.
-
-**Workspace and window.** The registry is the window's; the host is the workspace's (`WorkspaceServices.extensions`), like tasks and debugging. Closing or switching the workspace deactivates its extensions; an extension of A that acts afterwards -- a message, a registration, a view refresh -- reaches nothing (its API is inert, and only the workspace in front may show messages), and B's host starts with nothing active. Extension state is not session state: nothing of a host is remembered across a restart.
-
-**Discovery and installation.** Only `<app local data>/extensions/<folder>/yavin-extension.json`, read natively (at most 200 folders and 64 KiB per manifest, links not followed), once per window and again on Reload. There is no marketplace, download, update, dependency installation, publishing or signing; installing is putting a folder there.
-
-**Performance** (development machine): discovering and registering 200 manifests 44 ms; the startup event over 201 extensions 0.2 ms (nothing activates eagerly); a first command with lazy activation 2.6 ms, later ones 0.2 ms.
-
-**Not yet.** Running installed extensions' code (a real host), panel views, editor and Explorer context menus, language-feature providers through the API, dependencies, a marketplace.
+**Not yet.** OS sandboxing of the host process, a marketplace, remote extensions, network or process capabilities, file writes, webviews.
 
 ## Terminal
 

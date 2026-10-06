@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import type { ReactNode } from "react";
 import { TerminalView, type TerminalViewIde } from "../terminal/TerminalView";
 import { TerminalProfilesDialog } from "../terminal/TerminalProfilesDialog";
 import type { TerminalKeyAction } from "../../services/terminal";
@@ -96,6 +97,7 @@ export function TerminalPanel({
   onOpenProblem,
   ide,
   debugService,
+  extensionViews = [],
 }: {
   hidden: boolean;
   onClose: () => void;
@@ -121,6 +123,8 @@ export function TerminalPanel({
   ide?: TerminalViewIde & { revealFolder(id: TerminalId): void };
   /** The workspace's debugger, for the Debug Console (IDE-05). */
   debugService?: DebugService;
+  /** Extensions' panel views (IDE-08): extra tabs after Yavin's own; content made by the window. */
+  extensionViews?: readonly { id: string; label: string; content: ReactNode }[];
 }) {
   // Re-renders the tab strip as diagnostics change, so the badge stays accurate.
   const problemsRevision = useSyncExternalStore(
@@ -129,6 +133,9 @@ export function TerminalPanel({
     problemsVersion,
   );
   const [activeTab, setActiveTabState] = useState<PanelViewId>(readActiveView);
+  /** An extension's panel view in front, instead of one of Yavin's own (IDE-08). */
+  const [extensionTab, setExtensionTabState] = useState<string | null>(null);
+  const shownExtension = extensionViews.find((one) => one.id === extensionTab) ?? null;
   const setActiveTab = useCallback((id: PanelViewId) => {
     setActiveTabState(id);
     saveActiveView(id);
@@ -363,7 +370,7 @@ export function TerminalPanel({
               role="tab"
               id={`panel-tab-${tab.id}`}
               aria-controls="panel-view"
-              aria-selected={activeTab === tab.id}
+              aria-selected={activeTab === tab.id && !shownExtension}
               // Roving tabindex: a tablist is one tab stop, and the arrow keys move within
               // it. Leaving every tab focusable put five stops between the panel and its
               // contents.
@@ -382,7 +389,10 @@ export function TerminalPanel({
                 // arrow press moves from the wrong place.
                 requestAnimationFrame(() => tabRefs.current.get(next)?.focus());
               }}
-              onClick={() => setActiveTab(tab.id)}
+              onClick={() => {
+                setExtensionTabState(null);
+                setActiveTab(tab.id);
+              }}
               className={`relative flex items-center gap-1.5 pb-1 transition-colors ${
                 activeTab === tab.id
                   ? "font-semibold text-white"
@@ -400,7 +410,26 @@ export function TerminalPanel({
                   {badges[tab.id]}
                 </span>
               )}
-              {activeTab === tab.id && (
+              {activeTab === tab.id && !shownExtension && (
+                <span className="absolute right-0 bottom-0 left-0 h-[2px] rounded-full bg-indigo-500" />
+              )}
+            </button>
+          ))}
+          {extensionViews.map((tab) => (
+            <button
+              key={tab.id}
+              role="tab"
+              aria-selected={shownExtension?.id === tab.id}
+              tabIndex={-1}
+              onClick={() => setExtensionTabState(tab.id)}
+              className={`relative flex items-center gap-1.5 pb-1 transition-colors ${
+                shownExtension?.id === tab.id
+                  ? "font-semibold text-white"
+                  : "text-zinc-500 hover:text-zinc-300"
+              }`}
+            >
+              <span>{tab.label.toUpperCase()}</span>
+              {shownExtension?.id === tab.id && (
                 <span className="absolute right-0 bottom-0 left-0 h-[2px] rounded-full bg-indigo-500" />
               )}
             </button>
@@ -408,7 +437,7 @@ export function TerminalPanel({
         </div>
 
         <div className="flex items-center gap-1 text-zinc-500">
-          {activeTab === "terminal" && (
+          {activeTab === "terminal" && !shownExtension && (
             <>
               <ToolButton
                 label="New Terminal"
@@ -492,7 +521,7 @@ export function TerminalPanel({
       </div>
 
       {/* Terminal tabs */}
-      {activeTab === "terminal" && sessions.length > 0 && (
+      {activeTab === "terminal" && !shownExtension && sessions.length > 0 && (
         <div
           role="tablist"
           aria-label="Terminals"
@@ -555,7 +584,7 @@ export function TerminalPanel({
       )}
 
       {/* Find bar */}
-      {activeTab === "terminal" && finding && (
+      {activeTab === "terminal" && !shownExtension && finding && (
         <div
           role="search"
           aria-label="Terminal search"
@@ -690,7 +719,9 @@ export function TerminalPanel({
                   service={service}
                   ui={ui}
                   hasSplit={secondary !== null}
-                  visible={!hidden && activeTab === "terminal" && position !== -1}
+                  visible={
+                    !hidden && !shownExtension && activeTab === "terminal" && position !== -1
+                  }
                   fontSize={fontSize}
                   onShortcut={shortcut}
                   ide={ide}
@@ -713,7 +744,7 @@ export function TerminalPanel({
             />
           )}
         </div>
-        {!hidden && activeTab === "problems" && (
+        {!hidden && !shownExtension && activeTab === "problems" && (
           <ProblemsView
             trusted={trusted !== false}
             onManageTrust={onManageTrust}
@@ -721,9 +752,16 @@ export function TerminalPanel({
             onOpen={onOpenProblem}
           />
         )}
-        {!hidden && activeTab === "output" && <OutputView initialChannel={channel} />}
-        {!hidden && activeTab === "debug" && <DebugConsoleView service={debugService} />}
-        {!hidden && activeTab === "ports" && <PortsView />}
+        {!hidden && !shownExtension && activeTab === "output" && (
+          <OutputView initialChannel={channel} />
+        )}
+        {!hidden && !shownExtension && activeTab === "debug" && (
+          <DebugConsoleView service={debugService} />
+        )}
+        {!hidden && !shownExtension && activeTab === "ports" && <PortsView />}
+        {!hidden && shownExtension && (
+          <div className="h-full overflow-y-auto">{shownExtension.content}</div>
+        )}
       </div>
 
       {menu && (
@@ -769,7 +807,7 @@ export function TerminalPanel({
         />
       )}
 
-      {activeTab === "terminal" && status && (
+      {activeTab === "terminal" && !shownExtension && status && (
         <p
           role="status"
           aria-live="polite"

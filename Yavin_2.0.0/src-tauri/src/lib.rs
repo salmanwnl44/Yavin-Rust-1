@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 mod checkers;
 mod config;
 mod dap;
+mod extension_host;
 mod extensions;
 mod external;
 mod git;
@@ -31,6 +32,9 @@ mod trust;
 mod workbench;
 use checkers::{available_checkers, cancel_checker, run_checker, Checks};
 use dap::{dap_send, dap_start, dap_stop, dap_stop_all, DapSessions};
+use extension_host::{
+    ext_host_send, ext_host_start, ext_host_stop, ext_host_stop_all, ExtHostSessions,
+};
 use extensions::extensions_list;
 use external::open_external_url;
 use git::{
@@ -509,6 +513,8 @@ fn enter_workspace(
     // A debug session belongs to the workspace it debugs: the renderer ends it on leaving, and
     // whatever adapter (and debuggee) is left is ended here rather than outliving it (IDE-05).
     dap::stop_all(&app.state::<DapSessions>());
+    // So are the workspace's extension hosts: an extension of A never runs on in B (IDE-08).
+    extension_host::stop_all(&app.state::<ExtHostSessions>());
     // Its terminals are not: switching workspace detaches their views and the workspace's
     // TerminalService keeps them (TERMINAL-03); the page and the application end them.
     watch_workspace(app, watch, &watched);
@@ -675,6 +681,7 @@ pub fn run() {
         .manage(Checks::default())
         .manage(LspSessions::default())
         .manage(DapSessions::default())
+        .manage(ExtHostSessions::default())
         .manage(Recovery::default())
         .manage(LocalGit::default())
         .setup(|app| {
@@ -816,6 +823,10 @@ pub fn run() {
             dap_stop,
             dap_stop_all,
             extensions_list,
+            ext_host_start,
+            ext_host_send,
+            ext_host_stop,
+            ext_host_stop_all,
         ])
         .build(tauri::generate_context!())
         .map(|app| {
@@ -832,6 +843,8 @@ pub fn run() {
                     lsp::stop_all(&handle.state::<LspSessions>());
                     // Debug adapters, and the programs they debug (IDE-05).
                     dap::stop_all(&handle.state::<DapSessions>());
+                    // Extension hosts, and whatever their extensions were doing (IDE-08).
+                    extension_host::stop_all(&handle.state::<ExtHostSessions>());
                     // A checker is a child process too, and a cold `cargo check` outlives
                     // the window by minutes if nothing stops it.
                     checkers::cancel_running(&handle.state::<Checks>());

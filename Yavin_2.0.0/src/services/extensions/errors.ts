@@ -19,7 +19,13 @@ export type ExtensionErrorCode =
   | "StorageCorrupt"
   | "StorageLimit"
   | "StorageReadOnly"
-  | "HostDisposed";
+  | "HostDisposed"
+  | "HostUnavailable"
+  | "HostCrashed"
+  | "HostCrashedRepeatedly"
+  | "DependencyFailed"
+  | "Timeout"
+  | "Cancelled";
 
 export class ExtensionError extends Error {
   readonly code: ExtensionErrorCode;

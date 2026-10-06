@@ -24,8 +24,14 @@ import { createNativeAdapterTransport } from "./debug/nativeTransport.ts";
 import { createDebugService, type DebugService } from "./debug/service.ts";
 import { createExtensionRegistry } from "./extensions/registry.ts";
 import { createExtensionStorage } from "./extensions/storage.ts";
-import { createExtensionHost, type ExtensionHost } from "./extensions/host.ts";
-import { HELLO_WORLD_MANIFEST, helloWorld } from "../extensions/samples/helloWorld.ts";
+import { createExtensionHostManager, type ExtensionHostManager } from "./extensions/manager.ts";
+import { createNativeHostTransport } from "./extensions/transport.ts";
+import { rediscoverExtensions } from "./extensions/discovery.ts";
+import {
+  createDecorationStore,
+  createProviderRegistry,
+  type ExtensionWindow,
+} from "./extensions/window.ts";
 import type { WorkspaceContext, WorkspaceId } from "./workspaceManager.ts";
 
 /**
@@ -73,10 +79,10 @@ export interface WorkspaceServices {
    */
   debug: DebugService;
   /**
-   * The workspace's extension host (IDE-07): the extensions activated for it. Disposing the
-   * workspace deactivates them; nothing they do afterwards reaches the next workspace.
+   * The workspace's extension host manager (IDE-08): the host process generation running its
+   * extensions. Disposing the workspace ends it; nothing of it reaches the next workspace.
    */
-  extensions: ExtensionHost;
+  extensions: ExtensionHostManager;
 }
 
 /**
@@ -128,10 +134,39 @@ export const extensionRegistry = createExtensionRegistry({ settings });
 export const extensionStorage = createExtensionStorage(undefined, (id, message) =>
   console.warn(`${id}: ${message}`),
 );
-// The sample extension, in development and test-hook builds only: the release ships none.
-const env = (import.meta as { env?: Record<string, unknown> }).env;
-if (env?.DEV || env?.VITE_TEST_HOOKS === "1")
-  extensionRegistry.add(HELLO_WORLD_MANIFEST, { kind: "bundled", module: helloWorld }, "bundled");
+/** Extensions' language providers and decorations, for the editor (IDE-08). */
+export const extensionProviders = createProviderRegistry();
+export const extensionDecorations = createDecorationStore();
+
+/**
+ * What extensions may do to the window (documents, the editor, workspace files), provided by
+ * the window once it exists (`App.tsx`). The hosts reach it through `windowProxy` -- never the
+ * window's own objects -- and before it is provided those requests are refused.
+ */
+let extensionWindow: ExtensionWindow | null = null;
+export const provideExtensionWindow = (window: ExtensionWindow | null) => {
+  extensionWindow = window;
+};
+const unavailable = (): never => {
+  throw Object.assign(new Error("The window is not ready."), { code: "Unavailable" });
+};
+const windowProxy: ExtensionWindow = {
+  documents: {
+    all: () => extensionWindow?.documents.all() ?? [],
+    get: (resource) => extensionWindow?.documents.get(resource) ?? null,
+    text: (resource) => extensionWindow?.documents.text(resource) ?? null,
+    subscribe: (listener) => extensionWindow?.documents.subscribe(listener) ?? (() => {}),
+  },
+  editor: {
+    active: () => extensionWindow?.editor.active() ?? null,
+    onActive: (listener) => extensionWindow?.editor.onActive(listener) ?? (() => {}),
+    openLocation: (path, range) =>
+      (extensionWindow ?? unavailable()).editor.openLocation(path, range),
+    setSelection: (range) => extensionWindow?.editor.setSelection(range) ?? false,
+    revealRange: (range) => extensionWindow?.editor.revealRange(range) ?? false,
+  },
+  readFile: (path) => (extensionWindow ?? unavailable()).readFile(path),
+};
 
 /** What extensions say to the user (`window.show*Message`), for the window to show. */
 export type ExtensionMessage = {
@@ -240,13 +275,18 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
           publishProblems,
         ),
         tasks,
-        extensions: createExtensionHost({
+        extensions: createExtensionHostManager({
           registry: extensionRegistry,
           settings,
           storage: extensionStorage,
           workspace: folders.length ? id : null,
           folder: folders[0] ?? null,
-          generation: lifecycle.generation,
+          workspaceGeneration: lifecycle.generation,
+          transport: createNativeHostTransport(),
+          window: windowProxy,
+          decorations: extensionDecorations,
+          providers: extensionProviders,
+          rediscover: () => rediscoverExtensions(extensionRegistry),
           // Workspace Trust, asked before any extension code runs.
           trusted: () => readTrust().then((trust) => trust.trusted),
           notify: (level, extensionId, text) => {

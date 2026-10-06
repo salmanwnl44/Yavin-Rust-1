@@ -110,8 +110,11 @@ import { clearProblems, publishProblems } from "./services/panel/problems";
 import {
   breakpoints,
   currentGit,
+  extensionDecorations,
+  extensionProviders,
   extensionRegistry,
   onExtensionMessage,
+  provideExtensionWindow,
   settings,
   terminalSettings,
   terminalProfiles,
@@ -124,16 +127,25 @@ import type { SettingDefinition } from "./services/settings/settings";
 import { SettingsView } from "./components/settings/SettingsView";
 import { RunPanel } from "./components/layout/RunPanel";
 import { DebugPanel } from "./components/layout/DebugPanel";
-import { ExtensionsPanel } from "./components/layout/ExtensionsPanel";
+import {
+  ExtensionContainerPanel,
+  ExtensionsPanel,
+  ExtensionViewSection,
+} from "./components/layout/ExtensionsPanel";
 import { ExtensionError } from "./services/extensions/errors";
-import { discoverInstalledOnce, rediscoverExtensions } from "./services/extensions/discovery";
-import { resolveKeybindings } from "./services/extensions/contributions";
+import { discoverInstalledOnce } from "./services/extensions/discovery";
+import { documentInfoOf } from "./services/extensions/documentInfo";
+import type {
+  DocumentEvent as ExtensionDocumentEvent,
+  DocumentInfo,
+} from "./services/extensions/window";
+import { commandRegistry } from "./services/commandRegistry";
 import { DebugError } from "./services/debug/errors";
 import type { ResourceUri } from "./services/resource";
 import { TaskError } from "./services/tasks/errors";
 import { isFinal, type TaskRun } from "./services/tasks/service";
 import { createOverlayTracker } from "./services/localgit/overlays";
-import { fileUri, resourceId } from "./services/resource";
+import { fileUri, formatUri, resourceId } from "./services/resource";
 import { loadMinimapPreferences, saveMinimapPreferences } from "./services/minimapPreferences";
 import type { MinimapPreferences } from "./services/minimapPreferences";
 
@@ -1394,7 +1406,7 @@ export default function App() {
     taskReveal.current = taskSnapshot.revealRequest;
     revealTerminals();
   }, [taskSnapshot.revealRequest, revealTerminals]);
-  // --- Extensions (IDE-07): the registry's contributions, run by the workspace's host ------------
+  // --- Extensions (IDE-07/08): the registry's contributions, run by the workspace's host manager --
   const extensionHost = workspace.services.extensions;
   const extensionSnapshot = useSyncExternalStore(
     extensionRegistry.subscribe,
@@ -1424,7 +1436,11 @@ export default function App() {
   const runExtensionCommand = (command: string) => {
     void extensionHost.executeCommand(command).catch(reportExtensionError);
   };
-  // Installed extensions' manifests, read once (the desktop app only; nothing of theirs runs).
+  // Workspace Trust changing: revoked, the extension host ends at once; granted, it may run.
+  useEffect(() => {
+    void extensionHost.setTrusted(trust.trusted);
+  }, [extensionHost, trust.trusted]);
+  // Installed extensions' manifests, read once (the desktop app only).
   useEffect(() => {
     if (isTauri()) void discoverInstalledOnce(extensionRegistry).catch(() => undefined);
   }, []);
@@ -1843,6 +1859,136 @@ export default function App() {
   const activeTab = tabs.find((t) => t.id === activeTabId);
   const activeDocument: TextDocument | undefined =
     activeTab && activeTab.id !== "welcome" ? documents.get(activeTab.path) : undefined;
+  // What extensions may do to the window (IDE-08): narrow contracts over its own services --
+  // never the services themselves. Extensions reach these only through checked host requests.
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
+  const activeEditorListeners = useRef(new Set<() => void>()).current;
+  useEffect(() => {
+    for (const listener of [...activeEditorListeners]) listener();
+  }, [activeTab?.path, activeEditorListeners]);
+  useEffect(() => {
+    const lastInfo = new Map<string, DocumentInfo>();
+    const findDoc = (resource: string) =>
+      documents.all().find((doc) => documentInfoOf(doc).resourceId === resource);
+    const rangeOf = (range: {
+      startLine: number;
+      startColumn: number;
+      endLine: number;
+      endColumn: number;
+    }) => ({
+      startLineNumber: range.startLine,
+      startColumn: range.startColumn,
+      endLineNumber: range.endLine,
+      endColumn: range.endColumn,
+    });
+    const inEditor = () =>
+      !!editorRef.current && !!activeTabRef.current && activeTabRef.current.id !== "welcome";
+    provideExtensionWindow({
+      documents: {
+        all: () => documents.all().map(documentInfoOf),
+        get: (resource) => {
+          const doc = findDoc(resource);
+          return doc ? documentInfoOf(doc) : null;
+        },
+        text: (resource) => findDoc(resource)?.text ?? null,
+        subscribe: (listener) =>
+          documents.subscribe((event) => {
+            const kind: ExtensionDocumentEvent | null =
+              event.type === "opened"
+                ? "open"
+                : event.type === "changed" || event.type === "reloaded"
+                  ? "change"
+                  : event.type === "closed"
+                    ? "close"
+                    : null;
+            if (!kind) return;
+            const doc = documents.all().find((one) => one.id === event.id);
+            const info = doc ? documentInfoOf(doc) : lastInfo.get(event.id);
+            if (doc) lastInfo.set(event.id, documentInfoOf(doc));
+            if (kind === "close") lastInfo.delete(event.id);
+            if (info) listener(kind, info);
+          }),
+      },
+      editor: {
+        active() {
+          const tab = activeTabRef.current;
+          const doc = tab && tab.id !== "welcome" ? documents.get(tab.path) : undefined;
+          if (!doc) return null;
+          const cursor = cursorStatus.get();
+          const line = cursor?.line ?? 1;
+          const column = cursor?.column ?? 1;
+          return {
+            document: documentInfoOf(doc),
+            selection: { startLine: line, startColumn: column, endLine: line, endColumn: column },
+          };
+        },
+        onActive(listener) {
+          activeEditorListeners.add(listener);
+          return () => activeEditorListeners.delete(listener);
+        },
+        openLocation: async (path, range) =>
+          openLocationRef.current(path, range ? rangeOf(range) : undefined),
+        setSelection(range) {
+          if (!inEditor()) return false;
+          editorRef.current!.select(rangeOf(range));
+          return true;
+        },
+        revealRange(range) {
+          if (!inEditor()) return false;
+          editorRef.current!.select(rangeOf(range));
+          return true;
+        },
+      },
+      readFile: (path) => native("read_file_content", { path }),
+    });
+    return () => provideExtensionWindow(null);
+  }, [documents, cursorStatus, activeEditorListeners]);
+  // Extensions in the editor (IDE-08): providers, decorations, editor/context items.
+  const editorContextCommands = useMemo(
+    () =>
+      extensionSnapshot.menus
+        .filter((menu) => menu.location === "editor/context")
+        .map((menu) => ({
+          command: menu.command,
+          title:
+            extensionSnapshot.commands.find((command) => command.command === menu.command)?.title ??
+            menu.command,
+          when: menu.when,
+        })),
+    [extensionSnapshot],
+  );
+  const runExtensionCommandRef = useRef(runExtensionCommand);
+  runExtensionCommandRef.current = runExtensionCommand;
+  const editorExtensions = useMemo(
+    () => ({
+      providers: extensionProviders,
+      decorations: extensionDecorations,
+      infoOf: documentInfoOf,
+      contextCommands: editorContextCommands,
+      onRunCommand: (command: string) => runExtensionCommandRef.current(command),
+    }),
+    [editorContextCommands],
+  );
+  // Extensions' Explorer context-menu items (IDE-08); a command gets the entry's file URI.
+  const explorerExtensionItems = useMemo(
+    () =>
+      extensionSnapshot.menus
+        .filter((menu) => menu.location === "explorer/context")
+        .map((menu) => ({
+          title:
+            extensionSnapshot.commands.find((command) => command.command === menu.command)?.title ??
+            menu.command,
+          when: menu.when,
+          run: (target: string) =>
+            void extensionHost
+              .executeCommand(menu.command, formatUri(fileUri(target)))
+              .catch((error: unknown) => reportExtensionErrorRef.current(error)),
+        })),
+    [extensionSnapshot, extensionHost],
+  );
+  const reportExtensionErrorRef = useRef(reportExtensionError);
+  reportExtensionErrorRef.current = reportExtensionError;
   // A file of a language coming to the front activates extensions waiting for it (IDE-07).
   const activeLanguage = activeDocument?.languageId;
   useEffect(() => {
@@ -3203,27 +3349,17 @@ export default function App() {
         }),
     },
   ];
-  // Extensions' commands (IDE-07), after Yavin's own: in the palette under their category, run
-  // by the workspace's extension host (activating their extension first). A contributed
-  // shortcut applies only if no command of Yavin's has it.
-  const extensionKeys = resolveKeybindings(
+  // One command registry (IDE-08): Yavin's own commands, as the window states them now, and
+  // extensions' (the registry's), run through the workspace's extension host. Shortcuts: Yavin's
+  // first, then extensions' in order of their ids; conflicts are reported, never taken.
+  commandRegistry.setCore(builtInCommands);
+  commandRegistry.setExtensions(
     extensionSnapshot.commands,
-    builtInCommands.flatMap((command) => (command.shortcut ? [command.shortcut] : [])),
+    runExtensionCommand,
+    (id) => extensionRegistry.get(id)?.manifest.displayName ?? id,
   );
-  const commands: AppCommand[] = [
-    ...builtInCommands,
-    ...extensionSnapshot.commands.map((command) => ({
-      id: command.command,
-      menu:
-        command.category ??
-        extensionRegistry.get(command.extensionId)?.manifest.displayName ??
-        command.extensionId,
-      label: command.title,
-      shortcut: extensionKeys.shortcuts.get(command.command),
-      palette: command.palette,
-      run: () => runExtensionCommand(command.command),
-    })),
-  ];
+  const commands: AppCommand[] = commandRegistry.list();
+  const extensionConflicts = commandRegistry.conflicts();
 
   /**
    * The keyboard hints the welcome page shows, taken from the commands themselves so the
@@ -3350,6 +3486,10 @@ export default function App() {
           {/* Leftmost Activity Bar */}
           <ActivityBar
             activeTab={activeActivityTab}
+            extensionTabs={extensionSnapshot.viewContainers.map((container) => ({
+              id: `ext:${container.id}`,
+              title: container.title,
+            }))}
             gitBadge={totalGitChanges > 0 ? String(totalGitChanges) : ""}
             onSelectTab={(tabId) => {
               if (activeActivityTab === tabId && isSidebarOpen) {
@@ -3429,16 +3569,22 @@ export default function App() {
           <ExtensionsPanel
             key={`extensions:${workspacePath}`}
             registry={extensionRegistry}
-            host={extensionHost}
+            manager={extensionHost}
             visible={isSidebarOpen && activeActivityTab === "extensions"}
-            conflicts={extensionKeys.conflicts}
+            conflicts={extensionConflicts}
             onRunCommand={runExtensionCommand}
-            onReload={() =>
-              void rediscoverExtensions(extensionRegistry).catch((error: unknown) =>
-                reportError(`Could not read the installed extensions: ${String(error)}`),
-              )
-            }
           />
+          {/* IDE-08: extensions' own Activity Bar containers. */}
+          {extensionSnapshot.viewContainers.map((container) => (
+            <ExtensionContainerPanel
+              key={`${container.id}:${workspacePath}`}
+              registry={extensionRegistry}
+              manager={extensionHost}
+              containerId={container.id}
+              visible={isSidebarOpen && activeActivityTab === `ext:${container.id}`}
+              onRunCommand={runExtensionCommand}
+            />
+          ))}
           {/* IDE-05: the workspace's debug session and breakpoints. */}
           <DebugPanel
             key={`debug:${workspacePath}`}
@@ -3468,6 +3614,7 @@ export default function App() {
           />
           <Sidebar
             key={`explorer:${workspacePath}`}
+            extensionMenuItems={explorerExtensionItems}
             visible={
               isSidebarOpen &&
               activeActivityTab !== "search" &&
@@ -3475,7 +3622,8 @@ export default function App() {
               activeActivityTab !== "history" && // LG-08
               activeActivityTab !== "run" && // IDE-04
               activeActivityTab !== "debug" && // IDE-05
-              activeActivityTab !== "extensions" // IDE-07
+              activeActivityTab !== "extensions" && // IDE-07
+              !activeActivityTab.startsWith("ext:") // IDE-08
             }
             activeTab={activeActivityTab}
             workspacePath={workspacePath}
@@ -3605,6 +3753,7 @@ export default function App() {
                 zoom={zoom}
                 editorSettings={editorView.settings}
                 debug={editorDebug}
+                extensions={editorExtensions}
               />
             )}
 
@@ -3624,6 +3773,24 @@ export default function App() {
                   activeFile={activeTab?.path}
                   ide={terminalIde}
                   debugService={debug}
+                  extensionViews={extensionSnapshot.views
+                    .filter((view) => view.location === "panel")
+                    .map((view) => ({
+                      id: view.id,
+                      label: view.name,
+                      content: (
+                        <ExtensionViewSection
+                          view={view}
+                          manager={extensionHost}
+                          visible
+                          actionTitle={(command) =>
+                            extensionSnapshot.commands.find((one) => one.command === command)
+                              ?.title ?? command
+                          }
+                          onRunCommand={runExtensionCommand}
+                        />
+                      ),
+                    }))}
                   onOpenProblem={(file, line, column) =>
                     // The editor's own navigation: it waits for the file to be in front, then
                     // selects the exact line and column (the editor clamps a stale location).

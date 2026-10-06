@@ -97,6 +97,11 @@ interface Commands {
   dap_stop: { args: { session: number }; result: void };
   dap_stop_all: { args: Record<string, never>; result: void };
   /** Installed extensions' manifests (IDE-07, `src-tauri/src/extensions.rs`); never their code. */
+  /** Extension host processes (IDE-08, `src-tauri/src/extension_host.rs`); trust-gated. */
+  ext_host_start: { args: Record<string, never>; result: number };
+  ext_host_send: { args: { session: number; message: string }; result: void };
+  ext_host_stop: { args: { session: number }; result: void };
+  ext_host_stop_all: { args: Record<string, never>; result: void };
   extensions_list: {
     args: Record<string, never>;
     result: {

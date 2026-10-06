@@ -11,7 +11,7 @@
  * only an extension's own state, which the extension alone can reach through its context.
  */
 import type { WorkspaceId } from "../terminalProtocol.ts";
-import type { ExtensionMemento } from "./api.ts";
+import type { Memento as ExtensionMemento } from "./api.ts";
 import { ExtensionError } from "./errors.ts";
 
 export const STORAGE_VERSION = 1;
