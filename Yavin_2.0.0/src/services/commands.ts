@@ -18,6 +18,8 @@ export interface AppCommand {
    * it through to the window instead of sending it to the shell (the palette, the panel).
    */
   skipShell?: boolean;
+  /** False: not listed in the command palette (an extension's `menus.commandPalette`). */
+  palette?: boolean;
   run: () => void | Promise<void>;
 }
 

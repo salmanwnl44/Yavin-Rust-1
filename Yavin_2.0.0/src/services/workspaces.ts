@@ -22,6 +22,10 @@ import { createBreakpointRegistry } from "./debug/breakpoints.ts";
 import { DEBUG_SETTING_LIST } from "./debug/config.ts";
 import { createNativeAdapterTransport } from "./debug/nativeTransport.ts";
 import { createDebugService, type DebugService } from "./debug/service.ts";
+import { createExtensionRegistry } from "./extensions/registry.ts";
+import { createExtensionStorage } from "./extensions/storage.ts";
+import { createExtensionHost, type ExtensionHost } from "./extensions/host.ts";
+import { HELLO_WORLD_MANIFEST, helloWorld } from "../extensions/samples/helloWorld.ts";
 import type { WorkspaceContext, WorkspaceId } from "./workspaceManager.ts";
 
 /**
@@ -68,6 +72,11 @@ export interface WorkspaceServices {
    * runs. Disposing the workspace ends the session, the adapter and the program it debugs.
    */
   debug: DebugService;
+  /**
+   * The workspace's extension host (IDE-07): the extensions activated for it. Disposing the
+   * workspace deactivates them; nothing they do afterwards reaches the next workspace.
+   */
+  extensions: ExtensionHost;
 }
 
 /**
@@ -109,6 +118,34 @@ export const settings = createSettingsRegistry([
  * window lives, so switching file or workspace and back keeps them.
  */
 export const breakpoints = createBreakpointRegistry();
+
+/**
+ * The window's extensions (IDE-07): which are known and enabled, and what they contribute
+ * (`extensions/registry.ts`). Their settings go to `settings` above, which stays their owner.
+ */
+export const extensionRegistry = createExtensionRegistry({ settings });
+/** Extensions' own state, per extension and scope (`extensions/storage.ts`). */
+export const extensionStorage = createExtensionStorage(undefined, (id, message) =>
+  console.warn(`${id}: ${message}`),
+);
+// The sample extension, in development and test-hook builds only: the release ships none.
+const env = (import.meta as { env?: Record<string, unknown> }).env;
+if (env?.DEV || env?.VITE_TEST_HOOKS === "1")
+  extensionRegistry.add(HELLO_WORLD_MANIFEST, { kind: "bundled", module: helloWorld }, "bundled");
+
+/** What extensions say to the user (`window.show*Message`), for the window to show. */
+export type ExtensionMessage = {
+  level: "info" | "warning" | "error";
+  extensionId: string;
+  text: string;
+};
+const extensionMessageListeners = new Set<(message: ExtensionMessage) => void>();
+export function onExtensionMessage(listener: (message: ExtensionMessage) => void): () => void {
+  extensionMessageListeners.add(listener);
+  return () => {
+    extensionMessageListeners.delete(listener);
+  };
+}
 
 /**
  * What the terminal keeps across restarts (TERMINAL-07): profiles, defaults, the integration
@@ -203,6 +240,22 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
           publishProblems,
         ),
         tasks,
+        extensions: createExtensionHost({
+          registry: extensionRegistry,
+          settings,
+          storage: extensionStorage,
+          workspace: folders.length ? id : null,
+          folder: folders[0] ?? null,
+          generation: lifecycle.generation,
+          // Workspace Trust, asked before any extension code runs.
+          trusted: () => readTrust().then((trust) => trust.trusted),
+          notify: (level, extensionId, text) => {
+            // Only the workspace in front speaks: a closed one's host is already inert.
+            if (!lifecycle.isActive()) return;
+            for (const listener of [...extensionMessageListeners])
+              listener({ level, extensionId, text });
+          },
+        }),
         debug: createDebugService({
           workspace: folders.length ? id : null,
           folders,
@@ -228,6 +281,8 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
       services.tasks.dispose();
       // Its debug session ends, and the adapter and the program it debugs with it.
       services.debug.dispose();
+      // Its extensions are deactivated: their subscriptions disposed, nothing of them left.
+      await services.extensions.dispose();
       if (isTauri()) {
         // Its terminals are not ended: their views detach (the panel is remounted per
         // workspace) and the workspace's TerminalService keeps them for its return.

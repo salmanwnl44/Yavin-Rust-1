@@ -185,8 +185,15 @@ interface Layer {
 }
 
 export interface SettingsRegistry {
-  /** The definitions, in the order they were given. */
+  /** The definitions, in the order they were given (then the ones registered later). */
   readonly definitions: readonly SettingDefinition<unknown>[];
+  /**
+   * Adds a definition made after the registry (an extension's, IDE-07). Its id must be new: a
+   * setting is never replaced. Values already stored for it apply at once. Returns the removal.
+   */
+  register(definition: SettingDefinition<unknown>): () => void;
+  /** Hears that the definitions changed (one registered or removed). */
+  onDefinitions(listener: () => void): () => void;
   /** What `workspace` resolves the setting to (`null`: the user level only). */
   get<T>(definition: SettingDefinition<T>, workspace: WorkspaceId | null): T;
   inspect<T>(definition: SettingDefinition<T>, workspace: WorkspaceId | null): SettingInspection<T>;
@@ -220,6 +227,16 @@ export function createSettingsRegistry(
 ): SettingsRegistry {
   const byId = new Map(definitions.map((definition) => [definition.id, definition]));
   if (byId.size !== definitions.length) throw new SettingsError("Two settings share an id.");
+  let list: readonly SettingDefinition<unknown>[] = definitions;
+  const definitionListeners = new Set<() => void>();
+  const definitionsChanged = () => {
+    for (const listener of [...definitionListeners])
+      try {
+        listener();
+      } catch {
+        /* One listener's failure is not the others'. */
+      }
+  };
   const listeners = new Map<WorkspaceId | null, Set<(change: SettingChange) => void>>();
   const problemListeners = new Set<() => void>();
   let problems: string[] = [];
@@ -385,7 +402,28 @@ export function createSettingsRegistry(
   };
 
   return {
-    definitions,
+    get definitions() {
+      return list;
+    },
+    register(definition) {
+      if (byId.has(definition.id))
+        throw new SettingsError(`There is already a setting "${definition.id}".`);
+      byId.set(definition.id, definition);
+      list = [...list, definition];
+      definitionsChanged();
+      return () => {
+        if (byId.get(definition.id) !== definition) return;
+        byId.delete(definition.id);
+        list = list.filter((one) => one !== definition);
+        definitionsChanged();
+      };
+    },
+    onDefinitions(listener) {
+      definitionListeners.add(listener);
+      return () => {
+        definitionListeners.delete(listener);
+      };
+    },
     get: (definition, workspace) => inspect(definition, workspace).value,
     inspect,
     set(definition, scope, value, workspace = null) {

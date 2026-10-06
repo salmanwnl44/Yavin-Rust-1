@@ -43,10 +43,13 @@ export function SettingsView({
   // Any change in what the user level or this workspace resolves to redraws the view.
   useEffect(() => {
     const stopUser = registry.subscribe(null, refresh);
+    // Settings added or removed later (an extension's, IDE-07) appear and go at once.
+    const stopDefinitions = registry.onDefinitions(refresh);
     const stopWorkspace = workspace === null ? () => {} : registry.subscribe(workspace, refresh);
     return () => {
       stopUser();
       stopWorkspace();
+      stopDefinitions();
     };
   }, [registry, workspace]);
   const editingScope: SettingScope = workspace === null ? "user" : scope;

@@ -110,6 +110,8 @@ import { clearProblems, publishProblems } from "./services/panel/problems";
 import {
   breakpoints,
   currentGit,
+  extensionRegistry,
+  onExtensionMessage,
   settings,
   terminalSettings,
   terminalProfiles,
@@ -122,6 +124,10 @@ import type { SettingDefinition } from "./services/settings/settings";
 import { SettingsView } from "./components/settings/SettingsView";
 import { RunPanel } from "./components/layout/RunPanel";
 import { DebugPanel } from "./components/layout/DebugPanel";
+import { ExtensionsPanel } from "./components/layout/ExtensionsPanel";
+import { ExtensionError } from "./services/extensions/errors";
+import { discoverInstalledOnce, rediscoverExtensions } from "./services/extensions/discovery";
+import { resolveKeybindings } from "./services/extensions/contributions";
 import { DebugError } from "./services/debug/errors";
 import type { ResourceUri } from "./services/resource";
 import { TaskError } from "./services/tasks/errors";
@@ -1388,6 +1394,45 @@ export default function App() {
     taskReveal.current = taskSnapshot.revealRequest;
     revealTerminals();
   }, [taskSnapshot.revealRequest, revealTerminals]);
+  // --- Extensions (IDE-07): the registry's contributions, run by the workspace's host ------------
+  const extensionHost = workspace.services.extensions;
+  const extensionSnapshot = useSyncExternalStore(
+    extensionRegistry.subscribe,
+    extensionRegistry.getSnapshot,
+    extensionRegistry.getSnapshot,
+  );
+  /** What an extension said (`window.show*Message`), shown until dismissed. */
+  const [extensionNote, setExtensionNote] = useState<{ level: string; text: string } | null>(null);
+  useEffect(
+    () =>
+      onExtensionMessage((message) => {
+        const name =
+          extensionRegistry.get(message.extensionId)?.manifest.displayName ?? message.extensionId;
+        setExtensionNote({ level: message.level, text: `${name}: ${message.text}` });
+      }),
+    [],
+  );
+  /** Says why an extension's command did not run; an untrusted folder offers the trust decision. */
+  const reportExtensionError = useCallback(
+    (error: unknown) => {
+      if (error instanceof ExtensionError && error.code === "TrustRequired")
+        setTrustDialog("manage");
+      reportError(error instanceof Error ? error.message : String(error));
+    },
+    [reportError],
+  );
+  const runExtensionCommand = (command: string) => {
+    void extensionHost.executeCommand(command).catch(reportExtensionError);
+  };
+  // Installed extensions' manifests, read once (the desktop app only; nothing of theirs runs).
+  useEffect(() => {
+    if (isTauri()) void discoverInstalledOnce(extensionRegistry).catch(() => undefined);
+  }, []);
+  // Activation events: the window started (for this workspace), and its folder opened.
+  useEffect(() => {
+    void extensionHost.fire({ kind: "startup" });
+    if (workspace.folders.length) void extensionHost.fire({ kind: "workspace" });
+  }, [extensionHost, workspace]);
   // --- Debugging (IDE-05): the window's commands on the workspace's DebugService ------------------
   const debug = workspace.services.debug;
   const debugSnapshot = useSyncExternalStore(debug.subscribe, debug.getSnapshot, debug.getSnapshot);
@@ -1798,6 +1843,11 @@ export default function App() {
   const activeTab = tabs.find((t) => t.id === activeTabId);
   const activeDocument: TextDocument | undefined =
     activeTab && activeTab.id !== "welcome" ? documents.get(activeTab.path) : undefined;
+  // A file of a language coming to the front activates extensions waiting for it (IDE-07).
+  const activeLanguage = activeDocument?.languageId;
+  useEffect(() => {
+    if (activeLanguage) void extensionHost.fire({ kind: "language", id: activeLanguage });
+  }, [activeLanguage, extensionHost]);
   /** Revert File: the file as it is on disk, after asking when that loses unsaved changes. */
   const revertActive = () =>
     run(async () => {
@@ -2183,7 +2233,7 @@ export default function App() {
     revealFolder: revealTerminalFolder,
   };
 
-  const commands: AppCommand[] = [
+  const builtInCommands: AppCommand[] = [
     {
       id: "view.search",
       menu: "View",
@@ -3153,6 +3203,27 @@ export default function App() {
         }),
     },
   ];
+  // Extensions' commands (IDE-07), after Yavin's own: in the palette under their category, run
+  // by the workspace's extension host (activating their extension first). A contributed
+  // shortcut applies only if no command of Yavin's has it.
+  const extensionKeys = resolveKeybindings(
+    extensionSnapshot.commands,
+    builtInCommands.flatMap((command) => (command.shortcut ? [command.shortcut] : [])),
+  );
+  const commands: AppCommand[] = [
+    ...builtInCommands,
+    ...extensionSnapshot.commands.map((command) => ({
+      id: command.command,
+      menu:
+        command.category ??
+        extensionRegistry.get(command.extensionId)?.manifest.displayName ??
+        command.extensionId,
+      label: command.title,
+      shortcut: extensionKeys.shortcuts.get(command.command),
+      palette: command.palette,
+      run: () => runExtensionCommand(command.command),
+    })),
+  ];
 
   /**
    * The keyboard hints the welcome page shows, taken from the commands themselves so the
@@ -3235,6 +3306,24 @@ export default function App() {
         {!isTauri() && (
           <div role="status" className="bg-zinc-900 px-4 py-2 text-xs">
             Browser preview. Open the desktop app to work with local files.
+          </div>
+        )}
+        {extensionNote && (
+          <div
+            role="status"
+            aria-label="Extension message"
+            className={`px-4 py-2 text-sm ${
+              extensionNote.level === "error"
+                ? "bg-red-950"
+                : extensionNote.level === "warning"
+                  ? "bg-amber-950"
+                  : "bg-[#10213a]"
+            }`}
+          >
+            {extensionNote.text}
+            <button className="ml-4 underline" onClick={() => setExtensionNote(null)}>
+              Dismiss
+            </button>
           </div>
         )}
         {error && (
@@ -3336,6 +3425,20 @@ export default function App() {
             onShowTerminal={showTaskTerminal}
             onConfigure={configureTasks}
           />
+          {/* IDE-07: the extensions, their state here, and the views they contribute. */}
+          <ExtensionsPanel
+            key={`extensions:${workspacePath}`}
+            registry={extensionRegistry}
+            host={extensionHost}
+            visible={isSidebarOpen && activeActivityTab === "extensions"}
+            conflicts={extensionKeys.conflicts}
+            onRunCommand={runExtensionCommand}
+            onReload={() =>
+              void rediscoverExtensions(extensionRegistry).catch((error: unknown) =>
+                reportError(`Could not read the installed extensions: ${String(error)}`),
+              )
+            }
+          />
           {/* IDE-05: the workspace's debug session and breakpoints. */}
           <DebugPanel
             key={`debug:${workspacePath}`}
@@ -3371,7 +3474,8 @@ export default function App() {
               activeActivityTab !== "git" &&
               activeActivityTab !== "history" && // LG-08
               activeActivityTab !== "run" && // IDE-04
-              activeActivityTab !== "debug" // IDE-05
+              activeActivityTab !== "debug" && // IDE-05
+              activeActivityTab !== "extensions" // IDE-07
             }
             activeTab={activeActivityTab}
             workspacePath={workspacePath}

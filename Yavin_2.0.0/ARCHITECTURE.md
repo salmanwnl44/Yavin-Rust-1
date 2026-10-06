@@ -1191,6 +1191,70 @@ Application
 
 **Not yet.** Hot exit (unsaved and untitled content across restarts), editor groups, persisted breakpoints, several windows.
 
+## Extensions
+
+IDE-07 is the extension foundation: the contracts and the isolation layer that extensions (and later Yavin's AI features) build on. It is not a marketplace and not a second application architecture: extensions contribute to the IDE's own registries and act only through a small API, and the IDE's services stay their owners.
+
+```text
+installed: <app local data>/extensions/<folder>/yavin-extension.json   (native extensions.rs: manifests only)
+bundled:   code shipped in Yavin's own bundle (dev/test builds: the sample)
+      ▼
+ExtensionRegistry (window)    manifest validation, identity, enabled state, contribution indexes
+      │  settings ──────────► SettingsRegistry.register (owner: Settings)
+      │  commands, keybindings ► the window's command list and shortcut handling (commands.ts)
+      │  views, menus ───────► the Extensions view (side bar), view/title actions
+      ▼
+ExtensionHost (workspace)     lifecycle, lazy activation, trust gate, contexts, the API
+      ▼
+extension.activate(context, yavin)  ── yavin.commands / window / workspace / views ──► IDE services
+```
+
+**Ownership.**
+
+| Owner                                                                   | Owns                                                                                                                    |
+| ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| ExtensionRegistry (`registry.ts`)                                       | known extensions by identity, manifest validation, enabled/disabled (remembered), compatibility, what each contributes  |
+| ExtensionHost (`host.ts`)                                               | per workspace: activation state and events, ordering, failure, disposal, contexts, the API, handlers and view providers |
+| Extension storage (`storage.ts`)                                        | each extension's own global and workspace state                                                                         |
+| SettingsRegistry                                                        | extension settings (registered into it, persisted by it)                                                                |
+| The window (`App.tsx`, `commands.ts`)                                   | the command list, palette, shortcuts: extension commands are appended, never replacing Yavin's                          |
+| WorkspaceManager, Trust, Terminal, Tasks, Debug, Problems, LSP, Session | unchanged; extensions cannot reach them                                                                                 |
+
+**Manifest** (`manifest.ts`, `manifestVersion: 1`): `publisher`, `name`, `version` (semver), `displayName`, `description`, `engines.yavin` (a range against the extension API version, `EXTENSION_API` = 1.0.0), `activationEvents`, `main`, `contributes`, `capabilities.untrustedWorkspaces`. Validation is strict and every reason is reported: ids, semver, the engine range, `main` inside the extension's folder, each contribution. `extensionDependencies` is rejected as unsupported. Unknown fields, contribution points, menu locations and activation events are warnings, never a crash; an invalid manifest is rejected whole with its reasons and contributes nothing; a second extension with an id already registered is rejected.
+
+**Identity** is `publisher.name` (lower case), never the display name, and every contribution is namespaced by it: commands `<id>.<name>`, settings `<id>.<name>`, views `<id>.<name>`. The same id keys its activation, storage, output channel (`Extension: <displayName>`) and errors (`ExtensionError.extensionId`).
+
+**Contributions.**
+
+| Point                                      | Where it goes                                                                                                                                                                                   |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `commands`                                 | the command palette, under the command's category; run through the host (activating its extension)                                                                                              |
+| `keybindings`                              | the command's shortcut -- only if no Yavin command has it, and the first extension keeps a shared one; conflicts are shown in the Extensions view                                               |
+| `configuration`                            | SettingsRegistry definitions (boolean, number with bounds, string, enum; user or both scopes), in a Settings section named after the extension; values stored before the extension loaded apply |
+| `views` (`sidebar`)                        | sections of the Extensions side bar, filled by the extension's provider                                                                                                                         |
+| `views` (`panel`)                          | registered; not rendered yet (the panel's views are fixed)                                                                                                                                      |
+| `menus.commandPalette`                     | `when: false` hides a command from the palette                                                                                                                                                  |
+| `menus.view/title`                         | actions on the extension's own view                                                                                                                                                             |
+| `menus.editor/context`, `explorer/context` | validated and indexed; not rendered yet                                                                                                                                                         |
+
+**Lifecycle.** Registry: discovered → validated → registered (or rejected). Host, per extension: registered → activating → active, or → failed; active → deactivating → disposed (`canMoveExtension`). An extension is activated at most once per host (concurrent requests share one activation), never eagerly: by `onStartupFinished`/`*`, `onWorkspace`, `onCommand:<id>`, `onView:<id>`, `onLanguage:<id>` -- and always by one of its own commands or views being used. A failed activation is logged, its status says why, it is not retried behind the user's back, and other extensions are unaffected. Deactivation calls `deactivate`, then disposes its subscriptions newest first; each failure is logged and the rest still run.
+
+**API** (`api.ts`): `commands.registerCommand` (its own contributed commands only) and `executeCommand` (extension commands); `window.showInformationMessage`/`Warning`/`Error` (shown in the window, at most 20 per extension per workspace, then only logged); `workspace.getWorkspaceFolder`, `getConfiguration(<its id>)` and `onDidChangeConfiguration` (its own settings only); `views.registerView` (its own views). Registrations return disposables. `ExtensionContext`: `extensionId`, `extensionPath`, `workspaceFolder`, `globalState`, `workspaceState`, `subscriptions`, `log` (its output channel, at most 500 lines per workspace). Nothing else is reachable through it: no native IPC, processes, PTYs, files, Git, documents, terminals, tasks, debugging, Problems, React, Monaco, the DOM or secrets.
+
+**Storage.** `globalState` (`yavin.extensions.global:<id>`) and `workspaceState` (`yavin.extensions.workspace:<WorkspaceId>:<id>`): one record per extension and scope, `{version: 1, values}`, JSON values only, at most 64 KiB, an unreadable record copied to `.corrupt` and started empty, one from a newer Yavin read but never written. An extension can open only its own. It is extension state, not a settings system.
+
+**Trust.** No extension code runs in a folder that is not trusted (Workspace Trust, asked before each activation) unless its manifest declares `capabilities.untrustedWorkspaces: true`. A blocked extension stays registered, its declarative contributions apply, its status explains why, the window offers the trust decision, and trusting the folder lets it activate.
+
+**Execution boundary -- and its limits.** The host runs only code bundled in Yavin's own build, in the window's JavaScript context. That code is not sandboxed; the boundary is the API it is handed. The code of installed extensions is never read or run: discovery reads manifests only, and the window's content security policy (`script-src 'self'`) admits no code from outside the bundle. Installed extensions are therefore declarative today -- settings, and contributions referring to commands that exist. Running third-party code needs a real boundary -- a WASM runtime (`ide-plugin-host`, still a placeholder) or a separate worker/process host under an explicit policy -- which is future work.
+
+**Workspace and window.** The registry is the window's; the host is the workspace's (`WorkspaceServices.extensions`), like tasks and debugging. Closing or switching the workspace deactivates its extensions; an extension of A that acts afterwards -- a message, a registration, a view refresh -- reaches nothing (its API is inert, and only the workspace in front may show messages), and B's host starts with nothing active. Extension state is not session state: nothing of a host is remembered across a restart.
+
+**Discovery and installation.** Only `<app local data>/extensions/<folder>/yavin-extension.json`, read natively (at most 200 folders and 64 KiB per manifest, links not followed), once per window and again on Reload. There is no marketplace, download, update, dependency installation, publishing or signing; installing is putting a folder there.
+
+**Performance** (development machine): discovering and registering 200 manifests 44 ms; the startup event over 201 extensions 0.2 ms (nothing activates eagerly); a first command with lazy activation 2.6 ms, later ones 0.2 ms.
+
+**Not yet.** Running installed extensions' code (a real host), panel views, editor and Explorer context menus, language-feature providers through the API, dependencies, a marketplace.
+
 ## Terminal
 
 The terminal was rebuilt module by module, TERMINAL-00 to TERMINAL-08 (the module plan below); all of them are done. This section says what runs and the **contract** it is built on. Future work is named as such where it comes up (Unix validation, a Problems parser, AI's controlled access).

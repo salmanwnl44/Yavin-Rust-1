@@ -104,6 +104,7 @@ export function CommandPalette({
   // Nothing is filtered while closed; the file list can hold tens of thousands of paths.
   if (isOpen && commandMode) {
     items = commands
+      .filter((command) => command.palette !== false)
       .map((command) => ({
         id: command.id,
         title: `${command.menu}: ${command.label}`,

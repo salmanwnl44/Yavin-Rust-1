@@ -96,6 +96,15 @@ interface Commands {
   dap_send: { args: { session: number; message: string }; result: void };
   dap_stop: { args: { session: number }; result: void };
   dap_stop_all: { args: Record<string, never>; result: void };
+  /** Installed extensions' manifests (IDE-07, `src-tauri/src/extensions.rs`); never their code. */
+  extensions_list: {
+    args: Record<string, never>;
+    result: {
+      root: string;
+      extensions: { folder: string; manifest: string | null; error: string | null }[];
+      skipped: number;
+    };
+  };
   create_file: { args: { path: string }; result: void };
   /** Exclusive: fails if anything is there. Resolves to the operation's id (Module 03). */
   create_file_with_content: { args: { path: string; content: string }; result: number };

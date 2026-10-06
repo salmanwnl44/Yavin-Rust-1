@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import type { Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 import { appAlert, editorSelections, withEditor } from "./editor-harness";
 
 interface Call {
@@ -44,6 +44,8 @@ async function desktop(
     trust?: { trusted: boolean; decided: boolean; root: string | null; parent: string | null };
     /** Discovery finds one Unix bash, the default: its folders are this POSIX workspace's. */
     unixShell?: boolean;
+    /** Installed extensions' folders and manifest texts (IDE-07 discovery). */
+    extensions?: { folder: string; manifest: string | null; error: string | null }[];
   } = {},
 ) {
   await page.addInitScript((setup) => {
@@ -485,6 +487,8 @@ async function desktop(
             }
             return null;
           }
+          if (command === "extensions_list")
+            return { root: "/data/extensions", extensions: setup.extensions ?? [], skipped: 0 };
           if (command === "git_open_repo") return { repoId: "/work", root: "/work" };
           if (command === "git_repo_state") return "";
           if (command === "git_exec")
@@ -2986,4 +2990,143 @@ test("with no configuration the Debug view says so and Configure Debugging opens
   const debugConsole = page.getByRole("region", { name: "Debug Console" });
   await expect(debugConsole).toContainText("No debug session");
   await expect(debugConsole.getByRole("textbox", { name: "Evaluate expression" })).toBeDisabled();
+});
+
+// --- Extensions (IDE-07) ------------------------------------------------------------------------
+// The sample extension (bundled in development builds) and installed manifests from the mock's
+// discovery.
+
+async function extensionsView(page: Page) {
+  await page.getByTitle("Extensions & Plugins (Ctrl+Shift+X)", { exact: true }).click();
+  return page.getByRole("complementary", { name: "Extensions" });
+}
+
+const sampleState = (view: Locator) =>
+  view.getByRole("group", { name: "Hello World (sample)" }).getByTestId("extension-state");
+
+test("an extension command is in the palette, and running it activates its extension", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  // Lazy: nothing of it runs until it is needed. (Its view being shown is such a need, so the
+  // check is made before the Extensions view first shows it -- in a fresh window.)
+  await (await palette(page, "Hello World: Say Hello")).click();
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
+    "Hello World (sample): Hello, world!",
+  );
+  await expect(sampleState(view)).toHaveText(/^Active/);
+  // Its view shows what it did.
+  await expect(view.getByRole("region", { name: "Greetings" })).toContainText("Hello, world!");
+});
+
+test("disabling an extension takes its command out of the palette", async ({ page }) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await view.getByRole("checkbox", { name: "Enable Hello World (sample)" }).uncheck();
+  await expect(sampleState(view)).toHaveText("Disabled");
+  await palette(page, "Hello World: Say Hello");
+  await expect(page.getByRole("option").filter({ hasText: "Hello World: Say Hello" })).toHaveCount(
+    0,
+  );
+  await page.keyboard.press("Escape");
+  await view.getByRole("checkbox", { name: "Enable Hello World (sample)" }).check();
+  await expect(await palette(page, "Hello World: Say Hello")).toBeVisible();
+});
+
+test("in a restricted folder extension code does not run, and the trust decision is offered", async ({
+  page,
+}) => {
+  await desktop(page, {
+    trust: { trusted: false, decided: true, root: "/work", parent: "/projects" },
+  });
+  await (await palette(page, "Hello World: Say Hello")).click();
+  await expect(appAlert(page)).toContainText("not trusted");
+  await expect(page.getByRole("dialog")).toContainText("Workspace Trust");
+  await page.keyboard.press("Escape");
+  const view = await extensionsView(page);
+  await expect(sampleState(view)).toContainText("Not activated — This folder is not trusted");
+  await expect(page.getByRole("status", { name: "Extension message" })).toHaveCount(0);
+});
+
+test("a broken manifest is reported and breaks nothing; a declarative one contributes its setting", async ({
+  page,
+}) => {
+  const declarative = {
+    publisher: "acme",
+    name: "tidy",
+    displayName: "Tidy",
+    version: "0.1.0",
+    contributes: {
+      configuration: {
+        properties: {
+          "acme.tidy.width": {
+            type: "number",
+            default: 80,
+            minimum: 20,
+            maximum: 400,
+            description: "Line width.",
+          },
+        },
+      },
+    },
+  };
+  await desktop(page, {
+    extensions: [
+      { folder: "/data/extensions/acme.tidy", manifest: JSON.stringify(declarative), error: null },
+      { folder: "/data/extensions/broken", manifest: "{not json", error: null },
+      {
+        folder: "/data/extensions/old",
+        manifest: JSON.stringify({ ...declarative, name: "old", engines: { yavin: "^9.0.0" } }),
+        error: null,
+      },
+    ],
+  });
+  const view = await extensionsView(page);
+  await expect(view.getByRole("group", { name: "Tidy", exact: true })).toContainText(
+    "acme.tidy · 0.1.0 · installed · declarative",
+  );
+  await expect(
+    view.getByRole("group", { name: "Not loaded: /data/extensions/broken" }),
+  ).toContainText("not JSON");
+  await expect(view.getByRole("group", { name: "Not loaded: acme.old" })).toContainText(
+    "Needs extension API ^9.0.0",
+  );
+  // Found once: a second discovery would list them again as duplicates.
+  await expect(view.getByRole("group", { name: /^Not loaded/ })).toHaveCount(2);
+  // Everything else still works: the palette, and the sample's command.
+  await (await palette(page, "Hello World: Say Hello")).click();
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
+    "Hello, world!",
+  );
+  // The declarative extension's setting is in Settings, in its section, owned by Settings.
+  await page.keyboard.press("Control+Comma");
+  const settingsView = page.getByRole("region", { name: "Settings" });
+  await settingsView.getByRole("textbox", { name: "Search settings" }).fill("acme.tidy");
+  await expect(settingsView.getByRole("region", { name: "Tidy" })).toContainText("Line width.");
+});
+
+test("an extension's view and state are its workspace's: switching folders leaks nothing", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  const greetings = view.getByRole("region", { name: "Greetings" });
+  await expect(greetings).toContainText("No greetings yet");
+  await greetings.getByRole("button", { name: "No greetings yet" }).click();
+  await expect(greetings).toContainText("Hello, world!");
+  await expect(sampleState(view)).toHaveText(/^Active/);
+
+  // Another folder: the extension of /work is ended; in /other it starts again, from nothing.
+  await page.evaluate(() => {
+    (window as unknown as { __openFolder?: string }).__openFolder = "/other";
+  });
+  await page.getByRole("menubar").getByRole("menuitem", { name: "File", exact: true }).click();
+  await page
+    .getByRole("menu", { name: "File", exact: true })
+    .getByRole("menuitem", { name: "Open Folder…", exact: true })
+    .click();
+  const next = page.getByRole("complementary", { name: "Extensions" });
+  await expect(next.getByRole("region", { name: "Greetings" })).toContainText("No greetings yet");
+  await expect(next.getByRole("region", { name: "Greetings" })).not.toContainText("Hello, world!");
 });

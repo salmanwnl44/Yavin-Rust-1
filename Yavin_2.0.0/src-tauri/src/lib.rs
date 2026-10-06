@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 mod checkers;
 mod config;
 mod dap;
+mod extensions;
 mod external;
 mod git;
 mod localgit;
@@ -30,6 +31,7 @@ mod trust;
 mod workbench;
 use checkers::{available_checkers, cancel_checker, run_checker, Checks};
 use dap::{dap_send, dap_start, dap_stop, dap_stop_all, DapSessions};
+use extensions::extensions_list;
 use external::open_external_url;
 use git::{
     git_cancel_repo, git_clone_repo, git_close_repo, git_exec, git_init_repo, git_open_repo,
@@ -813,6 +815,7 @@ pub fn run() {
             dap_send,
             dap_stop,
             dap_stop_all,
+            extensions_list,
         ])
         .build(tauri::generate_context!())
         .map(|app| {
