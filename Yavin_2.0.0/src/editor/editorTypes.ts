@@ -38,6 +38,11 @@ export interface EditorHandle {
   /** Runs one of the editing engine's own actions by id (Go to Definition, Rename...). */
   runAction: (id: string) => Promise<void>;
   focus: () => void;
+  /**
+   * Where the editor is in the document it shows, as the engine saves it (plain data): what a
+   * session remembers for the document in front (IDE-06). Null with nothing shown.
+   */
+  viewState: () => unknown;
 }
 
 export interface EditorRange {

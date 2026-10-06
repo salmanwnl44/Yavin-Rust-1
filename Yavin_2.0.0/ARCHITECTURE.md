@@ -1105,22 +1105,22 @@ closing → closed    opening → active
 
 **Persistence boundary.** Where each kind of state belongs -- today and for the modules that build on this one:
 
-| Kind      | Examples                                                                 | Where                                                               |
-| --------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------- |
-| Global    | theme, keybindings, editor and panel preferences                         | user settings / browser storage, application-wide                   |
-| Machine   | recent folders, trusted folders, shell detection                         | Yavin's user-data directory (`session.json`, trust file)            |
-| Workspace | Git repositories and selection; later workspace configuration            | keyed by `WorkspaceId` in user data (`yavin.git.repos:<id>`)        |
-| Folder    | shareable project configuration (later)                                  | `.yavin/` in the folder, when a module needs it                     |
-| Session   | open tabs, active tab, Explorer expansion/selection/scroll; later layout | user data, per workspace (`session.json`)                           |
-| Runtime   | shells, language servers, watchers, running checkers, pending requests   | never persisted; ended with the workspace (shells: with the window) |
-| Document  | editor content                                                           | DocumentService; recovery (M04) for interrupted saves               |
-| Secret    | API keys, tokens, passwords                                              | the OS credential store; never in `.yavin/` or session files        |
+| Kind      | Examples                                                                                | Where                                                               |
+| --------- | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Global    | theme, keybindings, editor and panel preferences                                        | user settings / browser storage, application-wide                   |
+| Machine   | recent folders, trusted folders, shell detection                                        | Yavin's user-data directory (`session.json`, trust file)            |
+| Workspace | Git repositories and selection; later workspace configuration                           | keyed by `WorkspaceId` in user data (`yavin.git.repos:<id>`)        |
+| Folder    | shareable project configuration (later)                                                 | `.yavin/` in the folder, when a module needs it                     |
+| Session   | open tabs, active tab, editor positions, Explorer snapshot, side bar and panel (IDE-06) | user data, per workspace (`session.json`)                           |
+| Runtime   | shells, language servers, watchers, running checkers, pending requests                  | never persisted; ended with the workspace (shells: with the window) |
+| Document  | editor content                                                                          | DocumentService; recovery (M04) for interrupted saves               |
+| Secret    | API keys, tokens, passwords                                                             | the OS credential store; never in `.yavin/` or session files        |
 
 **`.yavin/`.** Not created by W1. When it is, it holds only what is meant to be shared with the project and is safe to commit (workspace configuration, working-set and changeset metadata). Private session state -- unsaved content, terminal output, AI conversations, Git selection -- stays in Yavin's user-data directory by default, so it cannot end up in a repository. Secrets are never written to either.
 
 **Multi-root.** The manager, identity and Git registry take several folders (each folder's repository is opened; all belong to one `WorkspaceId`), and language servers already run per folder. The window itself opens one folder today; there is no UI to add a second.
 
-**Not yet** (later modules): suspending a workspace so A → B → A keeps A's runtime alive; unsaved content, terminal metadata and layout kept across a switch; `.yavin/` project metadata; an `ActiveResourceContext` resolving the targets of commands (today commands resolve the workspace in front through `workspaces.current()`); AI conversations, agent runs and changesets (none exist yet; the AI Git tools are already bound to one workspace). The Output channels are application-wide logs.
+**Not yet** (later modules): suspending a workspace so A → B → A keeps A's runtime alive; unsaved content kept across a switch (layout and editor positions: see Session / Window); `.yavin/` project metadata; an `ActiveResourceContext` resolving the targets of commands (today commands resolve the workspace in front through `workspaces.current()`); AI conversations, agent runs and changesets (none exist yet; the AI Git tools are already bound to one workspace). The Output channels are application-wide logs.
 
 **Invariants**
 
@@ -1129,6 +1129,67 @@ closing → closed    opening → active
 3. Work that finishes after its workspace closed changes nothing.
 4. What a workspace remembers is stored under its own identity, never shared with another.
 5. The window is never left with one workspace's UI over another's services.
+
+## Session / Window
+
+IDE-06 makes the session's boundary and lifecycle explicit. **Session remembers UI/workspace arrangement; it does not own subsystem runtime state.** A workspace is what is open (folders, filesystem, Git, Problems, LSP, tasks, debugging); a session is how the user left it.
+
+```text
+Application
+ └─ Window ("main" -- the only one)
+     ├─ Session (services/workspaceSession.ts; the window's coordinator in session.ts)
+     │    files (references), the active one, where the editor was in each,
+     │    the Explorer's snapshot, side bar and panel visibility
+     │        ▼ persisted by
+     │    native session.rs → session.json (atomic, versioned, set aside when unreadable)
+     └─ Workspace (WorkspaceManager, see Workspace lifecycle)
+          DocumentService · Explorer · TerminalService · TaskService · DebugService
+          Git · Problems · LSP · Settings · Trust
+```
+
+**Ownership.**
+
+| State                                            | Owner                                                | Session holds                                              |
+| ------------------------------------------------ | ---------------------------------------------------- | ---------------------------------------------------------- |
+| Open editors, order, the one in front            | the window's tabs                                    | the files (paths, matched by `ResourceId`), the active one |
+| Where the editor was in a file                   | `EditorViews` (the engine's view state per document) | a plain cursor/selection/scroll record per file            |
+| Editor groups                                    | none: there is one editor group                      | nothing                                                    |
+| Explorer expansion, selection, focus, scroll     | the Explorer store (`explorerStore.ts`)              | a snapshot it is seeded from                               |
+| Side bar view and visibility, panel visibility   | the window                                           | `layout` (visibility and which view only)                  |
+| The panel's view (Problems, Terminal...)         | the panel (`yavin.panel.view`)                       | nothing                                                    |
+| Terminal layout, profiles                        | the terminal (`terminalSettings`, by `WorkspaceId`)  | nothing                                                    |
+| Terminal sessions, PTYs, output                  | TerminalService and the native side                  | nothing: never persisted                                   |
+| Document content, dirty and untitled text        | DocumentService                                      | nothing                                                    |
+| Tasks, debug sessions, breakpoints               | TaskService, DebugService, the breakpoint registry   | nothing                                                    |
+| Problems, Git, language servers, settings, trust | their owners                                         | nothing                                                    |
+
+**Lifecycle.** `created → restoring → active ⇄ saving → disposing → disposed`, and no other move (`canMoveSession`); one explicit state replaces the window's former `restoring` flag. The window has one current session at a time (`windowSessions`); beginning another first takes the current one's snapshot -- before the window is cleared for the next workspace -- and disposes it. Identity is the session's generation and its `WorkspaceId` (never a path).
+
+**Restore pipeline** (startup, Open Folder, the recent list):
+
+1. read the session file (`read_session`); the native side has already set aside an unreadable or newer file;
+2. resolve the workspace (`open_workspace`), and its `WorkspaceId`;
+3. `windowSessions.begin(...)`: the saved record, only if it is this workspace's (`savedFor`: folder however spelled, and the `workspaceId` it was written with, when it has one);
+4. `restore(work)`: the workspace is created (`loadWorkspace` → WorkspaceManager), the Explorer store is seeded with the snapshot, the files are opened through DocumentService (missing ones skipped, as before), where the editor was in each is handed to `EditorViews` (the editor restores it when it shows the file), and the side bar and panel are shown as they were;
+5. `active`: from here changes are saved.
+
+`work` receives `live()`: false once another session began or this one was disposed. Every asynchronous step checks it (and the workspace revision) before applying, so a slow restore of A never puts A's tabs, views or layout into B. Nothing is saved while a session restores, so the empty window it passes through is never written over its record -- including when a second switch overtakes the first, which the shared flag did not prevent (the first switch's end could unlock saving while the second still restored).
+
+**Snapshot** (`snapshotSession`): serializable data only -- `folder`, `workspaceId`, `files` (disk files, one per `ResourceId`, at most 50), `active`, the Explorer snapshot, `views` (`file`, `line`, `column`, optional `anchorLine`/`anchorColumn`, `topLine`, `topDelta`, `scrollLeft`) and `layout` (`sidebarView`, `sidebarOpen`, `panelOpen`). Never a handle, process id, PTY, terminal output, React or Monaco object, listener, promise, DAP connection or task execution; the engine's view state is reduced to those numbers.
+
+**Persistence** is the existing native session file, unchanged in mechanism: written whole and atomically (an interrupted write leaves the last complete file), versioned (`version: 1`; the new fields are optional, so files from before IDE-06 read as they are and an older Yavin ignores them), an unreadable or truncated file moved aside to `session.json.corrupt-<ms>.bak`, one from a newer Yavin moved aside and never overwritten, unknown fields ignored, every list capped, and a view of a file that is not open dropped. A corrupt session never stops startup: the window opens as on a first run. The renderer validates what it reads once more (`asSession`).
+
+**Saving.** A change the session remembers (tabs, the active tab, the Explorer, the side bar, the panel) marks it dirty; it is written after 400 ms of quiet, the last state winning, and the native side skips a write that changes nothing. The cursor and scroll mark nothing: they are taken whenever a snapshot is made, and when the window goes (`pagehide`: marked and flushed). No write blocks the window.
+
+**Documents.** The session references files; DocumentService opens them, as any file. Untitled and proposed documents are not in the session. A dirty document's text is not kept across a restart or a switch (there is no hot exit yet): leaving a folder and closing the window both ask before discarding unsaved changes, and a restored file is the file on disk -- the session never claims otherwise. Local Git's snapshots can record unsaved text (LG-02), but nothing restores it into an editor yet.
+
+**Terminals.** Terminal attachments are the terminal's own: TerminalService keeps a workspace's sessions for the life of the window (A → B → A finds them), and `terminalSettings` keeps the layout per `WorkspaceId` (TERMINAL-07). The session stores nothing of them. After a restart there are no old shells to attach to; opening the panel starts terminals by the terminal's rules, never a pretend old one.
+
+**Tasks and debugging.** Not session state. A task or debug session running when Yavin exits is ended with it, and nothing restores it as running: the services start empty. Breakpoints are kept per workspace for the life of the window (IDE-05), not in the session.
+
+**Windows.** Yavin has one window (`main`) and one session at a time. There is no window id because there is no second window to isolate from; a multi-window model is a later module.
+
+**Not yet.** Hot exit (unsaved and untitled content across restarts), editor groups, persisted breakpoints, several windows.
 
 ## Terminal
 

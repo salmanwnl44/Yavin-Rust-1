@@ -1,23 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  asSession,
-  createSessionWriter,
-  EMPTY_SESSION,
-  lastFolder,
-  workspaceIn,
-} from "./session.ts";
-import type { WorkspaceSession } from "./session.ts";
-
-const state = (folder: string, files: string[] = []): WorkspaceSession => ({
-  folder,
-  files,
-  active: files[0] ?? null,
-  expanded: [],
-  scroll: 0,
-});
-
-const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+import { asSession, EMPTY_SESSION, lastFolder, workspaceIn } from "./session.ts";
 
 test("a session file that is missing or empty reads as a first run", () => {
   assert.deepEqual(asSession(null), EMPTY_SESSION);
@@ -63,56 +46,34 @@ test("a folder's state is found however the path is spelled", () => {
   assert.equal(workspaceIn(session, "c:/work/other"), undefined);
 });
 
-test("a burst of changes is written once, with the last state", async () => {
-  // Opening a tab, switching to it and unfolding a directory are three changes in a moment;
-  // each is a full snapshot, so only the last one is worth writing.
-  const written: WorkspaceSession[] = [];
-  const writer = createSessionWriter(async (next) => void written.push(next), 10);
-  writer.save(state("/work", ["a.ts"]));
-  writer.save(state("/work", ["a.ts", "b.ts"]));
-  writer.save(state("/work", ["a.ts", "b.ts", "c.ts"]));
-  assert.equal(written.length, 0, "nothing is written while the changes are still arriving");
-
-  await wait(30);
-  assert.equal(written.length, 1);
-  assert.deepEqual(written[0].files, ["a.ts", "b.ts", "c.ts"]);
-});
-
-test("a later change is written too, rather than being swallowed by the first window", async () => {
-  const written: WorkspaceSession[] = [];
-  const writer = createSessionWriter(async (next) => void written.push(next), 10);
-  writer.save(state("/work", ["a.ts"]));
-  await wait(30);
-  writer.save(state("/work", ["a.ts", "b.ts"]));
-  await wait(30);
-  assert.equal(written.length, 2);
-});
-
-test("closing the window writes what is pending immediately", async () => {
-  const written: WorkspaceSession[] = [];
-  const writer = createSessionWriter(async (next) => void written.push(next), 10_000);
-  writer.save(state("/work", ["a.ts"]));
-  await writer.flush();
-  assert.equal(written.length, 1);
-  // And the pending state is cleared, so the timer cannot write it a second time.
-  await wait(20);
-  assert.equal(written.length, 1);
-});
-
-test("flushing with nothing pending writes nothing", async () => {
-  const written: WorkspaceSession[] = [];
-  const writer = createSessionWriter(async (next) => void written.push(next), 10);
-  await writer.flush();
-  assert.equal(written.length, 0);
-});
-
-test("a save that fails does not reject into the caller", async () => {
-  // Saves are fired from render effects; an unhandled rejection there is a crash report for
-  // something whose worst outcome is reopening a folder by hand.
-  const writer = createSessionWriter(async () => {
-    throw new Error("no config directory");
-  }, 5);
-  writer.save(state("/work"));
-  await writer.flush();
-  await wait(20);
+test("views and the layout are read back, and damaged entries of them drop out", () => {
+  const session = asSession({
+    folders: ["/work"],
+    workspaces: [
+      {
+        folder: "/work",
+        workspaceId: "file:///work",
+        files: ["/work/a.ts", "/work/b.ts"],
+        active: "/work/a.ts",
+        views: [
+          { file: "/work/a.ts", line: 4, column: 2, topLine: 1, topDelta: 0, scrollLeft: 0 },
+          // Not open, not a position, not even an object: each drops out alone.
+          { file: "/work/closed.ts", line: 1, column: 1 },
+          { file: "/work/b.ts", line: 0, column: 1 },
+          "nonsense",
+        ],
+        layout: { sidebarView: "debug", sidebarOpen: true, panelOpen: true },
+      },
+      { folder: "/other", files: [], layout: { sidebarView: "<script>" } },
+    ],
+  });
+  const [work, other] = session.workspaces;
+  assert.equal(work.workspaceId, "file:///work");
+  assert.deepEqual(
+    work.views?.map((view) => [view.file, view.line, view.column]),
+    [["/work/a.ts", 4, 2]],
+  );
+  assert.deepEqual(work.layout, { sidebarView: "debug", sidebarOpen: true, panelOpen: true });
+  assert.equal(other.layout, null);
+  assert.equal(other.workspaceId, undefined);
 });

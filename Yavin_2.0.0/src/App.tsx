@@ -55,11 +55,14 @@ import {
   EMPTY_SESSION,
   forgetFolder,
   lastFolder,
+  provideSessionParts,
   readSession,
   RECENT_FOLDERS,
-  saveWorkspaceSession,
+  windowSessions,
   workspaceIn,
 } from "./services/session";
+import { savedFor, viewStateOf } from "./services/workspaceSession";
+import { workspaceIdOf } from "./services/workspaceManager";
 import type { Session, WorkspaceSession } from "./services/session";
 import { cloneRepository } from "./services/git/clone";
 import { readTrust, UNKNOWN_TRUST } from "./services/trust";
@@ -124,7 +127,7 @@ import type { ResourceUri } from "./services/resource";
 import { TaskError } from "./services/tasks/errors";
 import { isFinal, type TaskRun } from "./services/tasks/service";
 import { createOverlayTracker } from "./services/localgit/overlays";
-import { fileUri } from "./services/resource";
+import { fileUri, resourceId } from "./services/resource";
 import { loadMinimapPreferences, saveMinimapPreferences } from "./services/minimapPreferences";
 import type { MinimapPreferences } from "./services/minimapPreferences";
 
@@ -336,8 +339,6 @@ export default function App() {
    * so that reopening a folder restores what it had a moment ago rather than at startup.
    */
   const sessionRef = useRef<Session>(EMPTY_SESSION);
-  /** True while a folder's tabs are being reopened. See `writeSession`. */
-  const restoring = useRef(false);
   /** Kept in step with `session`, so both the list and the lookups see the same thing. */
   const rememberSession = useCallback((next: Session) => {
     sessionRef.current = next;
@@ -564,7 +565,7 @@ export default function App() {
    * one that quietly opens what is still there.
    */
   const restoreTabs = useCallback(
-    async (state: WorkspaceSession) => {
+    async (state: WorkspaceSession, live: () => boolean = () => true) => {
       const revision = workspaceRevision.current;
       // Opened together rather than one after another: this is startup, and fifty files read
       // in series is fifty round trips the window waits through before it is usable.
@@ -575,23 +576,42 @@ export default function App() {
           documents.open(path).catch(() => null),
         ),
       );
-      if (revision !== workspaceRevision.current) return;
+      // Another workspace (or another restore) owns the window now: nothing of this one is applied.
+      if (revision !== workspaceRevision.current || !live()) return;
 
+      // One tab per resource, however the session spelled its path.
+      const identity = (path: string) => {
+        try {
+          return resourceId(fileUri(path));
+        } catch {
+          return path;
+        }
+      };
       const opened: OpenTab[] = [];
+      const seen = new Set<string>();
       for (const doc of read) {
-        if (!doc || opened.some((tab) => tab.path === doc.key)) continue;
+        if (!doc || seen.has(identity(doc.key))) continue;
+        seen.add(identity(doc.key));
         opened.push({ id: doc.key, path: doc.key, name: doc.name });
       }
       if (!opened.length) return;
+      // Where the editor was in each file: given to EditorViews, from which the editor restores
+      // a document's view when it shows it. The session never touches the editor itself.
+      for (const view of state.views ?? []) {
+        const doc = opened.find((tab) => identity(tab.path) === identity(view.file));
+        if (doc && !views.has(doc.id)) views.setViewState(doc.id, viewStateOf(view));
+      }
       setTabs((previous) => [
         ...previous,
         ...opened.filter((tab) => !previous.some((existing) => existing.path === tab.path)),
       ]);
       setRecentFiles(opened.map((tab) => ({ name: tab.name, path: tab.path })).reverse());
-      const active = state.active ? documents.get(state.active) : undefined;
-      if (active) setActiveTabId(active.key);
+      const active = state.active
+        ? opened.find((tab) => identity(tab.path) === identity(state.active!))
+        : undefined;
+      if (active) setActiveTabId(active.id);
     },
-    [documents],
+    [documents, views],
   );
 
   /**
@@ -601,42 +621,93 @@ export default function App() {
    */
   // The stored tabs, not the drawn ones: those are rebuilt on every render, and the session
   // would be rewritten on every keystroke.
-  const sessionState = useRef({ workspacePath, tabs: openTabs, activeTabId });
-  sessionState.current = { workspacePath, tabs: openTabs, activeTabId };
+  const sessionState = useRef({
+    tabs: openTabs,
+    activeTabId,
+    activeActivityTab,
+    isSidebarOpen,
+    isTerminalOpen,
+  });
+  sessionState.current = {
+    tabs: openTabs,
+    activeTabId,
+    activeActivityTab,
+    isSidebarOpen,
+    isTerminalOpen,
+  };
+  // What the window holds, for the session's snapshot (IDE-06, `workspaceSession.ts`): read when
+  // a snapshot is taken, never kept. Files only -- an untitled document has nothing on disk to
+  // reopen, and its content is DocumentService's (there is no hot exit yet).
+  useEffect(() => {
+    provideSessionParts(
+      () => {
+        const now = sessionState.current;
+        return {
+          tabs: now.tabs
+            .filter((tab) => tab.id !== "welcome")
+            .map((tab) => ({
+              key: tab.id,
+              path: tab.path,
+              disk: documents.get(tab.path)?.source.kind === "disk",
+            })),
+          active: now.activeTabId,
+          explorer: explorerRef.current,
+          // The document in front is asked of the editor itself: it saves its view state only
+          // when it leaves a document.
+          viewState: (key) =>
+            key === now.activeTabId && editorRef.current
+              ? editorRef.current.viewState()
+              : views.getViewState(key),
+          layout: {
+            sidebarView: now.activeActivityTab,
+            sidebarOpen: now.isSidebarOpen,
+            panelOpen: now.isTerminalOpen,
+          },
+        };
+      },
+      // Kept in memory as well as written: a folder reopened later in the run restores from
+      // this, not from the startup snapshot.
+      (record) => {
+        sessionRef.current = {
+          folders: sessionRef.current.folders,
+          workspaces: [
+            ...sessionRef.current.workspaces.filter(
+              (one) => folderKey(one.folder) !== folderKey(record.folder),
+            ),
+            record,
+          ],
+        };
+      },
+    );
+  }, [documents, views]);
+  /**
+   * Something the session remembers changed. Saved (debounced) once the workspace's session
+   * has finished restoring -- the empty window it passes through on the way is never saved.
+   */
   const writeSession = useCallback(() => {
-    const { workspacePath: folder, tabs: open, activeTabId: active } = sessionState.current;
-    // Nothing is written while a folder is still being restored. The window passes through
-    // "this folder has no tabs" on its way to reopening them, and saving that -- which took
-    // one debounce interval, less than a slow restore -- erased the folder's tabs on disk.
-    if (!isTauri() || !folder || restoring.current) return;
-    // Files only: an untitled document has nothing on disk to reopen, and its content is not
-    // kept across restarts (there is no hot exit yet).
-    const files = open
-      .filter((tab) => tab.id !== "welcome" && documents.get(tab.path)?.source.kind === "disk")
-      .map((tab) => tab.path);
-    const state: WorkspaceSession = {
-      folder,
-      files,
-      active: active && files.includes(active) ? active : null,
-      expanded: explorerRef.current.expanded,
-      scroll: explorerRef.current.scroll,
-      selected: explorerRef.current.selected,
-      focused: explorerRef.current.focused,
-    };
-    // Kept here as well as sent, because reopening a folder later in the same run restores
-    // from this -- reading the startup snapshot would bring back the tabs it had then.
-    sessionRef.current = {
-      folders: sessionRef.current.folders,
-      workspaces: [
-        ...sessionRef.current.workspaces.filter(
-          (one) => folderKey(one.folder) !== folderKey(folder),
-        ),
-        state,
-      ],
-    };
-    saveWorkspaceSession(state);
-  }, [documents]);
-  useEffect(writeSession, [workspacePath, openTabs, activeTabId, writeSession]);
+    if (isTauri()) windowSessions.current()?.markDirty();
+  }, []);
+  useEffect(writeSession, [
+    workspacePath,
+    openTabs,
+    activeTabId,
+    activeActivityTab,
+    isSidebarOpen,
+    isTerminalOpen,
+    writeSession,
+  ]);
+  /** The side bar and panel as the session left them. */
+  const restoreLayout = useCallback(
+    (state: WorkspaceSession) => {
+      const layout = state.layout;
+      if (!layout) return;
+      setActiveActivityTab(layout.sidebarView);
+      setIsSidebarOpen(layout.sidebarOpen);
+      // The panel is shown as it was; what it shows, and its terminals, are its own.
+      if (layout.panelOpen) showTerminal(true);
+    },
+    [showTerminal],
+  );
 
   /** The explorer reporting what it has unfolded and selected, and where it is scrolled. */
   const rememberExplorer = useCallback(
@@ -682,17 +753,23 @@ export default function App() {
         try {
           const root = await native("open_workspace", { path: target });
           if (superseded()) return;
-          const state = workspaceIn(saved, target);
+          const workspaceId = workspaceIdOf([root]);
+          // The session (IDE-06): created for the workspace, restored, then active -- nothing is
+          // saved before that, and nothing of it applies once another workspace is opened.
+          const session = windowSessions.begin({
+            folder: root,
+            workspaceId,
+            saved: savedFor(saved, target, workspaceId),
+          });
+          const state = session.saved;
           if (state) explorerRef.current = explorerStateOf(state);
-          restoring.current = true;
-          try {
+          const restored = await session.restore(async (live) => {
             // The tree listing and the files' contents are independent once the folder is
             // open, so they are fetched at the same time rather than one behind the other.
-            await Promise.all([loadWorkspace(root), state ? restoreTabs(state) : undefined]);
-          } finally {
-            restoring.current = false;
-          }
-          writeSession();
+            await Promise.all([loadWorkspace(root), state ? restoreTabs(state, live) : undefined]);
+            if (state && live()) restoreLayout(state);
+          });
+          if (restored) writeSession();
           return;
         } catch (reason) {
           // Moved, deleted, on a drive that is not mounted, or unreadable. Worth saying:
@@ -705,12 +782,33 @@ export default function App() {
       // Development builds open the directory Yavin was started from; release builds open
       // nothing, which is what puts the welcome page in front of a first run.
       const fallback = await native("get_default_workspace").catch(() => null);
-      if (!superseded() && fallback) await loadWorkspace(fallback).catch(reportError);
+      if (superseded() || !fallback) return;
+      // A session like any other workspace's: restored, then saved as it changes.
+      const workspaceId = workspaceIdOf([fallback]);
+      const session = windowSessions.begin({
+        folder: fallback,
+        workspaceId,
+        saved: savedFor(sessionRef.current, fallback, workspaceId),
+      });
+      const state = session.saved;
+      if (state) explorerRef.current = explorerStateOf(state);
+      try {
+        const restored = await session.restore(async (live) => {
+          await loadWorkspace(fallback);
+          if (state && live()) {
+            await restoreTabs(state, live);
+            if (live()) restoreLayout(state);
+          }
+        });
+        if (restored) writeSession();
+      } catch (reason) {
+        reportError(reason);
+      }
     })();
     return () => {
       cancelled = true;
     };
-  }, [loadWorkspace, restoreTabs, rememberSession, reportError, writeSession]);
+  }, [loadWorkspace, restoreTabs, restoreLayout, rememberSession, reportError, writeSession]);
 
   // Changes on disk reach the Explorer through its provider, which re-lists only the loaded
   // folders they touched. Changes the watcher credits to one of Yavin's own operations are
@@ -971,9 +1069,11 @@ export default function App() {
    */
   const enterWorkspace = async (selected: string, restore?: WorkspaceSession) => {
     workspaceRevision.current++;
-    // Held across the whole switch so the empty tab list this passes through is not saved
-    // over the folder's real one; released in the `finally` below.
-    restoring.current = true;
+    // The session left is saved as it is now -- before anything of it is cleared -- and ended;
+    // the new one restores, and is saved only once it has (IDE-06, `workspaceSession.ts`).
+    const workspaceId = workspaceIdOf([selected]);
+    const session = windowSessions.begin({ folder: selected, workspaceId, saved: restore ?? null });
+    restore = session.saved ?? undefined;
     setDiff(null);
     setPendingHit(null);
     documents.reset();
@@ -995,15 +1095,16 @@ export default function App() {
         ...sessionRef.current.folders.filter((folder) => folderKey(folder) !== folderKey(selected)),
       ].slice(0, RECENT_FOLDERS),
     });
-    try {
+    const restored = await session.restore(async (live) => {
       await loadWorkspace(selected);
-      if (restore) await restoreTabs(restore);
-    } finally {
-      restoring.current = false;
-    }
+      if (restore && live()) {
+        await restoreTabs(restore, live);
+        if (live()) restoreLayout(restore);
+      }
+    });
     // Written once the folder is actually open, so a folder that failed to list is not
     // recorded as the one to reopen next time.
-    writeSession();
+    if (restored) writeSession();
   };
 
   /** Refuses to leave a folder while saves are in flight, and asks about unsaved edits. */

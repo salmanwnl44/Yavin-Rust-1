@@ -375,6 +375,7 @@ export default function CodeEditor({
 
   useImperativeHandle(editorRef, () => ({
     focus: () => editor.current?.focus(),
+    viewState: () => (editor.current?.getModel() ? editor.current.saveViewState() : null),
     revealRange(start, end) {
       const instance = editor.current;
       const model = instance?.getModel();

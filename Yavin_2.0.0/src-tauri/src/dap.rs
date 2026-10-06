@@ -455,9 +455,11 @@ mod tests {
         process
             .send(r#"{"seq":1,"type":"request","command":"initialize","arguments":{"clientID":"yavin","adapterID":"debugpy","pathFormat":"path","linesStartAt1":true,"columnsStartAt1":true}}"#)
             .unwrap();
+        // Generous: a real Python starting while the whole workspace suite runs in parallel can
+        // take far longer than the ~3 s it takes alone (it once exceeded 30 s under that load).
         let answer = loop {
             let message = receiver
-                .recv_timeout(Duration::from_secs(30))
+                .recv_timeout(Duration::from_secs(120))
                 .expect("debugpy answers")
                 .expect("debugpy stays up");
             let value: serde_json::Value = serde_json::from_str(&message).unwrap();

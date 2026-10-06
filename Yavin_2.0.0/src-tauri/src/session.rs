@@ -31,11 +31,41 @@ const MAX_EXPANDED: usize = 500;
 /// Explorer entries remembered as selected per folder.
 const MAX_SELECTED: usize = 100;
 
+/// Where the editor was in one open file (IDE-06): numbers only, never the engine's object.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FileView {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_column: Option<u32>,
+    pub top_line: u32,
+    /// Pixels: fractional at any zoom other than 100% (see `scroll`).
+    pub top_delta: f64,
+    pub scroll_left: f64,
+}
+
+/// The side bar and panel around the editor (IDE-06). Visibility and which view only -- never
+/// what a view holds (a terminal's output, a debug session, a task's run).
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WindowLayout {
+    pub sidebar_view: String,
+    pub sidebar_open: bool,
+    pub panel_open: bool,
+}
+
 /// What one folder looked like when it was last open.
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct WorkspaceSession {
     pub folder: String,
+    /// The workspace it was written for (IDE-06); absent in files written before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     /// Open editor tabs, in tab order.
     pub files: Vec<String>,
     /// The tab that was in front, if any of `files` was.
@@ -54,6 +84,38 @@ pub struct WorkspaceSession {
     pub selected: Vec<String>,
     /// The explorer entry that had keyboard focus, if any.
     pub focused: Option<String>,
+    /// Where the editor was in each open file (IDE-06), one per file at most.
+    pub views: Vec<FileView>,
+    /// The side bar and panel (IDE-06).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<WindowLayout>,
+}
+
+impl WorkspaceSession {
+    /// Within the caps, and consistent: an active tab or a view of a file that is not open is
+    /// not kept, so the UI never has to defend against restoring what it cannot show.
+    fn bound(&mut self) {
+        self.files.truncate(MAX_FILES);
+        self.expanded.truncate(MAX_EXPANDED);
+        self.selected.truncate(MAX_SELECTED);
+        if let Some(active) = &self.active {
+            if !self.files.iter().any(|file| file == active) {
+                self.active = None;
+            }
+        }
+        let mut seen = Vec::new();
+        let files = &self.files;
+        self.views.retain(|view| {
+            let keep = files.contains(&view.file)
+                && view.line >= 1
+                && view.column >= 1
+                && !seen.contains(&view.file);
+            if keep {
+                seen.push(view.file.clone());
+            }
+            keep
+        });
+    }
 }
 
 /// The whole session. `folders` is the recent list, most recent first; its head is the
@@ -90,16 +152,7 @@ impl Session {
     /// that the file is not rewritten for a save that says exactly what it already says --
     /// the UI reports a snapshot whenever the explorer moves, and most of those are noise.
     fn remember(&mut self, mut state: WorkspaceSession) -> bool {
-        state.files.truncate(MAX_FILES);
-        state.expanded.truncate(MAX_EXPANDED);
-        state.selected.truncate(MAX_SELECTED);
-        // An active tab that is not open is not a tab; dropping it here means the UI never
-        // has to defend against restoring a selection it cannot show.
-        if let Some(active) = &state.active {
-            if !state.files.iter().any(|file| file == active) {
-                state.active = None;
-            }
-        }
+        state.bound();
         let key = normalise(Path::new(&state.folder));
         let unchanged = self
             .folders
@@ -121,9 +174,7 @@ impl Session {
     fn trim(&mut self) {
         self.folders.truncate(MAX_FOLDERS);
         for state in &mut self.workspaces {
-            state.files.truncate(MAX_FILES);
-            state.expanded.truncate(MAX_EXPANDED);
-            state.selected.truncate(MAX_SELECTED);
+            state.bound();
         }
         self.prune();
     }
@@ -689,6 +740,102 @@ mod tests {
         assert!(fs::read_to_string(&file)
             .unwrap()
             .contains("/work/precious"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- IDE-06: where the editor was, the layout, and whose session it is -------------------
+
+    fn view(file: &str, line: u32) -> FileView {
+        FileView {
+            file: file.to_string(),
+            line,
+            column: 3,
+            anchor_line: Some(line + 2),
+            anchor_column: Some(1),
+            top_line: line,
+            top_delta: 4.5,
+            scroll_left: 0.0,
+        }
+    }
+
+    #[test]
+    fn views_layout_and_workspace_identity_come_back_after_a_restart() {
+        let dir = temp("views");
+        let mut store = store_at(&dir);
+        let mut state = workspace("/work/a", &["/work/a/x.py", "/work/a/y.py"]);
+        state.workspace_id = Some("file:///work/a".into());
+        state.views = vec![view("/work/a/x.py", 12), view("/work/a/y.py", 1)];
+        state.layout = Some(WindowLayout {
+            sidebar_view: "debug".into(),
+            sidebar_open: true,
+            panel_open: true,
+        });
+        store.session.remember(state.clone());
+        store.save().unwrap();
+        let back = store_at(&dir);
+        assert_eq!(back.session.workspaces, vec![state]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_view_of_a_file_that_is_not_open_or_seen_twice_is_not_kept() {
+        let mut session = Session::default();
+        let mut state = workspace("/work/a", &["/work/a/x.py"]);
+        state.views = vec![
+            view("/work/a/x.py", 5),
+            view("/work/a/x.py", 9),
+            view("/work/a/closed.py", 2),
+            FileView {
+                line: 0,
+                ..view("/work/a/x.py", 1)
+            },
+        ];
+        session.remember(state);
+        let kept = &session.workspaces[0].views;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].line, 5);
+    }
+
+    #[test]
+    fn a_session_from_before_ide_06_reads_and_a_field_from_later_is_ignored() {
+        let dir = temp("before-ide-06");
+        let file = dir.join("session.json");
+        fs::write(
+            &file,
+            r#"{"version":1,"folders":["/work/a"],"workspaces":[{"folder":"/work/a","files":["/work/a/x.py"],"active":"/work/a/x.py","expanded":[],"scroll":0,"futureThing":{"x":1}}]}"#,
+        )
+        .unwrap();
+        let store = store_at(&dir);
+        assert!(store.writable);
+        let state = &store.session.workspaces[0];
+        assert_eq!(state.files, vec!["/work/a/x.py".to_string()]);
+        assert_eq!(state.workspace_id, None);
+        assert!(state.views.is_empty());
+        assert_eq!(state.layout, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A save interrupted before its rename leaves only a temporary file beside the session:
+    /// the session file is the last complete one, and it is what the next start reads.
+    #[test]
+    fn a_save_interrupted_before_its_rename_leaves_the_last_complete_session() {
+        let dir = temp("interrupted");
+        let mut store = store_at(&dir);
+        store
+            .session
+            .remember(workspace("/work/a", &["/work/a/x.py"]));
+        store.save().unwrap();
+        fs::write(
+            dir.join("session.json.12345.yavin-tmp"),
+            r#"{"version":1,"folders":["/work/b"],"works"#,
+        )
+        .unwrap();
+        let back = store_at(&dir);
+        assert_eq!(back.session.folders, vec!["/work/a".to_string()]);
+        assert_eq!(
+            back.session.workspaces[0].files,
+            vec!["/work/a/x.py".to_string()]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

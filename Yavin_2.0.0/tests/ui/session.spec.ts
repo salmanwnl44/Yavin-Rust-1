@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
-import { appAlert, expectText } from "./editor-harness";
+import { appAlert, editorSelections, expectText } from "./editor-harness";
 
 interface Call {
   command: string;
@@ -377,4 +377,120 @@ test("the welcome page can be reopened after its tab is closed", async ({ page }
   await expect(
     page.getByRole("tablist", { name: "Open editors" }).getByRole("tab", { name: "Welcome" }),
   ).toHaveAttribute("aria-selected", "true");
+});
+
+// --- IDE-06: where the editor was, the layout, and nothing that was running --------------------
+
+test("where the editor was in each file comes back with the file", async ({ page }) => {
+  await desktop(page, {
+    session: {
+      folders: ["/work"],
+      workspaces: [
+        {
+          folder: "/work",
+          files: ["/work/a.ts", "/work/b.ts"],
+          active: "/work/b.ts",
+          views: [
+            { file: "/work/b.ts", line: 1, column: 5, topLine: 1, topDelta: 0, scrollLeft: 0 },
+          ],
+        } as StoredWorkspace,
+      ],
+    },
+  });
+  await expectText(page, "the contents of b");
+  // The cursor is where it was left: after "the " on line 1.
+  await expect.poll(async () => (await editorSelections(page))?.[0]?.start).toBe(4);
+});
+
+test("the side bar and panel come back as they were; no task or debug session is resurrected", async ({
+  page,
+}) => {
+  await desktop(page, {
+    session: {
+      folders: ["/work"],
+      workspaces: [
+        {
+          folder: "/work",
+          files: ["/work/a.ts"],
+          active: "/work/a.ts",
+          layout: { sidebarView: "debug", sidebarOpen: true, panelOpen: true },
+        } as StoredWorkspace,
+      ],
+    },
+  });
+  await expect(page.getByRole("complementary", { name: "Debug" })).toBeVisible();
+  await expect(page.getByRole("tablist", { name: "Panel views" })).toBeVisible();
+  // A layout is visibility only: no debug session, no task, nothing started by the restore.
+  await expect(page.getByTestId("debug-status")).toHaveCount(0);
+  expect(await calls(page, "dap_start")).toEqual([]);
+  const launched = (await calls(page, "terminal_open")).filter((call) =>
+    JSON.stringify(call.args).includes('"task.'),
+  );
+  expect(launched).toEqual([]);
+});
+
+test("what is saved is references and positions only, for this workspace", async ({ page }) => {
+  await desktop(page, {
+    session: { folders: ["/work"], workspaces: [{ folder: "/work", files: [] }] },
+  });
+  await expect(entry(page, "a.ts")).toBeVisible();
+  await entry(page, "a.ts").dblclick();
+  await expectText(page, "the contents of a");
+  await expect
+    .poll(async () => {
+      const saved = await calls(page, "save_workspace_session");
+      return (saved.at(-1)?.args.state as StoredWorkspace | undefined)?.files;
+    })
+    .toEqual(["/work/a.ts"]);
+  const state = (await calls(page, "save_workspace_session")).at(-1)!.args.state as Record<
+    string,
+    unknown
+  >;
+  expect(state.workspaceId).toBe("file:///work");
+  expect(state.layout).toEqual({ sidebarView: "explorer", sidebarOpen: true, panelOpen: false });
+  // Nothing but the session's own fields: no content, terminal, task or debug state.
+  expect(Object.keys(state).sort()).toEqual(
+    [
+      "active",
+      "expanded",
+      "files",
+      "focused",
+      "folder",
+      "layout",
+      "scroll",
+      "selected",
+      "views",
+      "workspaceId",
+    ].sort(),
+  );
+});
+
+test("two quick switches keep the second folder's tabs: nothing is saved while it restores", async ({
+  page,
+}) => {
+  await desktop(page, {
+    session: {
+      folders: ["/work", "/other"],
+      workspaces: [
+        { folder: "/work", files: ["/work/a.ts"], active: "/work/a.ts" },
+        { folder: "/other", files: ["/other/only.ts"], active: "/other/only.ts" },
+      ],
+    },
+    slowReads: 300,
+  });
+  await expect(page.getByRole("tab", { name: /a\.ts/ })).toBeVisible();
+  // To /other, and straight back to /work while /other is still restoring.
+  await page.getByRole("tab", { name: "Welcome" }).click();
+  await welcome(page)
+    .getByRole("button", { name: /^other/ })
+    .click();
+  await page.getByRole("tab", { name: "Welcome" }).click();
+  await welcome(page).getByRole("button", { name: /^work/ }).click();
+  await expect(page.getByRole("tab", { name: /a\.ts/ })).toBeVisible();
+  await page.waitForTimeout(800);
+  const saved = (await calls(page, "save_workspace_session")).map(
+    (call) => call.args.state as StoredWorkspace,
+  );
+  // Neither folder was ever written as having no tabs.
+  expect(saved.filter((state) => !state.files?.length)).toEqual([]);
 });
