@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "name": "Yavin Extensions",
+  "categories": [
+    { "id": "productivity", "label": "Productivity" },
+    { "id": "linters", "label": "Linters" },
+    { "id": "samples", "label": "Samples" }
+  ],
+  "recommended": ["yavin.todo-highlighter", "yavin.word-count"],
+  "extensions": [
+    {
+      "id": "yavin-samples.hello-world",
+      "publisherDisplayName": "Yavin",
+      "categories": ["samples"],
+      "tags": ["sample", "api", "markdown"],
+      "repository": "https://github.com/salmanwnl44/Yavin-Rust-1",
+      "icon": "hello",
+      "versions": [
+        { "source": "extensions/samples/hello-world", "publishedAt": "2026-10-06" },
+        { "source": "extensions/catalog/hello-world-2.1.0", "publishedAt": "2026-10-07" }
+      ]
+    },
+    {
+      "id": "yavin.word-count",
+      "publisherDisplayName": "Yavin",
+      "categories": ["productivity"],
+      "tags": ["words", "statistics", "markdown"],
+      "repository": "https://github.com/salmanwnl44/Yavin-Rust-1",
+      "icon": "count",
+      "versions": [{ "source": "extensions/catalog/word-count", "publishedAt": "2026-10-07" }]
+    },
+    {
+      "id": "yavin.todo-highlighter",
+      "publisherDisplayName": "Yavin",
+      "categories": ["linters", "productivity"],
+      "tags": ["todo", "fixme", "comments", "highlight"],
+      "repository": "https://github.com/salmanwnl44/Yavin-Rust-1",
+      "icon": "todo",
+      "versions": [{ "source": "extensions/catalog/todo-highlighter", "publishedAt": "2026-10-07" }]
+    }
+  ]
+}

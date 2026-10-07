@@ -1,6 +1,7 @@
 export function ActivityBar({
   activeTab,
   gitBadge = "",
+  extensionsBadge = "",
   onSelectTab,
   onOpenSettings,
   onOpenAccounts = onOpenSettings,
@@ -10,6 +11,8 @@ export function ActivityBar({
   /** Extensions' own Activity Bar containers (IDE-08): `ext:<containerId>` tabs, a generic icon. */
   extensionTabs?: readonly { id: string; title: string }[];
   gitBadge?: string;
+  /** Extension updates available (IDE-09); recommendations never badge. */
+  extensionsBadge?: string;
   onSelectTab: (tab: string) => void;
   /** The gear: the Settings view (Ctrl+,). */
   onOpenSettings: () => void;
@@ -135,6 +138,7 @@ export function ActivityBar({
     {
       id: "extensions",
       title: "Extensions & Plugins (Ctrl+Shift+X)",
+      badge: extensionsBadge,
       icon: (
         <svg
           width="20"

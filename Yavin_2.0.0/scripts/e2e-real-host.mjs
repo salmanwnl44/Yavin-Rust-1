@@ -1,4 +1,4 @@
-// The real extension host, end to end in the installed application (IDE-08):
+// The real extension host and marketplace, end to end in the installed application (IDE-08/09):
 //
 //   1. builds the release installer (MSI) with a test identifier, `com.yavin.ide.e2e`, so the
 //      run has its own settings, session, trust and extensions -- never the user's
@@ -23,7 +23,18 @@ const run = (command, list, options = {}) =>
   execFileSync(command, list, { cwd: root, stdio: "inherit", shell: true, ...options });
 
 if (!skipBuild)
-  run("npx", ["tauri", "build", "--config", "src-tauri/tauri.e2e.conf.json", "--bundles", "msi"]);
+  run("npx", [
+    "tauri",
+    "build",
+    "--config",
+    "src-tauri/tauri.e2e.conf.json",
+    "--bundles",
+    "msi",
+    // The marketplace test's local registry (IDE-09): plain loopback HTTP, named by
+    // YAVIN_TEST_REGISTRY. Never part of a normal build.
+    "--features",
+    "test-registry",
+  ]);
 
 const bundles = join(
   process.env.CARGO_TARGET_DIR ?? join(root, "src-tauri", "target"),

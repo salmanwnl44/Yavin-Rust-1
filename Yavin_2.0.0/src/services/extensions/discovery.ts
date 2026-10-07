@@ -32,6 +32,14 @@ export async function rediscoverExtensions(
   return discoverExtensions(registry, list);
 }
 
+/**
+ * Yavin's own extensions folder, as the last discovery reported it: what the marketplace
+ * installs into and may uninstall from (IDE-09). Extensions found elsewhere (a development
+ * build's repository samples) are not removable.
+ */
+let userRoot: string | null = null;
+export const installedRoot = () => userRoot;
+
 export async function discoverExtensions(
   registry: ExtensionRegistry,
   list: () => Promise<{
@@ -42,6 +50,7 @@ export async function discoverExtensions(
 ): Promise<DiscoveryReport> {
   const started = performance.now();
   const found = await list();
+  userRoot = found.root;
   let registered = 0;
   let rejected = 0;
   for (const one of found.extensions) {

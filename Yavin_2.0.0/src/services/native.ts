@@ -110,6 +110,34 @@ interface Commands {
       skipped: number;
     };
   };
+  // --- Extension marketplace and installer (IDE-09) ---
+  marketplace_default_registry: { args: Record<string, never>; result: string };
+  marketplace_get_text: { args: { registryUrl: string; path: string }; result: string };
+  marketplace_get_icon: { args: { registryUrl: string; path: string }; result: string };
+  extensions_stage: {
+    args: {
+      source:
+        | { kind: "registry"; registryUrl: string; path: string; sha256: string; size: number }
+        | { kind: "file"; path: string };
+      expectedId: string;
+      expectedVersion: string;
+    };
+    result: {
+      token: string;
+      manifest: string;
+      files: number;
+      bytes: number;
+      sha256: string;
+      packageSize: number;
+    };
+  };
+  extensions_commit: {
+    args: { token: string; id: string };
+    result: { folder: string; replaced: boolean };
+  };
+  extensions_finish: { args: { token: string; id: string; keep: boolean }; result: void };
+  extensions_discard: { args: { token: string }; result: void };
+  extensions_uninstall: { args: { id: string }; result: string };
   create_file: { args: { path: string }; result: void };
   /** Exclusive: fails if anything is there. Resolves to the operation's id (Module 03). */
   create_file_with_content: { args: { path: string; content: string }; result: number };

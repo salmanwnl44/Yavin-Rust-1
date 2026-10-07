@@ -1,0 +1,29 @@
+{
+  "publisher": "yavin",
+  "name": "todo-highlighter",
+  "displayName": "TODO Highlighter",
+  "version": "1.0.0",
+  "description": "Highlights TODO and FIXME comments in open files and lists how many there are.",
+  "engines": { "yavin": "^2.0.0" },
+  "main": "extension.js",
+  "license": "MIT",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "commands": [
+      {
+        "command": "yavin.todo-highlighter.count",
+        "title": "Count TODOs in Active File",
+        "category": "TODO Highlighter"
+      }
+    ],
+    "configuration": {
+      "properties": {
+        "yavin.todo-highlighter.keywords": {
+          "type": "string",
+          "default": "TODO,FIXME",
+          "description": "Comma-separated words to highlight."
+        }
+      }
+    }
+  }
+}

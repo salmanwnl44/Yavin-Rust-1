@@ -16,12 +16,14 @@ mod checkers;
 mod config;
 mod dap;
 mod extension_host;
+mod extension_package;
 mod extensions;
 mod external;
 mod git;
 mod localgit;
 mod localgit_restore;
 mod lsp;
+mod marketplace;
 mod paths;
 mod ports;
 mod session;
@@ -827,6 +829,14 @@ pub fn run() {
             ext_host_send,
             ext_host_stop,
             ext_host_stop_all,
+            marketplace::marketplace_default_registry,
+            marketplace::marketplace_get_text,
+            marketplace::marketplace_get_icon,
+            marketplace::extensions_stage,
+            marketplace::extensions_commit,
+            marketplace::extensions_finish,
+            marketplace::extensions_discard,
+            marketplace::extensions_uninstall,
         ])
         .build(tauri::generate_context!())
         .map(|app| {

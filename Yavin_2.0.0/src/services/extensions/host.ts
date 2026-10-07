@@ -1006,7 +1006,12 @@ export function createExtensionHost(options: ExtensionHostOptions) {
     // anything of the chain runs.
     const unavailable = options.registry.getSnapshot().unavailable[id];
     if (unavailable) throw new ExtensionError("DependencyFailed", id, unavailable);
-    for (const each of options.registry.activationOrder(id)) await activateOne(each);
+    for (const each of options.registry.activationOrder(id)) {
+      // A version being retired (disabled, uninstalled, updated) is gone from the host first:
+      // its late unload must never hit the version that replaces it.
+      await retirements.get(each);
+      await activateOne(each);
+    }
   };
 
   const matches = (entry: RegisteredExtension, event: ActivationEvent) =>
@@ -1039,6 +1044,48 @@ export function createExtensionHost(options: ExtensionHostOptions) {
     }
     move(one, "disposed");
   };
+
+  /**
+   * The registry is the source of truth (IDE-09): an extension disabled, uninstalled or
+   * replaced (updated: a new registry entry) stops here -- deactivated, its code unloaded from
+   * the host, its contributions (handlers, views' rows, providers, decorations) removed. Used
+   * again, it starts fresh from what the registry now has.
+   */
+  const retirements = new Map<string, Promise<void>>();
+  const followRegistry = () => {
+    if (finished) return;
+    for (const [id, one] of [...running]) {
+      const entry = options.registry.get(id);
+      if (entry && entry.enabled && entry === one.entry) continue;
+      if (retirements.has(id)) continue;
+      const retirement = (async () => {
+        try {
+          if (one.status.state === "active" || one.status.state === "activating") {
+            await deactivate(one);
+            log(
+              one,
+              "info",
+              entry
+                ? entry.enabled
+                  ? "Replaced: it will start again from its new version."
+                  : "Disabled: stopped."
+                : "Uninstalled: stopped.",
+            );
+          } else {
+            if (one.loaded && channel && !finished)
+              await send({ type: "unload", extensionId: id }).catch(() => undefined);
+            clearContributions(id);
+          }
+        } finally {
+          if (running.get(id) === one) running.delete(id);
+          retirements.delete(id);
+          publish();
+        }
+      })();
+      retirements.set(id, retirement);
+    }
+  };
+  const stopFollowing = options.registry.subscribe(followRegistry);
 
   const api = {
     getSnapshot: () => snapshot,
@@ -1102,6 +1149,7 @@ export function createExtensionHost(options: ExtensionHostOptions) {
     /** Ends every extension of this host, then the process. */
     async dispose(): Promise<void> {
       if (finished) return;
+      stopFollowing();
       for (const one of [...running.values()].reverse()) await deactivate(one);
       finished = true;
       hostState = "stopped";

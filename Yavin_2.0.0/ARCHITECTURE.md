@@ -1301,7 +1301,86 @@ The renderer's own tests (`extensions.test.ts`, the UI suite) run the real `boot
 
 **Performance** (debug build, development machine): host startup 34 ms; the sample's load and activation 14 ms; command, view and provider round trips in the host p95 2.2 / 0.8 / 1.0 ms; shutdown 4 ms; discovering 200 manifests 42 ms; a command through the manager (in-process host) p95 0.2 ms. Budgets are asserted in `tests/host.rs` and `extensions.test.ts`.
 
-**Not yet.** OS sandboxing of the host process, a marketplace, remote extensions, network or process capabilities, file writes, webviews.
+**Not yet.** OS sandboxing of the host process (the marketplace is IDE-09, below), remote extensions, network or process capabilities, file writes, webviews.
+
+## Extension Marketplace
+
+IDE-09 is the user-facing side of extensions: a searchable marketplace, installed and recommended extensions as cards, an extension's page, and Install / Update / Enable / Disable / Uninstall. It adds no second registry, storage, settings or command system: what is installed is the ExtensionRegistry's, extension state is IDE-07's storage, marketplace settings are SettingsRegistry definitions, palette commands are the window's CommandRegistry.
+
+```text
+                    Extensions UI (ExtensionsPanel, ExtensionCard, ExtensionDetails)
+                         │ subscribes to: registry · host manager · marketplace · installer
+                         ▼
+              ExtensionMarketplaceService (window)  -- typed errors, compatibility, updates
+                         │
+                 ExtensionMarketplaceProvider (interface)
+                    /                          \
+       YavinRegistryProvider               LocalMarketplaceProvider
+       (static index over HTTPS,            (test catalog: unit/UI tests,
+        fetched natively)                    offline development only)
+                    \                          /
+                     createIndexProvider: strict index reader, search, pagination, cache
+                           │  normalized MarketplaceExtension
+                           ▼
+                   ExtensionInstaller (window)
+                           │  extensions_stage → validate manifest → extensions_commit → finish
+                           ▼          (native: download, SHA-256, archive checks, unpack, swap)
+                  ExtensionRegistry (window) ── the source of truth for "installed"
+                           │  host follows the registry: disabled / removed / replaced → stopped
+                           ▼
+                  ExtensionHost (workspace) ── yavin-extension-host process (QuickJS)
+                           │
+                           ▼
+                   the extension's code
+```
+
+**Ownership.**
+
+| Owner                                             | Owns                                                                                                   | Does not                                        |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------- |
+| `ExtensionMarketplaceService` (`service.ts`)      | the current provider, typed failures, compatibility answers, the list of available updates             | install, run code, know what is installed       |
+| Providers (`indexProvider.ts`, …)                 | talking to one marketplace and normalizing its answers; their metadata cache                           | download or unpack packages, touch the registry |
+| `ExtensionInstaller` (`installer.ts`)             | version choice, package validation, putting packages in place, rollback, uninstall, operation progress | run code; keep its own "installed" list         |
+| Native (`marketplace.rs`, `extension_package.rs`) | the network policy, downloads, checksums, archive validation, unpacking, the folder swap, deletion     | decide what to install                          |
+| `ExtensionRegistry`                               | what is installed and enabled (the Extensions view derives from it)                                    |                                                 |
+| `ExtensionHost` / manager                         | running extensions; it follows the registry                                                            |                                                 |
+| Session                                           | nothing of the marketplace (IDE-06 boundary): only which side-bar view was open                        | remember searches, installs or runtime state    |
+
+**The real marketplace: Yavin's registry.** Open VSX was considered and rejected as the install source: it serves VS Code extensions (`.vsix`, Node.js, the `vscode` API), which Yavin's QuickJS runtime and API 2.0 cannot execute -- listing them would be a catalog of incompatible packages. Yavin's registry is a static, versioned index plus packages, built from `registry/catalog.json` and extension sources by `scripts/build-registry.mjs` (deterministic packages: the same sources always give the same SHA-256; `--check` verifies the committed registry is current), and served as files over HTTPS -- by default from Yavin's public repository (`https://raw.githubusercontent.com/salmanwnl44/Yavin-Rust-1/main/Yavin_2.0.0/registry/`), which needs no server, account or authentication. A self-hosted registry of the same format is a URL in Settings. The provider interface leaves room for others (an Open VSX browser, a private registry API) without the UI changing.
+
+**Registry index (schema 1).** `name`, `categories`, `recommended`, and per extension: id (`publisher.name`), display name, publisher display name, description, categories, tags, icon/readme/changelog paths, repository, license, kind (`code`/`declarative`), activation events, a contributions summary, and versions -- each with its engine range, publication date, package path, size and SHA-256. The reader is strict: an entry whose id is not its publisher.name, a version without a valid checksum, a path leaving the registry, are dropped (with why); an unknown schema is refused. No metadata is invented: downloads and ratings are shown only if a provider publishes them (Yavin's registry does not).
+
+**Search** runs over the index: every word must match (id, name, tags, categories, publisher, description; ranked), category and compatible-only filters, pages of 20. The view debounces typing (300 ms), aborts the request in flight when a newer one starts, and drops any answer but the latest's (`search.ts`).
+
+**Installing** (`ExtensionInstaller`): the newest version this Yavin can run (or one chosen on the extension's page) → compatibility checked before anything is downloaded → the provider names the package → natively: downloaded into `extensions/.staging/`, its size and SHA-256 compared with the index, the archive validated and unpacked → its manifest validated in the renderer (`readManifest`) and required to be the extension and version asked for → only then is an installed version taken out of the registry (its host stops it) and the new folder moved in, the old one kept in `extensions/.previous/` → registered → the old folder deleted, or, if registering failed, moved back (rollback). A crash in between is repaired at the next discovery (`recover`). No extension code runs while installing. Folder layout: `extensions/<publisher.name>/` -- one current version, as discovery already reads it; `.staging` and `.previous` are the installer's and never discovered.
+
+**Package limits** (Yavin's own constraints set them: an entry point is at most 2 MiB, a manifest 64 KiB; the Hello World package is 2.4 KiB): 20 MiB compressed, 1000 entries, 16 MiB per file, 64 MiB unpacked, a 100:1 compression ratio per entry above 1 MiB -- each counted while reading, not taken from the archive's headers.
+
+**Enable / disable / uninstall / update.** Disable keeps the installation; the host stops the extension and removes its handlers, views' rows, providers and decorations; enable re-registers its contributions and it activates lazily. Uninstall asks first, and whether to delete its stored state (all workspaces) -- its settings values are kept; only extensions in Yavin's own folder can be uninstalled (a development build's repository samples cannot). Update is install over the running version, with the old one kept until the new one is registered.
+
+**Statuses** shown: Installed, Enabled, Disabled, Activating, Active, Failed, Incompatible (with the reason, e.g. "This extension requires Yavin API 3.0.0"), Update Available, Untrusted, Host Unavailable, Unavailable (dependencies), and Installing / Updating / Uninstalling with their phase. Host generations, request ids and process state are under **Runtime diagnostics** (the view's ⋯ menu), not in the normal view. Errors are one sentence ("Could not install Python Tools.", "The extension marketplace is unavailable."); the technical detail is behind Details.
+
+**Offline.** Installed extensions are the registry's and keep working; recommendations, search and details say the marketplace is unavailable, with Retry.
+
+**Caching.** The index (metadata, categories, recommendations) is cached for an hour in memory and in the window's storage, keyed by cache version, index schema, provider and registry URL; Refresh drops it. Icons and documents are cached in memory for the window. Packages are never cached.
+
+**Settings** (user scope only, so a project's workspace settings cannot redirect the marketplace): `extensions.marketplace.registryUrl` (empty: Yavin's registry), `extensions.autoCheckUpdates` (check at startup; updates are never installed automatically), `extensions.showRecommendations`.
+
+**Command palette.** Extensions: Open Extensions (Ctrl+Shift+X), Search Extensions, Check for Updates, Installed Extensions, Recommended Extensions, Reload, Enable, Disable, Uninstall. The Activity Bar's Extensions icon shows the number of available updates (recommendations never badge).
+
+**Trust.** Browsing and downloading metadata are allowed in any folder; installing is allowed (it runs nothing); running an installed extension's code needs a trusted folder, as in IDE-08 (`ext_host_start` refuses otherwise). Installed-but-untrusted extensions say "Untrusted".
+
+### Marketplace security -- what is and is not guaranteed
+
+- **Transport:** HTTPS only, through the platform's TLS (Windows: SChannel, its certificate store). Every request is a path inside the configured registry; redirects are followed by Yavin, at most 3, only to the registry's own host and only over HTTPS; responses are size-bounded and content-type checked (an HTML error page is refused). Extension manifests never supply download URLs. Plain HTTP is accepted only for a loopback registry in a `test-registry` build (the end-to-end test's), which is never shipped.
+- **Integrity:** each package's SHA-256 and size are published in the index and verified before anything is unpacked. This proves the package is the one the index lists -- not who wrote it.
+- **Signatures: none.** Packages and the index are **not cryptographically signed**. Trust in a package is trust in the registry and in the transport to it (for the default registry: GitHub serving Yavin's repository). A compromised registry can publish a malicious package with a matching checksum.
+- **Publisher identity:** the publisher is the id's prefix and the registry's display name; there is no verified-publisher mechanism.
+- **Package validation:** path traversal (`..`), absolute, drive and UNC paths, backslashes, alternate data streams, reserved device names, links, encrypted entries, case-colliding duplicates, file/folder clashes, oversized and over-compressed contents and manifest/package mismatches are refused, and nothing of a refused package is left on disk.
+- **Runtime:** an installed extension runs only in the extension host process under IDE-08's boundary (QuickJS, no filesystem/network/process APIs, mediated capabilities, memory and time limits) -- and that process is not sandboxed by the operating system.
+- **Updates** are checked, never installed without the user.
+
+**Tests.** `marketplace.test.ts` (index reading, search, filters, pagination, caching, offline, error mapping, compatibility, the search controller, the installer with the real extension host: install, refusals, mismatch, update, rollback, busy, disable/enable, uninstall with and without data, removability, trust, workspaces); `extension_package.rs` and `marketplace.rs` (every unsafe archive, the swap and rollback, recovery, HTTPS/redirect/content-type policy, a loopback download with each integrity failure, and every published registry package through the real validator); UI tests on the mock with the test catalog read by the real provider; the installed application (`tests/real/marketplace.spec.ts`) installing, updating and uninstalling real registry packages through the real native installer and host; and opt-in network tests (`cargo test -p yavin-ide --lib live_ -- --ignored`): HTTPS to GitHub, and the published registry end to end.
 
 ## Terminal
 

@@ -2,8 +2,9 @@
 //!
 //! Extensions are found in `<app local data>/extensions/<folder>/yavin-extension.json` --
 //! Yavin's own data directory, never the open project (a project's files are the project's,
-//! and untrusted) and never the network (there is no marketplace, download or update) -- and,
-//! in development builds only, in the repository's `extensions/samples`. Discovery reads
+//! and untrusted); the marketplace installs into it (IDE-09: `marketplace.rs`,
+//! `extension_package.rs`; its `.staging` and `.previous` folders are skipped here) -- and, in
+//! development builds only, in the repository's `extensions/samples`. Discovery reads
 //! manifests only. An extension's code is read by `extension_host.rs` alone, when its host
 //! loads it (`read_main`), from the folder discovery found.
 //! Everything is bounded: the number of folders, a manifest's size, and nothing is followed
@@ -50,6 +51,8 @@ pub fn discover(root: &Path) -> Discovery {
             .filter_map(|entry| entry.ok())
             // A link is never followed: an extension is a real folder in the extensions root.
             .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+            // `.staging`, `.previous`: the installer's, never extensions (IDE-09).
+            .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
             .map(|entry| entry.path())
             .collect(),
         Err(_) => Vec::new(),
@@ -131,6 +134,8 @@ pub fn roots(app: &AppHandle) -> Result<Vec<PathBuf>, String> {
 #[tauri::command(async)]
 pub fn extensions_list(app: AppHandle) -> Result<Discovery, String> {
     let roots = roots(&app)?;
+    // An install or update interrupted by a crash is repaired first (IDE-09).
+    crate::extension_package::recover(&roots[0]);
     let mut all = discover(&roots[0]);
     for root in &roots[1..] {
         let more = discover(root);

@@ -2,6 +2,12 @@ import { readFileSync } from "node:fs";
 import { test, expect } from "@playwright/test";
 import type { Locator, Page } from "@playwright/test";
 import { appAlert, editorSelections, withEditor } from "./editor-harness";
+import {
+  FIXTURE_DOCUMENTS,
+  FIXTURE_ICON,
+  FIXTURE_PACKAGES,
+  fixtureIndex,
+} from "../../src/services/extensions/marketplace/fixtures";
 
 /**
  * The extension host's real API (`bootstrap.js`) and the sample extension, read here and run by
@@ -22,6 +28,22 @@ const EXTENSION_HOST = {
   ),
 };
 const SAMPLE_FOLDER = "/repo/extensions/samples/hello-world";
+
+/**
+ * The marketplace the mock serves (IDE-09): the deterministic test catalog, in the real registry
+ * format -- read by the real YavinRegistryProvider -- with its packages' manifests and code.
+ * Hello World is the real sample's manifest and code.
+ */
+const MARKET = (() => {
+  const index = fixtureIndex({ manifest: JSON.parse(EXTENSION_HOST.sampleManifest) });
+  FIXTURE_PACKAGES["packages/yavin-samples.hello-world-2.0.0.yvx"].code = EXTENSION_HOST.sampleCode;
+  return {
+    index: JSON.stringify(index),
+    packages: FIXTURE_PACKAGES,
+    documents: FIXTURE_DOCUMENTS,
+    icon: FIXTURE_ICON,
+  };
+})();
 
 interface Call {
   command: string;
@@ -69,6 +91,8 @@ async function desktop(
     extensions?: { folder: string; manifest: string | null; error: string | null }[];
     /** Installed extensions' code, by extension id, as the native side reads it (IDE-08). */
     extensionCode?: Record<string, string>;
+    /** The marketplace (IDE-09): unreachable, slow to answer its index. */
+    marketplace?: { down?: boolean; indexDelayMs?: number };
   } = {},
 ) {
   await page.addInitScript(
@@ -136,8 +160,23 @@ async function desktop(
         };
         return `${manifest.publisher}.${manifest.name}`;
       })();
+      // --- The marketplace and installer (IDE-09), as the native side behaves -----------------
+      const market = { down: setup.marketplace?.down ?? false, failCommit: false };
+      /** Installed through the marketplace: id → manifest text and code. */
+      const installedExtensions: Record<string, { manifest: string; code: string | null }> = {};
+      const staged: Record<string, { id: string; manifest: string; code: string | null }> = {};
+      const aside: Record<string, { manifest: string; code: string | null } | undefined> = {};
+      let nextToken = 1;
+      Object.assign(window, {
+        /** The marketplace goes down or comes back. */
+        __market: market,
+      });
       const codeOf = (id: string) =>
-        id === sampleId ? setup.host.sampleCode : (setup.extensionCode?.[id] ?? null);
+        installedExtensions[id]
+          ? installedExtensions[id].code
+          : id === sampleId
+            ? setup.host.sampleCode
+            : (setup.extensionCode?.[id] ?? null);
       const hostHandle = (session: number, text: string) => {
         const one = hosts[session];
         if (!one || one.ended) return;
@@ -659,20 +698,98 @@ async function desktop(
               }
               return null;
             }
-            // The sample (as a development build finds it) and the installed extensions.
+            // The installed extensions (the user's folder first) and the sample (as a development
+            // build finds it).
             if (command === "extensions_list")
               return {
                 root: "/data/extensions",
                 extensions: [
+                  ...Object.entries(installedExtensions).map(([id, one]) => ({
+                    folder: `/data/extensions/${id}`,
+                    manifest: one.manifest,
+                    error: null,
+                  })),
+                  ...(setup.extensions ?? []),
                   {
                     folder: setup.host.sampleFolder,
                     manifest: setup.host.sampleManifest,
                     error: null,
                   },
-                  ...(setup.extensions ?? []),
                 ],
                 skipped: 0,
               };
+            if (command === "marketplace_default_registry") return "https://registry.test/yavin/";
+            if (command === "marketplace_get_text" || command === "marketplace_get_icon") {
+              if (market.down)
+                throw "MarketplaceUnavailable: the marketplace could not be reached (offline).";
+              const path = args.path as string;
+              if (command === "marketplace_get_icon") return setup.market.icon;
+              if (path === "index.json") {
+                const delay = setup.marketplace?.indexDelayMs ?? 0;
+                if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+                return setup.market.index;
+              }
+              return setup.market.documents[path] ?? `# ${path}\n\nFixture document.`;
+            }
+            if (command === "extensions_stage") {
+              const source = args.source as { kind: string; path: string };
+              const id = args.expectedId as string;
+              const version = args.expectedVersion as string;
+              const pkg = setup.market.packages[source.path];
+              if (!pkg || pkg.broken === "missing")
+                throw `NotFound: ${source.path} is not in the marketplace.`;
+              if (pkg.broken === "unsafe")
+                throw 'UnsafePackage: "../escape.txt" leaves the extension ("..")';
+              const manifest = pkg.manifest as { publisher: string; name: string; version: string };
+              if (`${manifest.publisher}.${manifest.name}` !== id || manifest.version !== version)
+                throw `ManifestMismatch: the package is ${manifest.publisher}.${manifest.name} ${manifest.version}.`;
+              const token = `${(nextToken++).toString(16).padStart(8, "0")}`;
+              staged[token] = {
+                id,
+                manifest: JSON.stringify(pkg.manifest),
+                code: pkg.code ?? null,
+              };
+              return {
+                token,
+                manifest: staged[token].manifest,
+                files: 2,
+                bytes: 100,
+                sha256: "0".repeat(64),
+                packageSize: 100,
+              };
+            }
+            if (command === "extensions_commit") {
+              if (market.failCommit)
+                throw "InstallFailed: the installed version could not be moved aside (it is in use).";
+              const one = staged[args.token as string];
+              delete staged[args.token as string];
+              aside[args.token as string] = installedExtensions[one.id];
+              installedExtensions[one.id] = { manifest: one.manifest, code: one.code };
+              return {
+                folder: `/data/extensions/${one.id}`,
+                replaced: !!aside[args.token as string],
+              };
+            }
+            if (command === "extensions_finish") {
+              const previous = aside[args.token as string];
+              delete aside[args.token as string];
+              if (!args.keep) {
+                if (previous) installedExtensions[args.id as string] = previous;
+                else delete installedExtensions[args.id as string];
+              }
+              return null;
+            }
+            if (command === "extensions_discard") {
+              delete staged[args.token as string];
+              return null;
+            }
+            if (command === "extensions_uninstall") {
+              const id = args.id as string;
+              if (!installedExtensions[id])
+                throw `UnknownExtension: ${id} is not installed in Yavin's extensions folder.`;
+              delete installedExtensions[id];
+              return `/data/extensions/${id}`;
+            }
             // The extension host (IDE-08), in the page: the real `bootstrap.js` and extension code,
             // the native contract around them -- start refused unless trusted, a `load` filled
             // with the extension's code, messages and the end as events by session.
@@ -711,7 +828,7 @@ async function desktop(
         __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => {} },
       });
     },
-    { ...options, host: { ...EXTENSION_HOST, sampleFolder: SAMPLE_FOLDER } },
+    { ...options, host: { ...EXTENSION_HOST, sampleFolder: SAMPLE_FOLDER }, market: MARKET },
   );
   await page.goto("/");
 }
@@ -3204,7 +3321,7 @@ test("with no configuration the Debug view says so and Configure Debugging opens
   await expect(debugConsole.getByRole("textbox", { name: "Evaluate expression" })).toBeDisabled();
 });
 
-// --- Extensions (IDE-07/08) ---------------------------------------------------------------------
+// --- Extensions (IDE-07/08/09) ------------------------------------------------------------------
 // The sample extension (found in the repository by development builds) and installed manifests
 // from the mock's discovery; their code runs in the mock's extension host, through the real
 // extension API (`bootstrap.js`) and the native start/send/stop contract.
@@ -3216,6 +3333,13 @@ async function extensionsView(page: Page) {
 
 const sampleState = (view: Locator) =>
   view.getByRole("group", { name: "Hello World (sample)" }).getByTestId("extension-state");
+
+/** The Extensions view's runtime diagnostics (the host, its generation, Restart, Reload). */
+async function showDiagnostics(page: Page, view: Locator) {
+  await view.getByRole("button", { name: "More actions" }).click();
+  await page.getByRole("menuitemcheckbox", { name: "Show Runtime Diagnostics" }).click();
+  await expect(view.getByTestId("extension-host")).toBeVisible();
+}
 
 test("an extension command is in the palette, and running it activates its extension", async ({
   page,
@@ -3236,14 +3360,14 @@ test("an extension command is in the palette, and running it activates its exten
 test("disabling an extension takes its command out of the palette", async ({ page }) => {
   await desktop(page);
   const view = await extensionsView(page);
-  await view.getByRole("checkbox", { name: "Enable Hello World (sample)" }).uncheck();
+  await view.getByRole("button", { name: "Disable Hello World (sample)" }).click();
   await expect(sampleState(view)).toHaveText("Disabled");
   await palette(page, "Hello World: Say Hello");
   await expect(page.getByRole("option").filter({ hasText: "Hello World: Say Hello" })).toHaveCount(
     0,
   );
   await page.keyboard.press("Escape");
-  await view.getByRole("checkbox", { name: "Enable Hello World (sample)" }).check();
+  await view.getByRole("button", { name: "Enable Hello World (sample)" }).click();
   await expect(await palette(page, "Hello World: Say Hello")).toBeVisible();
 });
 
@@ -3258,7 +3382,7 @@ test("in a restricted folder extension code does not run, and the trust decision
   await expect(page.getByRole("dialog")).toContainText("Workspace Trust");
   await page.keyboard.press("Escape");
   const view = await extensionsView(page);
-  await expect(sampleState(view)).toContainText("Not activated — This folder is not trusted");
+  await expect(sampleState(view)).toContainText("Untrusted — This folder is not trusted");
   await expect(page.getByRole("status", { name: "Extension message" })).toHaveCount(0);
 });
 
@@ -3296,8 +3420,10 @@ test("a broken manifest is reported and breaks nothing; a declarative one contri
     ],
   });
   const view = await extensionsView(page);
-  await expect(view.getByRole("group", { name: "Tidy", exact: true })).toContainText(
-    "acme.tidy · 0.1.0 · declarative",
+  const tidy = view.getByRole("group", { name: "Tidy", exact: true });
+  await expect(tidy).toContainText("v0.1.0");
+  await expect(tidy.getByTestId("extension-state")).toHaveText(
+    "Installed — Declarative: nothing to run.",
   );
   await expect(
     view.getByRole("group", { name: "Not loaded: /data/extensions/broken" }),
@@ -3392,6 +3518,7 @@ test("a crashed extension host is reported; Restart starts a new one and the ext
   const view = await extensionsView(page);
   await (await palette(page, "Hello World: Say Hello")).click();
   await expect(sampleState(view)).toHaveText(/^Active/);
+  await showDiagnostics(page, view);
   await expect(view.getByTestId("extension-host")).toContainText("Host running");
   const first = await hostGeneration(view);
   await page.evaluate(() =>
@@ -3419,6 +3546,7 @@ test("Reload ends the host and finds the extensions again, without duplicating a
   const view = await extensionsView(page);
   await (await palette(page, "Hello World: Say Hello")).click();
   await expect(sampleState(view)).toHaveText(/^Active/);
+  await showDiagnostics(page, view);
   const first = await hostGeneration(view);
   await view.getByRole("button", { name: "Reload", exact: true }).click();
   await expect.poll(() => hostGeneration(view)).toBeGreaterThan(first);
@@ -3463,4 +3591,343 @@ test("extension menus: a view's title action and the Explorer's context menu run
   await expect(list).toContainText("Hello, world!");
   await list.getByRole("button", { name: "Reset Greetings", exact: true }).click();
   await expect(list).toContainText("No greetings yet");
+});
+
+// --- The extension marketplace (IDE-09) -----------------------------------------------------------
+// The mock serves the deterministic test catalog in the real registry format, read by the real
+// YavinRegistryProvider; installing goes through the real ExtensionInstaller and the native
+// stage/commit/finish contract, and installed code runs in the mock's extension host.
+
+const card = (view: Locator, name: string) =>
+  view.getByRole("group", { name, exact: true }).first();
+const searchBox = (view: Locator) => view.getByRole("searchbox", { name: "Search extensions" });
+
+test("the Extensions view: installed extensions from the registry, recommendations from the marketplace", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  const installed = view.getByRole("region", { name: "Installed extensions" });
+  await expect(card(installed, "Hello World (sample)")).toContainText("yavin-samples");
+  await expect(installed.getByLabel("1 installed")).toBeVisible();
+  const recommended = view.getByRole("region", { name: "Recommended extensions" });
+  await expect(card(recommended, "Docker Tools")).toContainText("Acme Test Co.");
+  await expect(
+    card(recommended, "Python Tools").getByRole("button", { name: "Install Python Tools" }),
+  ).toBeEnabled();
+  // Browsing ran nothing of theirs.
+  expect((await calls(page, "extensions_stage")).length).toBe(0);
+  // Runtime internals are not part of the normal view.
+  await expect(view.getByTestId("extension-host")).toHaveCount(0);
+  await expect(view).not.toContainText("generation");
+});
+
+test("search: results, an empty result, the newest query wins, clear", async ({ page }) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await searchBox(view).fill("python");
+  await searchBox(view).fill("docker");
+  const results = view.getByRole("region", { name: "Marketplace results" });
+  await expect(card(results, "Docker Tools")).toBeVisible();
+  await expect(results.getByRole("group")).toHaveCount(1);
+  await searchBox(view).fill("zzz-nothing");
+  await expect(results).toContainText("No extensions match “zzz-nothing”");
+  await results.getByRole("button", { name: "Clear search" }).click();
+  await expect(searchBox(view)).toHaveValue("");
+  await expect(view.getByRole("region", { name: "Recommended extensions" })).toBeVisible();
+});
+
+test("filters: installed, a category from the marketplace, compatible only", async ({ page }) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  // Categories come from the provider (loaded when the menu first opens).
+  await view.getByRole("button", { name: "Filter extensions" }).click();
+  await page.keyboard.press("Escape");
+  await view.getByRole("button", { name: "Filter extensions" }).click();
+  await page.getByRole("menuitemcheckbox", { name: "Themes" }).click();
+  const results = view.getByRole("region", { name: "Marketplace results" });
+  await expect(card(results, "Midnight Settings")).toBeVisible();
+  await expect(results.getByRole("group")).toHaveCount(1);
+  await view.getByRole("button", { name: "Remove category filter" }).click();
+  await searchBox(view).fill("tools");
+  await expect(card(results, "Future Tools")).toBeVisible();
+  await view.getByRole("button", { name: "Filter extensions" }).click();
+  await page.getByRole("menuitemcheckbox", { name: "Compatible only" }).click();
+  await expect(card(results, "Docker Tools")).toBeVisible();
+  await expect(results.getByRole("group", { name: "Future Tools" })).toHaveCount(0);
+  await view.getByRole("button", { name: "Filter extensions" }).click();
+  await page.getByRole("menuitemcheckbox", { name: "Installed" }).click();
+  await expect(view.getByRole("region", { name: "Marketplace results" })).toHaveCount(0);
+  await expect(view.getByRole("region", { name: "Installed extensions" })).toBeVisible();
+});
+
+test("an incompatible extension says why and cannot be installed", async ({ page }) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await searchBox(view).fill("future");
+  const future = card(view.getByRole("region", { name: "Marketplace results" }), "Future Tools");
+  await expect(future.getByTestId("extension-state")).toContainText(
+    "Incompatible — This extension requires Yavin API 3.0.0",
+  );
+  await expect(future.getByRole("button", { name: "Install Future Tools" })).toBeDisabled();
+});
+
+test("details: an extension's page with its metadata, features and changelog; back to the list", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await card(view.getByRole("region", { name: "Recommended extensions" }), "Python Tools").click();
+  const details = page.getByRole("region", { name: "Extension: Python Tools" });
+  await expect(details).toContainText("Acme Test Co.");
+  await expect(details).toContainText("v1.2.0");
+  await details.getByRole("tab", { name: "Features" }).click();
+  await expect(details.getByRole("region", { name: "Commands" })).toContainText(
+    "Python Tools: Check Environment",
+  );
+  await details.getByRole("tab", { name: "Changelog" }).click();
+  await expect(details.getByRole("document", { name: "Changelog" })).toContainText(
+    "Fixture document",
+  );
+  await details.getByRole("tab", { name: "Information" }).click();
+  await expect(details).toContainText("acme.python-tools");
+  await expect(details).not.toContainText("Downloads");
+  await details.getByRole("button", { name: "Back to Extensions" }).click();
+  await expect(details).toHaveCount(0);
+});
+
+test("install: progress, then installed, in the registry, and its command runs", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await card(view.getByRole("region", { name: "Recommended extensions" }), "Python Tools")
+    .getByRole("button", { name: "Install Python Tools" })
+    .click();
+  const installed = view.getByRole("region", { name: "Installed extensions" });
+  await expect(card(installed, "Python Tools").getByTestId("extension-state")).toHaveText(
+    "Enabled",
+  );
+  await expect(installed.getByLabel("2 installed")).toBeVisible();
+  expect((await calls(page, "extensions_commit")).map((c) => c.args.id)).toEqual([
+    "acme.python-tools",
+  ]);
+  await (await palette(page, "Python Tools: Check Environment")).click();
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
+    "Python Tools: environment OK",
+  );
+  await expect(card(installed, "Python Tools").getByTestId("extension-state")).toHaveText("Active");
+});
+
+test("an unsafe package is refused with a clear message; nothing is installed", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await searchBox(view).fill("broken");
+  const broken = card(view.getByRole("region", { name: "Marketplace results" }), "Broken Package");
+  await broken.getByRole("button", { name: "Install Broken Package" }).click();
+  await expect(broken.getByRole("alert")).toContainText(
+    "Broken Package contains unsafe files; it was not installed.",
+  );
+  await broken.getByText("Details").click();
+  await expect(broken.getByRole("alert")).toContainText("../escape.txt");
+  expect(await calls(page, "extensions_commit")).toEqual([]);
+  await view.getByRole("button", { name: "Clear search" }).click();
+  await expect(
+    view.getByRole("region", { name: "Installed extensions" }).getByRole("group"),
+  ).toHaveCount(1);
+});
+
+test("disable removes its command and stops it; enable brings it back, activating only when used", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await card(view.getByRole("region", { name: "Recommended extensions" }), "Docker Tools")
+    .getByRole("button", { name: "Install Docker Tools" })
+    .click();
+  const docker = card(view.getByRole("region", { name: "Installed extensions" }), "Docker Tools");
+  await expect(docker.getByTestId("extension-state")).toHaveText("Enabled");
+  await (await palette(page, "Docker Tools: Show Status")).click();
+  await expect(docker.getByTestId("extension-state")).toHaveText("Active");
+  await docker.getByRole("button", { name: "Disable Docker Tools" }).click();
+  await expect(docker.getByTestId("extension-state")).toHaveText("Disabled");
+  await palette(page, "Docker Tools: Show Status");
+  await expect(
+    page.getByRole("option").filter({ hasText: "Docker Tools: Show Status" }),
+  ).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await docker.getByRole("button", { name: "Enable Docker Tools" }).click();
+  await expect(docker.getByTestId("extension-state")).toHaveText("Enabled");
+  await (await palette(page, "Docker Tools: Show Status")).click();
+  await expect(docker.getByTestId("extension-state")).toHaveText("Active");
+});
+
+test("update: an older version installed, the update found and badged, installed; the new code runs", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await searchBox(view).fill("updater");
+  await card(view.getByRole("region", { name: "Marketplace results" }), "Updater Demo").click();
+  const details = page.getByRole("region", { name: "Extension: Updater Demo" });
+  await details.getByRole("tab", { name: "Information" }).click();
+  await details.getByRole("button", { name: "Install version 1.0.0" }).click();
+  await expect(details.getByRole("region", { name: "Versions" })).toContainText("Installed");
+  await (await palette(page, "Updater: Which Version")).click();
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
+    "Updater 1.0.0",
+  );
+  await (await palette(page, "Extensions: Check for Updates")).click();
+  await expect(
+    page.getByTitle("Extensions & Plugins (Ctrl+Shift+X)", { exact: true }),
+  ).toContainText("1");
+  const updates = view.getByRole("region", { name: "Updates" });
+  const updater = card(updates, "Updater Demo");
+  await expect(updater.getByTestId("extension-state")).toHaveText(
+    "Update Available — Version 1.1.0 is available.",
+  );
+  await updater.getByRole("button", { name: "Update Updater Demo" }).click();
+  await expect(updates).toContainText("All installed extensions are up to date.");
+  await expect(
+    page.getByTitle("Extensions & Plugins (Ctrl+Shift+X)", { exact: true }),
+  ).not.toContainText("1");
+  await view.getByRole("button", { name: "Remove filter Updates" }).click();
+  await expect(
+    card(view.getByRole("region", { name: "Installed extensions" }), "Updater Demo"),
+  ).toContainText("v1.1.0");
+  await (await palette(page, "Updater: Which Version")).click();
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
+    "Updater 1.1.0",
+  );
+});
+
+test("uninstall asks first and whether to remove its data; the extension is gone", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await card(view.getByRole("region", { name: "Recommended extensions" }), "Docker Tools")
+    .getByRole("button", { name: "Install Docker Tools" })
+    .click();
+  const installed = view.getByRole("region", { name: "Installed extensions" });
+  await card(installed, "Docker Tools")
+    .getByRole("button", { name: "Manage Docker Tools" })
+    .click();
+  await page.getByRole("menuitem", { name: "Uninstall" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("Uninstall Docker Tools?");
+  await dialog.getByRole("option", { name: /^Uninstall and remove its data/ }).click();
+  await expect(installed.getByRole("group", { name: "Docker Tools" })).toHaveCount(0);
+  expect((await calls(page, "extensions_uninstall")).map((c) => c.args.id)).toEqual([
+    "acme.docker-tools",
+  ]);
+  // Back in the marketplace, installable again.
+  await expect(
+    card(view.getByRole("region", { name: "Recommended extensions" }), "Docker Tools").getByRole(
+      "button",
+      {
+        name: "Install Docker Tools",
+      },
+    ),
+  ).toBeEnabled();
+  // A sample found in the repository is not Yavin's to uninstall.
+  await card(installed, "Hello World (sample)")
+    .getByRole("button", { name: "Manage Hello World (sample)" })
+    .click();
+  await expect(page.getByRole("menuitem", { name: "Uninstall" })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+});
+
+test("marketplace unavailable: installed extensions still work; the marketplace says so and retries", async ({
+  page,
+}) => {
+  await desktop(page, { marketplace: { down: true } });
+  const view = await extensionsView(page);
+  await expect(
+    card(view.getByRole("region", { name: "Installed extensions" }), "Hello World (sample)"),
+  ).toBeVisible();
+  const recommended = view.getByRole("region", { name: "Recommended extensions" });
+  await expect(recommended.getByRole("alert")).toContainText(
+    "The extension marketplace is unavailable.",
+  );
+  await searchBox(view).fill("docker");
+  const results = view.getByRole("region", { name: "Marketplace results" });
+  await expect(results.getByRole("alert")).toContainText(
+    "The extension marketplace is unavailable.",
+  );
+  // The installed extension runs regardless.
+  await (await palette(page, "Hello World: Say Hello")).click();
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
+    "Hello, world!",
+  );
+  await page.evaluate(() => {
+    (window as unknown as { __market: { down: boolean } }).__market.down = false;
+  });
+  await results.getByRole("button", { name: "Retry" }).click();
+  await expect(card(results, "Docker Tools")).toBeVisible();
+});
+
+test("reload after installing: no duplicate cards, commands or views", async ({ page }) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await card(view.getByRole("region", { name: "Recommended extensions" }), "Python Tools")
+    .getByRole("button", { name: "Install Python Tools" })
+    .click();
+  const installed = view.getByRole("region", { name: "Installed extensions" });
+  await expect(card(installed, "Python Tools")).toBeVisible();
+  await (await palette(page, "Extensions: Reload")).click();
+  await expect(installed.getByLabel("2 installed")).toBeVisible();
+  await expect(installed.getByRole("group", { name: "Python Tools" })).toHaveCount(1);
+  await expect(view.getByRole("region", { name: "Greetings" })).toHaveCount(1);
+  await palette(page, "Python Tools: Check Environment");
+  await expect(
+    page.getByRole("option").filter({ hasText: "Python Tools: Check Environment" }),
+  ).toHaveCount(1);
+  await page.keyboard.press("Escape");
+});
+
+test("switching workspace: installed extensions are the window's; their runtime is not", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await card(view.getByRole("region", { name: "Recommended extensions" }), "Docker Tools")
+    .getByRole("button", { name: "Install Docker Tools" })
+    .click();
+  await (await palette(page, "Docker Tools: Show Status")).click();
+  await expect(
+    card(view.getByRole("region", { name: "Installed extensions" }), "Docker Tools").getByTestId(
+      "extension-state",
+    ),
+  ).toHaveText("Active");
+  await page.evaluate(() => {
+    (window as unknown as { __openFolder?: string }).__openFolder = "/other";
+  });
+  await page.getByRole("menubar").getByRole("menuitem", { name: "File", exact: true }).click();
+  await page
+    .getByRole("menu", { name: "File", exact: true })
+    .getByRole("menuitem", { name: "Open Folder…", exact: true })
+    .click();
+  const next = page.getByRole("complementary", { name: "Extensions" });
+  const docker = card(next.getByRole("region", { name: "Installed extensions" }), "Docker Tools");
+  await expect(docker.getByTestId("extension-state")).toHaveText("Enabled");
+});
+
+test("the command palette drives the Extensions view", async ({ page }) => {
+  await desktop(page);
+  await (await palette(page, "Extensions: Search Extensions")).click();
+  const view = page.getByRole("complementary", { name: "Extensions" });
+  await expect(searchBox(view)).toBeFocused();
+  await (await palette(page, "Extensions: Recommended Extensions")).click();
+  await expect(view.getByRole("button", { name: "Remove filter Recommended" })).toBeVisible();
+  await expect(view.getByRole("region", { name: "Installed extensions" })).toHaveCount(0);
+  await (await palette(page, "Extensions: Disable")).click();
+  await page
+    .getByRole("dialog")
+    .getByRole("option", { name: /^Hello World \(sample\)/ })
+    .click();
+  await (await palette(page, "Extensions: Installed Extensions")).click();
+  await expect(sampleState(view)).toHaveText("Disabled");
 });

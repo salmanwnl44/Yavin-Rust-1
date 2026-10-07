@@ -1,0 +1,197 @@
+{
+  "schema": 1,
+  "name": "Yavin Extensions",
+  "categories": [
+    {
+      "id": "productivity",
+      "label": "Productivity"
+    },
+    {
+      "id": "linters",
+      "label": "Linters"
+    },
+    {
+      "id": "samples",
+      "label": "Samples"
+    }
+  ],
+  "recommended": [
+    "yavin.todo-highlighter",
+    "yavin.word-count"
+  ],
+  "extensions": [
+    {
+      "id": "yavin-samples.hello-world",
+      "publisher": "yavin-samples",
+      "name": "hello-world",
+      "displayName": "Hello World (sample)",
+      "publisherDisplayName": "Yavin",
+      "description": "A sample extension: greets, remembers its greetings, lists them, and explains words on hover.",
+      "categories": [
+        "samples"
+      ],
+      "tags": [
+        "sample",
+        "api",
+        "markdown"
+      ],
+      "icon": "icons/yavin-samples.hello-world.png",
+      "readme": "docs/yavin-samples.hello-world/README.md",
+      "changelog": "docs/yavin-samples.hello-world/CHANGELOG.md",
+      "repository": "https://github.com/salmanwnl44/Yavin-Rust-1",
+      "contributes": {
+        "commands": [
+          {
+            "command": "yavin-samples.hello-world.greet",
+            "title": "Hello World: Say Hello"
+          },
+          {
+            "command": "yavin-samples.hello-world.reset",
+            "title": "Hello World: Reset Greetings"
+          },
+          {
+            "command": "yavin-samples.hello-world.describe",
+            "title": "Hello World: Describe Active File"
+          }
+        ],
+        "settings": [
+          {
+            "id": "yavin-samples.hello-world.name",
+            "description": "Who the sample greets."
+          }
+        ]
+      },
+      "extensionKind": "code",
+      "activationEvents": [
+        "onCommand:yavin-samples.hello-world.greet",
+        "onLanguage:markdown"
+      ],
+      "versions": [
+        {
+          "version": "2.1.0",
+          "publishedAt": "2026-10-07",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "package": "packages/yavin-samples.hello-world-2.1.0.yvx",
+          "sha256": "7253bbf2d02507f5148333402591651903ec44c52ffceec381eb180dc3a34823",
+          "size": 2492
+        },
+        {
+          "version": "2.0.0",
+          "publishedAt": "2026-10-06",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "package": "packages/yavin-samples.hello-world-2.0.0.yvx",
+          "sha256": "7507754eda370f89a7b7452c5a83677e8c3eec2f6efd68673c84e92bc30620be",
+          "size": 2450
+        }
+      ]
+    },
+    {
+      "id": "yavin.word-count",
+      "publisher": "yavin",
+      "name": "word-count",
+      "displayName": "Word Count",
+      "publisherDisplayName": "Yavin",
+      "description": "Counts the words, lines and characters of the active file.",
+      "categories": [
+        "productivity"
+      ],
+      "tags": [
+        "words",
+        "statistics",
+        "markdown"
+      ],
+      "icon": "icons/yavin.word-count.png",
+      "readme": "docs/yavin.word-count/README.md",
+      "changelog": "docs/yavin.word-count/CHANGELOG.md",
+      "repository": "https://github.com/salmanwnl44/Yavin-Rust-1",
+      "license": "MIT",
+      "contributes": {
+        "commands": [
+          {
+            "command": "yavin.word-count.count",
+            "title": "Word Count: Count Words in Active File"
+          }
+        ],
+        "settings": [
+          {
+            "id": "yavin.word-count.ignore-markup",
+            "description": "Leave Markdown markup (#, *, `, >) out of the word count."
+          }
+        ]
+      },
+      "extensionKind": "code",
+      "activationEvents": [
+        "onCommand:yavin.word-count.count"
+      ],
+      "versions": [
+        {
+          "version": "1.0.0",
+          "publishedAt": "2026-10-07",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "package": "packages/yavin.word-count-1.0.0.yvx",
+          "sha256": "49abb33291d23f99483cf3392e47910b5a11a92a7ccbdb8becb7e727f28bc653",
+          "size": 1741
+        }
+      ]
+    },
+    {
+      "id": "yavin.todo-highlighter",
+      "publisher": "yavin",
+      "name": "todo-highlighter",
+      "displayName": "TODO Highlighter",
+      "publisherDisplayName": "Yavin",
+      "description": "Highlights TODO and FIXME comments in open files and lists how many there are.",
+      "categories": [
+        "linters",
+        "productivity"
+      ],
+      "tags": [
+        "todo",
+        "fixme",
+        "comments",
+        "highlight"
+      ],
+      "icon": "icons/yavin.todo-highlighter.png",
+      "readme": "docs/yavin.todo-highlighter/README.md",
+      "changelog": "docs/yavin.todo-highlighter/CHANGELOG.md",
+      "repository": "https://github.com/salmanwnl44/Yavin-Rust-1",
+      "license": "MIT",
+      "contributes": {
+        "commands": [
+          {
+            "command": "yavin.todo-highlighter.count",
+            "title": "TODO Highlighter: Count TODOs in Active File"
+          }
+        ],
+        "settings": [
+          {
+            "id": "yavin.todo-highlighter.keywords",
+            "description": "Comma-separated words to highlight."
+          }
+        ]
+      },
+      "extensionKind": "code",
+      "activationEvents": [
+        "onStartupFinished"
+      ],
+      "versions": [
+        {
+          "version": "1.0.0",
+          "publishedAt": "2026-10-07",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "package": "packages/yavin.todo-highlighter-1.0.0.yvx",
+          "sha256": "0cab179489ec569ccd216daa1fb4e286e8446a82a1b1d9cce528385719657bc7",
+          "size": 2114
+        }
+      ]
+    }
+  ]
+}

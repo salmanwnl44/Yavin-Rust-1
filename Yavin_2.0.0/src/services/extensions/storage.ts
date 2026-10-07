@@ -143,6 +143,36 @@ export function createExtensionStorage(
     global: (extensionId: string) => memento(extensionId, globalStorageKey(extensionId)),
     workspace: (workspace: WorkspaceId, extensionId: string) =>
       memento(extensionId, workspaceStorageKey(workspace, extensionId)),
+    /**
+     * Removes everything an extension stored -- its global state and its state in every
+     * workspace (and any `.corrupt` copies). Only on uninstall, and only when the user asks
+     * (IDE-09). Returns how many records went.
+     */
+    removeAll(extensionId: string): number {
+      if (!storage) return 0;
+      const global = globalStorageKey(extensionId);
+      const workspacePrefix = "yavin.extensions.workspace:";
+      const doomed: string[] = [];
+      try {
+        for (let i = 0; i < storage.length; i++) {
+          const key = storage.key(i);
+          if (!key) continue;
+          const base = key.endsWith(".corrupt") ? key.slice(0, -".corrupt".length) : key;
+          if (
+            base === global ||
+            (base.startsWith(workspacePrefix) && base.endsWith(`:${extensionId}`))
+          )
+            doomed.push(key);
+        }
+        for (const key of doomed) storage.removeItem(key);
+      } catch {
+        return 0;
+      }
+      for (const key of [...opened.keys()])
+        if (key === global || (key.startsWith(workspacePrefix) && key.endsWith(`:${extensionId}`)))
+          opened.delete(key);
+      return doomed.length;
+    },
   };
 }
 

@@ -319,6 +319,41 @@ export function createExtensionRegistry(options: {
       publish();
       return entry;
     },
+    /**
+     * Replaces an installed extension by a new version of it (IDE-09: an update), in one step:
+     * the new manifest is validated first, and if it is not valid -- or not the same extension --
+     * nothing changes. Its enabled state is kept. The extension host sees a new entry and stops
+     * the old version.
+     */
+    replace(
+      id: string,
+      raw: unknown,
+      source: ExtensionSource,
+      origin: string,
+    ): RegisteredExtension | RejectedExtension {
+      const previous = extensions.get(id);
+      const result = readManifest(raw);
+      const problems = !result.ok
+        ? result.problems.filter((p) => p.severity === "error").map(describe)
+        : result.manifest.id !== id
+          ? [`It is ${result.manifest.id}, not ${id}.`]
+          : [];
+      if (!previous || problems.length || !result.ok)
+        return { id, origin, problems: previous ? problems : [`"${id}" is not installed.`] };
+      if (previous.enabled) removeSettings(previous);
+      const entry: RegisteredExtension = {
+        id,
+        manifest: result.manifest,
+        source,
+        origin,
+        enabled: !disabled.has(id),
+        warnings: result.warnings.map(describe),
+      };
+      extensions.set(id, entry);
+      if (entry.enabled) applySettings(entry);
+      publish();
+      return entry;
+    },
     /** Forgets an extension (its contributions go with it). */
     remove(id: string) {
       const entry = extensions.get(id);

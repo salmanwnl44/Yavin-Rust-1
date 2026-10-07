@@ -20,6 +20,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# Accepts plain-HTTP extension registries on the loopback interface: the end-to-end test's local
+# registry (IDE-09). Never enabled in a normal build.
+test-registry = []
+
 [dependencies]
 tauri = { version = "2", features = [] }
 serde = { workspace = true }
@@ -31,6 +36,9 @@ portable-pty = "0.9.0"
 anyhow = "1"
 # The terminal contract (TERMINAL-00): identities, states, errors and the output protocol.
 ide-terminal-protocol = { path = "crates/ide-terminal-protocol" }
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 # A terminal's shell and everything it starts are ended as one process group (`killpg`).

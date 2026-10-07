@@ -26,7 +26,14 @@ import { createExtensionRegistry } from "./extensions/registry.ts";
 import { createExtensionStorage } from "./extensions/storage.ts";
 import { createExtensionHostManager, type ExtensionHostManager } from "./extensions/manager.ts";
 import { createNativeHostTransport } from "./extensions/transport.ts";
-import { rediscoverExtensions } from "./extensions/discovery.ts";
+import { installedRoot, rediscoverExtensions } from "./extensions/discovery.ts";
+import { createExtensionInstaller } from "./extensions/marketplace/installer.ts";
+import { createMarketplaceService } from "./extensions/marketplace/service.ts";
+import {
+  configuredProvider,
+  MARKETPLACE_REGISTRY,
+  MARKETPLACE_SETTING_LIST,
+} from "./extensions/marketplace/setup.ts";
 import {
   createDecorationStore,
   createProviderRegistry,
@@ -117,6 +124,7 @@ export const settings = createSettingsRegistry([
   ...EDITOR_SETTING_LIST,
   TASK_DEFINITIONS,
   ...DEBUG_SETTING_LIST,
+  ...MARKETPLACE_SETTING_LIST,
 ]);
 
 /**
@@ -134,6 +142,22 @@ export const extensionRegistry = createExtensionRegistry({ settings });
 export const extensionStorage = createExtensionStorage(undefined, (id, message) =>
   console.warn(`${id}: ${message}`),
 );
+/**
+ * The extension marketplace (IDE-09): the window's one service for it, on the provider Settings
+ * choose, and the installer that puts its packages into Yavin's extensions folder and the
+ * registry. Neither runs extension code; the workspace's extension host does.
+ */
+export const marketplace = createMarketplaceService(configuredProvider(settings));
+settings.subscribe(null, (change) => {
+  if (change.id === MARKETPLACE_REGISTRY.id) marketplace.setProvider(configuredProvider(settings));
+});
+export const extensionInstaller = createExtensionInstaller({
+  service: marketplace,
+  registry: extensionRegistry,
+  storage: extensionStorage,
+  root: installedRoot,
+  rediscover: () => rediscoverExtensions(extensionRegistry),
+});
 /** Extensions' language providers and decorations, for the editor (IDE-08). */
 export const extensionProviders = createProviderRegistry();
 export const extensionDecorations = createDecorationStore();

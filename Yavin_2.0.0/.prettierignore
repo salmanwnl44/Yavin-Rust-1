@@ -5,3 +5,6 @@ package-lock.json
 .vscode
 test-results
 playwright-report
+
+# The extension registry is generated (scripts/build-registry.mjs); its bytes are checksummed.
+registry/

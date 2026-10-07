@@ -112,7 +112,9 @@ import {
   currentGit,
   extensionDecorations,
   extensionProviders,
+  extensionInstaller,
   extensionRegistry,
+  marketplace,
   onExtensionMessage,
   provideExtensionWindow,
   settings,
@@ -131,7 +133,13 @@ import {
   ExtensionContainerPanel,
   ExtensionsPanel,
   ExtensionViewSection,
+  type ExtensionsViewCommand,
 } from "./components/layout/ExtensionsPanel";
+import { ExtensionDetails } from "./components/extensions/ExtensionDetails";
+import {
+  MARKETPLACE_AUTO_CHECK,
+  MARKETPLACE_RECOMMENDATIONS,
+} from "./services/extensions/marketplace/setup";
 import { ExtensionError } from "./services/extensions/errors";
 import { discoverInstalledOnce } from "./services/extensions/discovery";
 import { documentInfoOf } from "./services/extensions/documentInfo";
@@ -1440,10 +1448,92 @@ export default function App() {
   useEffect(() => {
     void extensionHost.setTrusted(trust.trusted);
   }, [extensionHost, trust.trusted]);
-  // Installed extensions' manifests, read once (the desktop app only).
+  // Installed extensions' manifests, read once (the desktop app only); then, if the user wants
+  // it, the marketplace is asked which of them have updates (never installed without them).
   useEffect(() => {
-    if (isTauri()) void discoverInstalledOnce(extensionRegistry).catch(() => undefined);
+    if (!isTauri()) return;
+    void discoverInstalledOnce(extensionRegistry)
+      .then(() => {
+        const installed = extensionRegistry.getSnapshot().extensions;
+        if (installed.length && settings.get(MARKETPLACE_AUTO_CHECK, null))
+          return marketplace.checkForUpdates(
+            installed.map((one) => ({ id: one.id, version: one.manifest.version })),
+          );
+      })
+      .catch(() => undefined);
   }, []);
+  // --- The extension marketplace (IDE-09): the Extensions view, an extension's page ------------
+  const marketplaceSnapshot = useSyncExternalStore(
+    marketplace.subscribe,
+    marketplace.getSnapshot,
+    marketplace.getSnapshot,
+  );
+  const showRecommendations = useSyncExternalStore(
+    (listener) => settings.subscribe(null, listener),
+    () => settings.get(MARKETPLACE_RECOMMENDATIONS, null),
+    () => settings.get(MARKETPLACE_RECOMMENDATIONS, null),
+  );
+  /** The extension whose page is open in the editor area, if any. */
+  const [extensionPage, setExtensionPage] = useState<string | null>(null);
+  /** The command palette's last request to the Extensions view. */
+  const [extensionsCommand, setExtensionsCommand] = useState<ExtensionsViewCommand | null>(null);
+  const showExtensions = (kind?: ExtensionsViewCommand["kind"]) => {
+    setActiveActivityTab("extensions");
+    setIsSidebarOpen(true);
+    if (kind) setExtensionsCommand((previous) => ({ kind, nonce: (previous?.nonce ?? 0) + 1 }));
+  };
+  const openExtensionPage = (id: string) => {
+    setSettingsOpen(false);
+    setExtensionPage(id);
+  };
+  /** Uninstalling asks first, and whether the extension's stored data goes too. */
+  const confirmUninstall = (id: string) => {
+    const name = extensionRegistry.get(id)?.manifest.displayName ?? id;
+    setDialog({
+      title: `Uninstall ${name}?`,
+      message:
+        "Its files are deleted from Yavin's extensions folder. Your settings for it are kept.",
+      options: [
+        {
+          value: "keep",
+          label: "Uninstall",
+          description: "Keep what it stored in Yavin, in case you install it again.",
+        },
+        {
+          value: "remove",
+          label: "Uninstall and remove its data",
+          description: "Also delete everything it stored, in every workspace.",
+        },
+      ],
+      submit: (choice) =>
+        void extensionInstaller
+          .uninstall(id, choice === "remove")
+          .catch((error: unknown) =>
+            reportError(error instanceof Error ? error.message : String(error)),
+          ),
+    });
+  };
+  /** A palette command acting on one extension: which one, from the ones it applies to. */
+  const pickExtension = (
+    title: string,
+    candidates: readonly { id: string; manifest: { displayName: string; version: string } }[],
+    then: (id: string) => void,
+    none: string,
+  ) => {
+    if (!candidates.length) {
+      reportError(none);
+      return;
+    }
+    setDialog({
+      title,
+      options: candidates.map((one) => ({
+        value: one.id,
+        label: one.manifest.displayName,
+        description: `${one.id} · ${one.manifest.version}`,
+      })),
+      submit: (id) => then(id),
+    });
+  };
   // Activation events: the window started (for this workspace), and its folder opened.
   useEffect(() => {
     void extensionHost.fire({ kind: "startup" });
@@ -2380,6 +2470,82 @@ export default function App() {
   };
 
   const builtInCommands: AppCommand[] = [
+    // --- Extensions (IDE-09) ---
+    {
+      id: "extensions.open",
+      menu: "Extensions",
+      label: "Open Extensions",
+      shortcut: "Mod+Shift+x",
+      run: () => showExtensions(),
+    },
+    {
+      id: "extensions.search",
+      menu: "Extensions",
+      label: "Search Extensions",
+      run: () => showExtensions("search"),
+    },
+    {
+      id: "extensions.checkForUpdates",
+      menu: "Extensions",
+      label: "Check for Updates",
+      run: () => showExtensions("checkUpdates"),
+    },
+    {
+      id: "extensions.installed",
+      menu: "Extensions",
+      label: "Installed Extensions",
+      run: () => showExtensions("installed"),
+    },
+    {
+      id: "extensions.recommended",
+      menu: "Extensions",
+      label: "Recommended Extensions",
+      run: () => showExtensions("recommended"),
+    },
+    {
+      id: "extensions.reload",
+      menu: "Extensions",
+      label: "Reload",
+      run: () => void extensionHost.reload().catch(reportExtensionError),
+    },
+    {
+      id: "extensions.enable",
+      menu: "Extensions",
+      label: "Enable",
+      run: () =>
+        pickExtension(
+          "Enable which extension?",
+          extensionRegistry.getSnapshot().extensions.filter((one) => !one.enabled),
+          (id) => extensionRegistry.setEnabled(id, true),
+          "Every installed extension is enabled.",
+        ),
+    },
+    {
+      id: "extensions.disable",
+      menu: "Extensions",
+      label: "Disable",
+      run: () =>
+        pickExtension(
+          "Disable which extension?",
+          extensionRegistry.getSnapshot().extensions.filter((one) => one.enabled),
+          (id) => extensionRegistry.setEnabled(id, false),
+          "No extension is enabled.",
+        ),
+    },
+    {
+      id: "extensions.uninstall",
+      menu: "Extensions",
+      label: "Uninstall",
+      run: () =>
+        pickExtension(
+          "Uninstall which extension?",
+          extensionRegistry
+            .getSnapshot()
+            .extensions.filter((one) => extensionInstaller.removable(one)),
+          confirmUninstall,
+          "No extension installed in Yavin's extensions folder.",
+        ),
+    },
     {
       id: "view.search",
       menu: "View",
@@ -3491,6 +3657,10 @@ export default function App() {
               title: container.title,
             }))}
             gitBadge={totalGitChanges > 0 ? String(totalGitChanges) : ""}
+            extensionsBadge={(() => {
+              const updates = Object.keys(marketplaceSnapshot.updates).length;
+              return updates ? String(updates) : "";
+            })()}
             onSelectTab={(tabId) => {
               if (activeActivityTab === tabId && isSidebarOpen) {
                 setIsSidebarOpen(false);
@@ -3570,9 +3740,16 @@ export default function App() {
             key={`extensions:${workspacePath}`}
             registry={extensionRegistry}
             manager={extensionHost}
+            marketplace={marketplace}
+            installer={extensionInstaller}
             visible={isSidebarOpen && activeActivityTab === "extensions"}
+            trusted={trust.trusted}
+            showRecommendations={showRecommendations}
             conflicts={extensionConflicts}
+            command={extensionsCommand}
             onRunCommand={runExtensionCommand}
+            onOpenDetails={openExtensionPage}
+            onUninstall={confirmUninstall}
           />
           {/* IDE-08: extensions' own Activity Bar containers. */}
           {extensionSnapshot.viewContainers.map((container) => (
@@ -3662,7 +3839,19 @@ export default function App() {
 
           {/* Center: Editor + Bottom Terminal Panel */}
           <div className="flex flex-1 flex-col min-w-0 bg-[#000000]">
-            {settingsOpen ? (
+            {extensionPage && !settingsOpen ? (
+              <ExtensionDetails
+                key={extensionPage}
+                id={extensionPage}
+                registry={extensionRegistry}
+                manager={extensionHost}
+                marketplace={marketplace}
+                installer={extensionInstaller}
+                trusted={trust.trusted}
+                onClose={() => setExtensionPage(null)}
+                onUninstall={confirmUninstall}
+              />
+            ) : settingsOpen ? (
               <SettingsView
                 registry={settings}
                 workspace={settingsWorkspace}

@@ -2,3 +2,6 @@
 # Windows CI runner's default (core.autocrlf=true) otherwise checks out CRLF, failing
 # `format:check` on every file. The repository already stores LF throughout.
 * text=auto eol=lf
+
+# Extension packages (IDE-09) are byte-exact: their SHA-256 is in the registry index.
+*.yvx binary

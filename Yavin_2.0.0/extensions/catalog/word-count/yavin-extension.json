@@ -1,0 +1,29 @@
+{
+  "publisher": "yavin",
+  "name": "word-count",
+  "displayName": "Word Count",
+  "version": "1.0.0",
+  "description": "Counts the words, lines and characters of the active file.",
+  "engines": { "yavin": "^2.0.0" },
+  "main": "extension.js",
+  "license": "MIT",
+  "activationEvents": ["onCommand:yavin.word-count.count"],
+  "contributes": {
+    "commands": [
+      {
+        "command": "yavin.word-count.count",
+        "title": "Count Words in Active File",
+        "category": "Word Count"
+      }
+    ],
+    "configuration": {
+      "properties": {
+        "yavin.word-count.ignore-markup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Leave Markdown markup (#, *, `, >) out of the word count."
+        }
+      }
+    }
+  }
+}
