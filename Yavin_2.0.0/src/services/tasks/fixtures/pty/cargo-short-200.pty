@@ -1,0 +1,4 @@
+[6n[?9001h[?1004h[m]0;C:\WINDOWS\system32\cmd.exe[?25h]9;4;0;\]9;4;0;\]9;4;0;\]9;4;1;0\[92m[1m    Checking[m pty_capture v0.1.0 (C:\Users\salma\AppData\Local\Temp\yavin-pty-capture-12396\rs)[96m[1m
+    Building[m [                             ] 0/1: pty_capture(bin)[131X[199X[199C]9;4;1;0\src\main.rs:2:26: [91m[1merror[E0425][m: cannot find value `adeliberatelylongidentifiersothatthediagnosticlineiswiderthaneightycolumnsintheterminal` in this scope: not found in this scope[96m[1m
+    Building[m [                             ] 0/1: pty_capture(bin)[131X[199X[199C]9;4;0;\]9;4;0;\[91m[1merror[m: could not compile `pty_capture` (bin "pty_capture") due to 1 previous error
+[?9001l[?1004l

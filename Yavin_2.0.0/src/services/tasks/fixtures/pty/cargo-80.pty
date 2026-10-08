@@ -1,0 +1,8 @@
+[6n[?9001h[?1004h[m]0;C:\WINDOWS\system32\cmd.exe[?25h]9;4;0;\]9;4;0;\]9;4;0;\[92m[1m    Checking[m pty_capture v0.1.0 (C:\Users\salma\AppData\Local\Temp\yavin-pty-capture-12396\rs)
+]9;4;1;0\[96m[1m    Building[m [                             ] 0/1: pty_capture(bin)[11X[79X[79C]9;4;1;0\[?25l[91m[1merror[E0425][97m: cannot find value `adeliberatelylongidentifiersothatthediagnosticlineiswiderthaneightycolumnsintheterminal` in this scope[m
+ [96m[1m--> [msrc\main.rs:2:26
+  [96m[1m|
+2[m [96m[1m|[m [96m[1m...[m + adeliberatelylongidentifiersothatthediagnosticlineiswiderthaneightycolumnsintheterminal;
+  [96m[1m|[m       [91m[1m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[m [91m[1mnot found in this scope[96m[12;1H    Building[m [                             ] 0/1: pty_capture(bin)[11X[?25h[79X[79C]9;4;1;0\[97m[1mFor more information about this error, try `rustc --explain E0425`.[96m
+    Building[m [                             ] 0/1: pty_capture(bin)[11X]9;4;0;\]9;4;0;\[91m[1merror[m: could not compile `pty_capture` (bin "pty_capture") due to 1 previous error
+[?9001l[?1004l

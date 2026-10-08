@@ -22,6 +22,17 @@
  * `cancelled`; a pending one can also end `failed` (a dependency failed) or `cancelled`. Nothing
  * leaves a final state. Only the session an execution launched -- that session, that
  * generation -- moves it.
+ *
+ * - **One execution of a task at a time.** Running a task that runs is refused; a dependency
+ *   already running for another execution is waited for and its outcome used -- never started
+ *   a second time (Run/Tasks Module 01).
+ * - **A run ends when its output has been read.** The exit and the output arrive on separate
+ *   channels, the exit possibly first: a run with matchers ends at its output channel's end,
+ *   or `drainTimeoutMs` after the exit (`outputComplete: false`).
+ * - **A task's terminal is the task's.** A dedicated terminal that outlived the last workspace
+ *   context is found again (its profile id is `task.<id>`) rather than a second one opened, and
+ *   its Restart in the terminal UI is `restart` -- trust, the one-execution rule, a record and
+ *   the matchers -- never the command started again behind the service's back.
  */
 import type { SettingsRegistry } from "../settings/settings.ts";
 import type { TerminalService } from "../terminalService.ts";
@@ -72,6 +83,12 @@ export interface TaskRun {
   readonly sessionId: TerminalId | null;
   /** Why it failed or was cancelled, fit to show. */
   readonly error: string | null;
+  /**
+   * Whether its problem matchers read all of its output: `false` when the output could not be
+   * read to its end (its output channel failed, or did not end in time after the exit), so
+   * what it published may be missing problems. `null` before it ends, or without matchers.
+   */
+  readonly outputComplete: boolean | null;
 }
 
 export interface TaskSnapshot {
@@ -90,9 +107,10 @@ export interface TaskServiceOptions {
   settings: SettingsRegistry;
   terminals: Pick<
     TerminalService,
-    "open" | "get" | "subscribe" | "attach" | "write" | "kill" | "close" | "restart"
+    "open" | "get" | "list" | "subscribe" | "attach" | "write" | "kill" | "close" | "restart"
   >;
-  ui: Pick<TerminalUi, "activate" | "restart">;
+  /** The workspace's terminal UI; a task's terminal restarted from it runs the task again. */
+  ui: Pick<TerminalUi, "activate" | "restart"> & Partial<Pick<TerminalUi, "interceptRestart">>;
   /** The workspace's terminal profiles; discovery (`registry.load`) is awaited before a run. */
   profiles: Pick<WorkspaceProfiles, "resolve"> & { registry: Pick<ProfileRegistry, "load"> };
   /** Whether the folder is trusted now (Workspace Trust; asked before every execution). */
@@ -100,6 +118,11 @@ export interface TaskServiceOptions {
   publish(owner: string, label: string, diagnostics: readonly Diagnostic[]): void;
   /** How long a cancelled task has to stop after Ctrl+C before its terminal is killed. */
   killAfterMs?: number;
+  /**
+   * How long, after its exit, a task's output may take to be read to its end. The exit and the
+   * output travel on separate channels (`terminal_stream.rs`), and the exit can come first.
+   */
+  drainTimeoutMs?: number;
 }
 
 export interface TaskService {
@@ -112,6 +135,11 @@ export interface TaskService {
    * has ended. Rejects with a `TaskError`, starting nothing, when it cannot run at all.
    */
   run(taskId: string): Promise<TaskRun>;
+  /**
+   * Runs a task again: a running execution of it is stopped first (as `cancel` stops it), then
+   * it runs as `run` runs it -- trust, dependencies, its terminal, its matchers, its record.
+   */
+  restart(taskId: string): Promise<TaskRun>;
   /** Stops an execution (its dependencies too): Ctrl+C, then its terminal killed if need be. */
   cancel(executionId: string): void;
   dispose(): void;
@@ -129,12 +157,31 @@ interface Active {
   root: string;
   generation: Generation | null;
   finish: (state: "succeeded" | "failed" | "cancelled", patch?: Partial<TaskRun>) => void;
+  /**
+   * Its process ended: it finishes once its output has been read to the end (see
+   * `drainTimeoutMs`); at once when it was stopped or nothing reads its output.
+   */
+  ended: (state: "succeeded" | "failed" | "cancelled", patch?: Partial<TaskRun>) => void;
+  /** Ended, waiting for the rest of its output. */
+  draining: boolean;
+  /** How it ended, once it has. */
+  done: Promise<TaskState>;
 }
+
+/** A task's terminal: the profile id TaskService gives it (`prepare`). */
+const taskProfileId = (taskId: string) => `task.${taskId}`;
+const taskOfProfile = (profileId: string | null): string | null =>
+  profileId?.startsWith("task.") ? profileId.slice("task.".length) : null;
 
 export function createTaskService(options: TaskServiceOptions): TaskService {
   const { terminals } = options;
   const killAfter = options.killAfterMs ?? 3000;
+  const drainTimeout = options.drainTimeoutMs ?? 5000;
   const listeners = new Set<() => void>();
+  /** What wakes a run waiting on another execution, when its own is stopped (by root id). */
+  const wakers = new Map<string, Set<() => void>>();
+  /** The terminal TaskService is restarting itself: not a Restart for it to claim. */
+  let restartingOwn: TerminalId | null = null;
   let disposed = false;
   let runs: TaskRun[] = [];
   let snapshot: TaskSnapshot;
@@ -193,7 +240,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
   const stopWatching = terminals.subscribe(() => {
     for (const watch of [...active.values()]) {
       const { run } = watch;
-      if (!run.sessionId || watch.generation === null) continue;
+      if (!run.sessionId || watch.generation === null || watch.draining) continue;
       const view = terminals.get(run.sessionId);
       if (!view) {
         watch.finish(cancelled.has(watch.root) ? "cancelled" : "failed", {
@@ -209,7 +256,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         watch.run = update(run.executionId, { state: "running" }) ?? run;
       } else if (view.state === "Exited") {
         const stopped = cancelled.has(watch.root);
-        watch.finish(stopped ? "cancelled" : view.exitCode === 0 ? "succeeded" : "failed", {
+        watch.ended(stopped ? "cancelled" : view.exitCode === 0 ? "succeeded" : "failed", {
           exitCode: view.exitCode,
           error: stopped
             ? "Stopped."
@@ -218,7 +265,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
               : `Exited with code ${view.exitCode}.`,
         });
       } else if (view.state === "Failed") {
-        watch.finish("failed", { error: view.error ?? "Its terminal failed." });
+        watch.ended("failed", { error: view.error ?? "Its terminal failed." });
       }
     }
   });
@@ -257,7 +304,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
     return {
       cwd,
       profile: {
-        id: `task.${task.id}`,
+        id: taskProfileId(task.id),
         name: task.label,
         executable: entry.profile.executable,
         args,
@@ -277,93 +324,143 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
     task: ResolvedTask,
     root: string,
     prepared: { profile: TerminalProfile; cwd: string },
-  ): Promise<TaskState> =>
-    new Promise((resolve) => {
-      let current = update(run.executionId, { state: "starting", startedAt: Date.now() }) ?? run;
-      const matcher = new TaskOutputMatcher(task.problemMatcher);
-      let detach = () => {};
-      const watch: Active = {
-        run: current,
-        task,
-        root,
-        generation: null,
-        finish(state, patch = {}) {
-          if (!active.has(current.executionId)) return;
-          active.delete(current.executionId);
-          detach();
-          const ended = update(current.executionId, {
-            ...patch,
-            state,
-            finishedAt: Date.now(),
-          });
-          // What the task's matchers found replaces what its last run found; a stopped run
-          // proves nothing, so it changes nothing.
-          if (state !== "cancelled" && matcher.active && !disposed) {
-            const { diagnostics } = resolveTaskDiagnostics(
-              matcher.finish(),
-              prepared.cwd,
-              options.folders,
-            );
-            options.publish(taskOwner(task.id), task.label, diagnostics);
-          }
-          if (state === "failed" && task.presentation.reveal === "silent" && ended?.sessionId)
-            reveal(ended.sessionId);
-          resolve(state);
-        },
-      };
-      active.set(current.executionId, watch);
-
-      let sessionId: TerminalId;
-      try {
-        const reused = dedicatedSession(task, prepared);
-        if (reused) {
-          sessionId = reused;
-          // Restarting is a new generation of the same terminal: the old output's views go.
-          if (task.presentation.clear) options.ui.restart(sessionId);
-          else terminals.restart(sessionId);
-        } else {
-          sessionId = terminals.open({
-            title: `Task: ${task.label}`,
-            profile: prepared.profile,
-            cwd: prepared.cwd,
-          });
-          if (task.presentation.terminal === "dedicated") dedicated.set(task.id, sessionId);
+  ): Promise<TaskState> => {
+    let resolveDone!: (state: TaskState) => void;
+    const done = new Promise<TaskState>((resolve) => (resolveDone = resolve));
+    let current = update(run.executionId, { state: "starting", startedAt: Date.now() }) ?? run;
+    const matcher = new TaskOutputMatcher(task.problemMatcher);
+    let detach = () => {};
+    // The output channel's end: every byte of the generation has reached the matchers. Without
+    // matchers there is nothing to wait for.
+    let outputEnded = !matcher.active;
+    let outputFailed = false;
+    let drained: { state: "succeeded" | "failed" | "cancelled"; patch: Partial<TaskRun> } | null =
+      null;
+    let drainTimer: ReturnType<typeof setTimeout> | null = null;
+    const watch: Active = {
+      run: current,
+      task,
+      root,
+      generation: null,
+      draining: false,
+      done,
+      finish(state, patch = {}) {
+        if (!active.has(current.executionId)) return;
+        active.delete(current.executionId);
+        if (drainTimer) {
+          clearTimeout(drainTimer);
+          timers.delete(drainTimer);
+          drainTimer = null;
         }
-      } catch (error) {
-        watch.finish("failed", {
-          error:
-            error instanceof TerminalError || error instanceof Error
-              ? `Its terminal could not start: ${error.message}`
-              : "Its terminal could not start.",
+        detach();
+        // A stopped run proves nothing, so what it printed changes nothing.
+        const read = matcher.active && state !== "cancelled";
+        const ended = update(current.executionId, {
+          ...patch,
+          state,
+          finishedAt: Date.now(),
+          outputComplete: read ? outputEnded && !outputFailed : null,
         });
-        return;
-      }
-      current = update(current.executionId, { sessionId }) ?? current;
-      watch.run = current;
-      watch.generation = terminals.get(sessionId)?.generation ?? null;
-      // The output, from the generation's start: to the matchers (the terminal shows it too).
-      if (matcher.active) {
-        const attachment = terminals.attach(sessionId, {
-          output: (chunk, accepted) => {
-            matcher.push(chunk.bytes);
-            accepted();
-          },
-          ended: () => {},
-        });
-        detach = () => attachment.detach();
-      }
-      if (task.presentation.reveal === "always") reveal(sessionId);
-      // Asked to stop while it was being started.
-      if (cancelled.has(root)) stopActive(watch);
-    });
+        // What the task's matchers found replaces what its last run found.
+        if (read && !disposed) {
+          const { diagnostics } = resolveTaskDiagnostics(
+            matcher.finish(),
+            prepared.cwd,
+            options.folders,
+          );
+          options.publish(taskOwner(task.id), task.label, diagnostics);
+        }
+        if (state === "failed" && task.presentation.reveal === "silent" && ended?.sessionId)
+          reveal(ended.sessionId);
+        resolveDone(state);
+      },
+      ended(state, patch = {}) {
+        if (!active.has(current.executionId) || watch.draining) return;
+        if (outputEnded || state === "cancelled") {
+          watch.finish(state, patch);
+          return;
+        }
+        // The exit came first: the output still on its way is read before the run ends.
+        watch.draining = true;
+        drained = { state, patch };
+        const timer = setTimeout(() => {
+          timers.delete(timer);
+          drainTimer = null;
+          watch.finish(state, patch);
+        }, drainTimeout);
+        drainTimer = timer;
+        timers.add(timer);
+      },
+    };
+    active.set(current.executionId, watch);
 
-  /** The dedicated terminal to run `task` in again, if its last one can be reused as it is. */
+    let sessionId: TerminalId;
+    try {
+      const reused = dedicatedSession(task, prepared);
+      if (reused) {
+        sessionId = reused;
+        // Restarting is a new generation of the same terminal: the old output's views go.
+        if (task.presentation.clear) {
+          restartingOwn = sessionId;
+          try {
+            options.ui.restart(sessionId);
+          } finally {
+            restartingOwn = null;
+          }
+        } else terminals.restart(sessionId);
+      } else {
+        sessionId = terminals.open({
+          title: `Task: ${task.label}`,
+          profile: prepared.profile,
+          cwd: prepared.cwd,
+        });
+        if (task.presentation.terminal === "dedicated") dedicated.set(task.id, sessionId);
+      }
+    } catch (error) {
+      watch.finish("failed", {
+        error:
+          error instanceof TerminalError || error instanceof Error
+            ? `Its terminal could not start: ${error.message}`
+            : "Its terminal could not start.",
+      });
+      return done;
+    }
+    current = update(current.executionId, { sessionId }) ?? current;
+    watch.run = current;
+    watch.generation = terminals.get(sessionId)?.generation ?? null;
+    // The output, from the generation's start: to the matchers (the terminal shows it too).
+    // Its end comes after all of it, on the same channel.
+    if (matcher.active) {
+      const attachment = terminals.attach(sessionId, {
+        output: (chunk, accepted) => {
+          matcher.push(chunk.bytes);
+          accepted();
+        },
+        ended: (_message, failed) => {
+          outputEnded = true;
+          outputFailed = failed;
+          if (drained) watch.finish(drained.state, drained.patch);
+        },
+      });
+      detach = () => attachment.detach();
+    }
+    if (task.presentation.reveal === "always") reveal(sessionId);
+    // Asked to stop while it was being started.
+    if (cancelled.has(root)) stopActive(watch);
+    return done;
+  };
+
+  /**
+   * The dedicated terminal to run `task` in again, if its last one can be reused as it is: the
+   * one this service opened, or -- the workspace opened again, its terminals having outlived
+   * the last context -- the workspace's own task terminal for it that has ended.
+   */
   const dedicatedSession = (
     task: ResolvedTask,
     prepared: { profile: TerminalProfile; cwd: string },
   ): TerminalId | null => {
     if (task.presentation.terminal !== "dedicated") return null;
-    const id = dedicated.get(task.id);
+    const id = dedicated.get(task.id) ?? surviving(task);
     if (!id) return null;
     const view = terminals.get(id);
     if (!view) {
@@ -375,12 +472,27 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
     const same =
       JSON.stringify(view.profile) === JSON.stringify(prepared.profile) &&
       view.cwd === prepared.cwd;
-    if (same && (view.state === "Exited" || view.state === "Failed")) return id;
+    if (same && (view.state === "Exited" || view.state === "Failed")) {
+      dedicated.set(task.id, id);
+      return id;
+    }
     if (view.state === "Exited" || view.state === "Failed")
       void terminals.close(id).catch(() => {});
     dedicated.delete(task.id);
     return null;
   };
+
+  /** This workspace's latest ended terminal of `task`, from before this service existed. */
+  const surviving = (task: ResolvedTask): TerminalId | null =>
+    terminals
+      .list()
+      .filter(
+        (view) =>
+          view.workspaceId === options.workspace &&
+          view.profileId === taskProfileId(task.id) &&
+          (view.state === "Exited" || view.state === "Failed"),
+      )
+      .at(-1)?.sessionId ?? null;
 
   /** Stops one running task: Ctrl+C first; if it is still there after a moment, its tree is killed. */
   const stopActive = (watch: Active) => {
@@ -398,6 +510,61 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
       if (active.has(watch.run.executionId)) void terminals.kill(id).catch(() => {});
     }, killAfter);
     timers.add(timer);
+  };
+
+  /** The execution of `taskId` running now, whichever execution started it. */
+  const runningOf = (taskId: string): Active | undefined =>
+    [...active.values()].find((watch) => watch.task.id === taskId);
+
+  /** Settles when the execution `root` is asked to stop (or the workspace goes). */
+  const stopped = (root: string): Promise<"stopped"> =>
+    new Promise((resolve) => {
+      if (cancelled.has(root) || disposed) return resolve("stopped");
+      let set = wakers.get(root);
+      if (!set) wakers.set(root, (set = new Set()));
+      set.add(() => resolve("stopped"));
+    });
+
+  /** A run that could not start, recorded with why: what the terminal's Restart shows. */
+  const refused = (taskId: string, error: unknown) => {
+    if (disposed) return;
+    const now = Date.now();
+    const task = tasks().find((one) => one.id === taskId);
+    runs = [
+      Object.freeze({
+        executionId: `task-${++executions}`,
+        taskId,
+        label: task?.label ?? taskId,
+        state: "failed" as TaskState,
+        parent: null,
+        startedAt: null,
+        finishedAt: now,
+        exitCode: null,
+        sessionId: null,
+        error: error instanceof Error ? error.message : String(error),
+        outputComplete: null,
+      }),
+      ...runs,
+    ];
+    update(runs[0].executionId, {}); // keeps only the most recent finished runs
+  };
+
+  /**
+   * A task's terminal restarted from the terminal UI is the task run again, through every check
+   * a run has -- never a second way to start its command. Its profile names the task. One this
+   * service is restarting itself (a dedicated terminal reused) is not claimed.
+   */
+  const restartTerminal = (id: TerminalId): boolean => {
+    if (disposed || id === restartingOwn) return false;
+    const view = terminals.get(id);
+    const taskId = view && view.workspaceId === options.workspace && taskOfProfile(view.profileId);
+    if (!taskId) return false;
+    if (!tasks().some((task) => task.id === taskId)) {
+      refused(taskId, new TaskError("UnknownTask", `There is no task "${taskId}" any more.`));
+      return true;
+    }
+    void service.restart(taskId).catch((error) => refused(taskId, error));
+    return true;
   };
 
   const service: TaskService = {
@@ -433,17 +600,16 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
       await options.profiles.registry.load();
       if (disposed) throw new TaskError("NoWorkspace", "The workspace was closed.");
       const prepared = plan.map((task) => prepare(task));
-      const busy = plan.find((task) =>
-        [...active.values()].some((watch) => watch.task.id === task.id),
-      );
-      if (busy)
+      // One execution of a task at a time. The task asked for is refused while it runs; a
+      // dependency running for something else is waited for when its turn comes (below).
+      const target = plan[plan.length - 1];
+      if (runningOf(target.id))
         throw new TaskError(
           "AlreadyRunning",
-          `Task "${busy.label}" is already running. Stop it first, or wait for it to finish.`,
+          `Task "${target.label}" is already running. Stop it first, or wait for it to finish.`,
         );
 
       const root = `task-${++executions}`;
-      const target = plan[plan.length - 1];
       const planned: TaskRun[] = plan.map((task, index) =>
         Object.freeze({
           executionId: task === target ? root : `${root}.${index}`,
@@ -456,6 +622,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
           exitCode: null,
           sessionId: null,
           error: null,
+          outputComplete: null,
         }),
       );
       runs = [...planned.slice().reverse(), ...runs];
@@ -465,7 +632,17 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
       let failedAt: TaskRun | null = null;
       for (const [index, run] of planned.entries()) {
         if (disposed || cancelled.has(root)) break;
-        const state = await launch(run, plan[index], root, prepared[index]);
+        const elsewhere = runningOf(run.taskId);
+        let state: TaskState | "stopped";
+        if (elsewhere) {
+          // Already running for something else: that execution is this step -- it is waited
+          // for, not started a second time, and this step's own record goes (one record per
+          // execution). Stopping this execution stops the waiting, not that one.
+          runs = runs.filter((one) => one.executionId !== run.executionId);
+          publishSnapshot();
+          state = await Promise.race([elsewhere.done, stopped(root)]);
+        } else state = await launch(run, plan[index], root, prepared[index]);
+        if (state === "stopped") break;
         if (state !== "succeeded") {
           failedAt = run;
           break;
@@ -484,7 +661,17 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
           });
       }
       cancelled.delete(root);
+      wakers.delete(root);
       return runs.find((one) => one.executionId === root) ?? planned[planned.length - 1];
+    },
+
+    async restart(taskId) {
+      const running = runningOf(taskId);
+      if (running) {
+        service.cancel(running.root);
+        await running.done;
+      }
+      return service.run(taskId);
     },
 
     cancel(executionId) {
@@ -493,6 +680,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
       const root = run.parent ?? run.executionId;
       cancelled.add(root);
       for (const watch of active.values()) if (watch.root === root) stopActive(watch);
+      for (const wake of wakers.get(root) ?? []) wake();
     },
 
     dispose() {
@@ -500,8 +688,11 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
       disposed = true;
       stopWatching();
       stopSettings();
+      stopRestarts();
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
+      for (const wake of [...wakers.values()].flatMap((set) => [...set])) wake();
+      wakers.clear();
       // The workspace is going: what its tasks are running is ended, now.
       for (const watch of [...active.values()]) {
         cancelled.add(watch.root);
@@ -511,5 +702,6 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
       listeners.clear();
     },
   };
+  const stopRestarts = options.ui.interceptRestart?.(restartTerminal) ?? (() => {});
   return service;
 }

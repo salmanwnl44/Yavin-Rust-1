@@ -1,0 +1,2 @@
+# Raw PTY bytes: never normalise their line endings (core.autocrlf would rewrite CRLF).
+*.pty binary

@@ -1,0 +1,93 @@
+{
+  "capturedWith": "src-tauri/src/terminal_tests.rs capture_real_task_tool_output (Yavin's native terminal: portable-pty / ConPTY)",
+  "captures": [
+    {
+      "bytes": 638,
+      "cols": 80,
+      "command": "<repo>/node_modules/.bin/tsc.cmd --noEmit -p .",
+      "exitCode": 2,
+      "file": "tsc-80.pty",
+      "rows": 30,
+      "shell": "cmd.exe /d /s /c",
+      "tool": "tsc"
+    },
+    {
+      "bytes": 909,
+      "cols": 80,
+      "command": "<repo>/node_modules/.bin/tsc.cmd --watch --noEmit -p .",
+      "exitCode": 1,
+      "file": "tsc-watch-80.pty",
+      "rows": 30,
+      "shell": "cmd.exe /d /s /c",
+      "tool": "tsc-watch"
+    },
+    {
+      "bytes": 1211,
+      "cols": 80,
+      "command": "cargo check --target-dir target-human",
+      "exitCode": 101,
+      "file": "cargo-80.pty",
+      "rows": 30,
+      "shell": "cmd.exe /d /s /c",
+      "tool": "cargo"
+    },
+    {
+      "bytes": 735,
+      "cols": 80,
+      "command": "cargo check --message-format short --target-dir target-short",
+      "exitCode": 101,
+      "file": "cargo-short-80.pty",
+      "rows": 30,
+      "shell": "cmd.exe /d /s /c",
+      "tool": "cargo-short"
+    },
+    {
+      "bytes": 612,
+      "cols": 200,
+      "command": "<repo>/node_modules/.bin/tsc.cmd --noEmit -p .",
+      "exitCode": 2,
+      "file": "tsc-200.pty",
+      "rows": 30,
+      "shell": "cmd.exe /d /s /c",
+      "tool": "tsc"
+    },
+    {
+      "bytes": 883,
+      "cols": 200,
+      "command": "<repo>/node_modules/.bin/tsc.cmd --watch --noEmit -p .",
+      "exitCode": 1,
+      "file": "tsc-watch-200.pty",
+      "rows": 30,
+      "shell": "cmd.exe /d /s /c",
+      "tool": "tsc-watch"
+    },
+    {
+      "bytes": 1240,
+      "cols": 200,
+      "command": "cargo check --target-dir target-human",
+      "exitCode": 101,
+      "file": "cargo-200.pty",
+      "rows": 30,
+      "shell": "cmd.exe /d /s /c",
+      "tool": "cargo"
+    },
+    {
+      "bytes": 741,
+      "cols": 200,
+      "command": "cargo check --message-format short --target-dir target-short",
+      "exitCode": 101,
+      "file": "cargo-short-200.pty",
+      "rows": 30,
+      "shell": "cmd.exe /d /s /c",
+      "tool": "cargo-short"
+    }
+  ],
+  "longName": "aDeliberatelyLongIdentifierSoThatTheDiagnosticLineIsWiderThanEightyColumnsInTheTerminal",
+  "versions": {
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "node": "v24.19.0",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "tsc": "Version 5.9.3",
+    "windows": "Microsoft Windows [Version 10.0.26300.9457]"
+  }
+}

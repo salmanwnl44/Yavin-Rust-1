@@ -17,6 +17,14 @@ export class FakeNative implements TerminalNative {
   /** When set, opens wait until `release()`. */
   hold = false;
   private held: (() => void)[] = [];
+  /**
+   * When set, what views (output channels) are sent waits until `flushViews()`, while the
+   * lifecycle channel is sent at once -- as natively, where the lifecycle subscriber is never
+   * held back by output and each channel is its own transport (`terminal_stream.rs`). Off by
+   * default: views are sent in step with the lifecycle.
+   */
+  lagViews = false;
+  private lagged: { receive: Receive; message: unknown }[] = [];
   sessions = new Map<
     string,
     {
@@ -34,6 +42,14 @@ export class FakeNative implements TerminalNative {
   }
   release() {
     for (const go of this.held.splice(0)) go();
+  }
+  /** Sends the views what `lagViews` held back, in order. */
+  flushViews() {
+    for (const { receive, message } of this.lagged.splice(0)) receive(message);
+  }
+  private toView(receive: Receive, message: unknown) {
+    if (this.lagViews) this.lagged.push({ receive, message });
+    else receive(message);
   }
   private key(sessionId: string, generation: number) {
     return `${sessionId}:${generation}`;
@@ -63,7 +79,7 @@ export class FakeNative implements TerminalNative {
     const session = this.sessions.get(this.key(args.request.sessionId, args.request.generation));
     if (!session || session.released) throw "InvalidSession: That terminal is no longer running.";
     const receive = (args.events as { receive: Receive }).receive;
-    for (const message of session.replay) receive(message);
+    for (const message of session.replay) this.toView(receive, message);
     if (!session.ended) session.views.set(args.request.subscriptionId, receive);
   }
   async unsubscribe(request: unknown) {
@@ -98,7 +114,7 @@ export class FakeNative implements TerminalNative {
     const message = { sessionId, generation, ...fields };
     session?.replay.push(message);
     session?.lifecycle(message);
-    for (const view of session?.views.values() ?? []) view(message);
+    for (const view of session?.views.values() ?? []) this.toView(view, message);
   }
   /** A shell-integration signal (TERMINAL-05A): delivered live, never replayed, as natively. */
   shell(sessionId: string, generation: number, fields: Record<string, unknown>) {
@@ -117,7 +133,7 @@ export class FakeNative implements TerminalNative {
       bytes: Buffer.from(text, "utf8").toString("base64"),
     };
     session.replay.push(message);
-    for (const view of session.views.values()) view(message);
+    for (const view of session.views.values()) this.toView(view, message);
     return message;
   }
   end(sessionId: string, generation: number, exitCode: number, release = false) {

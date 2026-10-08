@@ -2002,3 +2002,231 @@ fn a_task_line_reaches_bash_cmd_and_powershell_intact_with_its_exit_code() {
         assert_eq!(code, Some(5));
     }
 }
+
+// --- Run/Tasks Module 01: what real tools print through this native terminal ------------------
+
+/// Where the captured bytes are kept: next to the task layer that will read them.
+fn pty_fixture_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("src")
+        .join("services")
+        .join("tasks")
+        .join("fixtures")
+        .join("pty")
+}
+
+/// A program's first line of `--version`, for the record.
+fn tool_version(program: &str, args: &[&str]) -> String {
+    let mut command = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+    let line = [program]
+        .iter()
+        .chain(args)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cfg!(windows) {
+        command.args(["/d", "/s", "/c", &line]);
+    } else {
+        command.args(["-c", &line]);
+    }
+    command
+        .output()
+        .ok()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// Runs `line` the way TaskService runs a task on Windows' default profile -- `cmd.exe /d /s /c
+/// <line>` in a terminal of its own, with a lifecycle subscriber and an acknowledging output
+/// subscriber -- at `cols` columns, in `cwd`. Stops when the shell ends, or once `until` has been
+/// printed (then the session is killed: a watch never ends). The exact bytes and exit code.
+fn capture_task_line(
+    session: &str,
+    line: &str,
+    cwd: &Path,
+    cols: u16,
+    until: Option<&str>,
+) -> (Vec<u8>, Option<i32>) {
+    let shell = available_shells()
+        .into_iter()
+        .find(|s| s.kind == ShellKind::Cmd)
+        .expect("cmd is always there on Windows");
+    let terminals = Terminals::default();
+    let mut request = request(session, 1);
+    request.profile = Some(profile(&shell.path, &["/d", "/s", "/c", line], false));
+    request.cwd = Some(cwd.to_string_lossy().into_owned());
+    request.dimensions = TerminalDimensions::new(cols, 30).unwrap();
+    let recorder = open_recorded_with(&terminals, request, launch()).unwrap();
+    answer_cursor_query(&terminals, &recorder, session);
+    let finished = match until {
+        Some(text) => recorder.wait(Duration::from_secs(180), |r| {
+            r.text().contains(text) || r.ended()
+        }),
+        None => recorder.wait(Duration::from_secs(300), Recorder::ended),
+    };
+    assert!(
+        finished,
+        "{session} did not finish; printed {:?}",
+        recorder.text()
+    );
+    if until.is_some() && !recorder.ended() {
+        // Let the end of the cycle's output arrive, then stop the watch.
+        thread::sleep(Duration::from_millis(1500));
+        let _ = kill(
+            &terminals,
+            TerminalKillRequest {
+                session_id: id(session),
+                generation: generation(1),
+            },
+        );
+        recorder.wait(Duration::from_secs(30), Recorder::ended);
+    }
+    let events = recorder.snapshot();
+    let bytes: Vec<u8> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Output(chunk) => Some(chunk.bytes.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let code = events.iter().rev().find_map(|event| match event {
+        Event::Exit(exit) => Some(exit.exit_code),
+        _ => None,
+    });
+    close_all(&terminals);
+    (bytes, code.flatten())
+}
+
+/// A long name, so diagnostics are wider than 80 columns and any wrapping shows.
+const LONG_NAME: &str =
+    "aDeliberatelyLongIdentifierSoThatTheDiagnosticLineIsWiderThanEightyColumnsInTheTerminal";
+
+/// Captures what `tsc` (the repository's own) and `cargo` print when run as tasks through the
+/// real PTY, at 80 and 200 columns, into `src/services/tasks/fixtures/pty/` with a manifest
+/// (`capture.json`) of the versions and exit codes. Evidence for the problem matchers (Run/Tasks
+/// Module 01), not a check of Yavin: run on purpose, it rewrites the fixtures --
+/// `cargo test --lib capture_real_task_tool_output -- --ignored --nocapture`.
+#[test]
+#[cfg(windows)] // the fixtures record ConPTY
+#[ignore = "writes fixtures; needs node, the repository's typescript and cargo"]
+fn capture_real_task_tool_output() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let tsc = repo
+        .join("node_modules")
+        .join(".bin")
+        .join("tsc.cmd")
+        .canonicalize()
+        .expect("npm install has been run");
+    let tsc = tsc
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .to_string();
+    let work = env::temp_dir().join(format!("yavin-pty-capture-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+
+    // A TypeScript project with one error on a line wider than 80 columns.
+    let ts = work.join("ts");
+    std::fs::create_dir_all(ts.join("src")).unwrap();
+    std::fs::write(
+        ts.join("tsconfig.json"),
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true, "target": "ES2022" }, "include": ["src"] }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ts.join("src").join("bad.ts"),
+        format!("export const ok = 1;\nexport const value: number = {LONG_NAME};\n"),
+    )
+    .unwrap();
+
+    // A crate with one error on a line wider than 80 columns.
+    let rs = work.join("rs");
+    std::fs::create_dir_all(rs.join("src")).unwrap();
+    std::fs::write(
+        rs.join("Cargo.toml"),
+        "[package]\nname = \"pty_capture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        rs.join("src").join("main.rs"),
+        format!(
+            "fn main() {{\n    let total: u32 = 1 + {};\n    println!(\"{{total}}\");\n}}\n",
+            LONG_NAME.to_lowercase()
+        ),
+    )
+    .unwrap();
+
+    let out = pty_fixture_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let mut manifest = vec![];
+    let cases: [(&str, String, &Path, Option<&str>); 4] = [
+        ("tsc", format!("{tsc} --noEmit -p ."), &ts, None),
+        (
+            "tsc-watch",
+            format!("{tsc} --watch --noEmit -p ."),
+            &ts,
+            Some("Watching for file changes."),
+        ),
+        // Its own target folder, and the first build (with its progress) every time.
+        (
+            "cargo",
+            "cargo check --target-dir target-human".into(),
+            &rs,
+            None,
+        ),
+        (
+            "cargo-short",
+            "cargo check --message-format short --target-dir target-short".into(),
+            &rs,
+            None,
+        ),
+    ];
+    for cols in [80u16, 200] {
+        for (name, line, cwd, until) in &cases {
+            let _ = std::fs::remove_dir_all(cwd.join("target-human"));
+            let _ = std::fs::remove_dir_all(cwd.join("target-short"));
+            let session = format!("t-capture-{name}-{cols}");
+            let (bytes, code) = capture_task_line(&session, line, cwd, cols, *until);
+            let file = format!("{name}-{cols}.pty");
+            std::fs::write(out.join(&file), &bytes).unwrap();
+            println!("{file}: {} bytes, exit {code:?}", bytes.len());
+            manifest.push(serde_json::json!({
+                "file": file,
+                "tool": name,
+                "cols": cols,
+                "rows": 30,
+                "shell": "cmd.exe /d /s /c",
+                "command": line.replace(&tsc, "<repo>/node_modules/.bin/tsc.cmd"),
+                "exitCode": code,
+                "bytes": bytes.len(),
+            }));
+        }
+    }
+    let windows = tool_version("ver", &[]);
+    let record = serde_json::json!({
+        "capturedWith": "src-tauri/src/terminal_tests.rs capture_real_task_tool_output (Yavin's native terminal: portable-pty / ConPTY)",
+        "versions": {
+            "windows": windows,
+            "tsc": tool_version(&tsc, &["--version"]),
+            "node": tool_version("node", &["--version"]),
+            "cargo": tool_version("cargo", &["--version"]),
+            "rustc": tool_version("rustc", &["--version"]),
+        },
+        "longName": LONG_NAME,
+        "captures": manifest,
+    });
+    std::fs::write(
+        out.join("capture.json"),
+        serde_json::to_string_pretty(&record).unwrap() + "\n",
+    )
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&work);
+}

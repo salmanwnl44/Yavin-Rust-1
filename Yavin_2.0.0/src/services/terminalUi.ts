@@ -125,7 +125,17 @@ export interface TerminalUi {
   kill(id: TerminalId): void;
   closeAll(): void;
   rename(id: TerminalId, title: string): void;
+  /**
+   * Restart (the terminal's menu, the ended terminal's button): offered first to whoever runs
+   * what the terminal runs -- a task's terminal is the task's to run again (`TaskService`),
+   * through its checks -- and otherwise a new generation of the same shell.
+   */
   restart(id: TerminalId): void;
+  /**
+   * Claims restarts: `handler` answers `true` for a terminal it restarts itself. One at a time
+   * (the workspace's current task layer); the returned function lets go, if it is still that.
+   */
+  interceptRestart(handler: (id: TerminalId) => boolean): () => void;
   zoom(action: TerminalKeyAction): void;
   openFind(): void;
   /** Gives the focused terminal the keyboard once the panel shows it. */
@@ -163,6 +173,8 @@ export function createTerminalUi(
   const listeners = new Set<() => void>();
   const layout = settings?.layout ?? DEFAULT_LAYOUT;
   const views = new Map<TerminalId, TerminalViewHandle>();
+  /** Who restarts the terminals it runs itself (`interceptRestart`). */
+  let restartHandler: ((id: TerminalId) => boolean) | null = null;
   let state: TerminalUiState = Object.freeze({
     primary: null,
     secondary: null,
@@ -378,8 +390,15 @@ export function createTerminalUi(
       service.rename(id, title);
     },
     restart(id) {
+      if (restartHandler?.(id)) return;
       views.get(id)?.clear();
       service.restart(id);
+    },
+    interceptRestart(handler) {
+      restartHandler = handler;
+      return () => {
+        if (restartHandler === handler) restartHandler = null;
+      };
     },
     zoom(action) {
       set({ fontSize: zoomFontSize(state.fontSize, action) });

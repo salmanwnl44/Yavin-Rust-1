@@ -53,7 +53,26 @@ export interface ProblemMatcher {
     code?: number;
     message: number;
   };
+  /**
+   * Other formats the same tool prints, each a run of consecutive lines -- what it prints by
+   * default in a terminal, when `pattern` is the format a checker asks for. Each line gives
+   * some of a diagnostic's parts; a diagnostic is complete at the format's last line.
+   */
+  formats?: readonly (readonly LinePattern[])[];
 }
+
+/** One line of a multi-line format, and which of a diagnostic's parts it gives. */
+export interface LinePattern {
+  regexp: RegExp;
+  groups: Partial<Record<Part, number>>;
+  /**
+   * The format's last line may repeat: each match is one more diagnostic, with the parts the
+   * lines before it gave (eslint's file line, then one line per finding).
+   */
+  loop?: boolean;
+}
+
+type Part = "file" | "line" | "column" | "severity" | "code" | "message";
 
 const severityOf = (text: string | undefined, fallback: Severity): Severity => {
   if (text === undefined) return fallback;
@@ -72,6 +91,16 @@ export const TSC: ProblemMatcher = {
   label: "TypeScript",
   pattern: /^\s*(\S.*?)\((\d+),(\d+)\):\s+(error|warning)\s+(TS\d+):\s+(.*)$/,
   groups: { file: 1, line: 2, column: 3, severity: 4, code: 5, message: 6 },
+  formats: [
+    // Its default in a terminal (`--pretty`, and every `--watch` cycle):
+    // `src/app.ts:12:7 - error TS2345: Argument of type 'x' is not assignable.`
+    [
+      {
+        regexp: /^\s*(\S.*?):(\d+):(\d+)\s+-\s+(error|warning|message)\s+(TS\d+):\s+(.*)$/,
+        groups: { file: 1, line: 2, column: 3, severity: 4, code: 5, message: 6 },
+      },
+    ],
+  ],
 };
 
 /**
@@ -83,6 +112,18 @@ export const CARGO: ProblemMatcher = {
   label: "Rust",
   pattern: /^\s*(\S.*?):(\d+):(\d+):\s+(error|warning)(?:\[([^\]]+)\])?:\s+(.*)$/,
   groups: { file: 1, line: 2, column: 3, severity: 4, code: 5, message: 6 },
+  formats: [
+    // Its default (`cargo check`, `cargo build`): the message, then where on the next line.
+    // `error[E0425]: cannot find value `x` in this scope`
+    // ` --> src\main.rs:3:5`
+    [
+      {
+        regexp: /^(error|warning)(?:\[([^\]]+)\])?:\s+(.*)$/,
+        groups: { severity: 1, code: 2, message: 3 },
+      },
+      { regexp: /^\s*-->\s+(.+?):(\d+):(\d+)\s*$/, groups: { file: 1, line: 2, column: 3 } },
+    ],
+  ],
 };
 
 /**
@@ -95,6 +136,20 @@ export const ESLINT: ProblemMatcher = {
   pattern:
     /^(\S.*?):\s+line\s+(\d+),\s+col\s+(\d+),\s+(Error|Warning)\s+-\s+(.*?)(?:\s+\(([^()]+)\))?$/,
   groups: { file: 1, line: 2, column: 3, severity: 4, code: 6, message: 5 },
+  formats: [
+    // Its default ("stylish"): the file on a line of its own, then one indented line per
+    // finding, the rule after two or more spaces.
+    // `C:\work\src\app.ts`
+    // `  4:1  error  'x' is assigned a value but never used  no-unused-vars`
+    [
+      { regexp: /^(\S.*)$/, groups: { file: 1 } },
+      {
+        regexp: /^\s+(\d+):(\d+)\s+(error|warning)\s+(.*?)(?:\s{2,}(\S+))?$/,
+        groups: { line: 1, column: 2, severity: 3, message: 4, code: 5 },
+        loop: true,
+      },
+    ],
+  ],
 };
 
 /**
@@ -125,29 +180,89 @@ export const MATCHERS: Readonly<Record<string, ProblemMatcher>> = {
  * one.
  */
 export function parseProblems(matcher: ProblemMatcher, output: string): Diagnostic[] {
+  const session = new MatcherSession(matcher);
   const found: Diagnostic[] = [];
-  for (const raw of output.split("\n")) {
-    const line = raw.replace(/\r$/, "");
-    const match = matcher.pattern.exec(line);
-    if (!match) continue;
-
-    const at = Number(match[matcher.groups.line]);
-    const column = matcher.groups.column === undefined ? 1 : Number(match[matcher.groups.column]);
-    // A location that is not a positive number is not a location.
-    if (!Number.isFinite(at) || at < 1) continue;
-
-    const code = matcher.groups.code === undefined ? undefined : match[matcher.groups.code];
-    found.push({
-      file: match[matcher.groups.file],
-      line: at,
-      column: Number.isFinite(column) && column >= 1 ? column : 1,
-      severity: severityOf(
-        matcher.groups.severity === undefined ? undefined : match[matcher.groups.severity],
-        matcher.defaultSeverity ?? "error",
-      ),
-      message: match[matcher.groups.message].trim(),
-      ...(code ? { code } : {}),
-    });
-  }
+  for (const raw of output.split("\n")) found.push(...session.line(raw.replace(/\r$/, "")));
   return found;
 }
+
+/**
+ * One matcher reading one output, line by line, as it arrives: each of its formats follows the
+ * lines it has matched so far, so a multi-line format is matched across lines given one at a
+ * time. A format's lines must be consecutive (blank lines aside); a line that breaks a format
+ * starts it over, and is tried as its first line.
+ */
+export class MatcherSession {
+  private readonly matcher: ProblemMatcher;
+  private readonly formats: { lines: readonly LinePattern[]; at: number; parts: Captured }[];
+
+  constructor(matcher: ProblemMatcher) {
+    this.matcher = matcher;
+    this.formats = [
+      [{ regexp: matcher.pattern, groups: matcher.groups }],
+      ...(matcher.formats ?? []),
+    ].map((lines) => ({ lines, at: 0, parts: {} }));
+  }
+
+  /** The diagnostics `line` completes. */
+  line(line: string): Diagnostic[] {
+    if (!line.trim()) return [];
+    const found: Diagnostic[] = [];
+    for (const format of this.formats) {
+      if (format.at > 0) {
+        const pattern = format.lines[format.at];
+        const match = pattern.regexp.exec(line);
+        if (match) {
+          const parts = { ...format.parts, ...capture(pattern, match) };
+          if (format.at === format.lines.length - 1) {
+            this.emit(parts, found);
+            // A repeating last line keeps what the lines before it gave.
+            if (!pattern.loop) format.at = 0;
+          } else {
+            format.parts = parts;
+            format.at += 1;
+          }
+          continue;
+        }
+        format.at = 0;
+        format.parts = {};
+      }
+      const first = format.lines[0];
+      const match = first.regexp.exec(line);
+      if (!match) continue;
+      if (format.lines.length === 1) {
+        this.emit(capture(first, match), found);
+      } else {
+        format.parts = capture(first, match);
+        format.at = 1;
+      }
+    }
+    return found;
+  }
+
+  private emit(parts: Captured, found: Diagnostic[]): void {
+    const at = Number(parts.line);
+    // A location that is not a positive number is not a location.
+    if (!parts.file || parts.message === undefined || !Number.isFinite(at) || at < 1) return;
+    const column = parts.column === undefined ? 1 : Number(parts.column);
+    found.push({
+      file: parts.file,
+      line: at,
+      column: Number.isFinite(column) && column >= 1 ? column : 1,
+      severity: severityOf(parts.severity, this.matcher.defaultSeverity ?? "error"),
+      message: parts.message.trim(),
+      ...(parts.code ? { code: parts.code } : {}),
+    });
+  }
+}
+
+type Captured = Partial<Record<Part, string>>;
+
+const capture = (pattern: LinePattern, match: RegExpExecArray): Captured => {
+  const parts: Captured = {};
+  for (const [part, group] of Object.entries(pattern.groups) as [Part, number][]) {
+    const value = match[group];
+    if (value !== undefined) parts[part] = value;
+  }
+  return parts;
+};
