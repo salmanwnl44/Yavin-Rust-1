@@ -34,6 +34,13 @@ import {
  */
 export type ExtensionSource = { kind: "folder"; path: string };
 
+/** Another copy of a registered extension, found but not used (EXT-02: the inventory's choice). */
+export interface ShadowedCopy {
+  folder: string;
+  version: string | null;
+  reason: string;
+}
+
 export interface RegisteredExtension {
   id: string;
   manifest: ExtensionManifest;
@@ -43,6 +50,8 @@ export interface RegisteredExtension {
   enabled: boolean;
   /** Manifest warnings, and contributions that could not be applied (with why). */
   warnings: string[];
+  /** Other copies of it that were found, and why they are not used. */
+  shadowed: readonly ShadowedCopy[];
 }
 
 export interface RejectedExtension {
@@ -81,6 +90,24 @@ export interface RegistrySnapshot {
 }
 
 export const DISABLED_KEY = "yavin.extensions.disabled";
+
+/**
+ * The disabled ids a window's storage holds (IDE-07's place for them; since EXT-02 the desktop
+ * app moves them into the native inventory once).
+ */
+export function readStoredDisabled(storage: Storage | null | undefined): string[] {
+  try {
+    const parsed = JSON.parse(storage?.getItem(DISABLED_KEY) ?? "null") as {
+      version?: number;
+      ids?: unknown;
+    } | null;
+    if (parsed && parsed.version === 1 && Array.isArray(parsed.ids))
+      return parsed.ids.filter((id): id is string => typeof id === "string");
+  } catch {
+    /* Unreadable: every extension starts enabled. */
+  }
+  return [];
+}
 
 const describe = (problem: ManifestProblem) =>
   problem.field ? `${problem.field}: ${problem.message}` : problem.message;
@@ -125,6 +152,11 @@ function definitionOf(setting: SettingContribution, section: string): SettingDef
 export function createExtensionRegistry(options: {
   settings: SettingsRegistry;
   storage?: Storage | null;
+  /**
+   * Where enabled state is kept (EXT-02: the native inventory). Without it, this window's
+   * storage keeps it (the browser preview, tests).
+   */
+  persistEnabled?: (id: string, enabled: boolean) => void;
 }) {
   const storage = (() => {
     if (options.storage !== undefined) return options.storage;
@@ -134,18 +166,9 @@ export function createExtensionRegistry(options: {
       return null;
     }
   })();
-  const disabled = new Set<string>();
-  try {
-    const parsed = JSON.parse(storage?.getItem(DISABLED_KEY) ?? "null") as {
-      version?: number;
-      ids?: unknown;
-    } | null;
-    if (parsed && parsed.version === 1 && Array.isArray(parsed.ids))
-      for (const id of parsed.ids) if (typeof id === "string") disabled.add(id);
-  } catch {
-    /* Unreadable: every extension starts enabled. */
-  }
-  const saveDisabled = () => {
+  const disabled = new Set<string>(options.persistEnabled ? [] : readStoredDisabled(storage));
+  const saveDisabled = (id: string, enabled: boolean) => {
+    if (options.persistEnabled) return options.persistEnabled(id, enabled);
     try {
       storage?.setItem(DISABLED_KEY, JSON.stringify({ version: 1, ids: [...disabled].sort() }));
     } catch {
@@ -281,6 +304,7 @@ export function createExtensionRegistry(options: {
       raw: unknown,
       source: ExtensionSource,
       origin: string,
+      shadowed: readonly ShadowedCopy[] = [],
     ): RegisteredExtension | RejectedExtension {
       const result = readManifest(raw);
       if (!result.ok) {
@@ -313,6 +337,7 @@ export function createExtensionRegistry(options: {
         origin,
         enabled: !disabled.has(manifest.id),
         warnings: result.warnings.map(describe),
+        shadowed,
       };
       extensions.set(manifest.id, entry);
       if (entry.enabled) applySettings(entry);
@@ -348,19 +373,30 @@ export function createExtensionRegistry(options: {
         origin,
         enabled: !disabled.has(id),
         warnings: result.warnings.map(describe),
+        shadowed: previous.shadowed,
       };
       extensions.set(id, entry);
       if (entry.enabled) applySettings(entry);
       publish();
       return entry;
     },
-    /** Forgets an extension (its contributions go with it). */
-    remove(id: string) {
+    /**
+     * Forgets an extension (its contributions go with it). `forget`: it was uninstalled, so its
+     * disabled state goes too (a reinstall starts enabled); the native inventory forgets it
+     * itself, so only this window's storage is written here.
+     */
+    remove(id: string, { forget = false }: { forget?: boolean } = {}) {
       const entry = extensions.get(id);
+      if (forget && disabled.delete(id) && !options.persistEnabled) saveDisabled(id, true);
       if (!entry) return;
       if (entry.enabled) removeSettings(entry);
       extensions.delete(id);
       publish();
+    },
+    /** The disabled ids as the native inventory has them (discovery). */
+    setDisabled(ids: readonly string[]) {
+      disabled.clear();
+      for (const id of ids) disabled.add(id);
     },
     setEnabled(id: string, enabled: boolean) {
       const entry = extensions.get(id);
@@ -375,7 +411,7 @@ export function createExtensionRegistry(options: {
         disabled.add(id);
         removeSettings(entry);
       }
-      saveDisabled();
+      saveDisabled(id, enabled);
       publish();
     },
     get: (id: string) => extensions.get(id),

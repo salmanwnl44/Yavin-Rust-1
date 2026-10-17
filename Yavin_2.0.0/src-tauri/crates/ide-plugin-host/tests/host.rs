@@ -385,6 +385,16 @@ fn performance_stays_within_budgets() {
     .unwrap();
     let id = "yavin-samples.hello-world";
 
+    // The first start of a binary the OS has not run before includes its one-time check of
+    // the new image -- measured at 0.4 to 10 s inside process creation alone, before any host
+    // code runs, and only once per build. That is not the host's startup: it is started and
+    // shut down once, untimed by the budget, and the budget measures the next start.
+    let started = Instant::now();
+    let mut first = Host::start();
+    first.send(json!({"type": "shutdown"}));
+    assert!(first.child.wait().unwrap().success());
+    let first_start = ms(started);
+
     let started = Instant::now();
     let mut host = Host::start();
     let startup = ms(started);
@@ -439,7 +449,7 @@ fn performance_stays_within_budgets() {
     let shutdown = ms(started);
 
     eprintln!(
-        "extension host: startup {startup:.1} ms, sample load+activate {activation:.1} ms, \
+        "extension host: first start {first_start:.1} ms (not budgeted), startup {startup:.1} ms, sample load+activate {activation:.1} ms, \
          command p95 {command:.2} ms, view p95 {view:.2} ms, provider p95 {provider:.2} ms, shutdown {shutdown:.1} ms"
     );
     for (what, value, budget) in [

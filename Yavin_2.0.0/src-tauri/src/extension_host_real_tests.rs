@@ -56,12 +56,12 @@ fn built_host() -> PathBuf {
     path
 }
 
-/// Yavin's side of one or more hosts: the native sessions, the events, the extension roots.
+/// Yavin's side of one or more hosts: the native sessions, the events, the extension inventory.
 struct Yavin {
     sessions: ExtHostSessions,
     events: Receiver<(u32, Event)>,
     sink: Arc<Channel>,
-    roots: Vec<PathBuf>,
+    extensions: ExtensionService,
     _scratch: Scratch,
 }
 
@@ -106,7 +106,7 @@ impl Yavin {
             sessions: ExtHostSessions::default(),
             events,
             sink: Arc::new(Channel(Mutex::new(sender))),
-            roots: vec![scratch.clone(), samples],
+            extensions: ExtensionService::new(scratch.clone(), vec![samples]),
             _scratch: Scratch(scratch),
         }
     }
@@ -118,8 +118,9 @@ impl Yavin {
     }
 
     fn send(&self, session: u32, message: Value) -> Result<(), String> {
-        self.sessions
-            .send(session, &message.to_string(), &self.roots)
+        self.sessions.send(session, &message.to_string(), &|id| {
+            self.extensions.folder_of(id)
+        })
     }
 
     /// `init` and its `ready`: the handshake.
@@ -231,8 +232,15 @@ fn kill(pid: u32) {
 fn running(pid: u32) -> bool {
     #[cfg(windows)]
     {
+        // By image name too: once the host is gone, Windows may give its id to another process.
         let out = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .args([
+                "/FI",
+                &format!("PID eq {pid}"),
+                "/FI",
+                &format!("IMAGENAME eq {HOST_NAME}"),
+                "/NH",
+            ])
             .output()
             .unwrap();
         String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
@@ -328,6 +336,11 @@ fn the_real_host_runs_the_hello_world_sample_from_start_to_shutdown() {
     let (code, _) = yavin.exit_of(session);
     assert_eq!(code, Some(0), "a clean shutdown");
     assert!(yavin.sessions.process_id(session).is_none());
+    // Windows may list an exited process for a moment after its exit was reported.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while running(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert!(!running(pid), "the host process is gone");
     assert!(yavin
         .send(session, json!({"type": "shutdown"}))
@@ -412,7 +425,7 @@ fn a_malformed_handshake_is_refused_and_the_host_survives() {
     let session = yavin.start();
     assert!(yavin
         .sessions
-        .send(session, "{not json", &yavin.roots)
+        .send(session, "{not json", &|id| yavin.extensions.folder_of(id))
         .unwrap_err()
         .starts_with("MalformedMessage"));
     yavin

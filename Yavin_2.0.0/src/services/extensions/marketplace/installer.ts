@@ -16,8 +16,12 @@
  *   5. the new one is registered; if that fails, the old folder is moved back and the registry
  *      re-read (rollback); if it succeeds, the old folder is deleted (`extensions_finish`).
  *
- * Uninstall: out of the registry (its host stops it), then its folder deleted -- its stored
- * state only if the user chooses.
+ * Uninstall: out of the registry (its host stops it) with its disabled state, then its folder
+ * deleted -- its stored state only if the user chooses.
+ *
+ * The native side is the authority throughout (EXT-02, `extension_service.rs`): it serializes
+ * operations per extension, re-reads the staged manifest at commit, and records every step in
+ * its inventory; the checks here are the renderer's own validation, not a safety boundary.
  */
 import { native } from "../../native.ts";
 import { readManifest } from "../manifest.ts";
@@ -250,7 +254,8 @@ export function createExtensionInstaller(options: {
         );
       begin(id, { kind: "uninstall", phase: "removing", version: entry.manifest.version });
       try {
-        options.registry.remove(id);
+        // Its disabled state goes with it: a reinstall starts enabled (EXT-02).
+        options.registry.remove(id, { forget: true });
         try {
           await io.uninstall(id);
         } catch (error) {

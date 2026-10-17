@@ -523,6 +523,16 @@ export function ExtensionsPanel({
             </>
           }
         />
+        {entry.shadowed.length > 0 && (
+          <div
+            className="px-12 pb-1 text-[10px] text-zinc-500"
+            title={entry.shadowed.map((copy) => `${copy.folder}: ${copy.reason}`).join("\n")}
+          >
+            {entry.shadowed.length === 1
+              ? `Another copy is shadowed${entry.shadowed[0].version ? ` (version ${entry.shadowed[0].version})` : ""}.`
+              : `${entry.shadowed.length} other copies are shadowed.`}
+          </div>
+        )}
         {diagnostics &&
           warnings.map((warning) => (
             <div key={warning} className="px-12 pb-1 text-[10px] text-amber-300/80">

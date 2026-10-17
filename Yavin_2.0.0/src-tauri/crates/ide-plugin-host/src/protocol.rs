@@ -52,20 +52,9 @@ pub enum Inbound {
     },
 }
 
-/// `publisher.name`, lower case: the same rule as the renderer's manifest.
+/// `publisher.name` in canonical form: Yavin's one id rule (`ide_workspace::extension_id`).
 pub fn valid_extension_id(id: &str) -> bool {
-    let Some((publisher, name)) = id.split_once('.') else {
-        return false;
-    };
-    let part = |text: &str| {
-        !text.is_empty()
-            && text.len() <= 50
-            && text
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-            && !text.starts_with('-')
-    };
-    part(publisher) && part(name)
+    ide_workspace::extension_id::is_canonical(id)
 }
 
 pub fn parse(text: &str) -> Result<Inbound, String> {

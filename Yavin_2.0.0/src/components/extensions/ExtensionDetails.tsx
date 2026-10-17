@@ -432,6 +432,14 @@ export function ExtensionDetails({
                   </Row>
                 )}
                 {entry && <Row label="Installed in">{entry.origin}</Row>}
+                {entry?.shadowed.map((copy) => (
+                  <Row key={copy.folder} label="Shadowed copy">
+                    <span data-testid="shadowed-copy">
+                      {copy.folder}
+                      {copy.version && ` (version ${copy.version})`} — {copy.reason}
+                    </span>
+                  </Row>
+                ))}
                 {listing.status === "error" && <Row label="Marketplace">{listing.error}</Row>}
               </Section>
               {extension && (

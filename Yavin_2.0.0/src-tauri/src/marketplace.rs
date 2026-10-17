@@ -14,20 +14,21 @@
 //!   portal) and, for a package, when its size or SHA-256 differ from what the registry's
 //!   index says.
 //!
-//! A package is downloaded into the extensions root's `.staging` folder, validated and
-//! unpacked there (`extension_package`), and only then -- after the renderer has validated its
-//! manifest -- put in place. Installing never runs extension code.
+//! A package is downloaded into its install operation's staging folder, validated and unpacked
+//! there (`extension_package`), and only then -- after the renderer has validated its manifest --
+//! put in place by the inventory (`extension_service`, EXT-02). Its size and SHA-256 are the
+//! registry index's, read here, never only the renderer's word. Installing never runs
+//! extension code.
 
-use crate::extension_package::{self, commit, finish, recover, unpack, Unpacked, LIMITS, STAGING};
-use crate::extensions::roots;
+use crate::extension_package::{self, unpack, Unpacked, LIMITS};
+use crate::extension_service::{operation_id_ok, Committed, ExtensionService};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
 use std::time::Duration;
-use tauri::AppHandle;
+use tauri::State;
 
 /// Whether `http://127.0.0.1` / `http://localhost` registries are accepted (tests only).
 const LOOPBACK_ALLOWED: bool = cfg!(any(test, feature = "test-registry"));
@@ -371,46 +372,65 @@ pub struct Staged {
     pub package_size: u64,
 }
 
-fn new_token() -> String {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!(
-        "{:x}{:x}{:x}",
-        nanos,
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-fn token_ok(token: &str) -> Result<(), String> {
-    if (8..=64).contains(&token.len()) && token.chars().all(|c| c.is_ascii_hexdigit()) {
-        Ok(())
-    } else {
-        Err(format!(
-            "InvalidRequest: \"{token}\" is not an install token."
-        ))
+/// What `registry`'s own index says of `id` at `version`: its package's path, SHA-256 and size.
+fn index_entry(
+    registry: &Registry,
+    id: &str,
+    version: &str,
+) -> Result<(String, String, u64), String> {
+    let mut bytes = Vec::new();
+    fetch(
+        registry,
+        "index.json",
+        Kind::Text,
+        MAX_INDEX,
+        &mut |chunk| {
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        },
+    )?;
+    let index: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "UnexpectedContent: the registry's index is not JSON.".to_string())?;
+    let published = index["extensions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|one| {
+            one["id"]
+                .as_str()
+                .and_then(ide_workspace::extension_id::canonical_id)
+                .as_deref()
+                == Some(id)
+        })
+        .flat_map(|one| one["versions"].as_array().into_iter().flatten())
+        .find(|one| one["version"].as_str() == Some(version))
+        .ok_or_else(|| format!("NotFound: {id} {version} is not in the registry's index."))?;
+    match (
+        published["package"].as_str(),
+        published["sha256"].as_str(),
+        published["size"].as_u64(),
+    ) {
+        (Some(path), Some(sha256), Some(size)) => Ok((path.to_string(), sha256.to_string(), size)),
+        _ => Err(format!(
+            "NotFound: the registry's index has no package for {id} {version}."
+        )),
     }
 }
 
-/// Downloads (or copies), verifies and unpacks a package into `root/.staging/<token>/`.
+/// Downloads (or copies), verifies and unpacks a package as a new install operation of
+/// `expected_id` at `expected_version`, into the operation's own staging folder.
 pub fn stage(
-    root: &Path,
+    service: &ExtensionService,
     source: PackageSource,
     expected_id: &str,
     expected_version: &str,
 ) -> Result<Staged, String> {
-    if !extension_package::valid_id(expected_id) {
-        return Err(format!(
-            "InvalidRequest: \"{expected_id}\" is not an extension id."
-        ));
-    }
-    let staging = root.join(STAGING);
-    fs::create_dir_all(&staging).map_err(|e| format!("InstallFailed: {e}"))?;
-    let token = new_token();
-    let archive = staging.join(format!("{token}.yvx"));
+    let label = match &source {
+        PackageSource::Registry { registry_url, .. } => format!("registry {registry_url}"),
+        PackageSource::File { .. } => "file".to_string(),
+    };
+    let (op, folder) = service.begin(expected_id, expected_version, &label)?;
+    let archive = folder.join("package.yvx");
     let result = (|| {
         let (sha256, size) = match source {
             PackageSource::Registry {
@@ -419,13 +439,24 @@ pub fn stage(
                 sha256,
                 size,
             } => {
+                let registry = registry(&registry_url)?;
+                // The renderer names the package; the registry's index vouches for it.
+                let (indexed_path, indexed_sha256, indexed_size) =
+                    index_entry(&registry, expected_id, expected_version)?;
+                if indexed_path != path
+                    || !indexed_sha256.eq_ignore_ascii_case(&sha256)
+                    || indexed_size != size
+                {
+                    return Err(format!(
+                        "IntegrityFailed: the registry's index describes {expected_id} {expected_version} differently ({indexed_path}, {indexed_size} bytes, SHA-256 {indexed_sha256})."
+                    ));
+                }
                 if size > LIMITS.package {
                     return Err(format!(
                         "UnsafePackage: the registry says the package is {size} bytes (the limit is {}).",
                         LIMITS.package
                     ));
                 }
-                let registry = registry(&registry_url)?;
                 let mut file =
                     fs::File::create(&archive).map_err(|e| format!("InstallFailed: {e}"))?;
                 let mut hasher = Sha256::new();
@@ -459,103 +490,78 @@ pub fn stage(
                 (extension_package::sha256_file(&archive)?, meta.len())
             }
         };
-        let Unpacked {
-            manifest,
-            files,
-            bytes,
-        } = unpack(&archive, &staging.join(&token), &LIMITS)?;
-        let (id, version) = extension_package::identity(&manifest)?;
-        if id != expected_id {
-            return Err(format!(
-                "ManifestMismatch: the package is {id}, not {expected_id}."
-            ));
-        }
-        if !expected_version.is_empty() && version != expected_version {
-            return Err(format!(
-                "ManifestMismatch: the package is version {version}, not {expected_version}."
-            ));
-        }
-        Ok(Staged {
-            token: token.clone(),
-            manifest,
-            files,
-            bytes,
-            sha256,
-            package_size: size,
-        })
+        let Unpacked { files, bytes, .. } = unpack(&archive, &folder.join("files"), &LIMITS)?;
+        Ok((sha256, size, files, bytes))
     })();
     let _ = fs::remove_file(&archive);
-    if result.is_err() {
-        let _ = fs::remove_dir_all(staging.join(&token));
-    }
-    result
-}
-
-fn user_root(app: &AppHandle) -> Result<PathBuf, String> {
-    let root = roots(app)?.remove(0);
-    fs::create_dir_all(&root).map_err(|e| format!("InstallFailed: {e}"))?;
-    Ok(root)
+    let (sha256, package_size, files, bytes) = match result {
+        Ok(done) => done,
+        Err(error) => {
+            service.abort(&op);
+            return Err(error);
+        }
+    };
+    // The inventory checks that the unpacked manifest is the id and version asked for.
+    let manifest = service.staged(&op, &sha256)?;
+    Ok(Staged {
+        token: op,
+        manifest,
+        files,
+        bytes,
+        sha256,
+        package_size,
+    })
 }
 
 #[tauri::command(async)]
 pub fn extensions_stage(
-    app: AppHandle,
+    service: State<'_, ExtensionService>,
     source: PackageSource,
     expected_id: String,
     expected_version: String,
 ) -> Result<Staged, String> {
-    stage(&user_root(&app)?, source, &expected_id, &expected_version)
+    stage(&service, source, &expected_id, &expected_version)
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Committed {
-    folder: String,
-    replaced: bool,
-}
-
-/// Puts a staged package in place (the installed version, if any, is kept aside).
+/// Puts a staged package in place (the inventory's `commit`: the id is the staged manifest's,
+/// and `id` must name the same extension).
 #[tauri::command(async)]
-pub fn extensions_commit(app: AppHandle, token: String, id: String) -> Result<Committed, String> {
-    token_ok(&token)?;
-    let root = user_root(&app)?;
-    let staged = root.join(STAGING).join(&token);
-    if !staged.is_dir() {
-        return Err(format!("InvalidRequest: nothing is staged as {token}."));
-    }
-    let previous = commit(&root, &staged, &id, &token)?;
-    Ok(Committed {
-        folder: root.join(&id).to_string_lossy().into_owned(),
-        replaced: previous.is_some(),
-    })
+pub fn extensions_commit(
+    service: State<'_, ExtensionService>,
+    token: String,
+    id: String,
+) -> Result<Committed, String> {
+    service.commit(&token, &id)
 }
 
-/// Keeps the new installation (deleting the old one) or rolls back to the old one.
+/// Keeps the new installation or rolls back to the one before.
 #[tauri::command(async)]
 pub fn extensions_finish(
-    app: AppHandle,
+    service: State<'_, ExtensionService>,
     token: String,
     id: String,
     keep: bool,
 ) -> Result<(), String> {
-    token_ok(&token)?;
-    finish(&user_root(&app)?, &id, &token, keep)
+    service.finish(&token, &id, keep)
 }
 
 /// Throws a staged package away.
 #[tauri::command(async)]
-pub fn extensions_discard(app: AppHandle, token: String) -> Result<(), String> {
-    token_ok(&token)?;
-    let _ = fs::remove_dir_all(user_root(&app)?.join(STAGING).join(&token));
-    Ok(())
+pub fn extensions_discard(
+    service: State<'_, ExtensionService>,
+    token: String,
+) -> Result<(), String> {
+    operation_id_ok(&token)?;
+    service.discard(&token)
 }
 
-/// Deletes an installed extension's folder (Yavin's own extensions folder only).
+/// Uninstalls an extension from Yavin's extensions folder.
 #[tauri::command(async)]
-pub fn extensions_uninstall(app: AppHandle, id: String) -> Result<String, String> {
-    let root = user_root(&app)?;
-    recover(&root);
-    extension_package::uninstall(&root, &id).map(|folder| folder.to_string_lossy().into_owned())
+pub fn extensions_uninstall(
+    service: State<'_, ExtensionService>,
+    id: String,
+) -> Result<String, String> {
+    service.uninstall(&id)
 }
 
 #[cfg(test)]
@@ -565,6 +571,7 @@ mod tests {
     use crate::extensions::MANIFEST_FILE;
     use std::io::BufRead;
     use std::net::TcpListener;
+    use std::path::Path;
 
     #[test]
     fn registries_are_https_and_paths_stay_inside_them() {
@@ -743,12 +750,13 @@ mod tests {
         let index: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(index["schema"], 1);
         let root = temp("live-registry");
+        let service = ExtensionService::new(root.clone(), Vec::new());
         let mut installed = 0;
         for extension in index["extensions"].as_array().unwrap() {
             let id = extension["id"].as_str().unwrap();
             for version in extension["versions"].as_array().unwrap() {
                 let staged = stage(
-                    &root,
+                    &service,
                     PackageSource::Registry {
                         registry_url: OFFICIAL_REGISTRY.into(),
                         path: version["package"].as_str().unwrap().into(),
@@ -829,9 +837,17 @@ mod tests {
         ))
         .unwrap();
         let body = good.clone();
+        // The registry's index: what each case says the package is.
+        let index = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let served = index.clone();
         let base = serve(move |path| {
             let octet = vec![("Content-Type", "application/octet-stream".to_string())];
             match path {
+                "/registry/index.json" => (
+                    200,
+                    vec![("Content-Type", "application/json".into())],
+                    served.lock().unwrap().clone().into_bytes(),
+                ),
                 "/registry/good.yvx" => (200, octet, body.clone()),
                 "/registry/html.yvx" => (
                     200,
@@ -849,8 +865,12 @@ mod tests {
                 _ => (404, vec![], vec![]),
             }
         });
-        let root = dir.join("root");
-        fs::create_dir_all(&root).unwrap();
+        let describe = |id: &str, version: &str, path: &str, sha256: &str, size: u64| {
+            *index.lock().unwrap() = serde_json::json!({"schema": 1, "extensions": [{"id": id, "versions": [{"version": version, "package": path, "sha256": sha256, "size": size}]}]}).to_string();
+        };
+        let service = ExtensionService::new(dir.join("root"), Vec::new());
+        // Each case stages again at once, as if the one before had lost its window.
+        *service.abandoned_after.lock().unwrap() = Some(std::time::Duration::ZERO);
         let from = |path: &str, sha256: &str, size: u64| PackageSource::Registry {
             registry_url: base.clone(),
             path: path.into(),
@@ -858,69 +878,93 @@ mod tests {
             size,
         };
         let n = good.len() as u64;
+        describe("acme.hello", "1.0.0", "good.yvx", &sha(&good), n);
         let staged = stage(
-            &root,
+            &service,
             from("good.yvx", &sha(&good), n),
             "acme.hello",
             "1.0.0",
         )
         .unwrap();
         assert_eq!(staged.manifest, MANIFEST);
-        assert!(root
-            .join(STAGING)
+        let staging = dir.join("root").join(crate::extension_service::STAGING);
+        assert!(staging
             .join(&staged.token)
+            .join("files")
             .join("extension.js")
             .is_file());
         // A same-host redirect is followed.
+        describe("acme.hello", "1.0.0", "moved.yvx", &sha(&good), n);
         assert!(stage(
-            &root,
+            &service,
             from("moved.yvx", &sha(&good), n),
             "acme.hello",
             "1.0.0"
         )
         .is_ok());
-        for (source, why) in [
-            (from("good.yvx", &"0".repeat(64), n), "IntegrityFailed"),
-            (from("good.yvx", &sha(&good), n - 1), "TooLarge"),
-            (from("good.yvx", &sha(&good), n + 1), "IntegrityFailed"),
-            (from("html.yvx", &sha(&good), n), "UnexpectedContent"),
-            (from("away.yvx", &sha(&good), n), "UnexpectedRedirect"),
-            (from("missing.yvx", &sha(&good), n), "NotFound"),
-            (from("../good.yvx", &sha(&good), n), "OutsideRegistry"),
-            (
-                from("good.yvx", &sha(&good), LIMITS.package + 1),
-                "UnsafePackage",
-            ),
+        for (path, sha256, size, why) in [
+            ("good.yvx", "0".repeat(64), n, "IntegrityFailed"),
+            ("good.yvx", sha(&good), n - 1, "TooLarge"),
+            ("good.yvx", sha(&good), n + 1, "IntegrityFailed"),
+            ("html.yvx", sha(&good), n, "UnexpectedContent"),
+            ("away.yvx", sha(&good), n, "UnexpectedRedirect"),
+            ("missing.yvx", sha(&good), n, "NotFound"),
+            ("../good.yvx", sha(&good), n, "OutsideRegistry"),
+            ("good.yvx", sha(&good), LIMITS.package + 1, "UnsafePackage"),
         ] {
-            let error = stage(&root, source, "acme.hello", "1.0.0").unwrap_err();
+            describe("acme.hello", "1.0.0", path, &sha256, size);
+            let error =
+                stage(&service, from(path, &sha256, size), "acme.hello", "1.0.0").unwrap_err();
             assert!(error.starts_with(why), "{why}: {error}");
         }
+        // The renderer's word is not enough: the index must say the same.
+        describe("acme.hello", "1.0.0", "good.yvx", &sha(&good), n);
+        for (path, sha256, size) in [
+            ("good.yvx", "0".repeat(64), n),
+            ("good.yvx", sha(&good), n + 1),
+            ("moved.yvx", sha(&good), n),
+        ] {
+            let error =
+                stage(&service, from(path, &sha256, size), "acme.hello", "1.0.0").unwrap_err();
+            assert!(error.contains("index describes"), "{error}");
+        }
+        let unlisted = stage(
+            &service,
+            from("good.yvx", &sha(&good), n),
+            "acme.hello",
+            "3.0.0",
+        )
+        .unwrap_err();
+        assert!(unlisted.starts_with("NotFound"), "{unlisted}");
+        describe("acme.other", "1.0.0", "good.yvx", &sha(&good), n);
         let mismatch = stage(
-            &root,
+            &service,
             from("good.yvx", &sha(&good), n),
             "acme.other",
             "1.0.0",
         )
         .unwrap_err();
         assert!(mismatch.starts_with("ManifestMismatch"), "{mismatch}");
+        describe("acme.hello", "2.0.0", "good.yvx", &sha(&good), n);
         let version = stage(
-            &root,
+            &service,
             from("good.yvx", &sha(&good), n),
             "acme.hello",
             "2.0.0",
         )
         .unwrap_err();
         assert!(version.starts_with("ManifestMismatch"), "{version}");
-        // Nothing of a refused package is left in staging (only the two staged ones).
-        let left: Vec<_> = fs::read_dir(root.join(STAGING)).unwrap().collect();
-        assert_eq!(left.len(), 2);
+        // Nothing of a refused package is left in staging; a newer staging of the same id
+        // replaced the idle one before it.
+        let left: Vec<_> = fs::read_dir(&staging).unwrap().collect();
+        assert_eq!(left.len(), 0);
         let missing = stage(
-            &root,
+            &service,
             PackageSource::File {
                 path: dir.join("nope.yvx").to_string_lossy().into(),
             },
             "acme.hello",
-            "",
+            "1.0.0",
         )
         .unwrap_err();
         assert!(missing.starts_with("PackageMissing"), "{missing}");

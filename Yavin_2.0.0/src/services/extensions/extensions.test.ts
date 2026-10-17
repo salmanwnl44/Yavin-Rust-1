@@ -1136,3 +1136,71 @@ test("performance budgets: discovering 200 extensions, and a command's round tri
   assert.ok(p95 < 20, `command p95 ${p95} ms (budget 20)`);
   await m.dispose();
 });
+
+test("EXT-02 discovery: one entry per id with its shadowed copies; the inventory's verdict and disabled list hold", async () => {
+  const { discoverExtensions } = await import("./discovery.ts");
+  const t = setup();
+  const report = await discoverExtensions(t.registry, async () => ({
+    root: "C:/data/extensions",
+    skipped: 0,
+    disabled: ["acme.hello"],
+    extensions: [
+      {
+        folder: "C:/data/extensions/.store/acme.hello/2.1.0-0123abcd",
+        manifest: JSON.stringify(manifest({ main: undefined, version: "2.1.0" })),
+        error: null,
+        shadowed: [
+          {
+            folder: "C:/repo/extensions/samples/hello",
+            version: "2.0.0",
+            reason: "An installed copy takes precedence over a development copy.",
+          },
+        ],
+      },
+      // A copy the inventory cannot use is never registered, whatever its manifest says.
+      {
+        folder: "C:/data/extensions/acme.other",
+        manifest: JSON.stringify(manifest({ name: "other", main: undefined })),
+        error: "The installed acme.other 1.0.0 cannot be used: its folder is missing.",
+      },
+    ],
+  }));
+  assert.deepEqual([report.registered, report.rejected], [1, 1]);
+  const entry = t.registry.get("acme.hello")!;
+  assert.equal(entry.manifest.version, "2.1.0");
+  assert.equal(entry.enabled, false, "the inventory's disabled list");
+  assert.deepEqual(
+    entry.shadowed.map((copy) => copy.version),
+    ["2.0.0"],
+  );
+  assert.equal(t.registry.get("acme.other"), undefined);
+  assert.match(t.registry.getSnapshot().rejected[0].problems[0], /cannot be used/);
+});
+
+test("EXT-02 uninstall forgets the disabled state: a reinstall starts enabled", () => {
+  const storage = memoryStorage();
+  const settings = createSettingsRegistry([], storage);
+  const raw = manifest({ main: undefined });
+  const source = { kind: "folder" as const, path: "C:/x" };
+  const registry = createExtensionRegistry({ settings, storage });
+  registry.add(raw, source, "C:/x");
+  registry.setEnabled("acme.hello", false);
+  registry.remove("acme.hello"); // a Reload keeps it disabled
+  const reloaded = registry.add(raw, source, "C:/x");
+  assert.equal("enabled" in reloaded && reloaded.enabled, false);
+  registry.remove("acme.hello", { forget: true }); // an uninstall does not
+  const again = createExtensionRegistry({ settings: createSettingsRegistry([], storage), storage });
+  const reinstalled = again.add(raw, source, "C:/x");
+  assert.equal("enabled" in reinstalled && reinstalled.enabled, true);
+  // With the native inventory as the store, changes go there and nothing to this window's.
+  const saved: [string, boolean][] = [];
+  const native = createExtensionRegistry({
+    settings: createSettingsRegistry([], memoryStorage()),
+    storage: memoryStorage({ [DISABLED_KEY]: JSON.stringify({ version: 1, ids: ["acme.hello"] }) }),
+    persistEnabled: (id, enabled) => void saved.push([id, enabled]),
+  });
+  const added = native.add(raw, source, "C:/x");
+  assert.equal("enabled" in added && added.enabled, true, "the window's old list is not read");
+  native.setEnabled("acme.hello", false);
+  assert.deepEqual(saved, [["acme.hello", false]]);
+});

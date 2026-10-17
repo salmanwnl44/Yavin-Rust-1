@@ -5,8 +5,10 @@
  *
  * Identity is `publisher.name` -- never the display name -- and is the one key for the
  * extension everywhere: the registry, its activation, the commands, views and settings it
- * contributes (all namespaced by it), its storage, its output channel and its errors.
+ * contributes (all namespaced by it), its storage, its output channel and its errors. Its rule
+ * is `identity.ts`, the native side's too (EXT-02).
  */
+import { ID_PART, MAX_ID_PART } from "./identity.ts";
 
 /** The extension API this Yavin provides. Bumped on a breaking change to `api.ts`. */
 export const EXTENSION_API = "2.0.0";
@@ -131,7 +133,6 @@ export type ManifestResult =
   | { ok: true; manifest: ExtensionManifest; warnings: ManifestProblem[] }
   | { ok: false; problems: ManifestProblem[]; id: string | null };
 
-const NAME = /^[a-z0-9][a-z0-9-]{0,49}$/;
 const PART = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const SEMVER =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-.]+)?$/;
@@ -213,10 +214,13 @@ export function readManifest(value: unknown): ManifestResult {
       "manifestVersion",
       `This Yavin reads manifest version ${MANIFEST_VERSION}, not ${JSON.stringify(manifestVersion)}.`,
     );
-  if (typeof raw.publisher !== "string" || !NAME.test(raw.publisher))
-    error("publisher", 'Needs a publisher: lower-case letters, digits and "-" (at most 50).');
-  if (typeof raw.name !== "string" || !NAME.test(raw.name))
-    error("name", 'Needs a name: lower-case letters, digits and "-" (at most 50).');
+  if (typeof raw.publisher !== "string" || !ID_PART.test(raw.publisher))
+    error(
+      "publisher",
+      `Needs a publisher: lower-case letters, digits and "-" (at most ${MAX_ID_PART}).`,
+    );
+  if (typeof raw.name !== "string" || !ID_PART.test(raw.name))
+    error("name", `Needs a name: lower-case letters, digits and "-" (at most ${MAX_ID_PART}).`);
   const id =
     typeof raw.publisher === "string" && typeof raw.name === "string"
       ? `${raw.publisher}.${raw.name}`

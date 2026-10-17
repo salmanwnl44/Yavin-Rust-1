@@ -1,4 +1,5 @@
 pub mod durable;
+pub mod extension_id;
 pub mod file_tree;
 pub mod lsp_framing;
 pub mod lsp_process;

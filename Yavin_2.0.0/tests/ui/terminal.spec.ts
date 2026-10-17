@@ -89,6 +89,8 @@ async function desktop(
     unixShell?: boolean;
     /** Installed extensions' folders and manifest texts (IDE-07 discovery). */
     extensions?: { folder: string; manifest: string | null; error: string | null }[];
+    /** Copies of the sample the inventory shadows (EXT-02: it lists one entry per id). */
+    sampleShadowed?: { folder: string; version: string | null; reason: string }[];
     /** Installed extensions' code, by extension id, as the native side reads it (IDE-08). */
     extensionCode?: Record<string, string>;
     /** The marketplace (IDE-09): unreachable, slow to answer its index. */
@@ -714,6 +716,7 @@ async function desktop(
                     folder: setup.host.sampleFolder,
                     manifest: setup.host.sampleManifest,
                     error: null,
+                    shadowed: setup.sampleShadowed ?? [],
                   },
                 ],
                 skipped: 0,
@@ -3659,6 +3662,31 @@ test("filters: installed, a category from the marketplace, compatible only", asy
   await page.getByRole("menuitemcheckbox", { name: "Installed" }).click();
   await expect(view.getByRole("region", { name: "Marketplace results" })).toHaveCount(0);
   await expect(view.getByRole("region", { name: "Installed extensions" })).toBeVisible();
+});
+
+test("a duplicate extension is one card; its shadowed copy is named on the card and its page", async ({
+  page,
+}) => {
+  await desktop(page, {
+    sampleShadowed: [
+      {
+        folder: "C:/repo/extensions/samples/hello-world",
+        version: "2.0.0",
+        reason: "An installed copy takes precedence over a development copy.",
+      },
+    ],
+  });
+  const view = await extensionsView(page);
+  const installed = view.getByRole("region", { name: "Installed extensions" });
+  await expect(installed.getByLabel("1 installed")).toBeVisible();
+  await expect(installed).toContainText("Another copy is shadowed (version 2.0.0).");
+  await expect(view).not.toContainText("already registered");
+  await card(installed, "Hello World (sample)").click();
+  const details = page.getByRole("region", { name: "Extension: Hello World (sample)" });
+  await details.getByRole("tab", { name: "Information" }).click();
+  await expect(details.getByTestId("shadowed-copy")).toContainText(
+    "C:/repo/extensions/samples/hello-world (version 2.0.0) — An installed copy takes precedence",
+  );
 });
 
 test("an incompatible extension says why and cannot be installed", async ({ page }) => {

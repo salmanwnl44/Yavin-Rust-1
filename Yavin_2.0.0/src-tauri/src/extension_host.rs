@@ -6,14 +6,15 @@
 //! needs the folder to be trusted: extensions run their authors' code. The renderer speaks the
 //! extension protocol to it through `ext_host_send`; this layer adds one thing, and checks one:
 //!
-//! - a `load` names only an extension id; the code is read here, from the folder discovery
-//!   found for that id (`extensions::locate` / `read_main`: contained, bounded) -- the renderer
-//!   never supplies code, so it cannot make the host run something that is not an extension;
+//! - a `load` names only an extension id; the code is read here, from the folder the inventory
+//!   chose for that id (`ExtensionService::folder_of`, the copy the renderer was listed;
+//!   `read_main`: contained, bounded) -- the renderer never supplies code or a folder, so it
+//!   cannot make the host run something that is not the installed extension (EXT-02);
 //! - every message is bounded (1 MiB).
 //!
 //! The work is done by `ExtHostSessions` (no Tauri in it, so the real host is tested through
-//! the same code the application runs); the commands add trust, the extension roots and the
-//! window's events. Errors are `Code: message`, mapped by the renderer to `ExtensionError`.
+//! the same code the application runs); the commands add trust, the inventory's folder choice
+//! and the window's events. Errors are `Code: message`, mapped by the renderer to `ExtensionError`.
 //!
 //! **Where the host is.** Packaged as a bundle resource, like the search tool:
 //! `<resources>/resources/extension-host/yavin-extension-host(.exe)`, put there by
@@ -21,7 +22,8 @@
 //! also looks beside its own executable (the Cargo target folder) and in the source tree's
 //! resource folder. `YAVIN_EXTENSION_HOST` overrides all of them.
 
-use crate::extensions::{locate, read_main, roots};
+use crate::extension_service::ExtensionService;
+use crate::extensions::read_main;
 use crate::trust::{require_trust, Trust};
 use crate::Workspace;
 use ide_workspace::lsp_process::{ServerEvents, ServerProcess};
@@ -108,6 +110,9 @@ pub trait HostEvents: Send + Sync + 'static {
 
 type Live = Arc<Mutex<HashMap<u32, Arc<ServerProcess>>>>;
 
+/// The folder and entry point to load for an extension id (`ExtensionService::folder_of`).
+pub type FolderOf<'a> = dyn Fn(&str) -> Result<(PathBuf, String), String> + 'a;
+
 /// Every extension host Yavin started, by session number (never reused).
 #[derive(Default)]
 pub struct ExtHostSessions {
@@ -166,10 +171,11 @@ impl ExtHostSessions {
             .ok_or_else(|| "HostStopped: The extension host has stopped.".to_string())
     }
 
-    /// Sends one protocol message; a `load` gets its extension's code from `roots`.
-    pub fn send(&self, session: u32, message: &str, roots: &[PathBuf]) -> Result<(), String> {
+    /// Sends one protocol message; a `load` gets its extension's code from the folder
+    /// `folder_of` names for it (and the entry point its manifest names).
+    pub fn send(&self, session: u32, message: &str, folder_of: &FolderOf) -> Result<(), String> {
         let process = self.live(session)?;
-        let prepared = prepare(roots, message)?;
+        let prepared = prepare(folder_of, message)?;
         process
             .send(&prepared)
             .map_err(|why| format!("HostStopped: {why}"))
@@ -201,7 +207,7 @@ impl ExtHostSessions {
 }
 
 /// A `load` with the extension's code read here; any other message as it is.
-fn prepare(roots: &[PathBuf], message: &str) -> Result<String, String> {
+fn prepare(folder_of: &FolderOf<'_>, message: &str) -> Result<String, String> {
     if message.len() > MAX_MESSAGE {
         return Err(format!(
             "MessageTooLarge: {} bytes (the limit is {MAX_MESSAGE}).",
@@ -218,7 +224,7 @@ fn prepare(roots: &[PathBuf], message: &str) -> Result<String, String> {
         .and_then(Value::as_str)
         .ok_or("MalformedMessage: a load names its extension")?
         .to_string();
-    let (folder, main) = locate(roots, &id)?;
+    let (folder, main) = folder_of(&id)?;
     let code = read_main(&folder, &main)?;
     let object = value.as_object_mut().ok_or("MalformedMessage")?;
     object.insert("code".into(), Value::String(code));
@@ -282,12 +288,12 @@ pub async fn ext_host_start(
 /// Sends one protocol message to a host (framing is added by the process host).
 #[tauri::command(async)]
 pub fn ext_host_send(
-    app: AppHandle,
     sessions: State<'_, ExtHostSessions>,
+    extensions: State<'_, ExtensionService>,
     session: u32,
     message: String,
 ) -> Result<(), String> {
-    sessions.send(session, &message, &roots(&app)?)
+    sessions.send(session, &message, &|id| extensions.folder_of(id))
 }
 
 /// Ends a host and everything it started.

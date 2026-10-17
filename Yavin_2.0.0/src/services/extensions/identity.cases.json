@@ -1,0 +1,33 @@
+{
+  "comment": "Extension id parity cases (EXT-02), read by identity.test.ts and by Rust's extension_id tests: `canonical` is what canonicalId(input) returns (null: not an id). An id is canonical when it equals its own canonical form.",
+  "cases": [
+    { "input": "acme.hello", "canonical": "acme.hello" },
+    { "input": "yavin-samples.hello-world", "canonical": "yavin-samples.hello-world" },
+    { "input": "a1.b2", "canonical": "a1.b2" },
+    { "input": "0.9", "canonical": "0.9" },
+    { "input": "Acme.Hello", "canonical": "acme.hello" },
+    { "input": "ACME.HELLO", "canonical": "acme.hello" },
+    { "input": "", "canonical": null },
+    { "input": "acme", "canonical": null },
+    { "input": "acme.", "canonical": null },
+    { "input": ".hello", "canonical": null },
+    { "input": "acme.hello.x", "canonical": null },
+    { "input": "-acme.hello", "canonical": null },
+    { "input": "acme.-hello", "canonical": null },
+    { "input": "acme.hel_lo", "canonical": null },
+    { "input": "acme.hel lo", "canonical": null },
+    { "input": " acme.hello", "canonical": null },
+    { "input": "../x.y", "canonical": null },
+    { "input": "a\\b.c", "canonical": null },
+    { "input": "con.x/y", "canonical": null },
+    { "input": "acme.héllo", "canonical": null },
+    { "input": "acme.Kelvin", "canonical": null },
+    { "input": "İstanbul.x", "canonical": null },
+    {
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "canonical": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    { "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b", "canonical": null },
+    { "input": "a.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "canonical": null }
+  ]
+}

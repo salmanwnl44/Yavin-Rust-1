@@ -17,6 +17,7 @@ mod config;
 mod dap;
 mod extension_host;
 mod extension_package;
+mod extension_service;
 mod extensions;
 mod external;
 mod git;
@@ -37,7 +38,7 @@ use dap::{dap_send, dap_start, dap_stop, dap_stop_all, DapSessions};
 use extension_host::{
     ext_host_send, ext_host_start, ext_host_stop, ext_host_stop_all, ExtHostSessions,
 };
-use extensions::extensions_list;
+use extension_service::{extensions_list, extensions_set_enabled, ExtensionService};
 use external::open_external_url;
 use git::{
     git_cancel_repo, git_clone_repo, git_close_repo, git_exec, git_init_repo, git_open_repo,
@@ -684,10 +685,16 @@ pub fn run() {
         .manage(LspSessions::default())
         .manage(DapSessions::default())
         .manage(ExtHostSessions::default())
+        .manage(ExtensionService::default())
         .manage(Recovery::default())
         .manage(LocalGit::default())
         .setup(|app| {
             recover_at_startup(app.handle());
+            // The extension inventory (EXT-02): Yavin's extensions folder, and in development
+            // builds the repository's samples.
+            if let Ok((root, development)) = extension_service::paths_of(app.handle()) {
+                app.state::<ExtensionService>().set_paths(root, development);
+            }
             // Local Git lives in Yavin's private data, never in a project.
             if let Ok(folder) = app.path().app_local_data_dir() {
                 app.state::<LocalGit>().set_base(folder.join("local-git"));
@@ -825,6 +832,7 @@ pub fn run() {
             dap_stop,
             dap_stop_all,
             extensions_list,
+            extensions_set_enabled,
             ext_host_start,
             ext_host_send,
             ext_host_stop,

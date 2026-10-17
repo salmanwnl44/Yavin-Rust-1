@@ -102,14 +102,25 @@ interface Commands {
   ext_host_send: { args: { session: number; message: string }; result: void };
   ext_host_stop: { args: { session: number }; result: void };
   ext_host_stop_all: { args: Record<string, never>; result: void };
+  /** The extension inventory (EXT-02, `src-tauri/src/extension_service.rs`). */
   extensions_list: {
-    args: Record<string, never>;
+    args: { legacyDisabled?: string[] };
     result: {
       root: string;
-      extensions: { folder: string; manifest: string | null; error: string | null }[];
+      extensions: {
+        id: string | null;
+        folder: string;
+        manifest: string | null;
+        error: string | null;
+        source: "installed" | "development";
+        shadowed: { folder: string; version: string | null; reason: string }[];
+      }[];
       skipped: number;
+      disabled: string[];
+      recoveries: { at: number; id: string | null; reason: string }[];
     };
   };
+  extensions_set_enabled: { args: { id: string; enabled: boolean }; result: void };
   // --- Extension marketplace and installer (IDE-09) ---
   marketplace_default_registry: { args: Record<string, never>; result: string };
   marketplace_get_text: { args: { registryUrl: string; path: string }; result: string };

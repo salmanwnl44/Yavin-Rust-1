@@ -15,10 +15,9 @@
 //! - unpacked only into a fresh folder this code created, with `create_new`, so nothing that
 //!   was already there -- a link included -- is ever written through.
 //!
-//! Putting a package in place never overwrites a working installation before the new one is
-//! complete: the current folder is moved aside, the new one moved in, and the old one either
-//! deleted once Yavin has registered the new one or moved back (`finish`). A crash in between
-//! is repaired on the next discovery (`recover`).
+//! Putting a package in place, and every later change to what is installed, is the
+//! inventory's (`extension_service.rs`, EXT-02): an unpacked package becomes a new, immutable
+//! store copy; nothing installed is ever overwritten.
 //!
 //! No extension code is run here, or anywhere in installing.
 
@@ -26,9 +25,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::extensions::{discover, MANIFEST_FILE};
+use crate::extensions::MANIFEST_FILE;
+use ide_workspace::extension_id::is_canonical;
 
 /// Limits on a package. Yavin's own constraints set them: an entry point is at most 2 MiB
 /// (`read_main`) and a manifest 64 KiB, so a package is code plus assets (icon, readme,
@@ -56,10 +56,6 @@ pub const LIMITS: Limits = Limits {
 };
 /// Below this, an entry's ratio is not checked (tiny highly-compressible files are normal).
 const RATIO_FLOOR: u64 = 1024 * 1024;
-
-/// Folders in the extensions root that are Yavin's, not extensions (discovery skips them).
-pub const STAGING: &str = ".staging";
-pub const PREVIOUS: &str = ".previous";
 
 /// What a validated, unpacked package holds.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -319,7 +315,8 @@ fn unpack_inner(package: &Path, destination: &Path, limits: &Limits) -> Result<U
     })
 }
 
-/// `publisher.name` and `version` of a manifest's text.
+/// `publisher.name` and `version` of a manifest's text. The id must already be canonical
+/// (Yavin's one id rule, `ide_workspace::extension_id`) and the version usable in a folder name.
 pub fn identity(manifest: &str) -> Result<(String, String), String> {
     let value: serde_json::Value = serde_json::from_str(manifest)
         .map_err(|e| format!("InvalidPackage: its {MANIFEST_FILE} is not JSON ({e})"))?;
@@ -330,142 +327,39 @@ pub fn identity(manifest: &str) -> Result<(String, String), String> {
             .map(str::to_string)
             .ok_or_else(|| format!("InvalidPackage: its {MANIFEST_FILE} has no \"{name}\""))
     };
-    Ok((
-        format!("{}.{}", field("publisher")?, field("name")?).to_lowercase(),
-        field("version")?,
-    ))
-}
-
-/// An extension id that is safe as a folder name (`publisher.name`, lower case).
-pub fn valid_id(id: &str) -> bool {
-    let parts: Vec<_> = id.split('.').collect();
-    parts.len() == 2
-        && parts.iter().all(|part| {
-            !part.is_empty()
-                && part.len() <= 64
-                && part
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-                && !part.starts_with('-')
-        })
-}
-
-/// The installed folder of `id` in `root` (the user's extensions), found by its manifest.
-pub fn installed_folder(root: &Path, id: &str) -> Option<PathBuf> {
-    discover(root).extensions.into_iter().find_map(|found| {
-        let manifest = found.manifest?;
-        (identity(&manifest).ok()?.0 == id).then(|| PathBuf::from(found.folder))
-    })
-}
-
-/// Puts an unpacked package (`staged`) in place as `<root>/<id>`. An installation already
-/// there is moved aside into `<root>/.previous/`, not deleted: `finish` deletes it once the
-/// new one is registered, or moves it back. Returns where the previous one went, if any.
-pub fn commit(
-    root: &Path,
-    staged: &Path,
-    id: &str,
-    token: &str,
-) -> Result<Option<PathBuf>, String> {
-    if !valid_id(id) {
-        return Err(format!("InvalidPackage: \"{id}\" is not an extension id"));
-    }
-    let target = root.join(id);
-    let current = installed_folder(root, id);
-    let mut previous = None;
-    if let Some(current) = current {
-        let aside_root = root.join(PREVIOUS);
-        fs::create_dir_all(&aside_root).map_err(|e| format!("InstallFailed: {e}"))?;
-        let aside = aside_root.join(format!("{id}-{token}"));
-        fs::rename(&current, &aside).map_err(|e| {
-            format!("InstallFailed: the installed version could not be moved aside ({e}); is it in use?")
-        })?;
-        previous = Some(aside);
-    }
-    if let Err(error) = fs::rename(staged, &target) {
-        // Put the working installation back before reporting.
-        if let Some(aside) = &previous {
-            let _ = fs::rename(aside, &target);
-        }
-        return Err(format!("InstallFailed: {error}"));
-    }
-    Ok(previous)
-}
-
-/// After `commit`: `keep` the new installation (the previous one is deleted) or roll back to
-/// the previous one (the new one is deleted; with no previous, the extension is uninstalled).
-pub fn finish(root: &Path, id: &str, token: &str, keep: bool) -> Result<(), String> {
-    if !valid_id(id) {
-        return Err(format!("InvalidPackage: \"{id}\" is not an extension id"));
-    }
-    let aside = root.join(PREVIOUS).join(format!("{id}-{token}"));
-    if keep {
-        if aside.exists() {
-            fs::remove_dir_all(&aside).map_err(|e| format!("CleanupFailed: {e}"))?;
-        }
-        return Ok(());
-    }
-    let target = root.join(id);
-    if target.exists() {
-        fs::remove_dir_all(&target).map_err(|e| format!("RollbackFailed: {e}"))?;
-    }
-    if aside.exists() {
-        fs::rename(&aside, &target).map_err(|e| format!("RollbackFailed: {e}"))?;
-    }
-    Ok(())
-}
-
-/// Deletes the user's installation of `id` (never anything outside `root`).
-pub fn uninstall(root: &Path, id: &str) -> Result<PathBuf, String> {
-    let folder = installed_folder(root, id).ok_or_else(|| {
-        format!("UnknownExtension: {id} is not installed in Yavin's extensions folder.")
-    })?;
-    let base = root
-        .canonicalize()
-        .map_err(|e| format!("UninstallFailed: {e}"))?;
-    let real = folder
-        .canonicalize()
-        .map_err(|e| format!("UninstallFailed: {e}"))?;
-    if real.parent() != Some(base.as_path()) {
+    let id = format!("{}.{}", field("publisher")?, field("name")?);
+    if !is_canonical(&id) {
         return Err(format!(
-            "UninstallFailed: {} is not inside Yavin's extensions folder.",
-            folder.display()
+            "InvalidPackage: \"{id}\" is not an extension id (publisher.name: lower-case letters, digits and \"-\", each part at most 50)"
         ));
     }
-    // `remove_dir_all` does not follow links inside the folder: only the folder's own files go.
-    fs::remove_dir_all(&folder).map_err(|e| format!("UninstallFailed: {e}"))?;
-    Ok(folder)
+    let version = field("version")?;
+    version_ok(&version)?;
+    Ok((id, version))
 }
 
-/// Repairs what an interrupted install left: staging folders are deleted; an installation
-/// moved aside whose replacement never arrived is moved back, and one whose replacement did
-/// is deleted.
-pub fn recover(root: &Path) {
-    let _ = fs::remove_dir_all(root.join(STAGING));
-    let Ok(entries) = fs::read_dir(root.join(PREVIOUS)) else {
-        return;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // `<id>-<token>`: the id is everything before the last `-`.
-        let Some((id, _)) = name.rsplit_once('-') else {
-            continue;
-        };
-        if !valid_id(id) {
-            continue;
-        }
-        if installed_folder(root, id).is_some() {
-            let _ = fs::remove_dir_all(entry.path());
-        } else {
-            let _ = fs::rename(entry.path(), root.join(id));
-        }
+/// A version Yavin can name a store folder after: 1 to 64 of `0-9 A-Z a-z . + -`, starting
+/// with a digit (a semantic version always does; the renderer checks the rest).
+pub fn version_ok(version: &str) -> Result<(), String> {
+    let ok = (1..=64).contains(&version.len())
+        && version.starts_with(|c: char| c.is_ascii_digit())
+        && !version.ends_with('.')
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+.-".contains(&b));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "InvalidPackage: \"{version}\" is not a version Yavin can install"
+        ))
     }
-    let _ = fs::remove_dir(root.join(PREVIOUS));
 }
 
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use std::path::PathBuf;
     use zip::write::SimpleFileOptions;
 
     pub fn temp(name: &str) -> PathBuf {
@@ -632,110 +526,24 @@ pub mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    fn installed(root: &Path, folder: &str, version: &str) {
-        let dir = root.join(folder);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(MANIFEST_FILE), MANIFEST.replace("1.0.0", version)).unwrap();
-    }
-
-    fn version_of(root: &Path) -> String {
-        identity(&fs::read_to_string(root.join("acme.hello").join(MANIFEST_FILE)).unwrap())
-            .unwrap()
-            .1
-    }
-
     #[test]
-    fn an_update_keeps_the_working_version_until_finished_and_rolls_back() {
-        let root = temp("update");
-        installed(&root, "acme.hello", "1.0.0");
-        let staged = root.join(STAGING).join("t1");
-        fs::create_dir_all(&staged).unwrap();
-        fs::write(
-            staged.join(MANIFEST_FILE),
-            MANIFEST.replace("1.0.0", "2.0.0"),
-        )
-        .unwrap();
-        let previous = commit(&root, &staged, "acme.hello", "t1").unwrap().unwrap();
-        assert!(
-            previous.join(MANIFEST_FILE).is_file(),
-            "the old version is kept aside"
+    fn a_manifests_id_must_be_canonical_and_its_version_a_folder_name() {
+        assert_eq!(
+            identity(MANIFEST).unwrap(),
+            ("acme.hello".into(), "1.0.0".into())
         );
-        assert_eq!(version_of(&root), "2.0.0");
-        // Discovery sees one acme.hello: the folders Yavin keeps aside are not extensions.
-        let found: Vec<_> = discover(&root)
-            .extensions
-            .into_iter()
-            .filter_map(|f| f.manifest)
-            .collect();
-        assert_eq!(found.len(), 1);
-        finish(&root, "acme.hello", "t1", false).unwrap();
-        assert_eq!(version_of(&root), "1.0.0", "rolled back");
-
-        let staged = root.join(STAGING).join("t2");
-        fs::create_dir_all(&staged).unwrap();
-        fs::write(
-            staged.join(MANIFEST_FILE),
-            MANIFEST.replace("1.0.0", "2.0.0"),
-        )
-        .unwrap();
-        commit(&root, &staged, "acme.hello", "t2").unwrap();
-        finish(&root, "acme.hello", "t2", true).unwrap();
-        assert_eq!(version_of(&root), "2.0.0");
-        assert!(
-            !root.join(PREVIOUS).join("acme.hello-t2").exists(),
-            "cleaned up"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn an_interrupted_update_is_repaired_on_recovery() {
-        let root = temp("recover");
-        // Moved aside, replacement never arrived: moved back.
-        fs::create_dir_all(root.join(PREVIOUS)).unwrap();
-        installed(&root.join(PREVIOUS), "acme.hello-t9", "1.0.0");
-        fs::create_dir_all(root.join(STAGING).join("junk")).unwrap();
-        recover(&root);
-        assert_eq!(version_of(&root), "1.0.0");
-        assert!(!root.join(STAGING).exists());
-        // Replacement arrived: the old one is deleted.
-        installed(&root.join(PREVIOUS), "acme.hello-t10", "0.9.0");
-        recover(&root);
-        assert_eq!(version_of(&root), "1.0.0");
-        assert!(!root.join(PREVIOUS).exists());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn uninstall_removes_only_the_extension_folder_inside_the_root() {
-        let root = temp("uninstall");
-        installed(&root, "hello-any-name", "1.0.0");
-        fs::write(root.join("keep.txt"), "x").unwrap();
-        let removed = uninstall(&root, "acme.hello").unwrap();
-        assert!(!removed.exists());
-        assert!(root.join("keep.txt").exists());
-        assert!(uninstall(&root, "acme.hello")
-            .unwrap_err()
-            .starts_with("UnknownExtension"));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn ids_are_checked_before_they_become_folder_names() {
-        for good in ["acme.hello", "yavin-samples.hello-world", "a1.b2"] {
-            assert!(valid_id(good), "{good}");
-        }
         for bad in [
-            "acme",
-            "../x.y",
-            "acme.hello.x",
-            "Acme.hello",
-            "acme.",
-            ".hello",
-            "a\\b.c",
-            "con.x/y",
+            MANIFEST.replace("acme", "Acme"),
+            MANIFEST.replace("hello", "../x"),
+            MANIFEST.replace("hello", &"h".repeat(51)),
+            MANIFEST.replace("1.0.0", "1.0.0/../../x"),
+            MANIFEST.replace("1.0.0", "v1"),
         ] {
-            assert!(!valid_id(bad), "{bad}");
+            assert!(
+                identity(&bad).unwrap_err().starts_with("InvalidPackage"),
+                "{bad}"
+            );
         }
+        assert!(identity(&MANIFEST.replace("hello", &"h".repeat(50))).is_ok());
     }
 }

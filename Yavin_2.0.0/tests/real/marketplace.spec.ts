@@ -118,13 +118,27 @@ async function timed<T>(what: string, step: () => Promise<T>): Promise<T> {
   return result;
 }
 
-const installedFolder = (id: string) => join(EXTENSIONS, id);
+/** The inventory's record of `id` (EXT-02: `extensions/inventory.json`), if any. */
+const recordOf = (id: string) => {
+  const file = join(EXTENSIONS, "inventory.json");
+  if (!existsSync(file)) return undefined;
+  return (
+    JSON.parse(readFileSync(file, "utf8")) as {
+      extensions: Record<
+        string,
+        { active: { folder: string }; previous: { version: string } | null }
+      >;
+    }
+  ).extensions[id];
+};
+/** The folder the inventory uses for `id` (its store copy), or where none would be. */
+const installedFolder = (id: string) =>
+  join(EXTENSIONS, ...(recordOf(id)?.active.folder.split("/") ?? [".store", id]));
+/** Install operations' leftovers: staging, and IDE-09's set-aside folder. */
 const leftovers = () =>
-  existsSync(EXTENSIONS)
-    ? readdirSync(EXTENSIONS).filter(
-        (name) => name.startsWith(".") && readdirSync(join(EXTENSIONS, name)).length,
-      )
-    : [];
+  [".staging", ".previous"].filter(
+    (name) => existsSync(join(EXTENSIONS, name)) && readdirSync(join(EXTENSIONS, name)).length,
+  );
 
 test("a real package from Yavin's registry: installed through the installer, run by the real host", async () => {
   const running = await start();
@@ -222,7 +236,9 @@ test("an update: Hello World 2.0.0 installed, 2.1.0 found and installed; the new
         ),
       ).version,
     ).toBe("2.1.0");
-    expect(leftovers()).toEqual([]); // the previous version was cleaned up
+    expect(leftovers()).toEqual([]);
+    // The version it replaced is kept as the fallback (EXT-02).
+    expect(recordOf("yavin-samples.hello-world")?.previous?.version).toBe("2.0.0");
     await palette(page, "Hello World: Say Hello");
     await expect(message(page)).toContainText("Hello, world! (greeting 2)"); // its state carried over
     await close(running);
@@ -249,6 +265,7 @@ test("uninstall: the folder is deleted, the command is gone", async () => {
       .getByRole("option", { name: /^Uninstall Keep/ })
       .click();
     await expect(installed.getByRole("group", { name: "TODO Highlighter" })).toHaveCount(0);
+    expect(recordOf("yavin.todo-highlighter")).toBeUndefined();
     expect(existsSync(installedFolder("yavin.todo-highlighter"))).toBe(false);
     await page.keyboard.press("Control+Shift+P");
     await page

@@ -137,7 +137,16 @@ export const breakpoints = createBreakpointRegistry();
  * The window's extensions (IDE-07): which are known and enabled, and what they contribute
  * (`extensions/registry.ts`). Their settings go to `settings` above, which stays their owner.
  */
-export const extensionRegistry = createExtensionRegistry({ settings });
+export const extensionRegistry = createExtensionRegistry({
+  settings,
+  // The desktop app keeps enabled state in the native extension inventory (EXT-02).
+  persistEnabled: isTauri()
+    ? (id, enabled) =>
+        void native("extensions_set_enabled", { id, enabled }).catch((error) =>
+          console.warn(`${id}: its enabled state was not saved: ${String(error)}`),
+        )
+    : undefined,
+});
 /** Extensions' own state, per extension and scope (`extensions/storage.ts`). */
 export const extensionStorage = createExtensionStorage(undefined, (id, message) =>
   console.warn(`${id}: ${message}`),
