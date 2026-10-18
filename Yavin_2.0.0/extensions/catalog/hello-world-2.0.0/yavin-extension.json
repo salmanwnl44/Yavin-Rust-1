@@ -1,0 +1,62 @@
+{
+  "publisher": "yavin-samples",
+  "name": "hello-world",
+  "displayName": "Hello World (sample)",
+  "version": "2.0.0",
+  "description": "A sample extension: greets, remembers its greetings, lists them, and explains words on hover.",
+  "engines": { "yavin": "^2.0.0" },
+  "main": "extension.js",
+  "activationEvents": ["onCommand:yavin-samples.hello-world.greet", "onLanguage:markdown"],
+  "contributes": {
+    "commands": [
+      {
+        "command": "yavin-samples.hello-world.greet",
+        "title": "Say Hello",
+        "category": "Hello World"
+      },
+      {
+        "command": "yavin-samples.hello-world.reset",
+        "title": "Reset Greetings",
+        "category": "Hello World"
+      },
+      {
+        "command": "yavin-samples.hello-world.describe",
+        "title": "Describe Active File",
+        "category": "Hello World"
+      }
+    ],
+    "keybindings": [{ "command": "yavin-samples.hello-world.greet", "key": "Mod+Alt+h" }],
+    "configuration": {
+      "properties": {
+        "yavin-samples.hello-world.name": {
+          "type": "string",
+          "default": "world",
+          "description": "Who the sample greets."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [{ "id": "yavin-samples.hello-world.home", "title": "Hello World" }]
+    },
+    "views": [
+      { "id": "yavin-samples.hello-world.greetings", "name": "Greetings", "location": "sidebar" },
+      {
+        "id": "yavin-samples.hello-world.about",
+        "name": "About",
+        "container": "yavin-samples.hello-world.home"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "yavin-samples.hello-world.reset",
+          "view": "yavin-samples.hello-world.greetings"
+        }
+      ],
+      "editor/context": [
+        { "command": "yavin-samples.hello-world.describe", "when": "resourceExtname == .md" }
+      ],
+      "explorer/context": [{ "command": "yavin-samples.hello-world.greet" }]
+    }
+  }
+}

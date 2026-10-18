@@ -1,0 +1,544 @@
+{
+  "about": "EXT-07: the extension permission rules, shared by the native side (extension_permissions.rs) and the renderer (permissions.ts). Both are tested against this file.",
+  "declarations": [
+    {
+      "about": "no permissions field, with code: an extension made before EXT-07 (legacy)",
+      "manifest": {
+        "main": "extension.js"
+      },
+      "ok": true,
+      "legacy": true,
+      "requested": ["documents.read", "editor.control", "workspace.fs.read"]
+    },
+    {
+      "about": "no permissions field and no code (a declarative extension): nothing to ask for",
+      "manifest": {},
+      "ok": true,
+      "legacy": true,
+      "requested": []
+    },
+    {
+      "about": "an empty request: nothing optional",
+      "manifest": {
+        "permissions": {
+          "version": 1,
+          "request": []
+        }
+      },
+      "ok": true,
+      "legacy": false,
+      "requested": []
+    },
+    {
+      "about": "every capability, sorted on the way out",
+      "manifest": {
+        "permissions": {
+          "version": 1,
+          "request": [
+            "workspace.fs.read",
+            "commands.execute:acme.other",
+            "documents.read",
+            "editor.control"
+          ]
+        }
+      },
+      "ok": true,
+      "legacy": false,
+      "requested": [
+        "commands.execute:acme.other",
+        "documents.read",
+        "editor.control",
+        "workspace.fs.read"
+      ]
+    },
+    {
+      "about": "a command target is folded to its canonical id",
+      "manifest": {
+        "permissions": {
+          "version": 1,
+          "request": ["commands.execute:Acme.Other"]
+        }
+      },
+      "ok": true,
+      "legacy": false,
+      "requested": ["commands.execute:acme.other"]
+    },
+    {
+      "about": "an unknown capability",
+      "manifest": {
+        "permissions": {
+          "version": 1,
+          "request": ["network.fetch"]
+        }
+      },
+      "ok": false
+    },
+    {
+      "about": "a capability with different case is not a capability",
+      "manifest": {
+        "permissions": {
+          "version": 1,
+          "request": ["Documents.Read"]
+        }
+      },
+      "ok": false
+    },
+    {
+      "about": "a newer permission model",
+      "manifest": {
+        "permissions": {
+          "version": 2,
+          "request": []
+        }
+      },
+      "ok": false
+    },
+    {
+      "about": "no version",
+      "manifest": {
+        "permissions": {
+          "request": ["documents.read"]
+        }
+      },
+      "ok": false
+    },
+    {
+      "about": "a version that is not a whole number",
+      "manifest": {
+        "permissions": {
+          "version": "1",
+          "request": []
+        }
+      },
+      "ok": false
+    },
+    {
+      "about": "a request that is not a list",
+      "manifest": {
+        "permissions": {
+          "version": 1,
+          "request": "documents.read"
+        }
+      },
+      "ok": false
+    },
+    {
+      "about": "no request",
+      "manifest": {
+        "permissions": {
+          "version": 1
+        }
+      },
+      "ok": false
+    },
+    {
+      "about": "a field the model does not know",
+      "manifest": {
+        "permissions": {
+          "version": 1,
+          "request": [],
+          "grant": ["documents.read"]
+        }
+      },
+      "ok": false
+    },
+    {
+      "about": "permissions that are not an object",
+      "manifest": {
+        "permissions": ["documents.read"]
+      },
+      "ok": false
+    },
+    {
+      "about": "permissions: null is not an absent field",
+      "manifest": {
+        "permissions": null
+      },
+      "ok": false
+    },
+    {
+      "about": "a capability listed twice",
+      "manifest": {
+        "permissions": {
+          "version": 1,
+          "request": ["documents.read", "documents.read"]
+        }
+      },
+      "ok": false
+    },
+    {
+      "about": "a capability that is not a string",
+      "manifest": {
+        "permissions": {
+          "version": 1,
+          "request": [7]
+        }
+      },
+      "ok": false
+    },
+    {
+      "about": "a command target that is not an extension id",
+      "manifest": {
+        "permissions": {
+          "version": 1,
+          "request": ["commands.execute:acme"]
+        }
+      },
+      "ok": false
+    },
+    {
+      "about": "a command target of every extension",
+      "manifest": {
+        "permissions": {
+          "version": 1,
+          "request": ["commands.execute:*"]
+        }
+      },
+      "ok": false
+    },
+    {
+      "about": "commands.execute without a target",
+      "manifest": {
+        "permissions": {
+          "version": 1,
+          "request": ["commands.execute"]
+        }
+      },
+      "ok": false
+    },
+    {
+      "about": "an extension's own commands need no capability",
+      "manifest": {
+        "permissions": {
+          "version": 1,
+          "request": ["commands.execute:acme.hello"]
+        }
+      },
+      "ok": false
+    },
+    {
+      "about": "too many capabilities",
+      "manifest": {
+        "permissions": {
+          "version": 1,
+          "request": [
+            "commands.execute:a.a",
+            "commands.execute:a.b",
+            "commands.execute:a.c",
+            "commands.execute:a.d",
+            "commands.execute:a.e",
+            "commands.execute:a.f",
+            "commands.execute:a.g",
+            "commands.execute:a.h",
+            "commands.execute:a.i",
+            "commands.execute:a.j",
+            "commands.execute:a.k",
+            "commands.execute:a.l",
+            "commands.execute:a.m",
+            "commands.execute:a.n",
+            "commands.execute:a.o",
+            "commands.execute:a.p",
+            "commands.execute:a.q"
+          ]
+        }
+      },
+      "ok": false
+    }
+  ],
+  "requests": [
+    {
+      "method": "commands.register",
+      "params": {
+        "id": "acme.hello.greet"
+      },
+      "need": "none"
+    },
+    {
+      "method": "commands.register",
+      "params": {
+        "id": "acme.other.greet"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "commands.register",
+      "params": {
+        "id": "acme.hellothere.x"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "commands.register",
+      "params": {},
+      "need": "invalid"
+    },
+    {
+      "method": "commands.unregister",
+      "params": {
+        "id": "acme.hello.greet"
+      },
+      "need": "none"
+    },
+    {
+      "method": "commands.unregister",
+      "params": {
+        "id": "acme.other.greet"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "commands.execute",
+      "params": {
+        "id": "acme.hello.greet"
+      },
+      "need": "none"
+    },
+    {
+      "method": "commands.execute",
+      "params": {
+        "id": "acme.other.greet"
+      },
+      "need": "commands.execute:acme.other"
+    },
+    {
+      "method": "commands.execute",
+      "params": {
+        "id": "Acme.Other.greet"
+      },
+      "need": "commands.execute:acme.other"
+    },
+    {
+      "method": "commands.execute",
+      "params": {
+        "id": "workbench.open"
+      },
+      "need": "invalid"
+    },
+    {
+      "method": "commands.execute",
+      "params": {
+        "id": 3
+      },
+      "need": "invalid"
+    },
+    {
+      "method": "window.showMessage",
+      "params": {
+        "message": "hi"
+      },
+      "need": "none"
+    },
+    {
+      "method": "storage.update",
+      "params": {
+        "key": "k",
+        "value": 1
+      },
+      "need": "none"
+    },
+    {
+      "method": "events.subscribe",
+      "params": {
+        "event": "configuration.changed"
+      },
+      "need": "none"
+    },
+    {
+      "method": "events.subscribe",
+      "params": {
+        "event": "documents.open"
+      },
+      "need": "none"
+    },
+    {
+      "method": "events.subscribe",
+      "params": {
+        "event": "documents.change"
+      },
+      "need": "none"
+    },
+    {
+      "method": "events.subscribe",
+      "params": {
+        "event": "documents.close"
+      },
+      "need": "none"
+    },
+    {
+      "method": "events.subscribe",
+      "params": {
+        "event": "editor.active"
+      },
+      "need": "none"
+    },
+    {
+      "method": "events.subscribe",
+      "params": {
+        "event": "network.data"
+      },
+      "need": "invalid"
+    },
+    {
+      "method": "views.register",
+      "params": {
+        "id": "acme.hello.list"
+      },
+      "need": "none"
+    },
+    {
+      "method": "views.register",
+      "params": {
+        "id": "acme.other.list"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "views.refresh",
+      "params": {
+        "id": "acme.hello.list"
+      },
+      "need": "none"
+    },
+    {
+      "method": "views.refresh",
+      "params": {
+        "id": "acme.other.list"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "views.unregister",
+      "params": {
+        "id": "acme.hello.list"
+      },
+      "need": "none"
+    },
+    {
+      "method": "languages.register",
+      "params": {
+        "providerId": "acme.hello#hover#1"
+      },
+      "need": "none"
+    },
+    {
+      "method": "languages.register",
+      "params": {
+        "providerId": "acme.other#hover#1"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "languages.unregister",
+      "params": {
+        "providerId": "acme.hello#hover#1"
+      },
+      "need": "none"
+    },
+    {
+      "method": "editor.setDecorations",
+      "params": {
+        "uri": "file:///c:/w/a.ts",
+        "key": "k"
+      },
+      "need": "none"
+    },
+    {
+      "method": "documents.all",
+      "params": {},
+      "need": "documents.read"
+    },
+    {
+      "method": "documents.get",
+      "params": {
+        "uri": "file:///c:/w/a.ts"
+      },
+      "need": "documents.read"
+    },
+    {
+      "method": "documents.getText",
+      "params": {
+        "uri": "file:///c:/w/a.ts"
+      },
+      "need": "documents.read"
+    },
+    {
+      "method": "editor.active",
+      "params": {},
+      "need": "documents.read"
+    },
+    {
+      "method": "editor.openLocation",
+      "params": {
+        "uri": "file:///c:/w/a.ts"
+      },
+      "need": "editor.control"
+    },
+    {
+      "method": "editor.setSelection",
+      "params": {},
+      "need": "editor.control"
+    },
+    {
+      "method": "editor.revealRange",
+      "params": {},
+      "need": "editor.control"
+    },
+    {
+      "method": "fs.readFile",
+      "params": {
+        "path": "a.ts"
+      },
+      "need": "workspace.fs.read"
+    },
+    {
+      "method": "fs.exists",
+      "params": {
+        "path": "a.ts"
+      },
+      "need": "workspace.fs.read"
+    },
+    {
+      "method": "fs.writeFile",
+      "params": {
+        "path": "a.ts"
+      },
+      "need": "unknown"
+    },
+    {
+      "method": "process.spawn",
+      "params": {},
+      "need": "unknown"
+    },
+    {
+      "method": "",
+      "params": {},
+      "need": "unknown"
+    }
+  ],
+  "events": [
+    {
+      "event": "configuration.changed",
+      "need": "none"
+    },
+    {
+      "event": "documents.open",
+      "need": "documents.read"
+    },
+    {
+      "event": "documents.change",
+      "need": "documents.read"
+    },
+    {
+      "event": "documents.close",
+      "need": "documents.read"
+    },
+    {
+      "event": "editor.active",
+      "need": "documents.read"
+    },
+    {
+      "event": "documents.opened",
+      "need": "invalid"
+    }
+  ]
+}

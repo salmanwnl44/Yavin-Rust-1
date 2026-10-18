@@ -211,10 +211,10 @@ test("Yavin's published registry index reads cleanly: every extension, version a
   const hello = index.entries.get("yavin-samples.hello-world")!;
   assert.deepEqual(
     hello.extension.versions.map((v) => v.version),
-    ["2.1.0", "2.0.0"],
+    ["2.1.1", "2.1.0", "2.0.1", "2.0.0"],
     "newest first",
   );
-  assert.equal(hello.extension.version, "2.1.0");
+  assert.equal(hello.extension.version, "2.1.1");
   assert.equal(hello.extension.extensionKind, "code");
   assert.ok(hello.extension.hasIcon && hello.extension.hasReadme && hello.extension.hasChangelog);
   assert.ok(

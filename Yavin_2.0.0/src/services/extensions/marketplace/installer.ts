@@ -16,6 +16,12 @@
  *   5. the new one is registered; if that fails, the old folder is moved back and the registry
  *      re-read (rollback); if it succeeds, the old folder is deleted (`extensions_finish`).
  *
+ * Permissions (EXT-07): a package that declares capabilities is reviewed before it is put in
+ * place (`consent`): the user allows what they choose, or nothing, or cancels the install. What
+ * they allowed is granted -- natively, for the new copy -- once it is installed; an update is
+ * granted nothing of what the version before it had. A legacy package (no declaration) is not
+ * asked about here: its page says what it may need, and nothing is allowed until the user does.
+ *
  * Uninstall: out of the registry (its host stops it) with its disabled state, then its folder
  * deleted -- its stored state only if the user chooses.
  *
@@ -57,6 +63,16 @@ export interface InstallerNative {
   uninstall(id: string): Promise<string>;
 }
 
+/** What a package asks to be allowed, for the user to review before it installs (EXT-07). */
+export interface PermissionRequest {
+  id: string;
+  name: string;
+  version: string;
+  requested: readonly string[];
+  /** What the installed version (if any) was allowed: shown, never carried over. */
+  previous: { version: string; granted: readonly string[] } | null;
+}
+
 export const nativeInstaller: InstallerNative = {
   stage: (source, expectedId, expectedVersion) =>
     native("extensions_stage", { source, expectedId, expectedVersion }),
@@ -77,6 +93,13 @@ export function createExtensionInstaller(options: {
   /** Re-reads the installed extensions from disk (a rollback's last resort). */
   rediscover: () => Promise<unknown>;
   native?: InstallerNative;
+  /**
+   * Asks the user what of a package's requested capabilities to allow (EXT-07): the ones to
+   * allow (maybe none), or null to cancel the install. Without it nothing is allowed.
+   */
+  consent?: (request: PermissionRequest) => Promise<readonly string[] | null>;
+  /** Re-reads what the native inventory allows each extension (after an install). */
+  refreshGrants?: () => Promise<unknown>;
 }) {
   const io = options.native ?? nativeInstaller;
   const listeners = new Set<() => void>();
@@ -196,6 +219,27 @@ export function createExtensionInstaller(options: {
         );
       }
 
+      // What it asks to be allowed (EXT-07), reviewed before it is put in place.
+      const wants =
+        read.ok && !read.manifest.permissions.legacy ? read.manifest.permissions.requested : [];
+      let allow: readonly string[] = [];
+      if (wants.length && options.consent) {
+        const answer = await options.consent({
+          id,
+          name,
+          version,
+          requested: wants,
+          previous: existing?.grants.granted.length
+            ? { version: existing.manifest.version, granted: existing.grants.granted }
+            : (existing?.grants.previous ?? null),
+        });
+        if (answer === null) {
+          await io.discard(staged.token).catch(() => undefined);
+          throw new MarketplaceError("Cancelled", `${name} was not installed.`);
+        }
+        allow = answer.filter((one) => wants.includes(one));
+      }
+
       phase(id, "installing");
       // The new folder goes in place (the working one kept aside); the registry changes only
       // after that, in one step -- an installed extension never disappears in between.
@@ -221,11 +265,23 @@ export function createExtensionInstaller(options: {
       }
       await io.finish(staged.token, id, true).catch(() => undefined);
       options.service.settled(id);
-      end(id, null);
+      // The new copy's grants, as the inventory holds them (none), then what the user allowed.
+      await options.refreshGrants?.().catch(() => undefined);
+      let notGranted: MarketplaceError | null = null;
+      if (allow.length)
+        await options.registry.grant(id, allow).catch((error: unknown) => {
+          notGranted = new MarketplaceError(
+            "InstallFailed",
+            `${name} was installed, but what you allowed it was not saved; allow it from its page.`,
+            String((error as Error)?.message ?? error),
+          );
+        });
+      end(id, notGranted);
       return added;
     } catch (error) {
       const failure = marketplaceErrorOf(error, "InstallFailed", name);
-      end(id, failure);
+      // A cancelled install is not a failure to show.
+      end(id, failure.code === "Cancelled" ? null : failure);
       throw failure;
     }
   }

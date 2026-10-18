@@ -114,6 +114,8 @@ interface Commands {
         error: string | null;
         source: "installed" | "development";
         shadowed: { folder: string; version: string | null; reason: string }[];
+        /** What it requests and what of it is allowed, for this copy (EXT-07). */
+        permissions: NativePermissions | null;
       }[];
       skipped: number;
       disabled: string[];
@@ -121,6 +123,11 @@ interface Commands {
     };
   };
   extensions_set_enabled: { args: { id: string; enabled: boolean }; result: void };
+  /** Allows exactly `capabilities` for the installed copy (EXT-07); the state it then holds. */
+  extensions_set_grants: {
+    args: { id: string; version: string; capabilities: string[] };
+    result: NativePermissions;
+  };
   /** One of an installed extension's files (its themes, snippets: EXT-04), contained. */
   extensions_read_resource: { args: { id: string; path: string }; result: string };
   // --- Extension marketplace and installer (IDE-09) ---
@@ -707,6 +714,14 @@ export function onGitChanged(handler: (event: GitChangeEvent) => void): () => vo
     cancelled = true;
     void pending.then((unlisten) => unlisten?.());
   };
+}
+
+/** An extension copy's permissions, as the native inventory holds them (EXT-07). */
+export interface NativePermissions {
+  legacy: boolean;
+  requested: string[];
+  granted: string[];
+  previous: { version: string; granted: string[] } | null;
 }
 
 export function native<K extends keyof Commands>(

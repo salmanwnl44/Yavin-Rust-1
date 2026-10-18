@@ -18,6 +18,8 @@ const SAMPLE: &str = "yavin-samples.hello-world";
 enum Event {
     Message(Value),
     Exit(Option<i32>, Option<String>),
+    /// A request the native layer refused (EXT-07).
+    Denied(Denied),
 }
 
 struct Channel(Mutex<Sender<(u32, Event)>>);
@@ -37,6 +39,13 @@ impl HostEvents for Channel {
             .lock()
             .unwrap()
             .send((session, Event::Exit(code, error)));
+    }
+    fn denied(&self, session: u32, denied: Denied) {
+        let _ = self
+            .0
+            .lock()
+            .unwrap()
+            .send((session, Event::Denied(denied)));
     }
 }
 
@@ -61,7 +70,9 @@ struct Yavin {
     sessions: ExtHostSessions,
     events: Receiver<(u32, Event)>,
     sink: Arc<Channel>,
-    extensions: ExtensionService,
+    extensions: Arc<ExtensionService>,
+    /// The native authority, as the application has it (trust a switch here).
+    authority: Arc<ServiceAuthority>,
     _scratch: Scratch,
 }
 
@@ -82,18 +93,27 @@ impl Drop for Yavin {
 
 impl Yavin {
     fn new(test: &str, extensions: &[(&str, &str)]) -> Yavin {
+        let with: Vec<_> = extensions
+            .iter()
+            .map(|(id, code)| (*id, json!({}), *code))
+            .collect();
+        Yavin::with(test, &with)
+    }
+
+    /// Test extensions with more in their manifests (`extra`: its permissions, EXT-07).
+    fn with(test: &str, extensions: &[(&str, Value, &str)]) -> Yavin {
         let scratch =
             std::env::temp_dir().join(format!("yavin-ext-e2e-{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
-        for (id, code) in extensions {
+        for (id, extra, code) in extensions {
             let (publisher, name) = id.split_once('.').unwrap();
             let folder = scratch.join(id);
             std::fs::create_dir_all(&folder).unwrap();
-            std::fs::write(
-                folder.join("yavin-extension.json"),
-                json!({"publisher": publisher, "name": name, "version": "1.0.0", "engines": {"yavin": "^2.0.0"}, "main": "extension.js"}).to_string(),
-            )
-            .unwrap();
+            let mut manifest = json!({"publisher": publisher, "name": name, "version": "1.0.0", "engines": {"yavin": "^2.0.0"}, "main": "extension.js"});
+            for (key, value) in extra.as_object().unwrap() {
+                manifest[key] = value.clone();
+            }
+            std::fs::write(folder.join("yavin-extension.json"), manifest.to_string()).unwrap();
             std::fs::write(folder.join("extension.js"), code).unwrap();
         }
         std::fs::create_dir_all(&scratch).unwrap();
@@ -102,25 +122,25 @@ impl Yavin {
             .join("extensions")
             .join("samples");
         let (sender, events) = channel();
+        let extensions = Arc::new(ExtensionService::new(scratch.clone(), vec![samples]));
         Yavin {
             sessions: ExtHostSessions::default(),
             events,
             sink: Arc::new(Channel(Mutex::new(sender))),
-            extensions: ExtensionService::new(scratch.clone(), vec![samples]),
+            authority: ServiceAuthority::new(extensions.clone()),
+            extensions,
             _scratch: Scratch(scratch),
         }
     }
 
     fn start(&self) -> u32 {
         self.sessions
-            .start(&built_host(), self.sink.clone())
+            .start(&built_host(), self.sink.clone(), self.authority.clone())
             .expect("the real host starts")
     }
 
     fn send(&self, session: u32, message: Value) -> Result<(), String> {
-        self.sessions.send(session, &message.to_string(), &|id| {
-            self.extensions.folder_of(id)
-        })
+        self.sessions.send(session, &message.to_string())
     }
 
     /// `init` and its `ready`: the handshake.
@@ -365,6 +385,7 @@ fn a_missing_host_is_reported_and_nothing_starts() {
         .start(
             Path::new("Z:/not-installed/yavin-extension-host.exe"),
             yavin.sink.clone(),
+            yavin.authority.clone(),
         )
         .unwrap_err();
     assert!(failed.starts_with("HostFailed:"), "{failed}");
@@ -425,7 +446,7 @@ fn a_malformed_handshake_is_refused_and_the_host_survives() {
     let session = yavin.start();
     assert!(yavin
         .sessions
-        .send(session, "{not json", &|id| yavin.extensions.folder_of(id))
+        .send(session, "{not json")
         .unwrap_err()
         .starts_with("MalformedMessage"));
     yavin
@@ -652,4 +673,382 @@ fn a_load_reads_only_a_discovered_extension() {
         .0;
     assert_eq!(activated["ok"], true);
     assert_ne!(activated["result"], "smuggled");
+}
+
+// --- EXT-07: the permission boundary, through the real host --------------------------------------
+
+/// Calls every privileged API, and the mandatory ones, and returns what each answered: `ok`
+/// (it reached the window: the test answers everything it sees) or the refusal's code.
+const PROBE: &str = r#"
+module.exports.activate = function (c, yavin) {
+  c.subscriptions.push(yavin.commands.registerCommand(c.extensionId + ".go", async function () {
+    const out = {};
+    const attempt = async (name, run) => {
+      try { await run(); out[name] = "ok"; } catch (e) { out[name] = e.code || String(e); }
+    };
+    await attempt("fs", () => yavin.workspace.fs.readFile("a.txt"));
+    await attempt("exists", () => yavin.workspace.fs.exists("a.txt"));
+    await attempt("text", () => yavin.documents.getText("file:///c:/work/a.txt"));
+    await attempt("all", () => yavin.documents.all());
+    await attempt("active", () => yavin.editor.activeEditor());
+    await attempt("open", () => yavin.editor.openLocation("file:///c:/work/a.txt"));
+    await attempt("other", () => yavin.commands.executeCommand("acme.other.secret"));
+    await attempt("own", () => yavin.commands.executeCommand(c.extensionId + ".go"));
+    await attempt("storage", () => yavin.storage.global.update("k", 1));
+    await attempt("message", () => yavin.window.showInformationMessage("hi"));
+    return out;
+  }));
+};
+"#;
+
+fn permissions(request: &[&str]) -> Value {
+    json!({"permissions": {"version": 1, "request": request}})
+}
+
+impl Yavin {
+    /// Like `ask`, also collecting what the native layer refused meanwhile.
+    fn ask_seeing(
+        &self,
+        session: u32,
+        generation: u64,
+        extension: &str,
+        id: &str,
+        method: &str,
+        params: Value,
+    ) -> (Value, Vec<Value>, Vec<Denied>) {
+        self.to(
+            session,
+            generation,
+            extension,
+            json!({"type": "request", "requestId": id, "method": method, "params": params}),
+        );
+        let (mut asked, mut denied) = (Vec::new(), Vec::new());
+        loop {
+            match self.next() {
+                (s, Event::Denied(one)) if s == session => denied.push(one),
+                (s, Event::Message(message)) if s == session => {
+                    if message["type"] == "request" {
+                        let from = message["extensionId"].as_str().unwrap().to_string();
+                        self.to(session, generation, &from, json!({"type": "response", "requestId": message["requestId"], "ok": true, "result": null}));
+                        asked.push(message);
+                    } else if message["type"] == "response" && message["requestId"] == json!(id) {
+                        return (message, asked, denied);
+                    }
+                }
+                (s, Event::Exit(code, error)) if s == session => {
+                    panic!("the host ended: {code:?} {error:?}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A started host with `extension` loaded and activated.
+    fn ready(&self, generation: u64, extension: &str) -> u32 {
+        let session = self.start();
+        self.handshake(session, generation, 2000);
+        assert_eq!(self.load(session, generation, extension)["type"], "loaded");
+        let activated = self
+            .ask(
+                session,
+                generation,
+                extension,
+                "a",
+                "activate",
+                json!({"globalState": {}, "workspaceState": {}, "configuration": {}}),
+            )
+            .0;
+        assert_eq!(activated["ok"], true, "{activated}");
+        session
+    }
+
+    /// Runs the probe's command: what each API answered, what the window saw, what was refused.
+    fn probe(
+        &self,
+        session: u32,
+        generation: u64,
+        extension: &str,
+    ) -> (Value, Vec<Value>, Vec<Denied>) {
+        let (answer, asked, denied) = self.ask_seeing(
+            session,
+            generation,
+            extension,
+            "p",
+            "command.run",
+            json!({"id": format!("{extension}.go"), "args": []}),
+        );
+        assert_eq!(answer["ok"], true, "{answer}");
+        (answer["result"].clone(), asked, denied)
+    }
+
+    fn grant(&self, id: &str, capabilities: &[&str]) {
+        let list: Vec<String> = capabilities.iter().map(|c| c.to_string()).collect();
+        self.extensions.set_grants(id, None, &list).unwrap();
+    }
+}
+
+const ALL: [&str; 4] = [
+    "workspace.fs.read",
+    "documents.read",
+    "editor.control",
+    "commands.execute:acme.other",
+];
+
+/// No optional grant: every privileged request is refused natively -- answered
+/// `PermissionDenied` to the extension, never shown to the window -- while the mandatory ones
+/// pass. A grant opens exactly its own requests; a revocation closes them for the next request,
+/// in the same host.
+#[test]
+fn privileged_requests_need_their_grant_and_a_revocation_holds_at_once() {
+    let yavin = Yavin::with("grants", &[("acme.probe", permissions(&ALL), PROBE)]);
+    let session = yavin.ready(20_001, "acme.probe");
+
+    let (out, asked, denied) = yavin.probe(session, 20_001, "acme.probe");
+    for name in ["fs", "exists", "text", "all", "active", "open", "other"] {
+        assert_eq!(out[name], "PermissionDenied", "{name}: {out}");
+    }
+    for name in ["own", "storage", "message"] {
+        assert_eq!(out[name], "ok", "{name}: {out}");
+    }
+    let seen: Vec<_> = asked
+        .iter()
+        .map(|m| m["method"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        seen,
+        ["commands.execute", "storage.update", "window.showMessage"],
+        "the window never saw a refused request"
+    );
+    let refused: std::collections::BTreeSet<_> = denied
+        .iter()
+        .map(|d| d.capability.clone().unwrap())
+        .collect();
+    assert_eq!(refused, ALL.iter().map(|c| c.to_string()).collect());
+    assert!(denied
+        .iter()
+        .all(|d| d.extension_id == "acme.probe" && d.code == "PermissionDenied"));
+
+    // documents.read: only the document requests open.
+    yavin.grant("acme.probe", &["documents.read"]);
+    let (out, ..) = yavin.probe(session, 20_001, "acme.probe");
+    for name in ["text", "all", "active"] {
+        assert_eq!(out[name], "ok", "{name}: {out}");
+    }
+    for name in ["fs", "exists", "open", "other"] {
+        assert_eq!(out[name], "PermissionDenied", "{name}: {out}");
+    }
+    // Everything requested.
+    yavin.grant("acme.probe", &ALL);
+    let (out, ..) = yavin.probe(session, 20_001, "acme.probe");
+    for name in ["fs", "exists", "text", "all", "active", "open", "other"] {
+        assert_eq!(out[name], "ok", "{name}: {out}");
+    }
+    // Revoked: the very next request is refused, without a reload.
+    yavin.grant("acme.probe", &["editor.control"]);
+    let (out, ..) = yavin.probe(session, 20_001, "acme.probe");
+    assert_eq!(out["open"], "ok");
+    for name in ["fs", "exists", "text", "all", "active", "other"] {
+        assert_eq!(out[name], "PermissionDenied", "{name}: {out}");
+    }
+}
+
+/// What an extension's script puts in its messages cannot change who it is or what it may do:
+/// the host stamps its real id, and the native check reads only the inventory. Here the script
+/// replaces `JSON.stringify` to claim another extension's id, a capability list and a grant, in
+/// the message and in its parameters; another extension really has every grant.
+#[test]
+fn a_forged_identity_or_capability_list_changes_nothing() {
+    let forger = PROBE.replace(
+        "module.exports.activate = function (c, yavin) {",
+        r#"const real = JSON.stringify;
+JSON.stringify = function (value) {
+  if (value && typeof value === "object" && value.type === "request") {
+    value = Object.assign({}, value, { extensionId: "acme.trusted", capabilities: ["documents.read", "workspace.fs.read"], granted: true });
+    value.params = Object.assign({}, value.params || {}, { extensionId: "acme.trusted", grant: ["documents.read"] });
+  }
+  return real.call(JSON, value);
+};
+module.exports.activate = function (c, yavin) {"#,
+    );
+    let yavin = Yavin::with(
+        "forged",
+        &[
+            ("acme.forger", permissions(&ALL), forger.as_str()),
+            ("acme.trusted", permissions(&ALL), PROBE),
+        ],
+    );
+    yavin.grant("acme.trusted", &ALL);
+    let session = yavin.ready(21_001, "acme.forger");
+    let (out, asked, denied) = yavin.probe(session, 21_001, "acme.forger");
+    for name in ["fs", "exists", "text", "all", "active", "open", "other"] {
+        assert_eq!(out[name], "PermissionDenied", "{name}: {out}");
+    }
+    assert!(!asked.is_empty());
+    assert!(
+        asked.iter().all(|m| m["extensionId"] == "acme.forger"),
+        "the window sees only the real id: {asked:?}"
+    );
+    assert!(denied.iter().all(|d| d.extension_id == "acme.forger"));
+    // The extension that is granted is, with the same code.
+    assert_eq!(
+        yavin.load(session, 21_001, "acme.trusted")["type"],
+        "loaded"
+    );
+    let activated = yavin
+        .ask(session, 21_001, "acme.trusted", "t", "activate", json!({}))
+        .0;
+    assert_eq!(activated["ok"], true);
+    let (out, ..) = yavin.probe(session, 21_001, "acme.trusted");
+    assert_eq!(out["text"], "ok", "{out}");
+}
+
+/// What the window sends cannot grant anything either: an event an extension may not have is
+/// refused natively, a load that carries a capability list loads the same copy with the same
+/// (inventory's) grants, and a disabled extension or an untrusted folder is refused whatever the
+/// window's own state says.
+#[test]
+fn the_windows_state_cannot_grant_or_bypass() {
+    let yavin = Yavin::with("window", &[("acme.probe", permissions(&ALL), PROBE)]);
+    let session = yavin.start();
+    yavin.handshake(session, 22_001, 2000);
+    yavin
+        .send(session, json!({"type": "load", "extensionId": "acme.probe", "workspaceId": WS, "hostGeneration": 22_001, "capabilities": ALL, "granted": ALL, "trusted": true}))
+        .unwrap();
+    assert_eq!(yavin.next_message(session)["type"], "loaded");
+    let activated = yavin
+        .ask(
+            session,
+            22_001,
+            "acme.probe",
+            "a",
+            "activate",
+            json!({"granted": ALL}),
+        )
+        .0;
+    assert_eq!(activated["ok"], true);
+    let (out, ..) = yavin.probe(session, 22_001, "acme.probe");
+    assert_eq!(out["text"], "PermissionDenied", "{out}");
+
+    // An event with a document, to an extension without documents.read.
+    let event = json!({"type": "event", "extensionId": "acme.probe", "workspaceId": WS, "hostGeneration": 22_001, "event": "documents.open", "payload": {"uri": "file:///c:/work/secret.env"}});
+    let refused = yavin.send(session, event.clone()).unwrap_err();
+    assert!(refused.starts_with("PermissionDenied"), "{refused}");
+    yavin.grant("acme.probe", &["documents.read"]);
+    yavin.send(session, event).unwrap();
+    // configuration.changed needs nothing; an event that does not exist is refused.
+    yavin
+        .send(session, json!({"type": "event", "extensionId": "acme.probe", "workspaceId": WS, "hostGeneration": 22_001, "event": "configuration.changed", "payload": {"values": {}}}))
+        .unwrap();
+    let unknown = yavin
+        .send(session, json!({"type": "event", "extensionId": "acme.probe", "workspaceId": WS, "hostGeneration": 22_001, "event": "secrets.read", "payload": {}}))
+        .unwrap_err();
+    assert!(unknown.starts_with("InvalidRequest"), "{unknown}");
+
+    // Disabled natively: its code is not called, its privileged requests are refused, and it
+    // is not loaded again -- whatever the window believes.
+    yavin.extensions.set_enabled("acme.probe", false).unwrap();
+    let call = yavin
+        .send(session, json!({"type": "request", "requestId": "x", "method": "command.run", "params": {"id": "acme.probe.go", "args": []}, "extensionId": "acme.probe", "workspaceId": WS, "hostGeneration": 22_001}))
+        .unwrap_err();
+    assert!(call.starts_with("ExtensionDisabled"), "{call}");
+    let load = yavin
+        .send(session, json!({"type": "load", "extensionId": "acme.probe", "workspaceId": WS, "hostGeneration": 22_001}))
+        .unwrap_err();
+    assert!(load.starts_with("ExtensionDisabled"), "{load}");
+    // Its deactivation still goes: it lets go of what it holds.
+    let (deactivated, ..) =
+        yavin.ask_seeing(session, 22_001, "acme.probe", "d", "deactivate", json!({}));
+    assert_eq!(deactivated["ok"], true, "{deactivated}");
+
+    // Untrusted natively: nothing loads, nothing is called, nothing privileged passes.
+    yavin.extensions.set_enabled("acme.probe", true).unwrap();
+    yavin
+        .authority
+        .trusted
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let load = yavin
+        .send(session, json!({"type": "load", "extensionId": "acme.probe", "workspaceId": WS, "hostGeneration": 22_001}))
+        .unwrap_err();
+    assert!(load.starts_with("TrustRequired"), "{load}");
+    let call = yavin
+        .send(session, json!({"type": "request", "requestId": "y", "method": "command.run", "params": {"id": "acme.probe.go", "args": []}, "extensionId": "acme.probe", "workspaceId": WS, "hostGeneration": 22_001}))
+        .unwrap_err();
+    assert!(call.starts_with("TrustRequired"), "{call}");
+}
+
+/// Running another extension's command needs `commands.execute:<its id>` for that very
+/// extension: a grant for one is not a grant for another (no confused deputy), and its own
+/// commands need nothing.
+#[test]
+fn another_extensions_commands_need_a_grant_naming_it() {
+    let caller = PROBE.replace(
+        r#"await attempt("own""#,
+        r#"await attempt("third", () => yavin.commands.executeCommand("acme.third.run"));
+    await attempt("own""#,
+    );
+    let yavin = Yavin::with(
+        "commands",
+        &[(
+            "acme.probe",
+            permissions(&["commands.execute:acme.other", "commands.execute:acme.third"]),
+            caller.as_str(),
+        )],
+    );
+    yavin.grant("acme.probe", &["commands.execute:acme.other"]);
+    let session = yavin.ready(23_001, "acme.probe");
+    let (out, asked, denied) = yavin.probe(session, 23_001, "acme.probe");
+    assert_eq!(out["other"], "ok", "{out}");
+    assert_eq!(out["third"], "PermissionDenied", "{out}");
+    assert_eq!(out["own"], "ok", "{out}");
+    assert!(asked
+        .iter()
+        .any(|m| m["method"] == "commands.execute" && m["params"]["id"] == "acme.other.secret"));
+    assert!(denied
+        .iter()
+        .any(|d| d.capability.as_deref() == Some("commands.execute:acme.third")));
+}
+
+/// A legacy manifest (no `permissions`) is granted nothing until the user allows it, and can
+/// be allowed only what extensions could do before -- never another extension's commands.
+#[test]
+fn a_legacy_extension_is_allowed_nothing_until_allowed() {
+    let yavin = Yavin::with("legacy", &[("acme.probe", json!({}), PROBE)]);
+    let session = yavin.ready(24_001, "acme.probe");
+    let (out, ..) = yavin.probe(session, 24_001, "acme.probe");
+    for name in ["fs", "text", "open", "other"] {
+        assert_eq!(out[name], "PermissionDenied", "{name}: {out}");
+    }
+    let refused = yavin
+        .extensions
+        .set_grants("acme.probe", None, &["commands.execute:acme.other".into()])
+        .unwrap_err();
+    assert!(refused.starts_with("NotRequested"), "{refused}");
+    yavin.grant(
+        "acme.probe",
+        &["workspace.fs.read", "documents.read", "editor.control"],
+    );
+    let (out, ..) = yavin.probe(session, 24_001, "acme.probe");
+    for name in ["fs", "text", "open"] {
+        assert_eq!(out[name], "ok", "{name}: {out}");
+    }
+    assert_eq!(out["other"], "PermissionDenied");
+}
+
+/// A crash and a restart change nothing: the new host's extensions have what the inventory
+/// grants, no more -- nothing of the old session is carried over.
+#[test]
+fn a_restarted_host_has_no_more_than_the_inventory_grants() {
+    let yavin = Yavin::with("restart", &[("acme.probe", permissions(&ALL), PROBE)]);
+    let first = yavin.ready(25_001, "acme.probe");
+    kill(yavin.sessions.process_id(first).unwrap());
+    let _ = yavin.exit_of(first);
+    let second = yavin.ready(25_002, "acme.probe");
+    let (out, ..) = yavin.probe(second, 25_002, "acme.probe");
+    assert_eq!(out["text"], "PermissionDenied", "{out}");
+    // A request from code this host never loaded (an extension named by the window only).
+    yavin
+        .send(second, json!({"type": "request", "requestId": "z", "method": "command.run", "params": {"id": "acme.ghost.go"}, "extensionId": "acme.ghost", "workspaceId": WS, "hostGeneration": 25_002}))
+        .unwrap();
+    let answer = yavin.next_message(second);
+    assert_eq!(answer["error"]["code"], "NotLoaded", "{answer}");
 }

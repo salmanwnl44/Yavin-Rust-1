@@ -7,6 +7,7 @@ import {
   FIXTURE_ICON,
   FIXTURE_PACKAGES,
   fixtureIndex,
+  helloWorldPackage,
 } from "../../src/services/extensions/marketplace/fixtures";
 
 /**
@@ -36,7 +37,8 @@ const SAMPLE_FOLDER = "/repo/extensions/samples/hello-world";
  */
 const MARKET = (() => {
   const index = fixtureIndex({ manifest: JSON.parse(EXTENSION_HOST.sampleManifest) });
-  FIXTURE_PACKAGES["packages/yavin-samples.hello-world-2.0.0.yvx"].code = EXTENSION_HOST.sampleCode;
+  FIXTURE_PACKAGES[helloWorldPackage(JSON.parse(EXTENSION_HOST.sampleManifest).version)].code =
+    EXTENSION_HOST.sampleCode;
   return {
     index: JSON.stringify(index),
     packages: FIXTURE_PACKAGES,
@@ -97,6 +99,10 @@ async function desktop(
     extensionCode?: Record<string, string>;
     /** The marketplace (IDE-09): unreachable, slow to answer its index. */
     marketplace?: { down?: boolean; indexDelayMs?: number };
+    /** EXT-07: what a marketplace package's manifest requests, by extension id. */
+    packagePermissions?: Record<string, string[]>;
+    /** EXT-07: the native side refuses to change grants (`Code: message`). */
+    failGrants?: string;
   } = {},
 ) {
   await page.addInitScript(
@@ -171,6 +177,48 @@ async function desktop(
       const staged: Record<string, { id: string; manifest: string; code: string | null }> = {};
       const aside: Record<string, { manifest: string; code: string | null } | undefined> = {};
       let nextToken = 1;
+      // --- Permissions (EXT-07), as the native inventory keeps them ----------------------------
+      /** Granted, per id, for the copy listed now (a new copy has none). */
+      const grants: Record<string, string[]> = {};
+      const previousGrants: Record<string, { version: string; granted: string[] }> = {};
+      const manifestOf = (id: string): string | null =>
+        installedExtensions[id]?.manifest ??
+        (id === sampleId ? setup.host.sampleManifest : null) ??
+        (setup.extensions ?? []).find((one) => {
+          try {
+            const m = JSON.parse(one.manifest ?? "null");
+            return m && `${m.publisher}.${m.name}` === id;
+          } catch {
+            return false;
+          }
+        })?.manifest ??
+        null;
+      const permissionsOf = (id: string) => {
+        const manifest = JSON.parse(manifestOf(id) ?? "{}") as {
+          main?: string;
+          permissions?: { request: string[] };
+        };
+        const legacy = !manifest.permissions;
+        const requested = legacy
+          ? manifest.main
+            ? ["documents.read", "editor.control", "workspace.fs.read"]
+            : []
+          : [...manifest.permissions!.request].sort();
+        return {
+          legacy,
+          requested,
+          granted: (grants[id] ?? []).filter((one) => requested.includes(one)),
+          previous: previousGrants[id] ?? null,
+        };
+      };
+      const idOf = (manifest: string | null) => {
+        try {
+          const m = JSON.parse(manifest ?? "null");
+          return m ? `${m.publisher}.${m.name}` : null;
+        } catch {
+          return null;
+        }
+      };
       Object.assign(window, {
         /** The marketplace goes down or comes back. */
         __market: market,
@@ -709,16 +757,23 @@ async function desktop(
                 root: "/data/extensions",
                 extensions: [
                   ...Object.entries(installedExtensions).map(([id, one]) => ({
+                    id,
                     folder: `/data/extensions/${id}`,
                     manifest: one.manifest,
                     error: null,
+                    permissions: permissionsOf(id),
                   })),
-                  ...(setup.extensions ?? []),
+                  ...(setup.extensions ?? []).map((one) => {
+                    const id = one.error ? null : idOf(one.manifest);
+                    return { ...one, id, permissions: id ? permissionsOf(id) : null };
+                  }),
                   {
+                    id: sampleId,
                     folder: setup.host.sampleFolder,
                     manifest: setup.host.sampleManifest,
                     error: null,
                     shadowed: setup.sampleShadowed ?? [],
+                    permissions: permissionsOf(sampleId),
                   },
                 ],
                 skipped: 0,
@@ -791,9 +846,14 @@ async function desktop(
               if (`${manifest.publisher}.${manifest.name}` !== id || manifest.version !== version)
                 throw `ManifestMismatch: the package is ${manifest.publisher}.${manifest.name} ${manifest.version}.`;
               const token = `${(nextToken++).toString(16).padStart(8, "0")}`;
+              const requested = setup.packagePermissions?.[id];
               staged[token] = {
                 id,
-                manifest: JSON.stringify(pkg.manifest),
+                manifest: JSON.stringify(
+                  requested
+                    ? { ...pkg.manifest, permissions: { version: 1, request: requested } }
+                    : pkg.manifest,
+                ),
                 code: pkg.code ?? null,
               };
               return {
@@ -810,6 +870,13 @@ async function desktop(
                 throw "InstallFailed: the installed version could not be moved aside (it is in use).";
               const one = staged[args.token as string];
               delete staged[args.token as string];
+              // A new copy has no grant; the old one's is shown as such (EXT-07).
+              if (grants[one.id]?.length && installedExtensions[one.id])
+                previousGrants[one.id] = {
+                  version: JSON.parse(installedExtensions[one.id].manifest).version,
+                  granted: grants[one.id],
+                };
+              delete grants[one.id];
               aside[args.token as string] = installedExtensions[one.id];
               installedExtensions[one.id] = { manifest: one.manifest, code: one.code };
               return {
@@ -835,7 +902,24 @@ async function desktop(
               if (!installedExtensions[id])
                 throw `UnknownExtension: ${id} is not installed in Yavin's extensions folder.`;
               delete installedExtensions[id];
+              delete grants[id];
+              delete previousGrants[id];
               return `/data/extensions/${id}`;
+            }
+            if (command === "extensions_set_grants") {
+              if (setup.failGrants) throw setup.failGrants;
+              const id = args.id as string;
+              if (!manifestOf(id)) throw `UnknownExtension: ${id} is not installed.`;
+              const version = JSON.parse(manifestOf(id)!).version;
+              if (args.version !== version)
+                throw `ExtensionChanged: ${id} is now version ${version}, not ${String(args.version)}.`;
+              const wanted = args.capabilities as string[];
+              const { requested } = permissionsOf(id);
+              const extra = wanted.find((one) => !requested.includes(one));
+              if (extra) throw `NotRequested: ${id} does not request "${extra}".`;
+              grants[id] = [...wanted].sort();
+              if (wanted.length) delete previousGrants[id];
+              return permissionsOf(id);
             }
             // The extension host (IDE-08), in the page: the real `bootstrap.js` and extension code,
             // the native contract around them -- start refused unless trusted, a `load` filled
@@ -3638,6 +3722,155 @@ test("extension menus: a view's title action and the Explorer's context menu run
   await expect(list).toContainText("Hello, world!");
   await list.getByRole("button", { name: "Reset Greetings", exact: true }).click();
   await expect(list).toContainText("No greetings yet");
+});
+
+// --- Permissions (EXT-07) -----------------------------------------------------------------------
+// The sample declares documents.read ("Describe Active File"). Nothing is allowed until the user
+// allows it on the extension's page; the mock keeps grants as the native inventory does.
+
+test("permissions: a refused request says why; the page allows and revokes it through the native side", async ({
+  page,
+}) => {
+  await desktop(page);
+  await page.getByText("file.ts", { exact: true }).click();
+  await (await palette(page, "Hello World: Describe Active File")).click();
+  const view = await extensionsView(page);
+  await expect(sampleState(view)).toHaveText(/^Permission Needed/);
+  await expect(sampleState(view)).toContainText("read your open documents");
+  await view.getByRole("group", { name: "Hello World (sample)" }).click();
+  const details = page.getByRole("region", { name: "Extension: Hello World (sample)" });
+  const permissions = details.getByRole("region", { name: "Permissions" });
+  const documents = permissions.locator('[data-capability="documents.read"]');
+  await expect(documents).toContainText("Read your open documents");
+  await expect(documents.getByTestId("permission-state")).toHaveText("Not allowed");
+
+  await permissions.getByRole("button", { name: "Allow: Read your open documents" }).click();
+  await expect(documents.getByTestId("permission-state")).toHaveText("Allowed");
+  expect((await calls(page, "extensions_set_grants")).map((call) => call.args)).toEqual([
+    { id: "yavin-samples.hello-world", version: "2.0.1", capabilities: ["documents.read"] },
+  ]);
+  await expect(details.getByTestId("extension-details-state")).not.toContainText(
+    "Permission Needed",
+  );
+  await details.getByRole("button", { name: "Back to Extensions" }).click();
+  await page.getByRole("tab", { name: /file\.ts/ }).click();
+  await (await palette(page, "Hello World: Describe Active File")).click();
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText("lines");
+
+  // Revoked: refused again at the next request.
+  await view.getByRole("group", { name: "Hello World (sample)" }).click();
+  await permissions.getByRole("button", { name: "Revoke: Read your open documents" }).click();
+  await expect(documents.getByTestId("permission-state")).toHaveText("Not allowed");
+  expect((await calls(page, "extensions_set_grants")).at(-1)?.args).toEqual({
+    id: "yavin-samples.hello-world",
+    version: "2.0.1",
+    capabilities: [],
+  });
+  await details.getByRole("button", { name: "Back to Extensions" }).click();
+  await page.getByRole("tab", { name: /file\.ts/ }).click();
+  await (await palette(page, "Hello World: Describe Active File")).click();
+  await expect(sampleState(view)).toHaveText(/^Permission Needed/);
+});
+
+test("permissions: a change the native side refuses is never shown as made", async ({ page }) => {
+  await desktop(page, {
+    failGrants:
+      "InventoryUnavailable: the extension inventory cannot be read right now; nothing was changed.",
+  });
+  const view = await extensionsView(page);
+  await view.getByRole("group", { name: "Hello World (sample)" }).click();
+  const permissions = page
+    .getByRole("region", { name: "Extension: Hello World (sample)" })
+    .getByRole("region", { name: "Permissions" });
+  await permissions.getByRole("button", { name: "Allow: Read your open documents" }).click();
+  await expect(permissions.getByRole("alert")).toContainText(
+    "Not changed: InventoryUnavailable: the extension inventory cannot be read right now",
+  );
+  await expect(
+    permissions.locator('[data-capability="documents.read"]').getByTestId("permission-state"),
+  ).toHaveText("Not allowed");
+});
+
+test("install: a package that requests permissions is reviewed first -- dismissed, not installed; installed without them, allowed later", async ({
+  page,
+}) => {
+  await desktop(page, {
+    packagePermissions: { "acme.docker-tools": ["documents.read", "workspace.fs.read"] },
+  });
+  const view = await extensionsView(page);
+  const recommended = view.getByRole("region", { name: "Recommended extensions" });
+  const installed = view.getByRole("region", { name: "Installed extensions" });
+  await card(recommended, "Docker Tools")
+    .getByRole("button", { name: "Install Docker Tools" })
+    .click();
+  const review = page.getByRole("dialog");
+  await expect(review).toContainText("Docker Tools 0.9.1 asks to:");
+  await expect(review).toContainText("Read your open documents");
+  await expect(review).toContainText("Read files in this workspace");
+  // Dismissed: not installed, nothing staged left, no failure shown.
+  await page.keyboard.press("Escape");
+  await expect(review).toHaveCount(0);
+  await expect(
+    card(recommended, "Docker Tools").getByRole("button", { name: "Install Docker Tools" }),
+  ).toBeEnabled();
+  await expect(installed.getByRole("group", { name: "Docker Tools" })).toHaveCount(0);
+  expect(await countCalls(page, "extensions_commit")).toBe(0);
+  expect(await countCalls(page, "extensions_discard")).toBe(1);
+  await expect(card(recommended, "Docker Tools").getByRole("alert")).toHaveCount(0);
+
+  // Installed without allowing: nothing is granted.
+  await card(recommended, "Docker Tools")
+    .getByRole("button", { name: "Install Docker Tools" })
+    .click();
+  await review.getByRole("option", { name: /^Install without allowing/ }).click();
+  await expect(card(installed, "Docker Tools")).toBeVisible();
+  expect(await countCalls(page, "extensions_set_grants")).toBe(0);
+  await card(installed, "Docker Tools").click();
+  const permissions = page
+    .getByRole("region", { name: "Extension: Docker Tools" })
+    .getByRole("region", { name: "Permissions" });
+  await expect(permissions.getByTestId("permission-state")).toHaveText([
+    "Not allowed",
+    "Not allowed",
+  ]);
+  // Allowed from its page.
+  await permissions.getByRole("button", { name: "Allow everything Docker Tools requests" }).click();
+  await expect(permissions.getByTestId("permission-state")).toHaveText(["Allowed", "Allowed"]);
+  expect((await calls(page, "extensions_set_grants")).map((call) => call.args)).toEqual([
+    {
+      id: "acme.docker-tools",
+      version: "0.9.1",
+      capabilities: ["documents.read", "workspace.fs.read"],
+    },
+  ]);
+});
+
+test("install: allowed when reviewed, the new copy is granted natively what was allowed", async ({
+  page,
+}) => {
+  await desktop(page, {
+    packagePermissions: { "acme.docker-tools": ["documents.read"] },
+  });
+  const view = await extensionsView(page);
+  await card(view.getByRole("region", { name: "Recommended extensions" }), "Docker Tools")
+    .getByRole("button", { name: "Install Docker Tools" })
+    .click();
+  await page
+    .getByRole("dialog")
+    .getByRole("option", { name: /^Install and allow/ })
+    .click();
+  const installed = view.getByRole("region", { name: "Installed extensions" });
+  await expect(card(installed, "Docker Tools")).toBeVisible();
+  await expect
+    .poll(async () => (await calls(page, "extensions_set_grants")).map((call) => call.args))
+    .toEqual([{ id: "acme.docker-tools", version: "0.9.1", capabilities: ["documents.read"] }]);
+  await card(installed, "Docker Tools").click();
+  await expect(
+    page
+      .getByRole("region", { name: "Extension: Docker Tools" })
+      .getByRole("region", { name: "Permissions" })
+      .getByTestId("permission-state"),
+  ).toHaveText("Allowed");
 });
 
 // --- The extension marketplace (IDE-09) -----------------------------------------------------------

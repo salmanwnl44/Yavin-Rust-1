@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.1.1
+
+- Declares the permission it uses (EXT-07): reading your open documents. Nothing else changed.
+
 ## 2.1.0
 
 - Each greeting says which number it is.

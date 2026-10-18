@@ -22,6 +22,12 @@
  *
  * Extensions never receive Yavin objects: no service, React, Monaco, IPC, process or path
  * outside the workspace crosses the protocol.
+ *
+ * Permissions (EXT-07, `permissions.ts`): the native side refuses a request whose capability
+ * is not granted before it gets here (`ext-host-denied` says so). This host applies the same
+ * rule to what reaches it -- the in-process host has no native side -- and to the events it
+ * sends; a refusal of either kind is kept in `denied` (the extension's last one), for the
+ * Extensions view, until what it needed is allowed.
  */
 import { createOutputChannel, type OutputChannel } from "../panel/output.ts";
 import {
@@ -37,10 +43,11 @@ import type { SettingsRegistry } from "../settings/settings.ts";
 import type { WorkspaceId } from "../terminalProtocol.ts";
 import { ExtensionError } from "./errors.ts";
 import { EXTENSION_API, type ActivationEvent } from "./manifest.ts";
+import { needOfEvent, needOfRequest } from "./permissions.ts";
 import { MAX_MESSAGE, readHostMessage, writeHostMessage, type HostMessage } from "./protocol.ts";
 import type { ExtensionRegistry, RegisteredExtension } from "./registry.ts";
 import type { ExtensionStorage } from "./storage.ts";
-import type { HostChannel, HostTransport } from "./transport.ts";
+import type { HostChannel, HostDenial, HostTransport } from "./transport.ts";
 import {
   DECORATION_STYLES,
   type DecorationStore,
@@ -90,6 +97,8 @@ export interface HostSnapshot {
   hostReason: string | null;
   statuses: Readonly<Record<string, ExtensionStatus>>;
   views: Readonly<Record<string, readonly ViewRow[]>>;
+  /** Each extension's last refused request (EXT-07), until what it needed is allowed. */
+  denied: Readonly<Record<string, Omit<HostDenial, "extensionId">>>;
 }
 
 export interface HostTimeouts {
@@ -177,6 +186,7 @@ export function createExtensionHost(options: ExtensionHostOptions) {
   const shownViews = new Set<string>();
   const viewVersions = new Map<string, number>();
   let views: Record<string, readonly ViewRow[]> = {};
+  let denied: Record<string, Omit<HostDenial, "extensionId">> = {};
   let hostState: HostState = "idle";
   let hostReason: string | null = null;
   let channel: HostChannel | null = null;
@@ -200,6 +210,7 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       hostReason,
       statuses,
       views,
+      denied,
     };
   }
   const publish = () => {
@@ -337,6 +348,13 @@ export function createExtensionHost(options: ExtensionHostOptions) {
           started.onLog((line) => {
             lastOutput = line;
             logHost(`host: ${line}`);
+          }),
+        );
+      // What the native side refused (EXT-07): the extension was answered there.
+      if (started.onDenied)
+        stops.push(
+          started.onDenied(({ extensionId, ...refusal }) => {
+            if (running.has(extensionId)) refuse(extensionId, refusal);
           }),
         );
       const ready = wait("ready", timeouts.start, "start");
@@ -546,6 +564,44 @@ export function createExtensionHost(options: ExtensionHostOptions) {
   // --- Capabilities: what an extension may ask of Yavin ------------------------------------------
 
   const owned = (one: Running, name: string) => name.startsWith(`${one.entry.id}.`);
+  /** Whether `capability` is requested by, and granted to, the copy registered (EXT-07). */
+  const allowed = (one: Running, capability: string) => {
+    const entry = options.registry.get(one.entry.id) ?? one.entry;
+    return (
+      entry.manifest.permissions.requested.includes(capability) &&
+      entry.grants.granted.includes(capability)
+    );
+  };
+  /** A refusal, kept for the Extensions view and said in the extension's output. */
+  const refuse = (id: string, refusal: Omit<HostDenial, "extensionId">) => {
+    const one = running.get(id);
+    if (one) log(one, "warn", `${refusal.method} refused: ${refusal.code}: ${refusal.message}`);
+    const last = denied[id];
+    // A repeat changes nothing shown: no new snapshot for it.
+    if (
+      last &&
+      last.method === refusal.method &&
+      last.capability === refusal.capability &&
+      last.code === refusal.code
+    )
+      return;
+    denied = { ...denied, [id]: refusal };
+    publish();
+  };
+  /** Refusals that no longer hold (it was allowed what it needed since) are forgotten. */
+  const forgetAllowed = () => {
+    let changed = false;
+    const next: typeof denied = {};
+    for (const [id, refusal] of Object.entries(denied)) {
+      const one = running.get(id);
+      if (one && refusal.capability && allowed(one, refusal.capability)) changed = true;
+      else next[id] = refusal;
+    }
+    if (changed) {
+      denied = next;
+      publish();
+    }
+  };
   const fail = (code: string, text: string): never => {
     throw Object.assign(new Error(text), { code });
   };
@@ -604,9 +660,12 @@ export function createExtensionHost(options: ExtensionHostOptions) {
 
   /** Events to subscribed extensions only; the window's listeners are added once, when first needed. */
   const emit = (event: string, payload: unknown, only?: string) => {
+    const need = needOfEvent(event);
     for (const one of running.values()) {
       if (one.status.state !== "active" || !one.events.has(event)) continue;
       if (only && one.entry.id !== only) continue;
+      // Allowed when it subscribed is not enough: allowed now (EXT-07).
+      if (need.kind === "capability" && !allowed(one, need.capability)) continue;
       void send({ type: "event", extensionId: one.entry.id, event, payload }).catch(
         () => undefined,
       );
@@ -854,7 +913,8 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       });
       return;
     }
-    const method = methods[message.method];
+    // Its own methods only (never one an object inherits).
+    const method = Object.hasOwn(methods, message.method) ? methods[message.method] : undefined;
     if (!method) {
       await respond(message, {
         ok: false,
@@ -867,6 +927,19 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       message.params && typeof message.params === "object" && !Array.isArray(message.params)
         ? (message.params as Record<string, unknown>)
         : {};
+    // The capability it needs, granted for this copy -- the native rule, applied here too.
+    const need = needOfRequest(one.entry.id, message.method, params);
+    if (need.kind === "capability" && !allowed(one, need.capability)) {
+      const text = `"${need.capability}" is not allowed for ${one.entry.id} ${one.entry.manifest.version}.`;
+      refuse(one.entry.id, {
+        method: message.method,
+        capability: need.capability,
+        code: "PermissionDenied",
+        message: text,
+      });
+      await respond(message, { ok: false, code: "PermissionDenied", text });
+      return;
+    }
     try {
       const value = await method(one, params);
       await respond(message, { ok: true, value });
@@ -879,17 +952,19 @@ export function createExtensionHost(options: ExtensionHostOptions) {
 
   // --- Views -----------------------------------------------------------------------------------------
 
-  const rows = (value: unknown, depth = 0, budget = { left: 1000 }): ViewRow[] =>
+  /** `owner`'s rows, as the window shows them. */
+  const rows = (owner: string, value: unknown, depth = 0, budget = { left: 1000 }): ViewRow[] =>
     (Array.isArray(value) ? value : []).flatMap((item) => {
       if (budget.left <= 0 || !item || typeof item.label !== "string") return [];
       budget.left--;
       const row: ViewRow = { label: item.label.slice(0, 200) };
       if (typeof item.description === "string") row.description = item.description.slice(0, 200);
       if (typeof item.tooltip === "string") row.tooltip = item.tooltip.slice(0, 500);
-      if (typeof item.command === "string" && options.registry.commandOwner(item.command))
+      // Its own commands only: a row may not make the user run another extension's (EXT-07).
+      if (typeof item.command === "string" && options.registry.commandOwner(item.command) === owner)
         row.command = item.command;
       if (depth < 2 && Array.isArray(item.children))
-        row.children = rows(item.children, depth + 1, budget);
+        row.children = rows(owner, item.children, depth + 1, budget);
       return [row];
     });
 
@@ -902,7 +977,7 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       const items = await ask(owner, "view.items", { id: view }, timeouts.view);
       if (finished || viewProviders.get(view) !== owner || viewVersions.get(view) !== version)
         return;
-      views = { ...views, [view]: rows(items) };
+      views = { ...views, [view]: rows(owner, items) };
       publish();
     } catch (error) {
       const one = running.get(owner);
@@ -1112,7 +1187,10 @@ export function createExtensionHost(options: ExtensionHostOptions) {
     }
     return Promise.all(retirements.values()).then(() => undefined);
   };
-  const stopFollowing = options.registry.subscribe(() => void reconcile());
+  const stopFollowing = options.registry.subscribe(() => {
+    forgetAllowed();
+    void reconcile();
+  });
 
   const api = {
     getSnapshot: () => snapshot,

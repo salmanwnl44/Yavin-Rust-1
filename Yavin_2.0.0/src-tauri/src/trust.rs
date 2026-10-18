@@ -260,7 +260,18 @@ pub fn set_workspace_trust(
         },
     );
     held.save()?;
-    Ok(state_for(held, Some(root)))
+    Ok(stop_untrusted(&app, state_for(held, Some(root))))
+}
+
+/// Extensions' code stops with the trust that let it run (EXT-07): natively, whatever the
+/// window does next.
+fn stop_untrusted(app: &AppHandle, state: TrustState) -> TrustState {
+    if !state.trusted {
+        if let Some(sessions) = app.try_state::<crate::extension_host::ExtHostSessions>() {
+            crate::extension_host::stop_all(&sessions);
+        }
+    }
+    state
 }
 
 #[tauri::command(async)]
@@ -287,7 +298,10 @@ pub fn forget_trusted_folder(
     let held = guard.as_mut().expect("loaded");
     held.forget(Path::new(&folder));
     held.save()?;
-    Ok(state_for(held, workspace_root(&state)))
+    Ok(stop_untrusted(
+        &app,
+        state_for(held, workspace_root(&state)),
+    ))
 }
 
 /// Whether the open folder may have its own toolchain run.

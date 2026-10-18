@@ -647,6 +647,8 @@ test("documents and editor: by URI inside the workspace only; events; decoration
       }));
     };`,
   );
+  // EXT-07: a legacy extension, allowed what it asks for (as the user would).
+  await t.registry.grant("acme.hello", ["documents.read", "editor.control"]);
   const m = t.manager();
   await m.fire({ kind: "startup" });
   await until(() => m.getSnapshot().statuses["acme.hello"]?.state === "active", "active");
@@ -681,6 +683,8 @@ test("the filesystem API reads workspace-relative files only: traversal and abso
       c.subscriptions.push(yavin.commands.registerCommand("acme.hello.other", function (path) { return yavin.workspace.fs.exists(path); }));
     };`,
   );
+  // EXT-07: allowed to read the workspace (as the user would).
+  await t.registry.grant("acme.hello", ["workspace.fs.read"]);
   const m = t.manager();
   assert.equal(await m.executeCommand("acme.hello.greet", "notes.txt"), "a note");
   for (const path of [
@@ -1058,6 +1062,8 @@ test("the sample extension works end to end through the host", async () => {
     { kind: "folder", path: "C:/repo/extensions/samples/hello-world" },
     "samples",
   );
+  // EXT-07: the sample declares documents.read ("Describe Active File"); the user allows it.
+  await t.registry.grant("yavin-samples.hello-world", ["documents.read"]);
   const m = t.manager();
   assert.equal(await m.executeCommand("yavin-samples.hello-world.greet"), "Hello, world!");
   await m.showView("yavin-samples.hello-world.greetings");
@@ -1399,4 +1405,283 @@ test("EXT-05 a restart registers nothing twice; a crash's reason carries the hos
     ),
   );
   assert.equal(t.providers.getSnapshot().length, 0, "a crash clears what it contributed");
+});
+
+// --- EXT-07: permissions -----------------------------------------------------------------------
+
+const ASKS_ALL = {
+  permissions: {
+    version: 1,
+    request: [
+      "documents.read",
+      "workspace.fs.read",
+      "editor.control",
+      "commands.execute:acme.other",
+    ],
+  },
+};
+const PROBE = `
+module.exports.activate = function (c, yavin) {
+  globalThis.__seen = [];
+  c.subscriptions.push(yavin.documents.onDidChange(function (d) { globalThis.__seen.push(d.uri); }));
+  c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", async function (what) {
+    if (what === "seen") return globalThis.__seen;
+    if (what === "state") return c.globalState.keys();
+    const out = {};
+    const attempt = async (name, run) => {
+      try { const value = await run(); out[name] = value === undefined || value === null ? "ok" : value; }
+      catch (e) { out[name] = e.code || String(e); }
+    };
+    await attempt("text", () => yavin.documents.getText("file:///C:/work/readme.md"));
+    await attempt("active", () => yavin.editor.activeEditor().then(() => "ok"));
+    await attempt("fs", () => yavin.workspace.fs.readFile("notes.txt"));
+    await attempt("open", () => yavin.editor.openLocation("file:///C:/work/readme.md"));
+    await attempt("other", () => yavin.commands.executeCommand("acme.other.greet"));
+    await attempt("third", () => yavin.commands.executeCommand("acme.third.greet"));
+    await attempt("storage", () => yavin.storage.global.update("mine", 1));
+    return out;
+  }));
+};`;
+const OTHER = {
+  name: "other",
+  displayName: "Other",
+  activationEvents: ["onCommand:acme.other.greet"],
+  contributes: { commands: [{ command: "acme.other.greet", title: "Greet" }] },
+};
+const OTHER_CODE = `
+module.exports.activate = async function (c, yavin) {
+  await c.globalState.update("token", "s3cret");
+  c.subscriptions.push(yavin.commands.registerCommand("acme.other.greet", function () { return "from other"; }));
+};`;
+
+test("EXT-07 nothing granted: every privileged request is refused, the mandatory ones served; a grant opens only its own; a revocation holds at once", async () => {
+  const t = setup();
+  t.add(ASKS_ALL, PROBE);
+  t.add(OTHER, OTHER_CODE);
+  const m = t.manager();
+  const run = async () => (await m.executeCommand("acme.hello.greet")) as Record<string, string>;
+  assert.deepEqual(await run(), {
+    text: "PermissionDenied",
+    active: "PermissionDenied",
+    fs: "PermissionDenied",
+    open: "PermissionDenied",
+    other: "PermissionDenied",
+    third: "PermissionDenied",
+    storage: "ok",
+  });
+  assert.deepEqual(t.win.opened, [], "nothing was opened");
+  assert.equal(t.host.started(), 1);
+  assert.equal(m.getSnapshot().statuses["acme.other"], undefined, "the other was never run");
+  assert.equal(m.getSnapshot().denied["acme.hello"]?.code, "PermissionDenied");
+  assert.ok(
+    t.logs.get("acme.hello")?.some((line) => /refused: PermissionDenied/.test(line)),
+    "said in its output",
+  );
+
+  await t.registry.grant("acme.hello", ["documents.read"]);
+  let out = await run();
+  assert.equal(out.text, "# Readme\nhello");
+  assert.equal(out.active, "ok");
+  for (const name of ["fs", "open", "other"]) assert.equal(out[name], "PermissionDenied", name);
+
+  await t.registry.grant("acme.hello", [...ASKS_ALL.permissions.request]);
+  out = await run();
+  assert.deepEqual(out, {
+    text: "# Readme\nhello",
+    active: "ok",
+    fs: "a note",
+    open: "ok",
+    other: "from other",
+    // A grant for acme.other's commands is not one for acme.third's (never requested).
+    third: "PermissionDenied",
+    storage: "ok",
+  });
+  assert.deepEqual(
+    m.getSnapshot().denied["acme.hello"]?.capability,
+    "commands.execute:acme.third",
+    "only what it still may not do is shown",
+  );
+
+  // Revoked: the very next request is refused -- no reload, no restart.
+  await t.registry.grant("acme.hello", ["editor.control"]);
+  out = await run();
+  assert.equal(out.open, "ok");
+  for (const name of ["text", "active", "fs", "other"])
+    assert.equal(out[name], "PermissionDenied", name);
+  assert.equal(t.host.started(), 1);
+  // Only what its manifest requests can be granted.
+  await assert.rejects(
+    t.registry.grant("acme.hello", ["commands.execute:acme.third"]),
+    (e: ExtensionError) => e.code === "NotRequested",
+  );
+  await assert.rejects(
+    t.registry.grant("acme.other", ["commands.execute:acme.hello"]),
+    (e: ExtensionError) => e.code === "NotRequested",
+  );
+});
+
+test("EXT-07 document events reach an extension only while it may read documents", async () => {
+  const t = setup();
+  t.add({ ...ASKS_ALL, activationEvents: ["onStartupFinished"] }, PROBE);
+  const m = t.manager();
+  await m.fire({ kind: "startup" });
+  await until(() => m.getSnapshot().statuses["acme.hello"]?.state === "active", "active");
+  const doc = t.win.window.documents.all()[0];
+  t.win.emit("change", doc);
+  await settle();
+  assert.deepEqual(await m.executeCommand("acme.hello.greet", "seen"), [], "not allowed: none");
+  // Allowed later: its subscription (made at activation) now receives them.
+  await t.registry.grant("acme.hello", ["documents.read"]);
+  t.win.emit("change", doc);
+  await settle();
+  assert.deepEqual(await m.executeCommand("acme.hello.greet", "seen"), [
+    "file:///C:/work/readme.md",
+  ]);
+  // Revoked: the next one is not sent.
+  await t.registry.grant("acme.hello", []);
+  t.win.emit("change", doc);
+  await settle();
+  assert.deepEqual(await m.executeCommand("acme.hello.greet", "seen"), [
+    "file:///C:/work/readme.md",
+  ]);
+});
+
+test("EXT-07 one extension cannot read another's storage, and runs another's commands only with a grant naming it", async () => {
+  const t = setup();
+  t.add(ASKS_ALL, PROBE);
+  t.add(OTHER, OTHER_CODE);
+  t.add(
+    {
+      name: "third",
+      displayName: "Third",
+      activationEvents: ["onCommand:acme.third.greet"],
+      contributes: { commands: [{ command: "acme.third.greet", title: "Greet" }] },
+    },
+    `module.exports.activate = function (c, yavin) { c.subscriptions.push(yavin.commands.registerCommand("acme.third.greet", function () { return "from third"; })); };`,
+  );
+  const m = t.manager();
+  assert.equal(await m.executeCommand("acme.other.greet"), "from other");
+  // Its activation state is its own: the other's token is not in it.
+  assert.deepEqual(await m.executeCommand("acme.hello.greet", "state"), []);
+  await t.registry.grant("acme.hello", ["commands.execute:acme.other"]);
+  const out = (await m.executeCommand("acme.hello.greet")) as Record<string, string>;
+  assert.equal(out.other, "from other");
+  assert.deepEqual(t.extensionStorage.global("acme.hello").keys(), ["mine"]);
+  assert.deepEqual(t.extensionStorage.global("acme.other").keys(), ["token"]);
+  assert.equal(out.third, "PermissionDenied");
+  assert.equal(m.getSnapshot().statuses["acme.third"], undefined, "never activated by it");
+});
+
+test("EXT-07 a new version is granted nothing; what the old one had is shown as such; uninstall forgets", async () => {
+  const t = setup();
+  t.add(ASKS_ALL, PROBE);
+  await t.registry.grant("acme.hello", ["documents.read", "editor.control"]);
+  assert.deepEqual(t.registry.get("acme.hello")!.grants, {
+    granted: ["documents.read", "editor.control"],
+    previous: null,
+  });
+  const updated = t.registry.replace(
+    "acme.hello",
+    manifest({
+      ...ASKS_ALL,
+      version: "2.0.0",
+      permissions: { version: 1, request: ["documents.read", "workspace.fs.read"] },
+    }),
+    { kind: "folder", path: "C:/extensions/acme.hello-2" },
+    "C:/extensions/acme.hello-2",
+  );
+  assert.ok("manifest" in updated);
+  assert.deepEqual(t.registry.get("acme.hello")!.grants, {
+    granted: [],
+    previous: { version: "1.2.3", granted: ["documents.read", "editor.control"] },
+  });
+  const m = t.manager();
+  const out = (await m.executeCommand("acme.hello.greet")) as Record<string, string>;
+  assert.equal(out.text, "PermissionDenied");
+  t.registry.remove("acme.hello", { forget: true });
+  t.add(ASKS_ALL, PROBE);
+  assert.deepEqual(t.registry.get("acme.hello")!.grants, { granted: [], previous: null });
+});
+
+test("EXT-07 a refusal from the native side is shown until what it needed is allowed", async () => {
+  const t = setup();
+  t.add(ASKS_ALL, PROBE);
+  const m = t.manager();
+  await m.executeCommand("acme.hello.greet", "seen");
+  t.host.denied({
+    extensionId: "acme.hello",
+    method: "fs.readFile",
+    capability: "workspace.fs.read",
+    code: "PermissionDenied",
+    message: '"workspace.fs.read" is not allowed for acme.hello 1.2.3.',
+  });
+  await settle();
+  assert.equal(m.getSnapshot().denied["acme.hello"]?.capability, "workspace.fs.read");
+  // Another extension's name in a refusal of a host it does not run in changes nothing.
+  t.host.denied({
+    extensionId: "acme.ghost",
+    method: "fs.readFile",
+    capability: null,
+    code: "NotLoaded",
+    message: "",
+  });
+  await settle();
+  assert.equal(m.getSnapshot().denied["acme.ghost"], undefined);
+  await t.registry.grant("acme.hello", ["documents.read"]);
+  assert.ok(m.getSnapshot().denied["acme.hello"], "documents.read is not what it needed");
+  await t.registry.grant("acme.hello", ["workspace.fs.read"]);
+  assert.equal(m.getSnapshot().denied["acme.hello"], undefined);
+});
+
+test("EXT-07 a failed activation, a crash and a restart leave no permission behind", async () => {
+  const t = setup();
+  t.add(ASKS_ALL, PROBE);
+  t.add(
+    {
+      ...OTHER,
+      permissions: { version: 1, request: ["documents.read"] },
+      activationEvents: ["onStartupFinished"],
+    },
+    "module.exports.activate = function () { throw new Error('kaboom'); };",
+  );
+  const m = t.manager();
+  await m.fire({ kind: "startup" });
+  await until(() => m.getSnapshot().statuses["acme.other"]?.state === "failed", "failed");
+  assert.deepEqual(t.registry.get("acme.other")!.grants, { granted: [], previous: null });
+  assert.equal(
+    ((await m.executeCommand("acme.hello.greet")) as Record<string, string>).text,
+    "PermissionDenied",
+  );
+  t.host.crash();
+  await settle();
+  await m.restart();
+  const out = (await m.executeCommand("acme.hello.greet")) as Record<string, string>;
+  assert.equal(out.text, "PermissionDenied", "a new host: the same grants, none");
+  assert.equal(out.storage, "ok");
+});
+
+test("EXT-07 a view row runs only its own extension's commands", async () => {
+  const t = setup();
+  t.add(
+    {
+      activationEvents: ["onView:acme.hello.people"],
+      contributes: {
+        commands: [{ command: "acme.hello.greet", title: "Greet" }],
+        views: [{ id: "acme.hello.people", name: "People" }],
+      },
+    },
+    `module.exports.activate = function (c, yavin) {
+      c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", function () { return 1; }));
+      c.subscriptions.push(yavin.views.registerView("acme.hello.people", { getItems: function () {
+        return [{ label: "mine", command: "acme.hello.greet" }, { label: "theirs", command: "acme.other.greet" }];
+      } }));
+    };`,
+  );
+  t.add(OTHER, OTHER_CODE);
+  const m = t.manager();
+  await m.showView("acme.hello.people");
+  await until(() => m.getSnapshot().views["acme.hello.people"]?.length === 2, "rows");
+  const rows = m.getSnapshot().views["acme.hello.people"];
+  assert.equal(rows[0].command, "acme.hello.greet");
+  assert.equal(rows[1].command, undefined, "another extension's command is not offered");
 });

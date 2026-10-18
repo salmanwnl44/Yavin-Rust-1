@@ -2,10 +2,11 @@
   "publisher": "yavin-samples",
   "name": "hello-world",
   "displayName": "Hello World (sample)",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "A sample extension: greets, remembers its greetings, lists them, and explains words on hover.",
   "engines": { "yavin": "^2.0.0" },
   "main": "extension.js",
+  "permissions": { "version": 1, "request": ["documents.read"] },
   "activationEvents": ["onCommand:yavin-samples.hello-world.greet", "onLanguage:markdown"],
   "contributes": {
     "commands": [

@@ -68,6 +68,16 @@
       ],
       "versions": [
         {
+          "version": "2.1.1",
+          "publishedAt": "2026-10-18",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "package": "packages/yavin-samples.hello-world-2.1.1.yvx",
+          "sha256": "0b4cf927ba818b8f7f9fd1a05a636ea34a5cb4d4ffb9f1d574eedc828389cef5",
+          "size": 2589
+        },
+        {
           "version": "2.1.0",
           "publishedAt": "2026-10-07",
           "engines": {
@@ -76,6 +86,16 @@
           "package": "packages/yavin-samples.hello-world-2.1.0.yvx",
           "sha256": "7253bbf2d02507f5148333402591651903ec44c52ffceec381eb180dc3a34823",
           "size": 2492
+        },
+        {
+          "version": "2.0.1",
+          "publishedAt": "2026-10-18",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "package": "packages/yavin-samples.hello-world-2.0.1.yvx",
+          "sha256": "bb39efb3bcc8eab03539c7b763427fd85cf334a139f5f3eca20dcb0f32b796bb",
+          "size": 2555
         },
         {
           "version": "2.0.0",
@@ -129,6 +149,16 @@
       ],
       "versions": [
         {
+          "version": "1.0.1",
+          "publishedAt": "2026-10-18",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "package": "packages/yavin.word-count-1.0.1.yvx",
+          "sha256": "b235b2c774cdcd7a5f948bcabc00c4acc32ff4fa3f48cc6b0c8be859d40faca1",
+          "size": 1844
+        },
+        {
           "version": "1.0.0",
           "publishedAt": "2026-10-07",
           "engines": {
@@ -181,6 +211,16 @@
         "onStartupFinished"
       ],
       "versions": [
+        {
+          "version": "1.0.1",
+          "publishedAt": "2026-10-18",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "package": "packages/yavin.todo-highlighter-1.0.1.yvx",
+          "sha256": "743f7c1e3a65e7d2887c275838d25dbe646ae910f0866aa88e956b9bba2ee817",
+          "size": 2213
+        },
         {
           "version": "1.0.0",
           "publishedAt": "2026-10-07",

@@ -4,7 +4,7 @@
  * per id -- an installed copy over a development sample -- so each id arrives once, with the
  * copies it shadows; the extension host loads code only from the folder listed here.
  */
-import { native } from "../native.ts";
+import { native, type NativePermissions } from "../native.ts";
 import { DISABLED_KEY, readStoredDisabled, type ExtensionRegistry } from "./registry.ts";
 
 export interface DiscoveryReport {
@@ -15,10 +15,13 @@ export interface DiscoveryReport {
 }
 
 export interface ListedExtension {
+  id?: string | null;
   folder: string;
   manifest: string | null;
   error: string | null;
   shadowed?: { folder: string; version: string | null; reason: string }[];
+  /** What the inventory allows this copy (EXT-07). */
+  permissions?: NativePermissions | null;
 }
 
 export interface Listing {
@@ -80,6 +83,23 @@ async function nativeList(): Promise<Listing> {
   return listing;
 }
 
+/**
+ * The grants the inventory holds now, for every registered extension (EXT-07): after an
+ * install or update, whose new copy starts with none.
+ */
+export async function refreshGrants(
+  registry: ExtensionRegistry,
+  list: () => Promise<Listing> = nativeList,
+): Promise<void> {
+  const found = await list();
+  for (const one of found.extensions)
+    if (one.id && one.permissions && one.error === null && registry.get(one.id))
+      registry.setGrants(one.id, {
+        granted: one.permissions.granted,
+        previous: one.permissions.previous,
+      });
+}
+
 export async function discoverExtensions(
   registry: ExtensionRegistry,
   list: () => Promise<Listing> = nativeList,
@@ -105,6 +125,12 @@ export async function discoverExtensions(
       rejected++;
       continue;
     }
+    // What the inventory allows this very copy (EXT-07), before it is registered.
+    if (one.id && one.permissions)
+      registry.setGrants(one.id, {
+        granted: one.permissions.granted,
+        previous: one.permissions.previous,
+      });
     const result = registry.add(
       parsed,
       { kind: "folder", path: one.folder },

@@ -1,12 +1,13 @@
 /**
  * What the Extensions view says about an extension (IDE-09): one status a user can act on --
  * Installed, Enabled, Disabled, Activating, Active, Failed, Incompatible, Update Available,
- * Untrusted, Host Unavailable -- and why. Runtime internals (host generations, request ids,
+ * Untrusted, Host Unavailable, Permission Needed -- and why. Runtime internals (host generations, request ids,
  * process state) are not part of it; they are in the view's diagnostics.
  */
 import type { RegisteredExtension } from "../registry.ts";
 import type { ExtensionStatus } from "../host.ts";
 import type { HoldKind } from "../manager.ts";
+import { describeCapability } from "../permissions.ts";
 import type { Operation } from "./installer.ts";
 import type { ExtensionUpdate } from "./types.ts";
 
@@ -23,6 +24,7 @@ export interface DisplayStatus {
     | "Failed"
     | "Incompatible"
     | "Update Available"
+    | "Permission Needed"
     | "Untrusted"
     | "Host Unavailable"
     | "Unavailable"
@@ -50,6 +52,8 @@ export function displayStatus(input: {
   held?: string | null;
   /** What holds them off (`ManagerSnapshot.heldBy`): the label never depends on `held`'s text. */
   heldBy?: HoldKind | null;
+  /** Its last refused request (EXT-07, `HostSnapshot.denied`), while that still holds. */
+  denied?: { method: string; capability: string | null } | null;
   trusted: boolean;
   update?: ExtensionUpdate;
   operation?: Operation;
@@ -97,6 +101,14 @@ export function displayStatus(input: {
       label: input.heldBy === "trust" ? "Untrusted" : "Host Unavailable",
       tone: "warning",
       detail: input.held,
+    };
+  if (runs && input.denied)
+    return {
+      label: "Permission Needed",
+      tone: "warning",
+      detail: input.denied.capability
+        ? `It asked to ${describeCapability(input.denied.capability).title.toLowerCase()} (${input.denied.method}), which you have not allowed.`
+        : `Yavin refused its request ${input.denied.method}.`,
     };
   if (input.update)
     return {

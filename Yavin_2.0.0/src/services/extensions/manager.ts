@@ -76,6 +76,7 @@ export function createExtensionHostManager(options: ManagerOptions) {
     hostReason: null,
     statuses: {},
     views: {},
+    denied: {},
   });
   let snapshot: ManagerSnapshot = { ...empty(), crashes: 0, held: null, heldBy: null };
   const publish = () => {

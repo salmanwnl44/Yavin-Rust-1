@@ -6,7 +6,7 @@
  * (`ide-plugin-host`, QuickJS in its own process) is, and is tested natively. Never used by the
  * application.
  */
-import type { HostChannel, HostTransport } from "./transport.ts";
+import type { HostChannel, HostDenial, HostTransport } from "./transport.ts";
 
 export interface InProcessHostOptions {
   /** The text of `src-tauri/crates/ide-plugin-host/src/bootstrap.js`. */
@@ -23,6 +23,7 @@ export function createInProcessTransport(options: InProcessHostOptions) {
     exit(crashed: boolean, reason: string): void;
     deliver(text: string): void;
     log(line: string): void;
+    denied(denied: HostDenial): void;
     resident(): string[];
   } | null = null;
   const transport: HostTransport = {
@@ -32,6 +33,7 @@ export function createInProcessTransport(options: InProcessHostOptions) {
       const messageListeners = new Set<(text: string) => void>();
       const exitListeners = new Set<(end: { reason: string; crashed: boolean }) => void>();
       const logListeners = new Set<(line: string) => void>();
+      const deniedListeners = new Set<(denied: HostDenial) => void>();
       let identity: {
         workspaceId: string;
         hostGeneration: number;
@@ -168,6 +170,9 @@ export function createInProcessTransport(options: InProcessHostOptions) {
         log(line) {
           for (const listener of [...logListeners]) listener(line);
         },
+        denied(denied) {
+          for (const listener of [...deniedListeners]) listener(denied);
+        },
         resident: () => [...extensions.keys()].sort(),
       };
       const self = live;
@@ -190,6 +195,10 @@ export function createInProcessTransport(options: InProcessHostOptions) {
           logListeners.add(listener);
           return () => logListeners.delete(listener);
         },
+        onDenied(listener) {
+          deniedListeners.add(listener);
+          return () => deniedListeners.delete(listener);
+        },
         async stop() {
           self.exit(false, "The extension host ended.");
         },
@@ -206,6 +215,8 @@ export function createInProcessTransport(options: InProcessHostOptions) {
     deliverRaw: (text: string) => live?.deliver(text),
     /** A line on the current host's stderr. */
     stderr: (line: string) => live?.log(line),
+    /** A request the native side refused, as it reports one (EXT-07). */
+    denied: (denied: HostDenial) => live?.denied(denied),
     /** The extensions loaded in the current host process (EXT-05: what still holds code). */
     resident: () => live?.resident() ?? [],
   };

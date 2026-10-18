@@ -43,6 +43,17 @@ export interface ShadowedCopy {
   reason: string;
 }
 
+/**
+ * What the user allowed an extension (EXT-07), as the native inventory last said: granted for
+ * the copy registered, and a grant for another copy (the version before an update), shown only.
+ */
+export interface GrantState {
+  granted: readonly string[];
+  previous: { version: string; granted: readonly string[] } | null;
+}
+
+export const NO_GRANTS: GrantState = { granted: [], previous: null };
+
 export interface RegisteredExtension {
   id: string;
   manifest: ExtensionManifest;
@@ -54,6 +65,8 @@ export interface RegisteredExtension {
   warnings: string[];
   /** Other copies of it that were found, and why they are not used. */
   shadowed: readonly ShadowedCopy[];
+  /** What the user allowed it (EXT-07): the native side decides; this shows it. */
+  grants: GrantState;
 }
 
 export interface RejectedExtension {
@@ -162,6 +175,11 @@ export function createExtensionRegistry(options: {
    * storage keeps it (the browser preview, tests).
    */
   persistEnabled?: (id: string, enabled: boolean) => void;
+  /**
+   * Where grants are decided and kept (EXT-07: the native inventory, which returns the state
+   * it then holds). Without it (the browser preview, tests), this window keeps them.
+   */
+  persistGrants?: (id: string, version: string, capabilities: string[]) => Promise<GrantState>;
 }) {
   const storage = (() => {
     if (options.storage !== undefined) return options.storage;
@@ -182,6 +200,8 @@ export function createExtensionRegistry(options: {
   };
 
   const extensions = new Map<string, RegisteredExtension>();
+  /** Grant states by id, as last confirmed (kept across a re-registration of the same copy). */
+  const grantStates = new Map<string, GrantState>();
   let rejected: RejectedExtension[] = [];
   /** Settings registered for each enabled extension, to remove with it. */
   const settingRemovals = new Map<string, (() => void)[]>();
@@ -312,6 +332,15 @@ export function createExtensionRegistry(options: {
       settingDefinitions.delete(setting.id);
   };
 
+  const setGrants = (id: string, state: GrantState) => {
+    grantStates.set(id, state);
+    const entry = extensions.get(id);
+    if (!entry) return;
+    // In place: the extension's registration is the same; what it may do is not.
+    entry.grants = state;
+    publish();
+  };
+
   return {
     /**
      * Validates a manifest and registers it. A rejected one -- invalid, or an id already
@@ -355,6 +384,7 @@ export function createExtensionRegistry(options: {
         enabled: !disabled.has(manifest.id),
         warnings: result.warnings.map(describe),
         shadowed,
+        grants: grantStates.get(manifest.id) ?? NO_GRANTS,
       };
       extensions.set(manifest.id, entry);
       if (entry.enabled) applySettings(entry);
@@ -391,7 +421,15 @@ export function createExtensionRegistry(options: {
         enabled: !disabled.has(id),
         warnings: result.warnings.map(describe),
         shadowed: previous.shadowed,
+        // A new copy has no grant: what the old one had is shown as such (the native rule).
+        grants: {
+          granted: [],
+          previous: previous.grants.granted.length
+            ? { version: previous.manifest.version, granted: previous.grants.granted }
+            : previous.grants.previous,
+        },
       };
+      grantStates.set(id, entry.grants);
       extensions.set(id, entry);
       if (entry.enabled) applySettings(entry);
       publish();
@@ -404,11 +442,37 @@ export function createExtensionRegistry(options: {
      */
     remove(id: string, { forget = false }: { forget?: boolean } = {}) {
       const entry = extensions.get(id);
+      if (forget) grantStates.delete(id);
       if (forget && disabled.delete(id) && !options.persistEnabled) saveDisabled(id, true);
       if (!entry) return;
       if (entry.enabled) removeSettings(entry);
       extensions.delete(id);
       publish();
+    },
+    /** An extension's grants as the native inventory has them (discovery, a grant change). */
+    setGrants,
+    /**
+     * Allows exactly `capabilities` (each one its manifest requests) and returns the state the
+     * native side then holds -- shown only once it said so.
+     */
+    async grant(id: string, capabilities: readonly string[]): Promise<GrantState> {
+      const entry = extensions.get(id);
+      if (!entry)
+        throw new ExtensionError("UnknownExtension", id, `There is no extension "${id}".`);
+      const wanted = [...new Set(capabilities)].sort();
+      const extra = wanted.find((one) => !entry.manifest.permissions.requested.includes(one));
+      if (extra !== undefined)
+        throw new ExtensionError(
+          "NotRequested",
+          id,
+          `${entry.manifest.displayName} does not request "${extra}".`,
+        );
+      // The version the user saw: the native side refuses if another is installed meanwhile.
+      const state = options.persistGrants
+        ? await options.persistGrants(id, entry.manifest.version, wanted)
+        : { granted: wanted, previous: wanted.length ? null : entry.grants.previous };
+      setGrants(id, state);
+      return state;
     },
     /** The disabled ids as the native inventory has them (discovery). */
     setDisabled(ids: readonly string[]) {

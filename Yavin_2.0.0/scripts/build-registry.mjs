@@ -177,6 +177,8 @@ for (const entry of catalog.extensions) {
           .map((p) => `${p.field}: ${p.message}`)
           .join("; ")}`,
       );
+    if (versions.some((v) => v.version === manifest.version))
+      throw new Error(`${entry.id} ${manifest.version} is listed twice in the catalog.`);
     const bytes = zip(filesOf(folder));
     const path = `packages/${id}-${manifest.version}.yvx`;
     written.set(path, bytes);
@@ -243,6 +245,27 @@ const index = {
   extensions,
 };
 written.set("index.json", Buffer.from(`${JSON.stringify(index, null, 2)}\n`));
+
+// A published version is immutable: the same version with other bytes would install different
+// code under a checksum users already trust. Change the content, change the version.
+const publishedFile = join(out, "index.json");
+if (existsSync(publishedFile)) {
+  const published = JSON.parse(readFileSync(publishedFile, "utf8"));
+  const changed = [];
+  for (const before of published.extensions ?? [])
+    for (const old of before.versions ?? []) {
+      const now = extensions
+        .find((e) => e.id === before.id)
+        ?.versions.find((v) => v.version === old.version);
+      if (now && now.sha256 !== old.sha256) changed.push(`${before.id} ${old.version}`);
+    }
+  if (changed.length) {
+    console.error(
+      `Published versions would change content: ${changed.join(", ")}. Give the changed package a new version.`,
+    );
+    process.exit(1);
+  }
+}
 
 if (check) {
   const stale = [...written].filter(([path, bytes]) => {

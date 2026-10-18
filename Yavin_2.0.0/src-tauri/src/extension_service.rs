@@ -4,7 +4,7 @@
 //! (`active`), the one it replaced (`previous`, kept as the known-good fallback), whether the
 //! extension is disabled, and the install operations in flight. It is the single source of
 //! truth: the renderer's registry is built from `list`, and the extension host loads code only
-//! from the folder `folder_of` chooses -- the same choice `list` reported.
+//! from the copy `host_copy` chooses -- the same choice `list` reported.
 //!
 //! **One writer.** Every change -- install, update, rollback, uninstall, enable/disable,
 //! recovery, cleanup -- goes through `ExtensionService` under one lock, and every inventory
@@ -36,10 +36,28 @@
 //! not know (migration: recorded as they are, nothing copied or deleted), reports every other
 //! copy of an id as shadowed, and falls back to the previous copy when the active one is gone
 //! or unusable (recorded as a recovery), else reports the install as broken.
+//!
+//! **A damaged or missing inventory** never costs an installation. Every save writes the
+//! inventory twice, durably: `inventory.last-good.json` first, then `inventory.json` -- so the
+//! last-good copy is never older than the inventory. When `inventory.json` is missing or cannot
+//! be read while installed copies exist (`.store`, `.staging`, a last-good copy), it is restored
+//! from the last-good copy; if that cannot be read either, it is rebuilt from the store copies
+//! that validate (`rebuild`) -- each recorded **disabled** (what was enabled is not known) and
+//! with no grant -- and everything that does not validate, staging included, is moved into
+//! `.unrecovered-<ms>/` (never swept, never discovered): nothing is deleted. A missing inventory
+//! with nothing installed is a new folder, or IDE-09's (its root folders are adopted as before).
+//!
+//! **Permissions** (EXT-07, `extension_permissions.rs`). What the user allowed an extension is
+//! recorded here too (`grants`), bound to the very copy it was allowed for -- its folder,
+//! version and package hash: an update, a reinstall or another copy has none of it. Only a
+//! capability that copy's manifest requests can be granted (`set_grants`); the window names
+//! capabilities, never the copy. `authorize` is what the host bridge asks before every
+//! privileged request, from the inventory in memory: a revocation holds for the next request.
 
 use crate::extension_package::identity;
+use crate::extension_permissions::{declared, grantable, Denial};
 use crate::extensions::{discover, read_manifest, read_resource};
-use ide_workspace::durable::{json_version, read_versioned, write_durably, Loaded};
+use ide_workspace::durable::{json_version, read_versioned, remove_durably, write_durably, Loaded};
 use ide_workspace::extension_id::{canonical_id, is_canonical};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -53,6 +71,10 @@ use tauri::{AppHandle, Manager, State};
 pub const INVENTORY: &str = "inventory.json";
 pub const STORE: &str = ".store";
 pub const STAGING: &str = ".staging";
+/// The inventory as last written (written before it): what a damaged inventory is restored from.
+pub const LAST_GOOD: &str = "inventory.last-good.json";
+/// Where a rebuild keeps what it could not validate (`.unrecovered-<ms>`).
+const UNRECOVERED: &str = ".unrecovered";
 /// IDE-09's folder for a version moved aside during an update.
 const LEGACY_PREVIOUS: &str = ".previous";
 const INVENTORY_VERSION: u32 = 1;
@@ -114,6 +136,26 @@ pub struct Recovery {
     pub reason: String,
 }
 
+/// What the user allowed one copy of an extension (EXT-07): bound to that copy -- its folder,
+/// version and package hash -- so no other copy (an update, a reinstall) has any of it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Grant {
+    /// The copy's folder as listed (`Listed::folder`).
+    pub folder: String,
+    pub version: String,
+    pub sha256: Option<String>,
+    pub capabilities: BTreeSet<String>,
+    /// Seconds since the Unix epoch.
+    pub granted_at: u64,
+}
+
+impl Grant {
+    fn binds(&self, folder: &str, version: &str, sha256: Option<&str>) -> bool {
+        self.folder == folder && self.version == version && self.sha256.as_deref() == sha256
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Inventory {
@@ -126,6 +168,9 @@ pub struct Inventory {
     pub operations: BTreeMap<String, Operation>,
     /// The latest recoveries, newest last.
     pub recoveries: Vec<Recovery>,
+    /// What the user allowed, per extension id (EXT-07). Absent in an older inventory: none.
+    #[serde(default)]
+    pub grants: BTreeMap<String, Grant>,
 }
 
 impl Default for Inventory {
@@ -137,6 +182,7 @@ impl Default for Inventory {
             disabled_imported: false,
             operations: BTreeMap::new(),
             recoveries: Vec::new(),
+            grants: BTreeMap::new(),
         }
     }
 }
@@ -162,6 +208,53 @@ pub struct Listed {
     /// `installed` (Yavin's extensions folder) or `development` (a repository sample).
     pub source: &'static str,
     pub shadowed: Vec<Shadowed>,
+    /// What it requests and what of it is allowed (EXT-07); none for an unusable copy.
+    pub permissions: Option<PermissionState>,
+    /// Which copy it is, for the host and for grants (not sent to the window).
+    #[serde(skip)]
+    pub copy: Option<CopyFacts>,
+}
+
+/// The copy an entry is (EXT-07): what a grant is bound to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopyFacts {
+    pub version: String,
+    pub sha256: Option<String>,
+    /// The inventory's folder for an installed copy; none for a development copy.
+    pub stored: Option<String>,
+}
+
+/// An extension's permissions as the window shows them (EXT-07).
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionState {
+    /// Its manifest has no `permissions`: it is taken to request what extensions could do before.
+    pub legacy: bool,
+    pub requested: Vec<String>,
+    /// Allowed for this very copy.
+    pub granted: Vec<String>,
+    /// Allowed for another copy (the version before an update): shown, never used.
+    pub previous: Option<PreviousGrant>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviousGrant {
+    pub version: String,
+    pub granted: Vec<String>,
+}
+
+/// What the host loads for an extension, and what its requests are checked against (EXT-07).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostCopy {
+    pub id: String,
+    /// As listed (`Listed::folder`).
+    pub folder: String,
+    pub main: String,
+    pub version: String,
+    pub sha256: Option<String>,
+    pub stored: Option<String>,
+    pub requested: BTreeSet<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -359,11 +452,12 @@ impl ExtensionService {
             .lock()
             .map_err(|_| "InstallFailed: the extension inventory is unavailable.".to_string())?;
         if inner.inventory.is_none() {
-            let loaded = self.load(paths)?;
+            let (loaded, restored) = self.load(paths)?;
             let before = loaded.clone();
             let mut inventory = sanitized(loaded);
             self.recover(paths, &mut inventory);
-            if inventory != before {
+            // A restored or rebuilt inventory is written at once: the next start reads it.
+            if restored || inventory != before {
                 save(paths, &inventory)?;
             }
             inner.inventory = Some(inventory);
@@ -371,31 +465,23 @@ impl ExtensionService {
         Ok((inner, paths))
     }
 
-    fn load(&self, paths: &Paths) -> Result<Inventory, String> {
+    /// The inventory, and whether it was restored or rebuilt (so it must be written now).
+    fn load(&self, paths: &Paths) -> Result<(Inventory, bool), String> {
         fs::create_dir_all(&paths.root).map_err(|e| format!("InstallFailed: {e}"))?;
         let file = paths.root.join(INVENTORY);
-        let loaded = read_versioned(&file, INVENTORY_VERSION, json_version, |text, version| {
-            (version == INVENTORY_VERSION)
-                .then(|| serde_json::from_str::<Inventory>(text).ok())
-                .flatten()
-        });
-        match loaded {
-            Loaded::Missing => Ok(Inventory::default()),
+        match read_inventory(&file) {
+            // Nothing installed: a new folder, or IDE-09's (adopted as it is by listing).
+            Loaded::Missing if !installed_data(&paths.root) => Ok((Inventory::default(), false)),
+            Loaded::Missing => self.restore(paths, "was missing").map(|inv| (inv, true)),
             Loaded::Current(inventory) | Loaded::Migrated { value: inventory, .. } => {
-                Ok(inventory)
+                Ok((inventory, false))
             }
-            Loaded::Corrupt { backup: Some(backup) } => {
-                let mut inventory = Inventory::default();
-                note(
-                    &mut inventory,
-                    None,
-                    format!(
-                        "The extension inventory could not be read; it was kept as {} and rebuilt from the installed folders.",
-                        display(&backup)
-                    ),
-                );
-                Ok(inventory)
-            }
+            Loaded::Corrupt { backup: Some(backup) } => self
+                .restore(
+                    paths,
+                    &format!("could not be read (it was kept as {})", display(&backup)),
+                )
+                .map(|inv| (inv, true)),
             Loaded::Future { version, .. } => Err(format!(
                 "InventoryUnsupported: the extension inventory was written by a newer Yavin (version {version}); it was kept aside, untouched. Update Yavin."
             )),
@@ -403,6 +489,139 @@ impl ExtensionService {
                 "InventoryUnavailable: the extension inventory cannot be read right now; nothing was changed.".into(),
             ),
         }
+    }
+
+    /// `inventory.json` `what` (missing, unreadable) while copies are installed: the last-good
+    /// copy if it reads, else a rebuild. A last-good copy a newer Yavin wrote, or one that cannot
+    /// be read right now, stops here: nothing is rebuilt over it.
+    fn restore(&self, paths: &Paths, what: &str) -> Result<Inventory, String> {
+        match read_inventory(&paths.root.join(LAST_GOOD)) {
+            Loaded::Current(mut inventory) | Loaded::Migrated { value: mut inventory, .. } => {
+                note(
+                    &mut inventory,
+                    None,
+                    format!("The extension inventory {what}; it was restored from its last good copy."),
+                );
+                Ok(inventory)
+            }
+            Loaded::Future { version, .. } => Err(format!(
+                "InventoryUnsupported: the extension inventory {what}, and its last good copy was written by a newer Yavin (version {version}); both were kept, untouched. Update Yavin."
+            )),
+            Loaded::Unreadable | Loaded::Corrupt { backup: None } => Err(format!(
+                "InventoryUnavailable: the extension inventory {what}, and its last good copy cannot be read right now; nothing was changed."
+            )),
+            Loaded::Missing | Loaded::Corrupt { backup: Some(_) } => self.rebuild(paths, what),
+        }
+    }
+
+    /// An inventory from the store copies alone: each that validates -- a canonical id, a plain
+    /// folder inside the store named `<version>-<sha8>`, its manifest that id and version -- is
+    /// recorded (the newest active, the next its previous), disabled, with no grant. Everything
+    /// else -- what does not validate, older copies, staging -- is moved, not deleted, into
+    /// `.unrecovered-<ms>/`. Idempotent: run again (after a crash), it finds what is left.
+    fn rebuild(&self, paths: &Paths, what: &str) -> Result<Inventory, String> {
+        let root = &paths.root;
+        let aside = root.join(format!(
+            "{UNRECOVERED}-{}",
+            ide_workspace::durable::now_millis()
+        ));
+        let mut kept = 0;
+        let mut copies: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        if let Ok(ids) = fs::read_dir(root.join(STORE)) {
+            for entry in ids.flatten() {
+                let id = entry.file_name().to_string_lossy().into_owned();
+                let plain = fs::symlink_metadata(entry.path()).is_ok_and(|m| m.is_dir());
+                if !is_canonical(&id) || !plain {
+                    self.keep(root, &aside, &entry.path(), &mut kept)?;
+                    continue;
+                }
+                for copy in fs::read_dir(entry.path()).into_iter().flatten().flatten() {
+                    let folder = format!("{STORE}/{id}/{}", copy.file_name().to_string_lossy());
+                    match validated(root, &id, &folder) {
+                        Some(version) => copies
+                            .entry(id.clone())
+                            .or_default()
+                            .push((version, folder)),
+                        None => self.keep(root, &aside, &copy.path(), &mut kept)?,
+                    }
+                }
+            }
+        }
+        // Staging nothing records any more: kept, not discarded.
+        for entry in fs::read_dir(root.join(STAGING))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            self.keep(root, &aside, &entry.path(), &mut kept)?;
+        }
+        let mut inventory = Inventory {
+            // Imported long ago, or never needed: a stale list is not brought in again.
+            disabled_imported: true,
+            ..Inventory::default()
+        };
+        for (id, mut found) in copies {
+            found.sort_by(|a, b| version_order(&b.0, &a.0));
+            for (_, folder) in found.iter().skip(2) {
+                self.keep(root, &aside, &join(root, folder), &mut kept)?;
+            }
+            let copy = |(version, folder): &(String, String)| Copy {
+                version: version.clone(),
+                folder: folder.clone(),
+                sha256: None,
+                source: "unknown".into(),
+                installed_at: now(),
+            };
+            inventory.extensions.insert(
+                id.clone(),
+                Record {
+                    active: copy(&found[0]),
+                    previous: found.get(1).map(copy),
+                    broken: None,
+                },
+            );
+            inventory.disabled.insert(id);
+        }
+        // IDE-09's root folders are adopted by listing, as always -- disabled too.
+        for found in discover(root).extensions {
+            if let Some(Ok((id, _))) = found.manifest.as_deref().map(identity) {
+                inventory.disabled.insert(id);
+            }
+        }
+        self.crash("rebuilt")?;
+        let count = inventory.disabled.len();
+        note(
+            &mut inventory,
+            None,
+            format!(
+                "The extension inventory {what}, and so was its last good copy; it was rebuilt from the installed copies. {count} extension(s) are disabled until you enable them again, and none has the permissions it had.{}",
+                if kept > 0 {
+                    format!(" {kept} folder(s) that could not be used were kept in {}.", display(&aside))
+                } else {
+                    String::new()
+                }
+            ),
+        );
+        Ok(inventory)
+    }
+
+    /// Moves `path` (inside the root) to the same place under `aside`: kept, never deleted. A
+    /// move that fails stops the rebuild with nothing written.
+    fn keep(&self, root: &Path, aside: &Path, path: &Path, kept: &mut usize) -> Result<(), String> {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| "InventoryUnrecoverable: a folder outside the extensions folder.")?;
+        let target = aside.join(relative);
+        let refused = |e: std::io::Error| {
+            format!(
+                "InventoryUnrecoverable: {} could not be kept aside ({e}); nothing was deleted or written.",
+                display(path)
+            )
+        };
+        fs::create_dir_all(target.parent().unwrap_or(aside)).map_err(refused)?;
+        fs::rename(path, &target).map_err(refused)?;
+        *kept += 1;
+        self.crash("kept")
     }
 
     /// The start of a process: no operation of it exists yet, so every recorded one is an
@@ -610,6 +829,14 @@ impl ExtensionService {
                 "ManifestMismatch: the package is not {} {}: {why}.",
                 operation.id, operation.version
             )
+        });
+        // Its permissions must be ones this Yavin offers (EXT-07): a refused declaration is
+        // never installed.
+        let checked = checked.and_then(|manifest| {
+            let value = serde_json::from_str::<serde_json::Value>(&manifest).unwrap_or_default();
+            declared(&value, &operation.id)
+                .map(|_| manifest)
+                .map_err(|why| format!("InvalidPackage: its permissions cannot be used: {why}."))
         });
         let manifest = match checked {
             Ok(manifest) => manifest,
@@ -848,6 +1075,7 @@ impl ExtensionService {
         self.reconcile(&mut inner, paths)?;
         let record = Self::write(&mut inner, paths, |inv| {
             inv.disabled.remove(&id);
+            inv.grants.remove(&id);
             inv.extensions.remove(&id).ok_or_else(|| {
                 format!("UnknownExtension: {id} is not installed in Yavin's extensions folder.")
             })
@@ -915,12 +1143,93 @@ impl ExtensionService {
         read_resource(Path::new(&chosen.folder), path)
     }
 
-    /// The folder and entry point the host loads for `id`: the copy `list` reports for it.
+    /// The folder and entry point the host loads for `id` (`host_copy`'s choice), for tests.
+    #[cfg(test)]
     pub fn folder_of(&self, requested: &str) -> Result<(PathBuf, String), String> {
+        self.host_copy(requested)
+            .map(|copy| (PathBuf::from(copy.folder), copy.main))
+    }
+
+    // --- Permissions (EXT-07) ------------------------------------------------------------------
+
+    /// Allows exactly `capabilities` for the copy of `id` that `list` reports (an empty list
+    /// allows nothing: the grant is removed). Each must be one that copy's manifest requests;
+    /// the copy is chosen here, never by the window. `reviewed`: the version the user decided
+    /// about -- another copy listed meanwhile (an update) is refused (`ExtensionChanged`).
+    /// Returns the state now.
+    pub fn set_grants(
+        &self,
+        requested: &str,
+        reviewed: Option<&str>,
+        capabilities: &[String],
+    ) -> Result<PermissionState, String> {
+        let id = canonical_id(requested)
+            .ok_or_else(|| format!("InvalidRequest: \"{requested}\" is not an extension id."))?;
+        let (mut inner, paths) = self.lock()?;
+        let (listed, _) = self.reconcile(&mut inner, paths)?;
+        let chosen = listed
+            .into_iter()
+            .find(|one| one.id.as_deref() == Some(id.as_str()) && one.error.is_none())
+            .ok_or_else(|| format!("UnknownExtension: {id} is not installed."))?;
+        let (Some(copy), Some(state)) = (chosen.copy, chosen.permissions) else {
+            return Err(format!("UnknownExtension: {id} is not installed."));
+        };
+        if let Some(version) = reviewed.filter(|v| *v != copy.version) {
+            return Err(format!(
+                "ExtensionChanged: {id} is now version {}, not {version}; review its permissions again.",
+                copy.version
+            ));
+        }
+        let mut wanted = BTreeSet::new();
+        for capability in capabilities {
+            if !state.requested.contains(capability) {
+                return Err(format!(
+                    "NotRequested: {id} {} does not request \"{capability}\"; only what an extension's manifest requests can be allowed.",
+                    copy.version
+                ));
+            }
+            wanted.insert(capability.clone());
+        }
+        let grant = Grant {
+            folder: chosen.folder.clone(),
+            version: copy.version.clone(),
+            sha256: copy.sha256.clone(),
+            capabilities: wanted,
+            granted_at: now(),
+        };
+        Self::write(&mut inner, paths, |inv| {
+            if grant.capabilities.is_empty() {
+                inv.grants.remove(&id);
+            } else {
+                inv.grants.insert(id.clone(), grant.clone());
+            }
+            Ok(())
+        })?;
+        let grants = &inner.inventory.as_ref().ok_or("InstallFailed")?.grants;
+        let requested: BTreeSet<String> = state.requested.iter().cloned().collect();
+        Ok(permission_state(
+            &requested,
+            state.legacy,
+            grants.get(&id),
+            &chosen.folder,
+            &copy,
+        ))
+    }
+
+    /// The copy the host loads for `id` (the one `list` reports), with what it requests. A
+    /// disabled extension is never loaded (EXT-07, F5).
+    pub fn host_copy(&self, requested: &str) -> Result<HostCopy, String> {
         let id = canonical_id(requested)
             .ok_or_else(|| format!("UnknownExtension: \"{requested}\" is not an extension id."))?;
         let (mut inner, paths) = self.lock()?;
         let (listed, _) = self.reconcile(&mut inner, paths)?;
+        let disabled = inner
+            .inventory
+            .as_ref()
+            .is_some_and(|inv| inv.disabled.contains(&id));
+        if disabled {
+            return Err(format!("ExtensionDisabled: {id} is disabled."));
+        }
         let chosen = listed
             .into_iter()
             .find(|one| one.id.as_deref() == Some(id.as_str()) && one.error.is_none())
@@ -931,7 +1240,73 @@ impl ExtensionService {
             .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
             .and_then(|value| value.get("main")?.as_str().map(str::to_string))
             .ok_or_else(|| format!("UnsupportedRuntime: {id} has no code (no \"main\")."))?;
-        Ok((PathBuf::from(chosen.folder), main))
+        let (Some(copy), Some(state)) = (chosen.copy, chosen.permissions) else {
+            return Err(format!("UnknownExtension: {id} is not installed."));
+        };
+        Ok(HostCopy {
+            id,
+            folder: chosen.folder,
+            main,
+            version: copy.version,
+            sha256: copy.sha256,
+            stored: copy.stored,
+            requested: state.requested.into_iter().collect(),
+        })
+    }
+
+    /// Whether the code of `copy` (what a host loaded) may still act: the extension is enabled
+    /// and `copy` is still the copy Yavin uses -- and, for `capability`, its manifest requests
+    /// it and it is granted for that very copy. From the inventory in memory, so a revocation,
+    /// a disable or an update holds for the next request.
+    pub fn authorize(&self, copy: &HostCopy, capability: Option<&str>) -> Result<(), Denial> {
+        let (inner, _) = self
+            .lock()
+            .map_err(|why| Denial::new("InventoryUnavailable", why))?;
+        let inv = inner
+            .inventory
+            .as_ref()
+            .ok_or_else(|| Denial::new("InventoryUnavailable", "The inventory is not read."))?;
+        let id = &copy.id;
+        if inv.disabled.contains(id) {
+            return Err(Denial::new(
+                "ExtensionDisabled",
+                format!("{id} is disabled."),
+            ));
+        }
+        let current = match (&copy.stored, inv.extensions.get(id)) {
+            (Some(stored), Some(record)) => {
+                record.active.folder == *stored && record.active.version == copy.version
+            }
+            // A development copy: still the one used while nothing is installed over it.
+            (None, None) => true,
+            _ => false,
+        };
+        if !current {
+            return Err(Denial::new(
+                "ExtensionChanged",
+                format!("The running code of {id} is no longer the installed copy; it must be reloaded."),
+            ));
+        }
+        let Some(capability) = capability else {
+            return Ok(());
+        };
+        if !copy.requested.contains(capability) {
+            return Err(Denial::new(
+                "PermissionDenied",
+                format!("{id} does not request \"{capability}\" in its manifest."),
+            ));
+        }
+        let granted = inv.grants.get(id).is_some_and(|grant| {
+            grant.binds(&copy.folder, &copy.version, copy.sha256.as_deref())
+                && grant.capabilities.contains(capability)
+        });
+        if !granted {
+            return Err(Denial::new(
+                "PermissionDenied",
+                format!("\"{capability}\" is not allowed for {id} {}.", copy.version),
+            ));
+        }
+        Ok(())
     }
 
     /// The disk and the inventory, made to agree; what to list. Root folders the inventory
@@ -966,6 +1341,8 @@ impl ExtensionService {
                     manifest: found.manifest,
                     source: "installed",
                     shadowed: Vec::new(),
+                    permissions: None,
+                    copy: None,
                 }),
             }
         }
@@ -1031,6 +1408,11 @@ impl ExtensionService {
                 }
                 read_copy(&join(root, &copy.folder), &id, Some(&copy.version))
             };
+            let facts = |copy: &Copy| CopyFacts {
+                version: copy.version.clone(),
+                sha256: copy.sha256.clone(),
+                stored: Some(copy.folder.clone()),
+            };
             let mut entry = Listed {
                 id: Some(id.clone()),
                 folder: display(&join(root, &record.active.folder)),
@@ -1038,6 +1420,8 @@ impl ExtensionService {
                 error: None,
                 source: "installed",
                 shadowed: shadows.remove(&id).unwrap_or_default(),
+                permissions: None,
+                copy: Some(facts(&record.active)),
             };
             match usable(&record.active) {
                 Ok(text) => {
@@ -1071,6 +1455,7 @@ impl ExtensionService {
                             })?;
                             entry.folder = display(&join(root, &previous.folder));
                             entry.manifest = Some(text);
+                            entry.copy = Some(facts(&previous));
                         }
                         None => {
                             let reason = format!("The installed {id} {} cannot be used: {why}. Reinstall or uninstall it.", record.active.version);
@@ -1084,6 +1469,7 @@ impl ExtensionService {
                                 })?;
                             }
                             entry.error = Some(reason);
+                            entry.copy = None;
                         }
                     }
                 }
@@ -1110,6 +1496,8 @@ impl ExtensionService {
                         manifest: found.manifest,
                         source: "development",
                         shadowed: Vec::new(),
+                        permissions: None,
+                        copy: None,
                     });
                     continue;
                 };
@@ -1136,10 +1524,67 @@ impl ExtensionService {
                     error: None,
                     source: "development",
                     shadowed: Vec::new(),
+                    permissions: None,
+                    copy: Some(CopyFacts {
+                        version,
+                        sha256: None,
+                        stored: None,
+                    }),
                 });
             }
         }
+        // What each usable copy requests, and what of it is granted for that very copy. A
+        // declaration this Yavin cannot read makes the copy unusable: it is never loaded.
+        let grants = &inner.inventory.as_ref().ok_or("InstallFailed")?.grants;
+        for entry in &mut listed {
+            let (Some(id), Some(copy), None) = (&entry.id, &entry.copy, &entry.error) else {
+                continue;
+            };
+            let manifest = entry
+                .manifest
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .unwrap_or_default();
+            match declared(&manifest, id) {
+                Ok(wanted) => {
+                    entry.permissions = Some(permission_state(
+                        &wanted.requested,
+                        wanted.legacy,
+                        grants.get(id),
+                        &entry.folder,
+                        copy,
+                    ))
+                }
+                Err(why) => {
+                    entry.error = Some(format!("Its permissions cannot be used: {why}."));
+                    entry.copy = None;
+                }
+            }
+        }
         Ok((listed, skipped))
+    }
+}
+
+/// The window's view of a copy's permissions: what it requests, what of it the grant -- if
+/// bound to this very copy -- allows, and a grant for another copy, shown as such.
+fn permission_state(
+    requested: &BTreeSet<String>,
+    legacy: bool,
+    grant: Option<&Grant>,
+    folder: &str,
+    copy: &CopyFacts,
+) -> PermissionState {
+    let bound = grant.filter(|g| g.binds(folder, &copy.version, copy.sha256.as_deref()));
+    PermissionState {
+        legacy,
+        requested: requested.iter().cloned().collect(),
+        granted: bound
+            .map(|g| g.capabilities.intersection(requested).cloned().collect())
+            .unwrap_or_default(),
+        previous: grant.filter(|_| bound.is_none()).map(|g| PreviousGrant {
+            version: g.version.clone(),
+            granted: g.capabilities.iter().cloned().collect(),
+        }),
     }
 }
 
@@ -1152,6 +1597,19 @@ fn sanitized(mut inventory: Inventory) -> Inventory {
     inventory
         .operations
         .retain(|op, operation| operation_id_ok(op).is_ok() && is_canonical(&operation.id));
+    // A grant naming what is not a capability, or for what is not an id, is dropped whole: an
+    // unreadable grant allows nothing (EXT-07).
+    let grants = inventory.grants.len();
+    inventory
+        .grants
+        .retain(|id, grant| grant.capabilities.iter().all(|c| grantable(id, c)));
+    if grants != inventory.grants.len() {
+        note(
+            &mut inventory,
+            None,
+            "Extension permissions that are not valid were dropped; those extensions are allowed nothing until they are allowed again.".into(),
+        );
+    }
     if before != (inventory.extensions.len(), inventory.operations.len()) {
         note(
             &mut inventory,
@@ -1162,11 +1620,84 @@ fn sanitized(mut inventory: Inventory) -> Inventory {
     inventory
 }
 
+/// Both copies, the last-good one first: it is never older than the inventory. Either write
+/// failing leaves the inventory as it was -- and, should the inventory's own write fail, the
+/// last-good copy is put back as it was too, so it is never ahead with a change that failed.
 fn save(paths: &Paths, inventory: &Inventory) -> Result<(), String> {
     let text =
         serde_json::to_string_pretty(inventory).map_err(|e| format!("InstallFailed: {e}"))?;
-    write_durably(&paths.root.join(INVENTORY), text.as_bytes())
-        .map_err(|e| format!("InstallFailed: the extension inventory could not be saved ({e})."))
+    let failed =
+        |e: String| format!("InstallFailed: the extension inventory could not be saved ({e}).");
+    let last_good = paths.root.join(LAST_GOOD);
+    let earlier = fs::read(&last_good).ok();
+    write_durably(&last_good, text.as_bytes()).map_err(failed)?;
+    if let Err(error) = write_durably(&paths.root.join(INVENTORY), text.as_bytes()) {
+        let _ = match &earlier {
+            Some(bytes) => write_durably(&last_good, bytes),
+            None => remove_durably(&last_good),
+        };
+        return Err(failed(error));
+    }
+    Ok(())
+}
+
+fn read_inventory(file: &Path) -> Loaded<Inventory> {
+    read_versioned(file, INVENTORY_VERSION, json_version, |text, version| {
+        (version == INVENTORY_VERSION)
+            .then(|| serde_json::from_str::<Inventory>(text).ok())
+            .flatten()
+    })
+}
+
+/// Whether anything was installed here by an inventory (not just IDE-09's root folders).
+fn installed_data(root: &Path) -> bool {
+    let nonempty = |folder: &str| {
+        fs::read_dir(root.join(folder)).is_ok_and(|mut entries| entries.next().is_some())
+    };
+    nonempty(STORE) || nonempty(STAGING) || root.join(LAST_GOOD).exists()
+}
+
+/// The version of store copy `folder` of `id` if it is one: a plain folder inside the root
+/// named `<version>-<sha8>`, whose manifest is `id` at that version.
+fn validated(root: &Path, id: &str, folder: &str) -> Option<String> {
+    if !folder_ok(folder) {
+        return None;
+    }
+    let path = join(root, folder);
+    if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    let name = folder.rsplit('/').next()?;
+    let (version, sha8) = name.rsplit_once('-')?;
+    let hex = sha8.len() == 8 && sha8.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if !hex || crate::extension_package::version_ok(version).is_err() {
+        return None;
+    }
+    let inside = match (root.canonicalize(), path.canonicalize()) {
+        (Ok(base), Ok(real)) => real.starts_with(&base),
+        _ => false,
+    };
+    (inside && read_copy(&path, id, Some(version)).is_ok()).then(|| version.to_string())
+}
+
+/// Semantic version order (a pre-release before its release); enough to choose the newest copy.
+fn version_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let parts = |v: &str| {
+        let v = v.split('+').next().unwrap_or(v);
+        let (core, pre) = match v.split_once('-') {
+            Some((core, pre)) => (core.to_string(), Some(pre.to_string())),
+            None => (v.to_string(), None),
+        };
+        let numbers: Vec<u64> = core.split('.').map(|n| n.parse().unwrap_or(0)).collect();
+        (numbers, pre)
+    };
+    let ((a_core, a_pre), (b_core, b_pre)) = (parts(a), parts(b));
+    a_core.cmp(&b_core).then_with(|| match (a_pre, b_pre) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(x), Some(y)) => x.cmp(&y),
+    })
 }
 
 /// Deletes a copy no record uses any more: a store copy, or an IDE-09 folder directly in the
@@ -1233,6 +1764,18 @@ pub fn extensions_set_enabled(
     enabled: bool,
 ) -> Result<(), String> {
     service.set_enabled(&id, enabled)
+}
+
+/// Allows exactly `capabilities` for an extension's installed copy, the `version` the user
+/// reviewed (EXT-07); returns the state.
+#[tauri::command(async)]
+pub fn extensions_set_grants(
+    service: State<'_, ExtensionService>,
+    id: String,
+    version: String,
+    capabilities: Vec<String>,
+) -> Result<PermissionState, String> {
+    service.set_grants(&id, Some(&version), &capabilities)
 }
 
 #[cfg(test)]

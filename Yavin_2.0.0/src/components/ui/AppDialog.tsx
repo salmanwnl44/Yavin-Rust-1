@@ -20,6 +20,8 @@ export interface DialogRequest {
   submit?: (value: string) => void | Promise<void>;
   confirmLabel?: string;
   afterClose?: () => void;
+  /** It closed without a choice: Escape, Cancel, the backdrop, or another dialog replaced it. */
+  onCancel?: () => void;
 }
 
 export function AppDialog({ request, onClose }: { request: DialogRequest; onClose: () => void }) {
@@ -33,6 +35,28 @@ export function AppDialog({ request, onClose }: { request: DialogRequest; onClos
   const [error, setError] = useState("");
   /** What had the keyboard before the dialog opened (read on the first render only). */
   const opener = useRef(document.activeElement);
+  /** A choice was made, or it was dismissed: what `onCancel` must not be told twice. */
+  const settled = useRef(false);
+  const dismiss = () => {
+    settled.current = true;
+    onClose();
+    request.onCancel?.();
+  };
+  // Replaced by another dialog (unmounted with no choice): a cancel too. Development mounts
+  // effects twice; only an unmount not followed by another run of this effect is real.
+  const runs = useRef(0);
+  useEffect(() => {
+    const run = ++runs.current;
+    const cancel = request.onCancel;
+    return () => {
+      queueMicrotask(() => {
+        if (runs.current !== run || settled.current) return;
+        settled.current = true;
+        cancel?.();
+      });
+    };
+    // Once per dialog (it is keyed): its own `onCancel`.
+  }, []);
 
   // Escape, Cancel and the backdrop remove the dialog without `close()`, and the browser then
   // returns focus to nothing. Give it back to what had it -- the editor, after Go to Line --
@@ -69,13 +93,14 @@ export function AppDialog({ request, onClose }: { request: DialogRequest; onClos
     else if (request.options) filterRef.current?.focus();
   }, [request.input, request.options]);
 
-  const choose = (chosen: string) => {
+  const choose = (choice: string) => {
     if (busy) return;
     setBusy(true);
     setError("");
     Promise.resolve()
-      .then(() => request.submit?.(chosen))
+      .then(() => request.submit?.(choice))
       .then(() => {
+        settled.current = true;
         ref.current?.close();
         onClose();
         request.afterClose?.();
@@ -93,12 +118,12 @@ export function AppDialog({ request, onClose }: { request: DialogRequest; onClos
       aria-labelledby="app-dialog-title"
       onCancel={(event) => {
         event.preventDefault();
-        if (!busy) onClose();
+        if (!busy) dismiss();
       }}
       // Clicking the backdrop dismisses, like every other modal in the app. The click lands
       // on the <dialog> itself only when it is outside the content box.
       onClick={(event) => {
-        if (event.target === event.currentTarget && !busy) onClose();
+        if (event.target === event.currentTarget && !busy) dismiss();
       }}
       className="m-auto max-h-[80vh] w-[min(480px,90vw)] overflow-y-auto rounded-xl border border-zinc-700 bg-zinc-950 p-6 text-zinc-100 backdrop:bg-black/70"
     >
@@ -200,7 +225,7 @@ export function AppDialog({ request, onClose }: { request: DialogRequest; onClos
         )}
         <div className="flex justify-end gap-3">
           {request.submit && (
-            <button type="button" disabled={busy} onClick={onClose}>
+            <button type="button" disabled={busy} onClick={dismiss}>
               Cancel
             </button>
           )}

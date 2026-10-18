@@ -27,8 +27,11 @@ import { createDeclarativeContributions } from "./extensions/declarative.ts";
 import { createExtensionStorage } from "./extensions/storage.ts";
 import { createExtensionHostManager, type ExtensionHostManager } from "./extensions/manager.ts";
 import { createNativeHostTransport } from "./extensions/transport.ts";
-import { installedRoot, rediscoverExtensions } from "./extensions/discovery.ts";
-import { createExtensionInstaller } from "./extensions/marketplace/installer.ts";
+import { installedRoot, rediscoverExtensions, refreshGrants } from "./extensions/discovery.ts";
+import {
+  createExtensionInstaller,
+  type PermissionRequest,
+} from "./extensions/marketplace/installer.ts";
 import { createMarketplaceService } from "./extensions/marketplace/service.ts";
 import {
   configuredProvider,
@@ -147,6 +150,13 @@ export const extensionRegistry = createExtensionRegistry({
           console.warn(`${id}: its enabled state was not saved: ${String(error)}`),
         )
     : undefined,
+  // Grants are decided and kept natively (EXT-07): what is shown is what it then holds.
+  persistGrants: isTauri()
+    ? async (id, version, capabilities) => {
+        const state = await native("extensions_set_grants", { id, version, capabilities });
+        return { granted: state.granted, previous: state.previous };
+      }
+    : undefined,
 });
 /** Extensions' own state, per extension and scope (`extensions/storage.ts`). */
 export const extensionStorage = createExtensionStorage(undefined, (id, message) =>
@@ -168,7 +178,19 @@ export const extensionInstaller = createExtensionInstaller({
   storage: extensionStorage,
   root: installedRoot,
   rediscover: () => rediscoverExtensions(extensionRegistry),
+  // What a package asks to be allowed is reviewed in the window (EXT-07); none can be asked
+  // before the window offers it, so none is allowed then.
+  consent: (request) => (askPermissions ? askPermissions(request) : Promise.resolve([])),
+  refreshGrants: isTauri() ? () => refreshGrants(extensionRegistry) : undefined,
 });
+let askPermissions: ((request: PermissionRequest) => Promise<readonly string[] | null>) | null =
+  null;
+/** How the window asks the user to review a package's permissions (EXT-07; App sets it). */
+export const setPermissionReview = (
+  ask: ((request: PermissionRequest) => Promise<readonly string[] | null>) | null,
+) => {
+  askPermissions = ask;
+};
 /** Extensions' language providers and decorations, for the editor (IDE-08). */
 export const extensionProviders = createProviderRegistry();
 export const extensionDecorations = createDecorationStore();

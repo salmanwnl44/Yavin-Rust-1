@@ -17,6 +17,7 @@ mod config;
 mod dap;
 mod extension_host;
 mod extension_package;
+mod extension_permissions;
 mod extension_service;
 mod extensions;
 mod external;
@@ -41,7 +42,8 @@ use extension_host::{
     ext_host_send, ext_host_start, ext_host_stop, ext_host_stop_all, ExtHostSessions,
 };
 use extension_service::{
-    extensions_list, extensions_read_resource, extensions_set_enabled, ExtensionService,
+    extensions_list, extensions_read_resource, extensions_set_enabled, extensions_set_grants,
+    ExtensionService,
 };
 use external::open_external_url;
 use git::{
@@ -837,6 +839,7 @@ pub fn run() {
             dap_stop_all,
             extensions_list,
             extensions_set_enabled,
+            extensions_set_grants,
             extensions_read_resource,
             ext_host_start,
             ext_host_send,

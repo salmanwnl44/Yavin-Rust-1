@@ -118,6 +118,7 @@ import {
   marketplace,
   onExtensionMessage,
   provideExtensionWindow,
+  setPermissionReview,
   settings,
   terminalSettings,
   terminalProfiles,
@@ -146,6 +147,7 @@ import { ExtensionError } from "./services/extensions/errors";
 import { discoverInstalledOnce } from "./services/extensions/discovery";
 import { followContributedThemes } from "./editor/themes";
 import { documentInfoOf } from "./services/extensions/documentInfo";
+import { describeCapability } from "./services/extensions/permissions";
 import type {
   DocumentEvent as ExtensionDocumentEvent,
   DocumentInfo,
@@ -1491,6 +1493,37 @@ export default function App() {
     setSettingsOpen(false);
     setExtensionPage(id);
   };
+  // A package that declares permissions is reviewed before it installs (EXT-07): allowed,
+  // installed without them, or (dismissed) not installed.
+  useEffect(() => {
+    setPermissionReview(
+      (request) =>
+        new Promise((resolve) => {
+          const titles = request.requested.map((one) => describeCapability(one).title);
+          const before = request.previous?.granted.length
+            ? `\n\nVersion ${request.previous.version} was allowed: ${request.previous.granted
+                .map((one) => describeCapability(one).title.toLowerCase())
+                .join("; ")}. A new version is allowed only what you allow it now.`
+            : "";
+          setDialog({
+            title: `${request.name} ${request.version} asks to:`,
+            message: titles.map((title) => `• ${title}`).join("\n") + before,
+            options: [
+              // The first (what Enter picks) allows nothing.
+              {
+                value: "deny",
+                label: "Install without allowing",
+                description: "Its requests for these are refused; allow them later on its page.",
+              },
+              { value: "allow", label: "Install and allow", description: titles.join("; ") },
+            ],
+            submit: (choice) => resolve(choice === "allow" ? request.requested : []),
+            onCancel: () => resolve(null),
+          });
+        }),
+    );
+    return () => setPermissionReview(null);
+  }, []);
   /** Uninstalling asks first, and whether the extension's stored data goes too. */
   const confirmUninstall = (id: string) => {
     const name = extensionRegistry.get(id)?.manifest.displayName ?? id;

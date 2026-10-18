@@ -9,6 +9,7 @@
  * is `identity.ts`, the native side's too (EXT-02).
  */
 import { ID_PART, MAX_ID_PART } from "./identity.ts";
+import { declaredPermissions, type DeclaredPermissions } from "./permissions.ts";
 
 /** The extension API this Yavin provides. Bumped on a breaking change to `api.ts`. */
 export const EXTENSION_API = "2.0.0";
@@ -156,6 +157,8 @@ export interface ExtensionManifest {
   dependencies: string[];
   /** Made from a VS Code package (EXT-04); null for a Yavin extension. */
   vsix: VsixOrigin | null;
+  /** What it asks to be allowed (`permissions`, EXT-07): granted only by the user. */
+  permissions: DeclaredPermissions;
 }
 
 /** One thing wrong with a manifest. `field` is a JSON path into it. */
@@ -326,6 +329,11 @@ export function readManifest(value: unknown): ManifestResult {
 
   const capabilities = (raw.capabilities ?? {}) as Record<string, unknown>;
   const untrustedWorkspaces = capabilities.untrustedWorkspaces === true;
+
+  // What it asks to be allowed (EXT-07): a declaration this Yavin cannot read rejects it.
+  const declared = declaredPermissions(raw, id ?? "");
+  if (!declared.ok) error("permissions", `${declared.error}.`);
+  const permissions = declared.ok ? declared.value : { legacy: true, requested: [] };
 
   const prefix = id ? `${id}.` : "\u0000";
   const owned = (value: unknown): value is string =>
@@ -706,6 +714,7 @@ export function readManifest(value: unknown): ManifestResult {
     "main",
     "contributes",
     "capabilities",
+    "permissions",
     "extensionDependencies",
     "license",
     "repository",
@@ -735,6 +744,7 @@ export function readManifest(value: unknown): ManifestResult {
       untrustedWorkspaces,
       dependencies,
       vsix,
+      permissions,
     },
   };
 }

@@ -25,7 +25,9 @@ export type ExtensionErrorCode =
   | "HostCrashedRepeatedly"
   | "DependencyFailed"
   | "Timeout"
-  | "Cancelled";
+  | "Cancelled"
+  | "NotRequested"
+  | "PermissionDenied";
 
 export class ExtensionError extends Error {
   readonly code: ExtensionErrorCode;

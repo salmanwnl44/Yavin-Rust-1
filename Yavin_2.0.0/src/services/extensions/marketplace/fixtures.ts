@@ -162,6 +162,10 @@ const LONG = Array.from(
 ).join("\n\n");
 
 /** The index, as a registry would publish it. Hello World is the real sample's identity. */
+/** The fixture's Hello World package at `version`. */
+export const helloWorldPackage = (version: string) =>
+  `packages/yavin-samples.hello-world-${version}.yvx`;
+
 export function fixtureIndex(helloWorld?: { manifest: Record<string, unknown> }) {
   let n = 0;
   const version = (path: string, v: string, publishedAt: string, yavin = "^2.0.0") => ({
@@ -214,10 +218,10 @@ export function fixtureIndex(helloWorld?: { manifest: Record<string, unknown> })
       ...extra,
     };
   };
-  if (helloWorld)
-    FIXTURE_PACKAGES["packages/yavin-samples.hello-world-2.0.0.yvx"] = {
-      manifest: helloWorld.manifest,
-    };
+  // Hello World is the sample's own manifest when given: its package is the sample's version.
+  const hello = (helloWorld?.manifest.version as string | undefined) ?? "2.0.0";
+  const helloPackage = helloWorldPackage(hello);
+  if (helloWorld) FIXTURE_PACKAGES[helloPackage] = { manifest: helloWorld.manifest };
   return {
     schema: 1,
     name: "Test Catalog",
@@ -235,7 +239,7 @@ export function fixtureIndex(helloWorld?: { manifest: Record<string, unknown> })
         "Hello World (sample)",
         "Yavin's sample extension.",
         ["samples"],
-        [version("packages/yavin-samples.hello-world-2.0.0.yvx", "2.0.0", "2026-10-06")],
+        [version(helloPackage, hello, "2026-10-06")],
       ),
       entry(
         "acme.python-tools",

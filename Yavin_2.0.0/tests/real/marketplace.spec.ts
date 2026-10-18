@@ -131,6 +131,34 @@ const recordOf = (id: string) => {
     }
   ).extensions[id];
 };
+/** What the inventory allows `id` (EXT-07: its grant, bound to one copy), if anything. */
+const grantOf = (id: string) => {
+  const file = join(EXTENSIONS, "inventory.json");
+  if (!existsSync(file)) return undefined;
+  return (
+    JSON.parse(readFileSync(file, "utf8")) as {
+      grants?: Record<
+        string,
+        { folder: string; version: string; sha256: string | null; capabilities: string[] }
+      >;
+    }
+  ).grants?.[id];
+};
+/** The sha256 the inventory records for `id`'s copy in use. */
+const shaOf = (id: string) =>
+  (recordOf(id) as { active: { sha256?: string | null } } | undefined)?.active.sha256;
+
+/** A package that declares permissions is reviewed before it installs (EXT-07). */
+async function review(
+  page: Running["page"],
+  choice: "Install and allow" | "Install without allowing",
+) {
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("asks to:");
+  await dialog.getByRole("option", { name: new RegExp(`^${choice}`) }).click();
+  await expect(dialog).toHaveCount(0);
+}
+
 /** The folder the inventory uses for `id` (its store copy), or where none would be. */
 const installedFolder = (id: string) =>
   join(EXTENSIONS, ...(recordOf(id)?.active.folder.split("/") ?? [".store", id]));
@@ -172,19 +200,24 @@ test("a real package from Yavin's registry: installed through the installer, run
       view.getByRole("region", { name: "Installed extensions" }),
       "Word Count",
     );
-    await timed("install (click to registered)", async () => {
+    await timed("install (click to registered, with the review)", async () => {
       await wordCount.getByRole("button", { name: "Install Word Count" }).click();
+      await review(page, "Install and allow");
       await expect(installed.getByTestId("extension-state")).toHaveText("Enabled");
     });
+    // What was allowed is granted natively, bound to the very copy installed (EXT-07).
+    await expect.poll(() => grantOf("yavin.word-count")?.capabilities).toEqual(["documents.read"]);
+    expect(grantOf("yavin.word-count")?.version).toBe("1.0.1");
+    expect(grantOf("yavin.word-count")?.sha256).toBe(shaOf("yavin.word-count"));
     // On disk: unpacked into Yavin's extensions folder, nothing left in staging.
     expect(existsSync(join(installedFolder("yavin.word-count"), "extension.js"))).toBe(true);
     expect(
       JSON.parse(
         readFileSync(join(installedFolder("yavin.word-count"), "yavin-extension.json"), "utf8"),
       ).version,
-    ).toBe("1.0.0");
+    ).toBe("1.0.1");
     expect(leftovers()).toEqual([]);
-    expect(server.requests).toContain("/packages/yavin.word-count-1.0.0.yvx");
+    expect(server.requests).toContain("/packages/yavin.word-count-1.0.1.yvx");
     expect(hostProcesses(app.pid!)).toEqual([]); // installing runs nothing
     // It runs, in the real host, on the open file.
     await page.getByTitle("Explorer (Ctrl+Shift+E)", { exact: true }).click();
@@ -201,7 +234,7 @@ test("a real package from Yavin's registry: installed through the installer, run
   }
 });
 
-test("an update: Hello World 2.0.0 installed, 2.1.0 found and installed; the new code runs", async () => {
+test("an update: Hello World 2.0.1 installed, 2.1.1 found and installed; the new code runs", async () => {
   const running = await start();
   const { app, page } = running;
   try {
@@ -213,7 +246,8 @@ test("an update: Hello World 2.0.0 installed, 2.1.0 found and installed; the new
     ).click();
     const details = page.getByRole("region", { name: "Extension: Hello World (sample)" });
     await details.getByRole("tab", { name: "Information" }).click();
-    await details.getByRole("button", { name: "Install version 2.0.0" }).click();
+    await details.getByRole("button", { name: "Install version 2.0.1" }).click();
+    await review(page, "Install and allow");
     await expect(details.getByRole("region", { name: "Versions" })).toContainText("Installed");
     await details.getByRole("button", { name: "Back to Extensions" }).click();
     await palette(page, "Hello World: Say Hello");
@@ -226,6 +260,9 @@ test("an update: Hello World 2.0.0 installed, 2.1.0 found and installed; the new
       await card(updates, "Hello World (sample)")
         .getByRole("button", { name: "Update Hello World (sample)" })
         .click();
+      // The new version is granted nothing of the old one's: it is reviewed again.
+      await expect(page.getByRole("dialog")).toContainText("Version 2.0.1 was allowed");
+      await review(page, "Install and allow");
       await expect(updates).toContainText("All installed extensions are up to date.");
     });
     expect(
@@ -235,10 +272,11 @@ test("an update: Hello World 2.0.0 installed, 2.1.0 found and installed; the new
           "utf8",
         ),
       ).version,
-    ).toBe("2.1.0");
+    ).toBe("2.1.1");
     expect(leftovers()).toEqual([]);
     // The version it replaced is kept as the fallback (EXT-02).
-    expect(recordOf("yavin-samples.hello-world")?.previous?.version).toBe("2.0.0");
+    expect(recordOf("yavin-samples.hello-world")?.previous?.version).toBe("2.0.1");
+    expect(grantOf("yavin-samples.hello-world")?.version).toBe("2.1.1");
     await palette(page, "Hello World: Say Hello");
     await expect(message(page)).toContainText("Hello, world! (greeting 2)"); // its state carried over
     await close(running);
@@ -255,7 +293,11 @@ test("uninstall: the folder is deleted, the command is gone", async () => {
     await card(view.getByRole("region", { name: "Recommended extensions" }), "TODO Highlighter")
       .getByRole("button", { name: "Install TODO Highlighter" })
       .click();
+    await review(page, "Install and allow");
     const installed = view.getByRole("region", { name: "Installed extensions" });
+    await expect
+      .poll(() => grantOf("yavin.todo-highlighter")?.capabilities)
+      .toEqual(["documents.read"]);
     await card(installed, "TODO Highlighter")
       .getByRole("button", { name: "Manage TODO Highlighter" })
       .click();
@@ -266,6 +308,7 @@ test("uninstall: the folder is deleted, the command is gone", async () => {
       .click();
     await expect(installed.getByRole("group", { name: "TODO Highlighter" })).toHaveCount(0);
     expect(recordOf("yavin.todo-highlighter")).toBeUndefined();
+    expect(grantOf("yavin.todo-highlighter")).toBeUndefined(); // uninstalling forgets the grant
     expect(existsSync(installedFolder("yavin.todo-highlighter"))).toBe(false);
     await page.keyboard.press("Control+Shift+P");
     await page
@@ -310,6 +353,7 @@ test("marketplace offline: installed extensions keep working; the marketplace sa
     await card(view.getByRole("region", { name: "Recommended extensions" }), "Word Count")
       .getByRole("button", { name: "Install Word Count" })
       .click();
+    await review(page, "Install and allow");
     await expect(
       card(view.getByRole("region", { name: "Installed extensions" }), "Word Count").getByTestId(
         "extension-state",
@@ -325,6 +369,56 @@ test("marketplace offline: installed extensions keep working; the marketplace sa
     await palette(page, "Word Count: Count Words in Active File");
     await expect(message(page)).toContainText("notes.md:");
     await expect(alert(page)).toHaveCount(0);
+    await close(running);
+  } finally {
+    if (app.exitCode === null) app.kill();
+  }
+});
+
+test("permissions, natively: refused without a grant, allowed on its page, refused again once revoked", async () => {
+  const running = await start();
+  const { app, page } = running;
+  try {
+    const view = await extensionsView(page);
+    await card(view.getByRole("region", { name: "Recommended extensions" }), "Word Count")
+      .getByRole("button", { name: "Install Word Count" })
+      .click();
+    await review(page, "Install without allowing");
+    const installed = card(
+      view.getByRole("region", { name: "Installed extensions" }),
+      "Word Count",
+    );
+    await expect(installed.getByTestId("extension-state")).toHaveText("Enabled");
+    expect(grantOf("yavin.word-count")).toBeUndefined();
+    // Its request for the document's text is refused by the native side, in the real host.
+    await page.getByTitle("Explorer (Ctrl+Shift+E)", { exact: true }).click();
+    await page.getByRole("tree", { name: "Files" }).getByText("notes.md", { exact: true }).click();
+    await palette(page, "Word Count: Count Words in Active File");
+    await expect(alert(page)).toContainText("is not allowed for yavin.word-count 1.0.1");
+    await extensionsView(page);
+    await expect(installed.getByTestId("extension-state")).toHaveText(/^Permission Needed/);
+    // Allowed on its page: granted natively, and it works at once, in the same host.
+    await installed.click();
+    const permissions = page
+      .getByRole("region", { name: "Extension: Word Count" })
+      .getByRole("region", { name: "Permissions" });
+    await permissions.getByRole("button", { name: "Allow: Read your open documents" }).click();
+    await expect(permissions.getByTestId("permission-state")).toHaveText("Allowed");
+    expect(grantOf("yavin.word-count")?.capabilities).toEqual(["documents.read"]);
+    const hosts = hostProcesses(app.pid!).map((one) => one.id);
+    // Back to the editor, where notes.md is the active file.
+    await page.getByRole("button", { name: "Back to Extensions" }).click();
+    await palette(page, "Word Count: Count Words in Active File");
+    await expect(message(page)).toContainText("notes.md:");
+    expect(hostProcesses(app.pid!).map((one) => one.id)).toEqual(hosts);
+    // Revoked: the next request is refused again.
+    await installed.click();
+    await permissions.getByRole("button", { name: "Revoke: Read your open documents" }).click();
+    await expect(permissions.getByTestId("permission-state")).toHaveText("Not allowed");
+    expect(grantOf("yavin.word-count")).toBeUndefined();
+    await page.getByRole("button", { name: "Back to Extensions" }).click();
+    await palette(page, "Word Count: Count Words in Active File");
+    await expect(alert(page)).toContainText("is not allowed for yavin.word-count 1.0.1");
     await close(running);
   } finally {
     if (app.exitCode === null) app.kill();

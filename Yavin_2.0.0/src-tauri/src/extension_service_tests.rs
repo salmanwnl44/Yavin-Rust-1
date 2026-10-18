@@ -1133,3 +1133,834 @@ fn a_failed_finish_can_be_finished_again() {
     install(&fx, &service, "acme.hello", "2.0.0");
     assert_eq!(version_listed(&service, "acme.hello"), "2.0.0");
 }
+
+// --- EXT-07: grants -----------------------------------------------------------------------------
+
+impl Fixture {
+    /// A package whose manifest requests `request` (`permissions`, EXT-07).
+    fn package_requesting(&self, id: &str, version: &str, request: &[&str]) -> PathBuf {
+        let (publisher, name) = id.split_once('.').unwrap();
+        let at = self
+            .dir
+            .join("packages")
+            .join(format!("{id}-{version}-p{}", request.len()));
+        fs::create_dir_all(&at).unwrap();
+        let manifest = serde_json::json!({
+            "publisher": publisher, "name": name, "version": version,
+            "engines": {"yavin": "^2.0.0"}, "main": "extension.js",
+            "permissions": {"version": 1, "request": request},
+        })
+        .to_string();
+        package(
+            &at,
+            &[
+                (MANIFEST_FILE, manifest.as_bytes()),
+                ("extension.js", b"module.exports.activate = function () {};"),
+            ],
+        )
+    }
+}
+
+fn install_requesting(
+    fx: &Fixture,
+    service: &ExtensionService,
+    id: &str,
+    version: &str,
+    request: &[&str],
+) -> String {
+    let pkg = fx.package_requesting(id, version, request);
+    let op = stage_file(service, &pkg, id, version).unwrap();
+    service.commit(&op, id).unwrap();
+    op
+}
+
+fn strings(list: &[&str]) -> Vec<String> {
+    list.iter().map(|c| c.to_string()).collect()
+}
+
+fn permissions_of(service: &ExtensionService, id: &str) -> PermissionState {
+    entry(service, id).permissions.expect("a usable copy")
+}
+
+/// A grant is bound to the copy it was given for: an update has none of it (it is shown as the
+/// previous version's), what the new version requests anew needs review like the rest, and a
+/// rollback brings the old copy back with its own grant.
+#[test]
+fn a_new_version_does_not_inherit_a_grant() {
+    let fx = fixture("grant-version");
+    let service = fx.service();
+    let op = install_requesting(&fx, &service, "acme.hello", "1.0.0", &["documents.read"]);
+    service.finish(&op, "acme.hello", true).unwrap();
+    let state = service
+        .set_grants("acme.hello", None, &strings(&["documents.read"]))
+        .unwrap();
+    assert_eq!(state.granted, ["documents.read"]);
+    let old = service.host_copy("acme.hello").unwrap();
+    service.authorize(&old, Some("documents.read")).unwrap();
+
+    // 2.0.0 requests more. Nothing is granted for it.
+    let op = install_requesting(
+        &fx,
+        &service,
+        "acme.hello",
+        "2.0.0",
+        &["documents.read", "workspace.fs.read"],
+    );
+    let state = permissions_of(&service, "acme.hello");
+    assert!(state.granted.is_empty(), "{state:?}");
+    assert_eq!(state.requested, ["documents.read", "workspace.fs.read"]);
+    let previous = state.previous.expect("the previous version's grant, shown");
+    assert_eq!(previous.version, "1.0.0");
+    assert_eq!(previous.granted, ["documents.read"]);
+    let new = service.host_copy("acme.hello").unwrap();
+    for capability in ["documents.read", "workspace.fs.read"] {
+        let denied = service.authorize(&new, Some(capability)).unwrap_err();
+        assert_eq!(denied.code, "PermissionDenied", "{capability}");
+    }
+    // The 1.0.0 code a host may still run is no longer the installed copy.
+    assert_eq!(
+        service
+            .authorize(&old, Some("documents.read"))
+            .unwrap_err()
+            .code,
+        "ExtensionChanged"
+    );
+    assert_eq!(
+        service.authorize(&old, None).unwrap_err().code,
+        "ExtensionChanged"
+    );
+
+    // Rolled back: 1.0.0 is installed again, and so its grant applies again.
+    service.finish(&op, "acme.hello", false).unwrap();
+    assert_eq!(
+        permissions_of(&service, "acme.hello").granted,
+        ["documents.read"]
+    );
+    let again = service.host_copy("acme.hello").unwrap();
+    service.authorize(&again, Some("documents.read")).unwrap();
+
+    // Updated and kept, then reviewed: only what it was allowed.
+    let op = install_requesting(
+        &fx,
+        &service,
+        "acme.hello",
+        "2.0.0",
+        &["documents.read", "workspace.fs.read"],
+    );
+    service.finish(&op, "acme.hello", true).unwrap();
+    service
+        .set_grants("acme.hello", None, &strings(&["workspace.fs.read"]))
+        .unwrap();
+    let new = service.host_copy("acme.hello").unwrap();
+    service.authorize(&new, Some("workspace.fs.read")).unwrap();
+    assert_eq!(
+        service
+            .authorize(&new, Some("documents.read"))
+            .unwrap_err()
+            .code,
+        "PermissionDenied"
+    );
+    let state = permissions_of(&service, "acme.hello");
+    assert_eq!(state.granted, ["workspace.fs.read"]);
+    assert!(state.previous.is_none());
+}
+
+/// Only what the copy's manifest requests can be granted -- not another capability, not a
+/// misspelled one, not for another extension -- and the copy is the inventory's choice.
+#[test]
+fn only_what_a_copy_requests_can_be_granted() {
+    let fx = fixture("grant-requested");
+    let service = fx.service();
+    let op = install_requesting(&fx, &service, "acme.hello", "1.0.0", &["documents.read"]);
+    service.finish(&op, "acme.hello", true).unwrap();
+    for wrong in [
+        "workspace.fs.read",
+        "Documents.Read",
+        "documents.read ",
+        "commands.execute:acme.other",
+        "network.fetch",
+    ] {
+        let refused = service
+            .set_grants("acme.hello", None, &strings(&[wrong]))
+            .unwrap_err();
+        assert!(refused.starts_with("NotRequested"), "{wrong}: {refused}");
+    }
+    assert!(service
+        .set_grants("acme.ghost", None, &strings(&["documents.read"]))
+        .unwrap_err()
+        .starts_with("UnknownExtension"));
+    assert!(inventory(&fx).grants.is_empty(), "nothing was granted");
+    // Upper case names the same extension; the grant is the canonical one's.
+    service
+        .set_grants("Acme.Hello", None, &strings(&["documents.read"]))
+        .unwrap();
+    assert!(inventory(&fx).grants.contains_key("acme.hello"));
+    // An empty list revokes everything.
+    let state = service.set_grants("acme.hello", None, &[]).unwrap();
+    assert!(state.granted.is_empty());
+    assert!(inventory(&fx).grants.is_empty());
+}
+
+/// Uninstalling forgets the grant: a reinstall of the very same version starts with none.
+/// Disabling keeps it, but a disabled extension is allowed nothing and is not loaded.
+#[test]
+fn uninstall_forgets_grants_and_disable_suspends_them() {
+    let fx = fixture("grant-lifecycle");
+    let service = fx.service();
+    let op = install_requesting(&fx, &service, "acme.hello", "1.0.0", &["documents.read"]);
+    service.finish(&op, "acme.hello", true).unwrap();
+    service
+        .set_grants("acme.hello", None, &strings(&["documents.read"]))
+        .unwrap();
+    let copy = service.host_copy("acme.hello").unwrap();
+
+    service.set_enabled("acme.hello", false).unwrap();
+    assert_eq!(
+        service
+            .authorize(&copy, Some("documents.read"))
+            .unwrap_err()
+            .code,
+        "ExtensionDisabled"
+    );
+    assert_eq!(
+        service.authorize(&copy, None).unwrap_err().code,
+        "ExtensionDisabled"
+    );
+    assert!(service
+        .host_copy("acme.hello")
+        .unwrap_err()
+        .starts_with("ExtensionDisabled"));
+    service.set_enabled("acme.hello", true).unwrap();
+    service.authorize(&copy, Some("documents.read")).unwrap();
+
+    service.uninstall("acme.hello").unwrap();
+    assert!(inventory(&fx).grants.is_empty());
+    assert_eq!(
+        service
+            .authorize(&copy, Some("documents.read"))
+            .unwrap_err()
+            .code,
+        "ExtensionChanged"
+    );
+    let op = install_requesting(&fx, &service, "acme.hello", "1.0.0", &["documents.read"]);
+    service.finish(&op, "acme.hello", true).unwrap();
+    assert!(permissions_of(&service, "acme.hello").granted.is_empty());
+    let copy = service.host_copy("acme.hello").unwrap();
+    assert_eq!(
+        service
+            .authorize(&copy, Some("documents.read"))
+            .unwrap_err()
+            .code,
+        "PermissionDenied"
+    );
+}
+
+/// A grant record that is not what Yavin writes allows nothing: one naming what is not a
+/// capability, or for what is not an extension id, is dropped (and said); one bound to another
+/// copy, or forged for a capability the copy does not request, opens nothing; an inventory
+/// whose grants cannot be read at all is kept aside and rebuilt, with no grant.
+#[test]
+fn invalid_or_corrupted_grants_fail_closed() {
+    let fx = fixture("grant-corrupt");
+    let service = fx.service();
+    let op = install_requesting(&fx, &service, "acme.hello", "1.0.0", &["documents.read"]);
+    service.finish(&op, "acme.hello", true).unwrap();
+    let listed = entry(&service, "acme.hello").folder;
+    drop(service);
+
+    let mut inv = inventory(&fx);
+    let grant = |folder: &str, version: &str, sha: Option<String>, caps: &[&str]| Grant {
+        folder: folder.to_string(),
+        version: version.to_string(),
+        sha256: sha,
+        capabilities: caps.iter().map(|c| c.to_string()).collect(),
+        granted_at: 0,
+    };
+    let sha = inv.extensions["acme.hello"].active.sha256.clone();
+    // Not a capability: the whole grant goes.
+    inv.grants.insert(
+        "acme.hello".into(),
+        grant(
+            &listed,
+            "1.0.0",
+            sha.clone(),
+            &["documents.read", "network.fetch"],
+        ),
+    );
+    inv.grants.insert(
+        "../evil".into(),
+        grant(&listed, "1.0.0", None, &["documents.read"]),
+    );
+    fs::write(
+        fx.root.join(INVENTORY),
+        serde_json::to_string(&inv).unwrap(),
+    )
+    .unwrap();
+    let service = fx.service();
+    assert!(permissions_of(&service, "acme.hello").granted.is_empty());
+    let copy = service.host_copy("acme.hello").unwrap();
+    assert_eq!(
+        service
+            .authorize(&copy, Some("documents.read"))
+            .unwrap_err()
+            .code,
+        "PermissionDenied"
+    );
+    let saved = inventory(&fx);
+    assert!(saved.grants.is_empty(), "{:?}", saved.grants);
+    assert!(saved
+        .recoveries
+        .iter()
+        .any(|r| r.reason.contains("permissions that are not valid")));
+    drop(service);
+
+    // Bound to another copy (a different hash, another version, another folder): nothing.
+    for wrong in [
+        grant(&listed, "1.0.0", Some("00".repeat(32)), &["documents.read"]),
+        grant(&listed, "0.9.0", sha.clone(), &["documents.read"]),
+        grant(
+            "C:/elsewhere/acme.hello",
+            "1.0.0",
+            sha.clone(),
+            &["documents.read"],
+        ),
+    ] {
+        let mut inv = inventory(&fx);
+        inv.grants.insert("acme.hello".into(), wrong);
+        fs::write(
+            fx.root.join(INVENTORY),
+            serde_json::to_string(&inv).unwrap(),
+        )
+        .unwrap();
+        let service = fx.service();
+        let copy = service.host_copy("acme.hello").unwrap();
+        assert_eq!(
+            service
+                .authorize(&copy, Some("documents.read"))
+                .unwrap_err()
+                .code,
+            "PermissionDenied"
+        );
+        assert!(permissions_of(&service, "acme.hello").granted.is_empty());
+    }
+
+    // Forged for a capability its manifest does not request: valid as a capability, but the
+    // copy does not ask for it, so it opens nothing.
+    let mut inv = inventory(&fx);
+    inv.grants.insert(
+        "acme.hello".into(),
+        grant(
+            &listed,
+            "1.0.0",
+            sha.clone(),
+            &["documents.read", "workspace.fs.read"],
+        ),
+    );
+    fs::write(
+        fx.root.join(INVENTORY),
+        serde_json::to_string(&inv).unwrap(),
+    )
+    .unwrap();
+    let service = fx.service();
+    let copy = service.host_copy("acme.hello").unwrap();
+    service.authorize(&copy, Some("documents.read")).unwrap();
+    assert_eq!(
+        service
+            .authorize(&copy, Some("workspace.fs.read"))
+            .unwrap_err()
+            .code,
+        "PermissionDenied"
+    );
+    assert_eq!(
+        permissions_of(&service, "acme.hello").granted,
+        ["documents.read"]
+    );
+    drop(service);
+
+    // Grants that are not even grants: the inventory is kept aside, rebuilt, nothing granted.
+    let text = fs::read_to_string(fx.root.join(INVENTORY)).unwrap();
+    let mut raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+    raw["grants"] = serde_json::json!({"acme.hello": "everything"});
+    fs::write(fx.root.join(INVENTORY), raw.to_string()).unwrap();
+    let service = fx.service();
+    let listing = service.list(None).unwrap();
+    assert!(listing
+        .recoveries
+        .iter()
+        .any(|r| r.reason.contains("could not be read")));
+    // (EXT-02's rebuild also lets go of the store copies the empty inventory does not know:
+    // whatever is left, nothing in it is granted.)
+    let grants = fs::read_to_string(fx.root.join(INVENTORY))
+        .map(|text| serde_json::from_str::<Inventory>(&text).unwrap().grants)
+        .unwrap_or_default();
+    assert!(grants.is_empty(), "{grants:?}");
+    if let Ok(copy) = service.host_copy("acme.hello") {
+        assert_eq!(
+            service
+                .authorize(&copy, Some("documents.read"))
+                .unwrap_err()
+                .code,
+            "PermissionDenied"
+        );
+    }
+}
+
+/// A declaration Yavin cannot read fails closed: such a package is not installed, and a copy
+/// already in the folder with one is listed as unusable and never loaded.
+#[test]
+fn an_unreadable_declaration_is_never_installed_or_loaded() {
+    let fx = fixture("grant-declaration");
+    let service = fx.service();
+    let (publisher, name) = ("acme", "hello");
+    let at = fx.dir.join("packages").join("bad");
+    fs::create_dir_all(&at).unwrap();
+    let manifest = serde_json::json!({
+        "publisher": publisher, "name": name, "version": "1.0.0", "main": "extension.js",
+        "permissions": {"version": 2, "request": ["documents.read"]},
+    })
+    .to_string();
+    let pkg = package(
+        &at,
+        &[
+            (MANIFEST_FILE, manifest.as_bytes()),
+            ("extension.js", b"module.exports.activate = function () {};"),
+        ],
+    );
+    let refused = stage_file(&service, &pkg, "acme.hello", "1.0.0").unwrap_err();
+    assert!(refused.starts_with("InvalidPackage"), "{refused}");
+    assert!(refused.contains("permission model version 2"), "{refused}");
+    assert!(inventory(&fx).operations.is_empty());
+    assert_eq!(staging_entries(&fx), 0);
+
+    // Put in the folder by hand (an older Yavin, a copy): listed, unusable, not loaded.
+    fx.folder(
+        &fx.root,
+        "acme.other",
+        r#"{"publisher":"acme","name":"other","version":"1.0.0","main":"extension.js","permissions":{"version":1,"request":["process.spawn"]}}"#,
+    );
+    let listed = entry(&service, "acme.other");
+    assert!(
+        listed
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("permissions cannot be used"),
+        "{listed:?}"
+    );
+    assert!(listed.permissions.is_none());
+    assert!(service.host_copy("acme.other").is_err());
+    assert!(service
+        .set_grants("acme.other", None, &strings(&["documents.read"]))
+        .is_err());
+}
+
+/// A development copy (a repository sample) is granted like an installed one, bound to its
+/// folder and version; an installed copy of the same id then takes over without its grant.
+#[test]
+fn a_development_copys_grant_is_its_own() {
+    let fx = fixture("grant-development");
+    fx.folder(
+        &fx.development,
+        "acme.hello",
+        r#"{"publisher":"acme","name":"hello","version":"1.0.0","main":"extension.js","permissions":{"version":1,"request":["documents.read"]}}"#,
+    );
+    let service = fx.service();
+    assert_eq!(entry(&service, "acme.hello").source, "development");
+    service
+        .set_grants("acme.hello", None, &strings(&["documents.read"]))
+        .unwrap();
+    let development = service.host_copy("acme.hello").unwrap();
+    assert!(development.stored.is_none());
+    service
+        .authorize(&development, Some("documents.read"))
+        .unwrap();
+
+    let op = install_requesting(&fx, &service, "acme.hello", "1.0.0", &["documents.read"]);
+    service.finish(&op, "acme.hello", true).unwrap();
+    assert_eq!(entry(&service, "acme.hello").source, "installed");
+    assert!(permissions_of(&service, "acme.hello").granted.is_empty());
+    let installed = service.host_copy("acme.hello").unwrap();
+    assert_eq!(
+        service
+            .authorize(&installed, Some("documents.read"))
+            .unwrap_err()
+            .code,
+        "PermissionDenied"
+    );
+    assert_eq!(
+        service.authorize(&development, None).unwrap_err().code,
+        "ExtensionChanged"
+    );
+}
+
+/// What the user allowed applies to the version they reviewed: if another copy is listed
+/// meanwhile (an update finished between the review and the click), nothing is granted.
+#[test]
+fn a_grant_for_a_version_no_longer_installed_is_refused() {
+    let fx = fixture("grant-reviewed");
+    let service = fx.service();
+    let op = install_requesting(&fx, &service, "acme.hello", "1.0.0", &["documents.read"]);
+    service.finish(&op, "acme.hello", true).unwrap();
+    let op = install_requesting(&fx, &service, "acme.hello", "2.0.0", &["documents.read"]);
+    service.finish(&op, "acme.hello", true).unwrap();
+    let refused = service
+        .set_grants("acme.hello", Some("1.0.0"), &strings(&["documents.read"]))
+        .unwrap_err();
+    assert!(refused.starts_with("ExtensionChanged"), "{refused}");
+    assert!(inventory(&fx).grants.is_empty());
+    service
+        .set_grants("acme.hello", Some("2.0.0"), &strings(&["documents.read"]))
+        .unwrap();
+    assert_eq!(
+        permissions_of(&service, "acme.hello").granted,
+        ["documents.read"]
+    );
+}
+
+// --- A damaged or missing inventory (EXT-02 recovery safety) --------------------------------------
+
+/// Every file under the root but the inventory's own (its two copies, their backups, temps):
+/// what a recovery must never lose, by content.
+fn kept_files(fx: &Fixture) -> Vec<Vec<u8>> {
+    let mut all: Vec<Vec<u8>> = tree(&fx.root)
+        .into_iter()
+        .filter(|(path, _)| {
+            let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            !name.starts_with("inventory.") && !name.starts_with(".inventory.")
+        })
+        .map(|(_, bytes)| bytes)
+        .collect();
+    all.sort();
+    all
+}
+
+/// Installed through the store: acme.hello 1.0.0 then 2.0.0 (active 2.0.0, previous 1.0.0),
+/// acme.other 1.0.0 disabled, acme.hello allowed documents.read.
+fn installed(fx: &Fixture) -> ExtensionService {
+    let service = fx.service();
+    install(fx, &service, "acme.hello", "1.0.0");
+    install(fx, &service, "acme.hello", "2.0.0");
+    install(fx, &service, "acme.other", "1.0.0");
+    service.set_enabled("acme.other", false).unwrap();
+    service
+        .set_grants("acme.hello", None, &strings(&["documents.read"]))
+        .unwrap();
+    service
+}
+
+fn recovered(fx: &Fixture, about: &str) -> bool {
+    inventory(fx)
+        .recoveries
+        .iter()
+        .any(|r| r.reason.contains(about))
+}
+
+/// Every save writes the last-good copy first and the inventory after it: the same text.
+#[test]
+fn every_save_keeps_a_last_good_copy() {
+    let fx = fixture("last-good");
+    let service = installed(&fx);
+    drop(service);
+    assert_eq!(
+        fs::read(fx.root.join(LAST_GOOD)).unwrap(),
+        fs::read(fx.root.join(INVENTORY)).unwrap()
+    );
+}
+
+/// A missing inventory, a malformed one, a truncated one: restored from the last-good copy --
+/// every record, disabled state and grant as it was, nothing on disk changed, the damaged file
+/// kept aside.
+#[test]
+fn a_missing_malformed_or_truncated_inventory_is_restored_from_its_last_good_copy() {
+    let fx = fixture("restore");
+    drop(installed(&fx));
+    let good = inventory(&fx);
+    let text = fs::read_to_string(fx.root.join(INVENTORY)).unwrap();
+    let files = kept_files(&fx);
+    for (damage, about) in [
+        ("missing", "was missing"),
+        ("malformed", "could not be read"),
+        ("truncated", "could not be read"),
+    ] {
+        match damage {
+            "missing" => fs::remove_file(fx.root.join(INVENTORY)).unwrap(),
+            "malformed" => fs::write(fx.root.join(INVENTORY), "{ not json").unwrap(),
+            _ => fs::write(fx.root.join(INVENTORY), &text[..text.len() / 2]).unwrap(),
+        }
+        let service = fx.service();
+        assert_eq!(version_listed(&service, "acme.hello"), "2.0.0", "{damage}");
+        let now = inventory(&fx);
+        assert_eq!(now.extensions, good.extensions, "{damage}");
+        assert_eq!(now.disabled, good.disabled, "{damage}");
+        assert_eq!(
+            now.grants, good.grants,
+            "{damage}: the grants come back too"
+        );
+        assert!(recovered(&fx, about), "{damage}");
+        assert!(
+            recovered(&fx, "it was restored from its last good copy"),
+            "{damage}"
+        );
+        assert_eq!(kept_files(&fx), files, "{damage}: nothing on disk changed");
+        let copy = service.host_copy("acme.hello").unwrap();
+        service.authorize(&copy, Some("documents.read")).unwrap();
+    }
+    let backups = fs::read_dir(&fx.root)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("inventory.json.corrupt")
+        })
+        .count();
+    assert_eq!(backups, 2, "the damaged inventories are kept");
+}
+
+/// What a rebuild must handle: the installs, and what does not validate.
+fn damage_beyond_the_last_good_copy(fx: &Fixture) {
+    // A third, older copy of acme.hello (a rebuild keeps two).
+    let store = fx.root.join(STORE);
+    fx.folder(
+        &store.join("acme.hello"),
+        "0.9.0-0123abcd",
+        &manifest("acme.hello", "0.9.0"),
+    );
+    // Not a store copy name; a manifest that is not its folder's version; not an id.
+    fx.folder(
+        &store.join("acme.hello"),
+        "9.9.9-zzzzzzzz",
+        &manifest("acme.hello", "9.9.9"),
+    );
+    fx.folder(
+        &store.join("acme.hello"),
+        "3.0.0-0123abcd",
+        &manifest("acme.hello", "1.0.0"),
+    );
+    fx.folder(
+        &store.join("Bad_ID"),
+        "1.0.0-0123abcd",
+        &manifest("acme.bad", "1.0.0"),
+    );
+    // Staging nothing records.
+    fs::create_dir_all(fx.root.join(STAGING).join("0123456789abcdef")).unwrap();
+    fs::write(
+        fx.root
+            .join(STAGING)
+            .join("0123456789abcdef")
+            .join("package.yvx"),
+        b"half",
+    )
+    .unwrap();
+    // Both copies of the inventory unreadable.
+    fs::write(fx.root.join(INVENTORY), "{ not json").unwrap();
+    fs::write(fx.root.join(LAST_GOOD), "{\"version\": 1, \"extensions\": ").unwrap();
+}
+
+fn unrecovered(fx: &Fixture) -> Vec<PathBuf> {
+    fs::read_dir(&fx.root)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(".unrecovered-"))
+        })
+        .collect()
+}
+
+fn assert_rebuilt(fx: &Fixture, service: &ExtensionService) {
+    let inv = inventory(fx);
+    let hello = &inv.extensions["acme.hello"];
+    assert_eq!(
+        hello.active.version, "2.0.0",
+        "the newest copy is the active one"
+    );
+    assert_eq!(hello.previous.as_ref().unwrap().version, "1.0.0");
+    assert_eq!(inv.extensions["acme.other"].active.version, "1.0.0");
+    assert_eq!(inv.extensions.len(), 2, "{:?}", inv.extensions.keys());
+    // Its state is not known: disabled, with no grant (fail closed).
+    assert_eq!(
+        inv.disabled.iter().cloned().collect::<Vec<_>>(),
+        ["acme.hello", "acme.other"]
+    );
+    assert!(inv.grants.is_empty());
+    assert!(service
+        .host_copy("acme.hello")
+        .unwrap_err()
+        .starts_with("ExtensionDisabled"));
+    assert!(recovered(fx, "it was rebuilt from the installed copies"));
+    // What did not validate, the third copy and the staging are kept, not deleted.
+    let aside: Vec<String> = unrecovered(fx)
+        .iter()
+        .flat_map(|dir| tree(dir).into_keys())
+        .map(|p| p.replace('\\', "/"))
+        .collect();
+    for expected in [
+        ".store/acme.hello/9.9.9-zzzzzzzz/yavin-extension.json",
+        ".store/acme.hello/3.0.0-0123abcd/yavin-extension.json",
+        ".store/Bad_ID/1.0.0-0123abcd/yavin-extension.json",
+        ".staging/0123456789abcdef/package.yvx",
+    ] {
+        assert!(
+            aside.iter().any(|p| p == expected),
+            "{expected} in {aside:?}"
+        );
+    }
+    assert!(
+        aside
+            .iter()
+            .any(|p| p.starts_with(".store/acme.hello/0.9.0-")),
+        "{aside:?}"
+    );
+    assert_eq!(staging_entries(fx), 0);
+    // Enabled again by the user, it runs.
+    service.set_enabled("acme.hello", true).unwrap();
+    assert_eq!(version_listed(service, "acme.hello"), "2.0.0");
+}
+
+/// Neither copy of the inventory readable: rebuilt from the store copies that validate --
+/// disabled, no grant -- and everything else kept in `.unrecovered-*`. Nothing is deleted;
+/// both damaged copies are kept too.
+#[test]
+fn with_no_readable_copy_the_inventory_is_rebuilt_and_nothing_is_deleted() {
+    let fx = fixture("rebuild");
+    drop(installed(&fx));
+    damage_beyond_the_last_good_copy(&fx);
+    let files = kept_files(&fx);
+    let service = fx.service();
+    service.list(None).unwrap();
+    assert_eq!(kept_files(&fx), files, "every file is still there");
+    assert_rebuilt(&fx, &service);
+    let backups: Vec<_> = fs::read_dir(&fx.root)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".bak"))
+        .collect();
+    assert!(
+        backups
+            .iter()
+            .any(|n| n.starts_with("inventory.json.corrupt")),
+        "{backups:?}"
+    );
+    assert!(
+        backups
+            .iter()
+            .any(|n| n.starts_with("inventory.last-good.json.corrupt")),
+        "{backups:?}"
+    );
+}
+
+/// Recovering again changes nothing: the rebuilt inventory is read as it is, and a rebuild run
+/// once more (both copies lost again) finds the same and moves nothing.
+#[test]
+fn recovery_repeated_gives_the_same_result() {
+    let fx = fixture("rebuild-again");
+    drop(installed(&fx));
+    damage_beyond_the_last_good_copy(&fx);
+    fx.service().list(None).unwrap();
+    let first = inventory(&fx).extensions;
+    let files = kept_files(&fx);
+    for _ in 0..2 {
+        fx.service().list(None).unwrap();
+        assert_eq!(inventory(&fx).extensions, first);
+        assert_eq!(kept_files(&fx), files);
+    }
+    assert_eq!(unrecovered(&fx).len(), 1);
+    fs::remove_file(fx.root.join(INVENTORY)).unwrap();
+    fs::remove_file(fx.root.join(LAST_GOOD)).unwrap();
+    let service = fx.service();
+    service.list(None).unwrap();
+    let mut again = inventory(&fx).extensions;
+    let mut expected = first.clone();
+    for record in again.values_mut().chain(expected.values_mut()) {
+        record.active.installed_at = 0;
+        if let Some(previous) = record.previous.as_mut() {
+            previous.installed_at = 0;
+        }
+    }
+    assert_eq!(again, expected);
+    assert_eq!(kept_files(&fx), files, "nothing more moved or deleted");
+}
+
+/// A rebuild stopped at each of its steps -- after a folder was moved aside, after all were,
+/// before the inventory was written -- loses nothing, writes no inventory, and completes the
+/// next time with the same result.
+#[test]
+fn a_rebuild_interrupted_at_each_step_completes_the_next_time() {
+    for step in ["kept", "rebuilt"] {
+        let fx = fixture(&format!("rebuild-crash-{step}"));
+        drop(installed(&fx));
+        damage_beyond_the_last_good_copy(&fx);
+        let files = kept_files(&fx);
+        let service = fx.service();
+        *service.crash_at.lock().unwrap() = Some(step);
+        let error = service.list(None).unwrap_err();
+        assert!(error.starts_with("Crashed"), "{step}: {error}");
+        assert!(!fx.root.join(INVENTORY).exists(), "{step}: nothing written");
+        assert_eq!(kept_files(&fx), files, "{step}: nothing lost");
+        drop(service);
+        let service = fx.service();
+        service.list(None).unwrap();
+        assert_eq!(kept_files(&fx), files, "{step}");
+        assert_rebuilt(&fx, &service);
+    }
+}
+
+/// A last-good copy written by a newer Yavin is not rebuilt over: nothing is changed, and the
+/// extensions folder is unusable until Yavin is updated (fail closed).
+#[test]
+fn a_newer_last_good_copy_stops_recovery_untouched() {
+    let fx = fixture("rebuild-future");
+    drop(installed(&fx));
+    fs::write(fx.root.join(INVENTORY), "{ not json").unwrap();
+    fs::write(fx.root.join(LAST_GOOD), r#"{"version": 99}"#).unwrap();
+    let files = kept_files(&fx);
+    let error = fx.service().list(None).unwrap_err();
+    assert!(error.starts_with("InventoryUnsupported"), "{error}");
+    assert_eq!(kept_files(&fx), files);
+    assert!(unrecovered(&fx).is_empty());
+}
+
+/// Nothing installed by an inventory (only IDE-09's root folders): a missing inventory is the
+/// first start -- adopted as before, enabled.
+#[test]
+fn a_missing_inventory_with_nothing_installed_is_a_first_start() {
+    let fx = fixture("first-start");
+    fx.folder(&fx.root, "acme.hello", &manifest("acme.hello", "1.0.0"));
+    let service = fx.service();
+    assert_eq!(version_listed(&service, "acme.hello"), "1.0.0");
+    assert!(inventory(&fx).disabled.is_empty());
+    assert!(inventory(&fx).recoveries.is_empty());
+    assert!(unrecovered(&fx).is_empty());
+}
+
+/// A save whose inventory write fails leaves the last-good copy as it was: a change reported
+/// as failed (here a grant) never comes back through a later restore.
+#[test]
+fn a_failed_save_does_not_leave_the_last_good_copy_ahead() {
+    let fx = fixture("last-good-failed");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    let before = fs::read(fx.root.join(LAST_GOOD)).unwrap();
+    // A folder where the inventory goes: its write fails, the last-good one does not.
+    let blocker = fx.root.join(INVENTORY);
+    fs::remove_file(&blocker).unwrap();
+    fs::create_dir(&blocker).unwrap();
+    assert!(service
+        .set_grants("acme.hello", None, &strings(&["documents.read"]))
+        .is_err());
+    assert_eq!(
+        fs::read(fx.root.join(LAST_GOOD)).unwrap(),
+        before,
+        "put back as it was"
+    );
+    drop(service);
+    // The inventory is then lost: the restore has no trace of the failed grant.
+    fs::remove_dir(&blocker).unwrap();
+    let service = fx.service();
+    assert_eq!(version_listed(&service, "acme.hello"), "1.0.0");
+    assert!(inventory(&fx).grants.is_empty());
+    assert!(recovered(&fx, "it was restored from its last good copy"));
+}

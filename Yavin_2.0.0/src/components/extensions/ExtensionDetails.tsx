@@ -14,6 +14,7 @@ import { openExternalUrl } from "../../services/git/remoteUrl";
 import { CardButton } from "./ExtensionCard";
 import { ExtensionIcon } from "./ExtensionIcon";
 import { ExtensionMarkdown } from "./ExtensionMarkdown";
+import { ExtensionPermissions } from "./ExtensionPermissions";
 import { statusOf, useExtensionsState } from "./model";
 
 type Tab = "overview" | "features" | "requirements" | "changelog" | "information";
@@ -47,8 +48,9 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 
 /**
  * An extension's page (IDE-09), in the editor area: what it is, what it contributes, what it
- * needs, its changelog and versions, and Install / Update / Enable / Disable / Uninstall. It
- * shows only what the marketplace published and the installed manifest says.
+ * needs, its changelog and versions, and Install / Update / Enable / Disable / Uninstall -- and,
+ * installed, its permissions (EXT-07). It shows only what the marketplace published, the
+ * installed manifest says and the native inventory allows.
  */
 export function ExtensionDetails({
   id,
@@ -275,6 +277,8 @@ export function ExtensionDetails({
             Details are under Requirements.
           </p>
         )}
+
+        {entry && <ExtensionPermissions entry={entry} registry={registry} />}
 
         <nav
           role="tablist"
