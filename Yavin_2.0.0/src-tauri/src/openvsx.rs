@@ -64,34 +64,44 @@ pub fn encode(text: &str) -> String {
     out
 }
 
-/// A namespace, extension name or version as Open VSX names them: never empty, `.` or `..`,
-/// at most 128 characters, no control characters (anything else is encoded).
-fn segment(what: &str, text: &str) -> Result<String, String> {
+/// A namespace, extension name or version as Open VSX names them, as one path segment
+/// (EXT-08): never empty, `.` or `..`, at most 128 bytes; no `/` or `\\` (a segment that would
+/// be two), no `%` (already-encoded or double-encoded text is ambiguous), no `?` or `#` (a
+/// query or fragment), no whitespace or control characters. Refused, never encoded into
+/// something else; what is left (Unicode included) is encoded by `api_url`.
+pub(crate) fn segment(what: &str, text: &str) -> Result<String, String> {
+    let ambiguous =
+        |c: char| c.is_control() || c.is_whitespace() || matches!(c, '/' | '\\' | '%' | '?' | '#');
     if text.is_empty()
         || text == "."
         || text == ".."
         || text.len() > 128
-        || text.chars().any(char::is_control)
+        || text.chars().any(ambiguous)
     {
         return Err(format!(
             "InvalidRequest: \"{text}\" is not an Open VSX {what}."
         ));
     }
-    Ok(encode(text))
+    Ok(text.to_string())
 }
 
-/// The URL of `api/<segments>?<query>` in `registry`.
+/// The URL of `api/<segments>?<query>` in `registry`, built with a URL parser: each segment
+/// (checked by `segment`) percent-encoded as one path segment, each query value encoded.
 pub fn api_url(registry: &Registry, segments: &[String], query: &[(&str, String)]) -> String {
-    let mut url = format!("{}api/{}", registry.base, segments.join("/"));
+    let mut url = url::Url::parse(&registry.base).expect("a registry's base is a checked URL");
+    url.path_segments_mut()
+        .expect("an https URL has a path")
+        .pop_if_empty()
+        .push("api")
+        .extend(segments);
     let pairs: Vec<_> = query
         .iter()
         .map(|(key, value)| format!("{key}={}", encode(value)))
         .collect();
     if !pairs.is_empty() {
-        url.push('?');
-        url.push_str(&pairs.join("&"));
+        url.set_query(Some(&pairs.join("&")));
     }
-    url
+    url.to_string()
 }
 
 fn metadata(registry: &Registry) -> Registry {

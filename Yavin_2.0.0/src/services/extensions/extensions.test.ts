@@ -169,7 +169,12 @@ function fakeWindow() {
 }
 
 function setup(
-  options: { trusted?: boolean; codes?: Record<string, string>; failStart?: string } = {},
+  options: {
+    trusted?: boolean;
+    codes?: Record<string, string>;
+    failStart?: string;
+    delay?: Parameters<typeof createInProcessTransport>[0]["delay"];
+  } = {},
 ) {
   const storage = memoryStorage();
   const settings = createSettingsRegistry([], storage);
@@ -185,6 +190,7 @@ function setup(
     bootstrap: BOOTSTRAP,
     code: (id) => codes[id] ?? null,
     failStart: options.failStart,
+    delay: options.delay,
   });
   let trusted = options.trusted ?? true;
   let rediscovered = 0;
@@ -1684,4 +1690,90 @@ test("EXT-07 a view row runs only its own extension's commands", async () => {
   const rows = m.getSnapshot().views["acme.hello.people"];
   assert.equal(rows[0].command, "acme.hello.greet");
   assert.equal(rows[1].command, undefined, "another extension's command is not offered");
+});
+
+// --- EXT-08: timeouts, cancellation, stale hosts -------------------------------------------------
+
+const HOVERING = (activate: string) => `
+module.exports.activate = async function (c, yavin) {
+  c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", function () { return "hi"; }));
+  c.subscriptions.push(yavin.languages.registerHoverProvider("markdown", { provideHover: function () { return { contents: "h" }; } }));
+  ${activate}
+};`;
+const quick = { load: 100, activate: 100, deactivate: 1000 };
+
+test("EXT-08 a load that times out leaves no code in the host, and a retry (Restart) activates once", async () => {
+  let slow = true;
+  const t = setup({ delay: (m) => (m.type === "load" && slow ? 300 : undefined) });
+  t.add({}, HOVERING(""));
+  const m = t.manager(A, 1, quick);
+  await assert.rejects(
+    m.executeCommand("acme.hello.greet"),
+    (e: ExtensionError) => e.code === "ActivationFailed" || e.code === "CommandFailed",
+  );
+  // Reported only once the host let go of it: the late load came first, then the unload.
+  assert.deepEqual(t.host.resident(), [], "no code left in the host");
+  assert.equal(m.getSnapshot().statuses["acme.hello"].state, "failed");
+  assert.equal(t.providers.getSnapshot().length, 0);
+  // Retried (a failed extension stays failed in its host until Restart): once, cleanly.
+  slow = false;
+  await m.restart();
+  assert.equal(await m.executeCommand("acme.hello.greet"), "hi");
+  assert.equal(t.providers.getSnapshot().length, 1, "registered once");
+  assert.deepEqual(t.host.resident(), ["acme.hello"]);
+});
+
+test("EXT-08 an activation that times out after registering is cleaned up and unloaded; late work is refused", async () => {
+  const t = setup();
+  t.add(
+    {},
+    HOVERING(`await new Promise(function (resolve) { setTimeout(resolve, 300); });
+  c.subscriptions.push(yavin.commands.registerCommand("acme.hello.other", function () { return "late"; }));`),
+  );
+  const m = t.manager(A, 1, quick);
+  await assert.rejects(m.executeCommand("acme.hello.greet"));
+  assert.equal(m.getSnapshot().statuses["acme.hello"].state, "failed");
+  assert.equal(t.providers.getSnapshot().length, 0, "its partial registrations are gone");
+  assert.deepEqual(t.host.resident(), [], "its code is unloaded");
+  // Its activation finishes later: its late registration, and its late answer, change nothing.
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  await settle();
+  assert.equal(m.getSnapshot().statuses["acme.hello"].state, "failed");
+  assert.equal(t.providers.getSnapshot().length, 0);
+  assert.ok(
+    t.logs.get("acme.hello")?.some((line) => /Activation failed/.test(line)),
+    "said in its output",
+  );
+});
+
+test("EXT-08 a host that does not let go of an extension in time is ended, not used again", async () => {
+  const t = setup({ delay: (m) => (m.type === "unload" ? 5000 : undefined) });
+  t.add({}, HOVERING("await new Promise(function () {});"));
+  const m = t.manager(A, 1, { ...quick, deactivate: 100 });
+  await assert.rejects(m.executeCommand("acme.hello.greet"));
+  assert.notEqual(m.getSnapshot().host, "running", "that host is over");
+  assert.equal(t.providers.getSnapshot().length, 0);
+  // The next use is a new host.
+  t.add(OTHER, OTHER_CODE);
+  assert.equal(await m.executeCommand("acme.other.greet"), "from other");
+  assert.equal(t.host.started(), 2);
+});
+
+test("EXT-08 a host that ended removes only its own providers and decorations, never its replacement's", async () => {
+  const t = setup();
+  t.add({}, HOVERING(""));
+  const first = t.manager(A, 1);
+  await first.executeCommand("acme.hello.greet");
+  const second = t.manager(A, 2);
+  await second.executeCommand("acme.hello.greet");
+  assert.equal(t.providers.getSnapshot().length, 2);
+  const generations = t.providers.getSnapshot().map((p) => p.generation);
+  assert.equal(new Set(generations).size, 2, "each host's own");
+  // The old host goes (as a stale one would): the replacement's provider stays.
+  await first.dispose();
+  const left = t.providers.getSnapshot();
+  assert.equal(left.length, 1);
+  assert.equal(left[0].generation, second.getSnapshot().generation);
+  await second.dispose();
+  assert.equal(t.providers.getSnapshot().length, 0);
 });

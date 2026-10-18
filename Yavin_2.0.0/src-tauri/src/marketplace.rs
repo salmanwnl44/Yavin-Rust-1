@@ -226,14 +226,22 @@ pub fn url_on(registry: &Registry, url: &str) -> Result<String, String> {
 
 /// Where a redirect from `from` to `location` leads, if it stays on the registry's host.
 pub fn redirect(registry: &Registry, from: &str, location: &str) -> Result<String, String> {
-    let target = if location.starts_with('/') && !location.starts_with("//") {
-        format!("{}{location}", registry.origin)
-    } else if location.contains("://") {
+    let refused = || {
+        format!("UnexpectedRedirect: {from} redirected to \"{location}\", which is not allowed.")
+    };
+    let target = if location.contains("://") {
+        // Absolute: checked exactly as written, never normalized first.
         location.to_string()
     } else {
-        return Err(format!(
-            "UnexpectedRedirect: {from} redirected to \"{location}\", which is not allowed."
-        ));
+        // Relative (EXT-08): resolved against this hop -- not the registry's origin -- as a
+        // browser would (root-, path- and parent-relative). What a URL parser would reinterpret
+        // is refused first: a backslash (a slash to it), encoded dots or separators (`%2e%2e` is
+        // `..` to it), a malformed escape, whitespace or control characters.
+        if location.is_empty() || !relative_ok(location) {
+            return Err(refused());
+        }
+        let base = url::Url::parse(from).map_err(|_| refused())?;
+        base.join(location).map_err(|_| refused())?.to_string()
     };
     let (origin, _, path) = split_url(&target, LOOPBACK_ALLOWED)?;
     if origin != registry.origin && !registry.file_origins.contains(&origin) {
@@ -243,6 +251,35 @@ pub fn redirect(registry: &Registry, from: &str, location: &str) -> Result<Strin
         ));
     }
     Ok(format!("{origin}{path}"))
+}
+
+/// A relative `Location` with nothing a URL parser would read otherwise than written.
+fn relative_ok(location: &str) -> bool {
+    if location
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return false;
+    }
+    let bytes = location.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let Some(hex) = location
+                .get(i + 1..i + 3)
+                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+            else {
+                return false;
+            };
+            if matches!(hex.to_ascii_lowercase().as_str(), "2e" | "2f" | "5c") {
+                return false;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    true
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -785,20 +822,20 @@ pub(crate) mod tests {
     #[test]
     fn redirects_stay_on_the_registry_host_and_on_https() {
         let r = registry_with("https://example.com/registry/", false).unwrap();
+        let from = "https://example.com/registry/index.json";
         assert_eq!(
-            redirect(&r, "u", "/registry/moved.json").unwrap(),
+            redirect(&r, from, "/registry/moved.json").unwrap(),
             "https://example.com/registry/moved.json"
         );
-        assert!(redirect(&r, "u", "https://example.com/elsewhere").is_ok());
+        assert!(redirect(&r, from, "https://example.com/elsewhere").is_ok());
         for (location, why) in [
             ("https://evil.example.net/x.yvx", "UnexpectedRedirect"),
             ("http://example.com/x", "InsecureTransport"),
             ("//evil.com/x", "UnexpectedRedirect"),
-            ("relative.json", "UnexpectedRedirect"),
             ("file:///C:/Windows/x", "InsecureTransport"),
         ] {
             assert!(
-                redirect(&r, "u", location).unwrap_err().starts_with(why),
+                redirect(&r, from, location).unwrap_err().starts_with(why),
                 "{location}"
             );
         }
@@ -1202,8 +1239,9 @@ mod hardening_tests {
     #[test]
     fn a_redirect_must_stay_on_the_registrys_whole_origin() {
         let r = registry_with("https://example.com/registry/", false).unwrap();
+        let from = "https://example.com/registry/index.json";
         assert_eq!(
-            redirect(&r, "u", "https://example.com:443/registry/x.yvx").unwrap(),
+            redirect(&r, from, "https://example.com:443/registry/x.yvx").unwrap(),
             "https://example.com/registry/x.yvx"
         );
         for location in [
@@ -1215,14 +1253,66 @@ mod hardening_tests {
             "https://example.com/registry/%2e%2e/x",
             "https://example.com/registry/x.yvx?token=1",
             "//evil.net/x.yvx",
-            "x.yvx",
             "javascript:alert(1)",
         ] {
-            assert!(redirect(&r, "u", location).is_err(), "{location}");
+            assert!(redirect(&r, from, location).is_err(), "{location}");
         }
         // A relative location is checked as the URL it makes.
-        assert!(redirect(&r, "u", "/registry/%2e%2e/x").is_err());
-        assert!(redirect(&r, "u", "/registry/y.yvx").is_ok());
+        assert!(redirect(&r, from, "/registry/%2e%2e/x").is_err());
+        assert!(redirect(&r, from, "/registry/y.yvx").is_ok());
+    }
+
+    /// A relative `Location` is resolved against the hop that sent it (EXT-08): root-, path-
+    /// and parent-relative as a browser would; a query or fragment is still refused, and so is
+    /// anything a URL parser would read otherwise than written. Every result is checked again.
+    #[test]
+    fn a_relative_redirect_resolves_against_its_own_hop() {
+        let r = registry_with("https://example.com/registry/", false).unwrap();
+        let from = "https://example.com/registry/sub/a.json";
+        for (location, to) in [
+            ("/registry/b.json", "https://example.com/registry/b.json"),
+            ("b.json", "https://example.com/registry/sub/b.json"),
+            ("./b.json", "https://example.com/registry/sub/b.json"),
+            ("../c.json", "https://example.com/registry/c.json"),
+            (
+                "deeper/d.json",
+                "https://example.com/registry/sub/deeper/d.json",
+            ),
+        ] {
+            assert_eq!(redirect(&r, from, location).unwrap(), to, "{location}");
+        }
+        for location in [
+            "?x=1",
+            "#f",
+            "b.json?token=1",
+            "%2e%2e/c.json",
+            "..%2fc.json",
+            "..%2Fc.json",
+            "%5cevil",
+            "a%zz",
+            "a%2",
+            "\\evil.com\\x",
+            "..\\c.json",
+            " b.json",
+            "b\njson",
+            "//evil.com/x",
+            "",
+        ] {
+            assert!(redirect(&r, from, location).is_err(), "{location:?}");
+        }
+        // Open VSX: a relative redirect from its file host stays on its file host (it went to
+        // open-vsx.org before) -- and the file host's relatives are still only those two origins.
+        let official = registry_with("https://open-vsx.org/", false).unwrap();
+        let mut official = official;
+        official
+            .file_origins
+            .push("https://openvsx.eclipsecontent.org".into());
+        let cdn = "https://openvsx.eclipsecontent.org/redhat/vscode-yaml/1.15.0/file/a.vsix";
+        assert_eq!(
+            redirect(&official, cdn, "b.vsix").unwrap(),
+            "https://openvsx.eclipsecontent.org/redhat/vscode-yaml/1.15.0/file/b.vsix"
+        );
+        assert!(redirect(&official, cdn, "//evil.com/a.vsix").is_err());
     }
 
     #[test]
@@ -1249,6 +1339,9 @@ mod hardening_tests {
                 vec![],
             ),
             "/registry/ok.json" => (302, vec![("Location", "/registry/end.json".into())], vec![]),
+            // A chain of relative hops, each resolved against the one before (EXT-08).
+            "/registry/rel/a.json" => (302, vec![("Location", "b.json".into())], vec![]),
+            "/registry/rel/b.json" => (302, vec![("Location", "../end.json".into())], vec![]),
             "/registry/end.json" => (
                 200,
                 vec![("Content-Type", "application/json".into())],
@@ -1259,6 +1352,11 @@ mod hardening_tests {
         let r = registry(&base).unwrap();
         let get = |path: &str| fetch(&r, path, Kind::Text, 1024, &mut |_| Ok(()));
         assert_eq!(get("ok.json").unwrap(), 2, "a same-origin hop is followed");
+        assert_eq!(
+            get("rel/a.json").unwrap(),
+            2,
+            "relative hops resolve against each hop"
+        );
         let error = get("a.json").unwrap_err();
         assert!(
             error.starts_with("UnexpectedRedirect") && error.contains(":"),

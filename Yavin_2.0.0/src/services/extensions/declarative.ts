@@ -345,6 +345,8 @@ export function snippetsFrom(
 
 // --- The store ---------------------------------------------------------------------------------
 
+// What is applied: every theme and snippet file of every enabled copy (`copy`: EXT-08) -- an
+// update keeping the same paths is another key, so it is read again.
 const keyOf = (snapshot: RegistrySnapshot) => JSON.stringify([snapshot.themes, snapshot.snippets]);
 
 export function createDeclarativeContributions(options: {
@@ -355,6 +357,11 @@ export function createDeclarativeContributions(options: {
   let snapshot: DeclarativeSnapshot = { themes: [], snippets: [], problems: {}, loading: false };
   let applied = "";
   let sequence = 0;
+  /**
+   * Files read, by copy and path (EXT-08): a change elsewhere reads only what changed; a copy
+   * that is gone (updated, rolled back, uninstalled) is forgotten after the next load.
+   */
+  let files = new Map<string, Promise<string>>();
   const publish = (next: DeclarativeSnapshot) => {
     snapshot = next;
     for (const listener of [...listeners])
@@ -366,6 +373,21 @@ export function createDeclarativeContributions(options: {
   };
 
   async function load(registry: RegistrySnapshot, mine: number) {
+    const used = new Map<string, Promise<string>>();
+    const failed = new Set<string>();
+    const readerOf =
+      (copy: string): ResourceReader =>
+      (id, path) => {
+        const key = `${copy}\n${path}`;
+        let text = used.get(key) ?? files.get(key);
+        if (!text) {
+          text = options.read(id, path);
+          // A failed read is not kept: tried again next time.
+          text.catch(() => failed.add(key));
+        }
+        used.set(key, text);
+        return text;
+      };
     const problems: Record<string, string[]> = {};
     const problem = (id: string, text: string) => (problems[id] ??= []).push(text);
     const labels = new Map<string, number>();
@@ -377,7 +399,9 @@ export function createDeclarativeContributions(options: {
         const n = index.get(theme.extensionId) ?? 0;
         index.set(theme.extensionId, n + 1);
         try {
-          const mapped = themeFrom(await readTheme(options.read, theme.extensionId, theme.path));
+          const mapped = themeFrom(
+            await readTheme(readerOf(theme.copy), theme.extensionId, theme.path),
+          );
           if (mapped.unmapped.length)
             problem(
               theme.extensionId,
@@ -407,7 +431,7 @@ export function createDeclarativeContributions(options: {
       registry.snippets.map(async (entry) => {
         try {
           const found = snippetsFrom(
-            parseJsonc(await options.read(entry.extensionId, entry.path)),
+            parseJsonc(await readerOf(entry.copy)(entry.extensionId, entry.path)),
             entry.extensionId,
             entry.language,
           );
@@ -423,6 +447,7 @@ export function createDeclarativeContributions(options: {
       }),
     );
     if (mine !== sequence) return; // a newer registry state is loading
+    files = new Map([...used].filter(([key]) => !failed.has(key)));
     publish({
       themes: themes.filter((one): one is ThemeDefinition => one !== null),
       snippets: snippets.flat(),

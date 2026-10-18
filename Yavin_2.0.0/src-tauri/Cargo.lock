@@ -5500,6 +5500,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "ureq",
+ "url",
  "windows-sys 0.59.0",
  "zip",
 ]

@@ -73,6 +73,8 @@ export interface DecorationSet {
   extensionId: string;
   resource: ResourceId;
   decorations: readonly ExtensionDecoration[];
+  /** The host generation that set it (EXT-08): only that host's cleanup removes it. */
+  generation?: number;
 }
 
 /** Extension decorations, by owner and resource; the editor shows them (`extensionMonaco.ts`). */
@@ -95,10 +97,16 @@ export function createDecorationStore() {
       ].filter((one) => one.decorations.length);
       changed();
     },
-    /** Everything of an extension (deactivated, crashed, its host ended). */
-    clearExtension(extensionId: string) {
-      if (!sets.some((one) => one.extensionId === extensionId)) return;
-      sets = sets.filter((one) => one.extensionId !== extensionId);
+    /**
+     * Everything of an extension (deactivated, crashed, its host ended) -- of host `generation`
+     * when given: a host that ended never removes what its replacement set (EXT-08).
+     */
+    clearExtension(extensionId: string, generation?: number) {
+      const mine = (one: DecorationSet) =>
+        one.extensionId === extensionId &&
+        (generation === undefined || one.generation === generation);
+      if (!sets.some(mine)) return;
+      sets = sets.filter((one) => !mine(one));
       changed();
     },
     clear() {
@@ -117,6 +125,8 @@ export interface LanguageProvider {
   extensionId: string;
   kind: ProviderKind;
   language: string;
+  /** The host generation that registered it (EXT-08): only that host removes it. */
+  generation?: number;
   /** Asks the provider; rejects on timeout or failure, never hangs. */
   invoke(
     params: { document: DocumentInfo; position: { line: number; column: number } | null },
@@ -141,14 +151,22 @@ export function createProviderRegistry() {
       providers = [...providers, provider];
       changed();
     },
-    remove(providerId: string) {
-      if (!providers.some((one) => one.providerId === providerId)) return;
-      providers = providers.filter((one) => one.providerId !== providerId);
+    /** One provider -- of host `generation` when given (provider ids restart per host). */
+    remove(providerId: string, generation?: number) {
+      const mine = (one: LanguageProvider) =>
+        one.providerId === providerId &&
+        (generation === undefined || one.generation === generation);
+      if (!providers.some(mine)) return;
+      providers = providers.filter((one) => !mine(one));
       changed();
     },
-    clearExtension(extensionId: string) {
-      if (!providers.some((one) => one.extensionId === extensionId)) return;
-      providers = providers.filter((one) => one.extensionId !== extensionId);
+    /** Everything of an extension -- of host `generation` when given (EXT-08). */
+    clearExtension(extensionId: string, generation?: number) {
+      const mine = (one: LanguageProvider) =>
+        one.extensionId === extensionId &&
+        (generation === undefined || one.generation === generation);
+      if (!providers.some(mine)) return;
+      providers = providers.filter((one) => !mine(one));
       changed();
     },
     for: (kind: ProviderKind, language: string) =>

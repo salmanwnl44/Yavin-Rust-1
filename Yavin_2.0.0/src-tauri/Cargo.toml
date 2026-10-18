@@ -39,6 +39,8 @@ ide-terminal-protocol = { path = "crates/ide-terminal-protocol" }
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
+# Resolving redirects and building request URLs (EXT-08): already in the build, through Tauri.
+url = "2.5"
 
 [target.'cfg(unix)'.dependencies]
 # A terminal's shell and everything it starts are ended as one process group (`killpg`).

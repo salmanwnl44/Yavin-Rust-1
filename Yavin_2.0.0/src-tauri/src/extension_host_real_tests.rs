@@ -449,8 +449,17 @@ fn a_malformed_handshake_is_refused_and_the_host_survives() {
         .send(session, "{not json")
         .unwrap_err()
         .starts_with("MalformedMessage"));
-    yavin
+    // A call into an extension before `init`: nothing is loaded, refused natively (EXT-08).
+    assert!(yavin
         .send(session, json!({"type": "request", "requestId": "x", "method": "activate", "extensionId": SAMPLE, "workspaceId": WS, "hostGeneration": 1}))
+        .unwrap_err()
+        .starts_with("NotLoaded"));
+    // A load before `init` reaches the host, which refuses it.
+    yavin
+        .send(
+            session,
+            json!({"type": "load", "extensionId": SAMPLE, "workspaceId": WS, "hostGeneration": 1}),
+        )
         .unwrap();
     assert_eq!(
         yavin.next_message(session)["error"]["code"],
@@ -580,23 +589,15 @@ fn stale_generation_and_foreign_workspace_messages_are_refused() {
     let session = yavin.start();
     yavin.handshake(session, 9002, 2000);
     assert_eq!(yavin.load(session, 9002, SAMPLE)["type"], "loaded");
-    yavin.to(
-        session,
-        9001,
-        SAMPLE,
-        json!({"type": "request", "requestId": "old", "method": "activate", "params": {}}),
-    );
-    assert_eq!(
-        yavin.next_message(session)["error"]["code"],
-        "StaleGeneration"
-    );
-    yavin
+    // Refused natively (EXT-08), against the identity of this session's `init`.
+    let old = yavin
+        .send(session, json!({"type": "request", "requestId": "old", "method": "activate", "params": {}, "extensionId": SAMPLE, "workspaceId": WS, "hostGeneration": 9001}))
+        .unwrap_err();
+    assert!(old.starts_with("StaleGeneration"), "{old}");
+    let foreign = yavin
         .send(session, json!({"type": "request", "requestId": "b", "method": "activate", "params": {}, "extensionId": SAMPLE, "workspaceId": "file://c:/other", "hostGeneration": 9002}))
-        .unwrap();
-    assert_eq!(
-        yavin.next_message(session)["error"]["code"],
-        "StaleGeneration"
-    );
+        .unwrap_err();
+    assert!(foreign.starts_with("StaleGeneration"), "{foreign}");
     // The current generation is served.
     let activated = yavin
         .ask(
@@ -611,33 +612,31 @@ fn stale_generation_and_foreign_workspace_messages_are_refused() {
     assert_eq!(activated["ok"], true);
 }
 
-/// The workspace closing (or changing) ends every host: each end is reported, nothing is left
-/// running, and nothing more can be sent to them.
+/// A new host retires the one before it (EXT-08), and the workspace closing (or changing) ends
+/// every host: each end is reported, nothing is left running, and nothing more can be sent.
 #[test]
 fn closing_the_workspace_ends_every_host() {
     let yavin = Yavin::new("dispose", &[]);
-    let sessions = [yavin.start(), yavin.start()];
-    let pids: Vec<_> = sessions
-        .iter()
-        .map(|&s| yavin.sessions.process_id(s).unwrap())
-        .collect();
-    for (n, &session) in sessions.iter().enumerate() {
-        yavin.handshake(session, 10_001 + n as u64, 2000);
-    }
+    let first = yavin.start();
+    let first_pid = yavin.sessions.process_id(first).unwrap();
+    yavin.handshake(first, 10_001, 2000);
+    let second = yavin.start();
+    let second_pid = yavin.sessions.process_id(second).unwrap();
+    let sessions = [first, second];
+    let pids = [first_pid, second_pid];
+    // The first, retired by the second, ends (whatever the window did).
+    let _ = yavin.exit_of(first);
+    yavin.handshake(second, 10_002, 2000);
     yavin.sessions.stop_all();
-    let mut ended = Vec::new();
-    while ended.len() < 2 {
-        if let (session, Event::Exit(..)) = yavin.next() {
-            ended.push(session);
-        }
-    }
-    ended.sort();
-    assert_eq!(ended, sessions);
+    let _ = yavin.exit_of(second);
     for (&session, &pid) in sessions.iter().zip(&pids) {
-        assert!(yavin
+        let refused = yavin
             .send(session, json!({"type": "shutdown"}))
-            .unwrap_err()
-            .starts_with("HostStopped"));
+            .unwrap_err();
+        assert!(
+            refused.starts_with("HostStopped") || refused.starts_with("HostRetired"),
+            "{refused}"
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         while running(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
@@ -1045,10 +1044,146 @@ fn a_restarted_host_has_no_more_than_the_inventory_grants() {
     let second = yavin.ready(25_002, "acme.probe");
     let (out, ..) = yavin.probe(second, 25_002, "acme.probe");
     assert_eq!(out["text"], "PermissionDenied", "{out}");
-    // A request from code this host never loaded (an extension named by the window only).
-    yavin
+    // A call into code this host never loaded (an extension named by the window only): refused
+    // natively, at once (EXT-08).
+    let refused = yavin
         .send(second, json!({"type": "request", "requestId": "z", "method": "command.run", "params": {"id": "acme.ghost.go"}, "extensionId": "acme.ghost", "workspaceId": WS, "hostGeneration": 25_002}))
-        .unwrap();
-    let answer = yavin.next_message(second);
-    assert_eq!(answer["error"]["code"], "NotLoaded", "{answer}");
+        .unwrap_err();
+    assert!(refused.starts_with("NotLoaded"), "{refused}");
+}
+
+// --- EXT-08: a retired host, through the real host -------------------------------------------------
+
+/// Busy for a moment, then asks Yavin for everything at once -- every request class an
+/// extension can make -- and logs, and answers.
+const BURST: &str = r#"
+module.exports.activate = function (c, yavin) {
+  c.subscriptions.push(yavin.commands.registerCommand("acme.probe.burst", function () {
+    const until = Date.now() + 400;
+    while (Date.now() < until) {}
+    yavin.commands.registerCommand("acme.probe.late", function () { return 1; });
+    yavin.commands.executeCommand("acme.probe.late");
+    yavin.storage.global.update("k", 1);
+    yavin.window.showInformationMessage("from the old host");
+    yavin.documents.getText("file:///c:/work/a.txt");
+    yavin.workspace.fs.readFile("a.txt");
+    yavin.editor.openLocation("file:///c:/work/a.txt");
+    yavin.documents.onDidChange(function () {});
+    yavin.views.registerView("acme.probe.list", { getItems: function () { return []; } });
+    yavin.languages.registerHoverProvider("markdown", { provideHover: function () { return null; } });
+    console.log("the old host speaks");
+    return "done";
+  }));
+};
+"#;
+
+impl Yavin {
+    /// Everything `session` made heard for `wait`: messages, refusals.
+    fn heard_from(&self, session: u32, wait: Duration) -> Vec<String> {
+        let deadline = Instant::now() + wait;
+        let mut heard = Vec::new();
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match self.events.recv_timeout(left) {
+                Ok((s, Event::Message(message))) if s == session => heard.push(message.to_string()),
+                Ok((s, Event::Denied(denied))) if s == session => heard.push(format!("{denied:?}")),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        heard
+    }
+}
+
+/// A host replaced (retired) while it still runs: whatever it then says -- registrations,
+/// commands, events, requests for data, logs, the answer it owes -- never reaches the window,
+/// and nothing of any kind can be sent to it. Its replacement works.
+#[test]
+fn a_retired_host_cannot_act_through_the_bridge() {
+    let yavin = Yavin::with("retired", &[("acme.probe", permissions(&ALL), BURST)]);
+    yavin.grant("acme.probe", &ALL);
+    let old = yavin.ready(26_001, "acme.probe");
+    // Asked to do everything; retired (but left running) before it answers.
+    yavin.to(old, 26_001, "acme.probe", json!({"type": "request", "requestId": "b", "method": "command.run", "params": {"id": "acme.probe.burst", "args": []}}));
+    yavin.sessions.retire_but_keep_running(old);
+    let heard = yavin.heard_from(old, Duration::from_millis(1500));
+    assert!(heard.is_empty(), "the retired host was heard: {heard:?}");
+    assert!(yavin.sessions.process_id(old).is_some(), "it still runs");
+    // Nothing reaches it: no message of any kind.
+    let to_old = |message: Value| {
+        let mut message = message;
+        let object = message.as_object_mut().unwrap();
+        object.insert("workspaceId".into(), json!(WS));
+        object.insert("hostGeneration".into(), json!(26_001));
+        yavin.send(old, message).unwrap_err()
+    };
+    for message in [
+        json!({"type": "init", "apiVersion": "2.0.0"}),
+        json!({"type": "load", "extensionId": "acme.probe"}),
+        json!({"type": "unload", "extensionId": "acme.probe"}),
+        json!({"type": "request", "extensionId": "acme.probe", "requestId": "c", "method": "command.run", "params": {"id": "acme.probe.burst"}}),
+        json!({"type": "request", "extensionId": "acme.probe", "requestId": "d", "method": "deactivate", "params": {}}),
+        json!({"type": "response", "extensionId": "acme.probe", "requestId": "h1", "ok": true, "result": null}),
+        json!({"type": "event", "extensionId": "acme.probe", "event": "documents.change", "payload": {}}),
+        json!({"type": "event", "extensionId": "acme.probe", "event": "configuration.changed", "payload": {}}),
+        json!({"type": "shutdown"}),
+    ] {
+        let refused = to_old(message.clone());
+        assert!(refused.starts_with("HostRetired"), "{message}: {refused}");
+    }
+    // Its replacement: a new session, which also ends the old process.
+    let new = yavin.ready(26_002, "acme.probe");
+    let (answer, asked, _) = yavin.ask_seeing(
+        new,
+        26_002,
+        "acme.probe",
+        "n",
+        "command.run",
+        json!({"id": "acme.probe.burst", "args": []}),
+    );
+    assert_eq!(answer["result"], "done", "{answer}");
+    assert!(asked.iter().all(|m| m["hostGeneration"] == 26_002));
+    // Starting it ended the old process.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while yavin.sessions.process_id(old).is_some() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        yavin.sessions.process_id(old).is_none(),
+        "the retired host ended"
+    );
+}
+
+/// What a host says must be its own session's: a message stamped for another generation or
+/// workspace, an answer or log of an extension it does not hold, an `unloaded` nobody asked for
+/// -- each is dropped natively, not passed on.
+#[test]
+fn only_this_sessions_own_messages_are_passed_on() {
+    let yavin = Yavin::new("stamps", &[]);
+    let session = yavin.start();
+    yavin.handshake(session, 27_001, 2000);
+    assert_eq!(yavin.load(session, 27_001, SAMPLE)["type"], "loaded");
+    let host = yavin.sessions.live(session).unwrap();
+    let screen = |message: Value| host.shared.screen(&message.to_string());
+    for message in [
+        json!({"type": "response", "extensionId": SAMPLE, "workspaceId": WS, "hostGeneration": 27_000, "requestId": "y1", "ok": true}),
+        json!({"type": "response", "extensionId": SAMPLE, "workspaceId": "file://c:/other", "hostGeneration": 27_001, "requestId": "y1", "ok": true}),
+        json!({"type": "response", "extensionId": "acme.ghost", "workspaceId": WS, "hostGeneration": 27_001, "requestId": "y1", "ok": true}),
+        json!({"type": "log", "extensionId": "acme.ghost", "workspaceId": WS, "hostGeneration": 27_001, "level": "info", "text": "x"}),
+        json!({"type": "unloaded", "extensionId": SAMPLE, "workspaceId": WS, "hostGeneration": 27_001}),
+        json!({"type": "loaded", "extensionId": "acme.ghost", "workspaceId": WS, "hostGeneration": 27_001}),
+        json!({"type": "response", "requestId": "y1", "ok": true}),
+    ] {
+        assert_eq!(screen(message.clone()), Screened::Drop, "{message}");
+    }
+    let own = json!({"type": "response", "extensionId": SAMPLE, "workspaceId": WS, "hostGeneration": 27_001, "requestId": "y1", "ok": true});
+    assert_eq!(screen(own), Screened::Pass);
+    // An unload asked for: its answer is passed on, once.
+    yavin.to(session, 27_001, SAMPLE, json!({"type": "unload"}));
+    assert_eq!(yavin.next_message(session)["type"], "unloaded");
+    assert_eq!(
+        screen(
+            json!({"type": "unloaded", "extensionId": SAMPLE, "workspaceId": WS, "hostGeneration": 27_001})
+        ),
+        Screened::Drop
+    );
 }

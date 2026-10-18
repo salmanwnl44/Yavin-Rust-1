@@ -4,7 +4,7 @@
 
 use crate::lsp_framing::{frame, FrameReader};
 use crate::process::{kill_tree, poll_interval};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -128,6 +128,49 @@ pub mod job {
 /// The longest a stderr line is kept; a server printing a megabyte on one line is truncated.
 const MAX_LOG_LINE: usize = 16 * 1024;
 
+/// Reads `input` to its end as lines of at most `max_line` bytes, handing each to `emit`
+/// (EXT-08). Nothing grows with the stream: a longer line is cut at `max_line` (and marked),
+/// the rest of it read and dropped -- also a stream with no newline at all -- and the pipe is
+/// drained to its end, so the writer never blocks on it. Invalid UTF-8 is replaced, not refused.
+pub fn pump_lines(mut input: impl Read, max_line: usize, emit: &mut dyn FnMut(String)) {
+    let text = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .trim_end_matches('\r')
+            .to_string()
+    };
+    let mut buffer = [0u8; 8192];
+    let mut line: Vec<u8> = Vec::with_capacity(256);
+    // Past `max_line` in this line: dropped until its newline.
+    let mut dropping = false;
+    loop {
+        let count = match input.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        for &byte in &buffer[..count] {
+            if byte == b'\n' {
+                if !dropping {
+                    emit(text(&line));
+                }
+                line.clear();
+                dropping = false;
+            } else if !dropping {
+                line.push(byte);
+                if line.len() >= max_line {
+                    emit(format!("{} …(cut)", text(&line)));
+                    line.clear();
+                    dropping = true;
+                }
+            }
+        }
+    }
+    if !line.is_empty() && !dropping {
+        emit(text(&line));
+    }
+}
+
 impl ServerProcess {
     /// Starts `program` with `args` in `cwd`. Nothing about the command comes from the caller
     /// beyond these three, which the caller has already resolved from its allow-list.
@@ -172,19 +215,7 @@ impl ServerProcess {
 
         let log = events.clone();
         std::thread::spawn(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                match reader.read_until(b'\n', &mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        line.truncate(MAX_LOG_LINE);
-                        let text = String::from_utf8_lossy(&line);
-                        log.log(text.trim_end_matches(['\r', '\n']).to_string());
-                    }
-                }
-            }
+            pump_lines(stderr, MAX_LOG_LINE, &mut |line| log.log(line));
         });
 
         let watched = child.clone();
@@ -304,6 +335,7 @@ pub fn resolve_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
     use std::sync::mpsc;
 
     fn temp(name: &str) -> PathBuf {
@@ -562,5 +594,88 @@ setInterval(() => {}, 1000);"#,
         .err()
         .unwrap();
         assert!(error.contains("was not found"), "{error}");
+    }
+
+    /// What `pump_lines` emits for `bytes`.
+    fn pumped(bytes: &[u8], max: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        pump_lines(bytes, max, &mut |line| lines.push(line));
+        lines
+    }
+
+    /// Lines are kept at most `max` bytes: an oversized one is cut and marked, the rest of it
+    /// dropped; CRLF ends a line; invalid UTF-8 is replaced; the last line needs no newline.
+    #[test]
+    fn stderr_lines_are_bounded_and_whatever_bytes_they_hold() {
+        assert_eq!(pumped(b"one\r\ntwo\nthree", 100), ["one", "two", "three"]);
+        let long = format!("{}\nafter\n", "x".repeat(5000));
+        let lines = pumped(long.as_bytes(), 1000);
+        assert_eq!(
+            lines.len(),
+            2,
+            "{:?}",
+            lines.iter().map(String::len).collect::<Vec<_>>()
+        );
+        assert!(lines[0].starts_with(&"x".repeat(1000)) && lines[0].ends_with("…(cut)"));
+        assert_eq!(lines[1], "after");
+        assert_eq!(
+            pumped(b"bad \xff\xfe bytes\n", 100),
+            ["bad \u{fffd}\u{fffd} bytes"]
+        );
+        let repeated = "same line\n".repeat(10_000);
+        assert_eq!(pumped(repeated.as_bytes(), 100).len(), 10_000);
+    }
+
+    /// A child writing many megabytes with no newline: the pipe is drained to the end (the
+    /// writer is never blocked), and what is kept is one bounded line.
+    #[test]
+    fn a_stream_with_no_newline_is_drained_and_kept_bounded() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let total = 16 * 1024 * 1024;
+        let writing = std::thread::spawn(move || {
+            let chunk = vec![b'z'; 64 * 1024];
+            let mut written = 0;
+            while written < total {
+                writer.write_all(&chunk).unwrap();
+                written += chunk.len();
+            }
+            written
+        });
+        let started = std::time::Instant::now();
+        let mut kept = 0usize;
+        let mut lines = 0usize;
+        pump_lines(reader, MAX_LOG_LINE, &mut |line| {
+            kept += line.len();
+            lines += 1;
+        });
+        assert_eq!(
+            writing.join().unwrap(),
+            total,
+            "the writer was never blocked"
+        );
+        assert_eq!(lines, 1);
+        assert!(kept <= MAX_LOG_LINE + 16, "kept {kept} bytes of {total}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    }
+
+    /// High-volume output in bursts, through a pipe: every line comes through, each bounded, and
+    /// the writer finishes.
+    #[test]
+    fn high_volume_output_is_passed_through_line_by_line() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let writing = std::thread::spawn(move || {
+            for n in 0..50_000 {
+                writeln!(writer, "line {n} {}", "y".repeat(n % 200)).unwrap();
+            }
+        });
+        let mut count = 0usize;
+        let mut longest = 0usize;
+        pump_lines(reader, 100, &mut |line| {
+            count += 1;
+            longest = longest.max(line.len());
+        });
+        writing.join().unwrap();
+        assert_eq!(count, 50_000);
+        assert!(longest <= 100 + "…(cut)".len() + 4, "{longest}");
     }
 }

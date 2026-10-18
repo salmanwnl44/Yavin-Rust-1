@@ -23,7 +23,11 @@
 //!   window sends an extension pass the same check (`documents.*` needs `documents.read`), and
 //!   so does every call into an extension's code (`activate`, `command.run`, ...): none for a
 //!   disabled extension or an untrusted folder, except its `deactivate`. The window's answers
-//!   to an extension's requests are not checked again: each answers a checked request.
+//!   to an extension's requests are not checked again: each answers a checked request;
+//! - **one host at a time (EXT-08).** A session is a host's identity (never reused; its own
+//!   pipes). Starting one retires every other -- marked (nothing it says is passed on, nothing is
+//!   sent to it), then ended. Every message must carry its session's `init` identity, and what
+//!   only an extension's code says must come from an extension the session holds.
 //!
 //! The work is done by `ExtHostSessions` (no Tauri in it, so the real host is tested through
 //! the same code the application runs); the commands add trust, the inventory's choices and
@@ -156,6 +160,13 @@ pub trait HostAuthority: Send + Sync + 'static {
 /// One host's permission state: its authority, and what each extension it loaded is.
 struct Shared {
     authority: Arc<dyn HostAuthority>,
+    /// Replaced or stopped (EXT-08): nothing it sends is heard, nothing is sent to it.
+    retired: std::sync::atomic::AtomicBool,
+    /// The workspace and generation of its `init` (the first, which the host takes): what every
+    /// stamped message of this session must carry.
+    identity: Mutex<Option<(String, u64)>>,
+    /// Unloads sent and not yet answered: their `unloaded` is still this extension's.
+    unloading: Mutex<std::collections::HashSet<String>>,
     /// What each loaded extension's code is: recorded when the host says it loaded it.
     loaded: Mutex<HashMap<String, HostCopy>>,
     /// Loads sent and not yet answered: the host keeps what it had until a load succeeds.
@@ -177,6 +188,9 @@ impl Shared {
     fn new(authority: Arc<dyn HostAuthority>) -> Shared {
         Shared {
             authority,
+            retired: std::sync::atomic::AtomicBool::new(false),
+            identity: Mutex::new(None),
+            unloading: Mutex::new(std::collections::HashSet::new()),
             loaded: Mutex::new(HashMap::new()),
             loading: Mutex::new(HashMap::new()),
             told: Mutex::new((0, None)),
@@ -185,6 +199,25 @@ impl Shared {
 
     fn loaded(&self, id: &str) -> Option<HostCopy> {
         held(&self.loaded).get(id).cloned()
+    }
+
+    fn retired(&self) -> bool {
+        self.retired.load(Ordering::SeqCst)
+    }
+
+    /// Whether `value`'s stamp (if it has one) is this session's own identity.
+    fn stamped_here(&self, value: &Value) -> bool {
+        let identity = held(&self.identity);
+        let Some((workspace, generation)) = identity.as_ref() else {
+            return true;
+        };
+        let workspace_ok = value
+            .get("workspaceId")
+            .is_none_or(|w| w.as_str() == Some(workspace.as_str()));
+        let generation_ok = value
+            .get("hostGeneration")
+            .is_none_or(|g| g.as_u64() == Some(*generation));
+        workspace_ok && generation_ok
     }
 
     /// Whether the window is told of `denied`: not a repeat of the last, not past `MAX_TOLD`.
@@ -233,34 +266,66 @@ impl Shared {
         }
     }
 
-    /// A message from the host: `None` to pass it to the window, or the refusal of a request
-    /// (the answer to the extension, and what the window is told).
-    fn screen(&self, text: &str) -> Option<(String, Option<Denied>)> {
-        let value: Value = serde_json::from_str(text).ok()?;
-        let kind = value.get("type").and_then(Value::as_str);
+    /// A message from the host, decided: passed to the window, dropped (a retired host, a
+    /// stamp that is not this session's, an extension this session does not hold), or a
+    /// refused request (the answer to the extension, and what the window is told).
+    fn screen(&self, text: &str) -> Screened {
+        if self.retired() {
+            return Screened::Drop;
+        }
+        // The host's own output is JSON, always: anything else is not passed on.
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            return Screened::Drop;
+        };
+        if !self.stamped_here(&value) {
+            return Screened::Drop;
+        }
+        let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
         let id = value.get("extensionId").and_then(Value::as_str);
-        // A load's answer: only a load the host made is what that extension now is.
+        let holds = |id: &str| held(&self.loaded).contains_key(id);
         match (kind, id) {
-            (Some("loaded"), Some(id)) => {
-                if let Some(copy) = held(&self.loading).remove(id) {
-                    held(&self.loaded).insert(id.to_string(), copy);
-                }
-                return None;
+            // A load's answer: only a load the host made is what that extension now is.
+            ("loaded", Some(id)) => {
+                return match held(&self.loading).remove(id) {
+                    Some(copy) => {
+                        held(&self.loaded).insert(id.to_string(), copy);
+                        Screened::Pass
+                    }
+                    None => Screened::Drop,
+                };
             }
-            (Some("error"), Some(id)) => {
+            ("unloaded", Some(id)) => {
+                return if held(&self.unloading).remove(id) {
+                    Screened::Pass
+                } else {
+                    Screened::Drop
+                };
+            }
+            ("error", Some(id)) => {
                 held(&self.loading).remove(id);
-                return None;
+                return Screened::Pass;
             }
-            (Some("request"), _) => {}
-            _ => return None,
+            // What only a loaded extension's code says: from one this session holds, or nothing.
+            ("response" | "log", Some(id)) => {
+                return if holds(id) || held(&self.loading).contains_key(id) {
+                    Screened::Pass
+                } else {
+                    Screened::Drop
+                };
+            }
+            ("request", _) => {}
+            ("response" | "log" | "loaded" | "unloaded", None) => return Screened::Drop,
+            _ => return Screened::Pass,
         }
         // The host stamps every message an extension sends; one without an id is not passed on.
         let Some(id) = id else {
-            return Some((String::new(), None));
+            return Screened::Drop;
         };
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
         let params = value.get("params").cloned().unwrap_or(Value::Null);
-        let (denial, capability) = self.decide(id, method, &params).err()?;
+        let Err((denial, capability)) = self.decide(id, method, &params) else {
+            return Screened::Pass;
+        };
         let answer = json!({
             "type": "response",
             "extensionId": id,
@@ -281,16 +346,41 @@ impl Shared {
             code: denial.code.to_string(),
             message: denial.message,
         };
-        Some((
+        Screened::Refuse(
             answer.to_string(),
             (tell && self.tell(&denied)).then_some(denied),
-        ))
+        )
+    }
+}
+
+/// What becomes of a message from the host (`Shared::screen`).
+#[derive(Debug, PartialEq)]
+enum Screened {
+    Pass,
+    Drop,
+    /// A refused request: the answer to the extension, and what the window is told, if anything.
+    Refuse(String, Option<Denied>),
+}
+
+#[cfg(test)]
+impl Screened {
+    fn is_pass(&self) -> bool {
+        *self == Screened::Pass
+    }
+    fn refused(self) -> (String, Option<Denied>) {
+        match self {
+            Screened::Refuse(answer, told) => (answer, told),
+            other => panic!("not refused: {other:?}"),
+        }
     }
 }
 
 /// The most stderr lines passed on per host, and the longest line.
 const MAX_LOG_LINES: usize = 200;
 const MAX_LOG_LINE: usize = 1000;
+/// The latest stderr lines kept (EXT-08): passed on at the host's end when it wrote more than
+/// `MAX_LOG_LINES`, so what it said last -- before a crash -- is not lost. Bounded.
+const RECENT_LINES: usize = 20;
 
 /// A running host: its process and its permission state.
 #[derive(Clone)]
@@ -315,6 +405,8 @@ struct Session {
     events: Arc<dyn HostEvents>,
     /// Lines of stderr passed on so far.
     logged: AtomicU32,
+    /// The latest lines (`RECENT_LINES`), whether passed on or not.
+    recent: Mutex<std::collections::VecDeque<String>>,
     shared: Arc<Shared>,
     /// Answers to refused requests, written to the host by the session's answering thread.
     answers: std::sync::mpsc::SyncSender<String>,
@@ -325,21 +417,28 @@ const MAX_ANSWERS: usize = 1024;
 
 impl ServerEvents for Session {
     fn message(&self, message: String) {
-        let Some((answer, denied)) = self.shared.screen(&message) else {
-            self.events.message(self.session, message);
-            return;
-        };
-        if !answer.is_empty() {
-            let _ = self.answers.try_send(answer);
-        }
-        if let Some(denied) = denied {
-            self.events.denied(self.session, denied);
+        match self.shared.screen(&message) {
+            Screened::Pass => self.events.message(self.session, message),
+            Screened::Drop => {}
+            Screened::Refuse(answer, denied) => {
+                let _ = self.answers.try_send(answer);
+                if let Some(denied) = denied {
+                    self.events.denied(self.session, denied);
+                }
+            }
         }
     }
     fn log(&self, line: String) {
         let n = self.logged.fetch_add(1, Ordering::Relaxed) as usize;
+        let line: String = line.chars().take(MAX_LOG_LINE).collect();
+        {
+            let mut recent = held(&self.recent);
+            if recent.len() == RECENT_LINES {
+                recent.pop_front();
+            }
+            recent.push_back(line.clone());
+        }
         if n < MAX_LOG_LINES {
-            let line: String = line.chars().take(MAX_LOG_LINE).collect();
             self.events.log(self.session, line);
         } else if n == MAX_LOG_LINES {
             self.events.log(
@@ -351,6 +450,17 @@ impl ServerEvents for Session {
     fn exit(&self, code: Option<i32>, error: Option<String>) {
         if let Ok(mut live) = self.live.lock() {
             live.remove(&self.session);
+        }
+        // It wrote more than was passed on: what it wrote last, before its end.
+        if self.logged.load(Ordering::Relaxed) as usize > MAX_LOG_LINES {
+            let recent: Vec<String> = held(&self.recent).iter().cloned().collect();
+            self.events.log(
+                self.session,
+                format!("(the last {} lines it wrote:)", recent.len()),
+            );
+            for line in recent {
+                self.events.log(self.session, line);
+            }
         }
         self.events.exit(self.session, code, error);
     }
@@ -366,6 +476,9 @@ impl ExtHostSessions {
         authority: Arc<dyn HostAuthority>,
     ) -> Result<u32, String> {
         let session = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        // One host at a time (EXT-08): every other is retired -- not heard, not spoken to, ended
+        // -- before this one exists, whether or not the window stopped it.
+        self.retire_others(session);
         let shared = Arc::new(Shared::new(authority));
         // Refusals are answered on a thread of their own: the thread reading the host's output
         // never waits to write its input (with both pipes full, that would deadlock). It ends
@@ -392,6 +505,7 @@ impl ExtHostSessions {
                 live: self.live.clone(),
                 events,
                 logged: AtomicU32::new(0),
+                recent: Mutex::new(std::collections::VecDeque::with_capacity(RECENT_LINES)),
                 shared: shared.clone(),
                 answers,
             }),
@@ -416,10 +530,42 @@ impl ExtHostSessions {
             .ok_or_else(|| "HostStopped: The extension host has stopped.".to_string())
     }
 
-    /// Sends one protocol message, checked (EXT-07); a `load` gets its extension's code from
-    /// the copy the authority names for it (and the entry point its manifest names).
+    /// Retires every live host but `keep`: marked first (nothing more of it is heard), then
+    /// ended. Idempotent.
+    fn retire_others(&self, keep: u32) {
+        let others: Vec<Host> = match self.live.lock() {
+            Ok(live) => live
+                .iter()
+                .filter(|(session, _)| **session != keep)
+                .map(|(_, host)| host.clone())
+                .collect(),
+            Err(_) => return,
+        };
+        for host in others {
+            host.shared.retired.store(true, Ordering::SeqCst);
+            host.process.stop();
+        }
+    }
+
+    /// Test only: marks `session` retired without ending it -- a host that outlives its
+    /// replacement, for the tests to try to speak through.
+    #[cfg(test)]
+    pub fn retire_but_keep_running(&self, session: u32) {
+        if let Ok(host) = self.live(session) {
+            host.shared.retired.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Sends one protocol message, checked (EXT-07, EXT-08); a `load` gets its extension's code
+    /// from the copy the authority names for it (and the entry point its manifest names).
     pub fn send(&self, session: u32, message: &str) -> Result<(), String> {
         let host = self.live(session)?;
+        if host.shared.retired() {
+            return Err(
+                "HostRetired: this extension host was replaced or stopped; it takes no more messages."
+                    .into(),
+            );
+        }
         let prepared = prepare(&host.shared, message)?;
         host.process
             .send(&prepared)
@@ -432,9 +578,11 @@ impl ExtHostSessions {
         self.live(session).ok().and_then(|host| host.process.id())
     }
 
-    /// Ends a host and everything it started (its exit is still reported).
+    /// Ends a host and everything it started (its exit is still reported); nothing more of it
+    /// is heard meanwhile.
     pub fn stop(&self, session: u32) {
         if let Ok(host) = self.live(session) {
+            host.shared.retired.store(true, Ordering::SeqCst);
             host.process.stop();
         }
     }
@@ -446,6 +594,7 @@ impl ExtHostSessions {
             Err(_) => return,
         };
         for host in all {
+            host.shared.retired.store(true, Ordering::SeqCst);
             host.process.stop();
         }
     }
@@ -473,6 +622,22 @@ fn prepare(shared: &Shared, message: &str) -> Result<String, String> {
         .get("extensionId")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // The session's identity is its first `init`'s; every other message must carry it.
+    if kind == "init" {
+        let mut identity = held(&shared.identity);
+        if identity.is_none() {
+            if let (Some(workspace), Some(generation)) = (
+                value.get("workspaceId").and_then(Value::as_str),
+                value.get("hostGeneration").and_then(Value::as_u64),
+            ) {
+                *identity = Some((workspace.to_string(), generation));
+            }
+        }
+    } else if !shared.stamped_here(&value) {
+        return Err(
+            "StaleGeneration: this message is for another workspace or host generation.".into(),
+        );
+    }
     match (kind, id) {
         ("load", Some(id)) => {
             let copy = shared.authority.copy_of(&id)?;
@@ -489,6 +654,7 @@ fn prepare(shared: &Shared, message: &str) -> Result<String, String> {
         ("unload", Some(id)) => {
             held(&shared.loaded).remove(&id);
             held(&shared.loading).remove(&id);
+            held(&shared.unloading).insert(id);
             Ok(message.to_string())
         }
         ("event", Some(id)) => {
@@ -515,16 +681,22 @@ fn prepare(shared: &Shared, message: &str) -> Result<String, String> {
                 _ => Err(format!("InvalidRequest: \"{event}\" is not an event.")),
             }
         }
-        // A call into an extension's code: only while it may run. Its deactivation always may
-        // (it lets the extension let go); one not loaded is answered by the host itself.
+        // A call into an extension's code: only one this session loaded (EXT-08: refused here,
+        // at once, not left to a host answer), and only while it may run -- its deactivation
+        // always may (it lets the extension let go).
         ("request", Some(id)) => {
             let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+            let copy = shared
+                .loaded(&id)
+                .ok_or_else(|| format!("NotLoaded: {id} is not loaded in this host."))?;
             if method != "deactivate" {
-                if let Some(copy) = shared.loaded(&id) {
-                    shared.authority.allow(&copy, None).map_err(refused)?;
-                }
+                shared.authority.allow(&copy, None).map_err(refused)?;
             }
             Ok(message.to_string())
+        }
+        // An answer to an extension's request: only to one this session loaded.
+        ("response", Some(id)) if shared.loaded(&id).is_none() => {
+            Err(format!("NotLoaded: {id} is not loaded in this host."))
         }
         _ => Ok(message.to_string()),
     }
@@ -722,6 +894,7 @@ mod tests {
             live: Live::default(),
             events: seen.clone(),
             logged: AtomicU32::new(0),
+            recent: Mutex::new(std::collections::VecDeque::new()),
             shared: Arc::new(Shared::new(ServiceAuthority::new(Arc::new(
                 ExtensionService::default(),
             )))),
@@ -731,11 +904,30 @@ mod tests {
         for n in 0..(MAX_LOG_LINES + 20) {
             session.log(format!("line {n}"));
         }
+        {
+            let lines = seen.0.lock().unwrap();
+            assert_eq!(lines.len(), MAX_LOG_LINES + 1);
+            assert!(lines.iter().all(|(s, _)| *s == 7));
+            assert_eq!(lines[0].1.chars().count(), MAX_LOG_LINE);
+            assert!(lines.last().unwrap().1.contains("the rest is not shown"));
+        }
+        // At its end, what it wrote last (EXT-08): the latest lines, bounded.
+        session.exit(Some(1), None);
         let lines = seen.0.lock().unwrap();
-        assert_eq!(lines.len(), MAX_LOG_LINES + 1);
-        assert!(lines.iter().all(|(s, _)| *s == 7));
-        assert_eq!(lines[0].1.chars().count(), MAX_LOG_LINE);
-        assert!(lines.last().unwrap().1.contains("the rest is not shown"));
+        let tail: Vec<&str> = lines[MAX_LOG_LINES + 1..]
+            .iter()
+            .map(|(_, l)| l.as_str())
+            .collect();
+        assert_eq!(tail.len(), RECENT_LINES + 1, "{tail:?}");
+        assert!(tail[0].contains("the last 20 lines"));
+        assert_eq!(
+            tail[1],
+            format!("line {}", MAX_LOG_LINES + 20 - RECENT_LINES)
+        );
+        assert_eq!(
+            *tail.last().unwrap(),
+            format!("line {}", MAX_LOG_LINES + 19)
+        );
     }
 
     #[test]
@@ -805,7 +997,9 @@ mod tests {
                 .join(HOST_NAME)]
         );
         let source = include_str!("extension_host.rs");
-        let code = source.split("#[cfg(test)]").next().unwrap();
+        // The body of `ExtHostSessions::start` (not this test's own text).
+        let start = source.find("    pub fn start(").unwrap();
+        let code = &source[start..start + source[start..].find("\n    }\n").unwrap()];
         assert!(
             code.contains(
                 "ServerProcess::spawn(
@@ -849,21 +1043,21 @@ mod tests {
             shared.loaded("acme.probe").is_none(),
             "not until the host answers"
         );
-        let (_, denied) = shared.screen(&request("commands.execute")).unwrap();
+        let (_, denied) = shared.screen(&request("commands.execute")).refused();
         assert!(denied.is_none());
         // The host failed to load it: nothing is recorded.
         assert!(shared
             .screen(&json!({"type": "error", "extensionId": "acme.probe", "error": {"code": "LoadFailed", "message": "x"}}).to_string())
-            .is_none());
+            .is_pass());
         assert!(shared.loaded("acme.probe").is_none());
         // Loaded: now it is what it is.
         prepare(&shared, &load).unwrap();
         assert!(shared
             .screen(&json!({"type": "loaded", "extensionId": "acme.probe"}).to_string())
-            .is_none());
+            .is_pass());
         assert_eq!(shared.loaded("acme.probe").unwrap().version, "1.0.0");
         assert!(
-            shared.screen(&request("commands.execute")).is_none(),
+            shared.screen(&request("commands.execute")).is_pass(),
             "its own command passes"
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -880,7 +1074,7 @@ mod tests {
         prepare(&shared, &load).unwrap();
         shared.screen(&json!({"type": "loaded", "extensionId": "acme.probe"}).to_string());
         authority.service.set_enabled("acme.probe", false).unwrap();
-        let (answer, told) = shared.screen(&request("storage.update")).unwrap();
+        let (answer, told) = shared.screen(&request("storage.update")).refused();
         assert!(answer.contains("ExtensionDisabled"), "{answer}");
         assert!(told.is_none(), "not a permission the user can give");
         let event = json!({"type": "event", "extensionId": "acme.probe", "workspaceId": "w", "hostGeneration": 1, "event": "configuration.changed", "payload": {}}).to_string();
@@ -895,11 +1089,11 @@ mod tests {
         prepare(&shared, &deactivate).unwrap();
         // A refusal the user can act on is told once, not on every repeat.
         authority.service.set_enabled("acme.probe", true).unwrap();
-        let first = shared.screen(&request("documents.all")).unwrap().1;
+        let first = shared.screen(&request("documents.all")).refused().1;
         assert_eq!(first.unwrap().capability.as_deref(), Some("documents.read"));
         assert!(shared
             .screen(&request("documents.all"))
-            .unwrap()
+            .refused()
             .1
             .is_none());
         let _ = std::fs::remove_dir_all(dir);

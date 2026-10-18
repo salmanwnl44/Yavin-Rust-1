@@ -15,6 +15,11 @@ export interface InProcessHostOptions {
   code(extensionId: string): string | null;
   /** Fails `start`, as the native side does (`Code: message`). */
   failStart?: string;
+  /**
+   * Holds a message back for this many milliseconds before it is handled (EXT-08 tests: a slow
+   * load, an unload never answered). Messages are handled in order, as the real host does.
+   */
+  delay?(message: { type: string; extensionId?: string; method?: string }): number | undefined;
 }
 
 export function createInProcessTransport(options: InProcessHostOptions) {
@@ -42,6 +47,8 @@ export function createInProcessTransport(options: InProcessHostOptions) {
       } | null = null;
       const extensions = new Map<string, { receive(text: string): void }>();
       let ended = false;
+      /** Messages are handled one after another, in the order sent (the real host reads one pipe). */
+      let queue = Promise.resolve();
       const out = (message: Record<string, unknown>) => {
         const text = JSON.stringify(message);
         queueMicrotask(() => {
@@ -179,7 +186,9 @@ export function createInProcessTransport(options: InProcessHostOptions) {
       return {
         async send(text) {
           if (ended) throw new Error("HostStopped: The extension host has stopped.");
-          queueMicrotask(() => {
+          queue = queue.then(async () => {
+            const ms = options.delay?.(JSON.parse(text));
+            if (ms) await new Promise((resolve) => setTimeout(resolve, ms));
             if (!ended) handle(text);
           });
         },

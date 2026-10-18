@@ -461,6 +461,7 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         waiters.get(`load:${message.extensionId}`)?.resolve();
         return;
       case "unloaded":
+        waiters.get(`unload:${message.extensionId}`)?.resolve();
         return;
       case "log": {
         const one = running.get(message.extensionId);
@@ -556,8 +557,9 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         const { [view]: _gone, ...rest } = views;
         views = rest;
       }
-    options.providers.clearExtension(extensionId);
-    options.decorations.clearExtension(extensionId);
+    // Only this host's: a host that ended never removes what its replacement registered.
+    options.providers.clearExtension(extensionId, options.generation);
+    options.decorations.clearExtension(extensionId, options.generation);
     running.get(extensionId)?.events.clear();
   };
 
@@ -831,6 +833,7 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       options.decorations.set({
         owner: `${one.entry.id}:${key}`,
         extensionId: one.entry.id,
+        generation: options.generation,
         resource,
         decorations,
       });
@@ -845,12 +848,17 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         fail("NotOwned", "A provider id is the extension's own.");
       const language = stringParam(params, "language", 50);
       if (!LANGUAGE.test(language)) fail("InvalidRequest", `"${language}" is not a language id.`);
-      if (options.providers.getSnapshot().some((p) => p.providerId === providerId))
+      if (
+        options.providers
+          .getSnapshot()
+          .some((p) => p.providerId === providerId && p.generation === options.generation)
+      )
         fail("DuplicateProvider", `"${providerId}" is already registered.`);
       const extensionId = one.entry.id;
       options.providers.add({
         providerId,
         extensionId,
+        generation: options.generation,
         kind,
         language,
         invoke: (request, signal) =>
@@ -866,7 +874,8 @@ export function createExtensionHost(options: ExtensionHostOptions) {
     },
     "languages.unregister"(one, params) {
       const providerId = stringParam(params, "providerId", 200);
-      if (providerId.startsWith(`${one.entry.id}#`)) options.providers.remove(providerId);
+      if (providerId.startsWith(`${one.entry.id}#`))
+        options.providers.remove(providerId, options.generation);
       return null;
     },
     async "fs.readFile"(_one, params) {
@@ -1030,10 +1039,13 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       const started = performance.now();
       move(one, "activating", null);
       publish();
+      // A load sent (answered or not): its code may be in the host, so a failure unloads it.
+      let sent = one.loaded;
       try {
         await ensureHost();
         if (!one.loaded) {
           const loaded = wait(`load:${id}`, timeouts.load, `load ${id}`);
+          sent = true;
           await send({ type: "load", extensionId: id });
           await loaded;
           one.loaded = true;
@@ -1053,14 +1065,14 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       } catch (error) {
         const reason = `Activation failed: ${(error as Error)?.message ?? String(error)}`;
         log(one, "error", reason);
-        clearContributions(id);
-        // Its code is unloaded too: a failed extension keeps nothing in the host -- not its
-        // half-registered commands, not a pending promise -- until it is used again (EXT-05).
-        if (one.loaded && channel && !finished) {
-          one.loaded = false;
-          await send({ type: "unload", extensionId: id }).catch(() => undefined);
-        }
+        // Failed first: from now on nothing it asks is served (not a late registration).
         if (one.status.state === "activating") move(one, "failed", reason);
+        clearContributions(id);
+        // Its code is unloaded too -- also after a load that timed out, which the host may yet
+        // finish -- and the failure is reported only once the host let go of it (EXT-05,
+        // EXT-08): a failed extension keeps nothing in the host, not a pending promise.
+        if (sent) await release(one, "its activation failed");
+        clearContributions(id);
         one.activation = null;
         publish();
         throw new ExtensionError(
@@ -1119,6 +1131,30 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       entry.manifest.contributes.commands.some((c) => c.command === event.id)) ||
     (event.kind === "view" && entry.manifest.contributes.views.some((v) => v.id === event.id));
 
+  /**
+   * `one`'s code out of the host (EXT-08): an `unload`, and its answer. The host handles
+   * messages in order, so the answer comes after any load or call still running; a host that
+   * does not answer in time is ended -- it is not used again -- rather than trusted to have let
+   * go. Resolves only once one of the two holds.
+   */
+  const release = async (one: Running, why: string) => {
+    one.loaded = false;
+    if (!channel || finished) return;
+    const id = one.entry.id;
+    const unloaded = wait(`unload:${id}`, timeouts.deactivate, `let go of ${id}`);
+    try {
+      await send({ type: "unload", extensionId: id });
+      await unloaded;
+    } catch {
+      unloaded.catch(() => undefined);
+      if (!finished)
+        await crash(
+          `The extension host did not let go of ${id} (${why}) in time; it was ended.`,
+          false,
+        );
+    }
+  };
+
   const deactivate = async (one: Running) => {
     if (one.status.state === "active" || one.status.state === "activating") {
       move(one, "deactivating");
@@ -1133,7 +1169,7 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         } catch (error) {
           log(one, "error", `Deactivation failed: ${(error as Error).message}`);
         }
-        await send({ type: "unload", extensionId: one.entry.id }).catch(() => undefined);
+        await release(one, "it was deactivated");
       }
       clearContributions(one.entry.id);
     }

@@ -30,16 +30,26 @@ fn queries_and_segments_are_encoded_under_any_base() {
     assert_eq!(
         api_url(
             &mirror,
-            &[encode("PKief"), encode("material-icon-theme")],
+            &["PKief".into(), "material-icon-theme".into()],
             &[]
         ),
         "https://mirror.example.com/openvsx/api/PKief/material-icon-theme"
     );
-    for bad in ["", ".", "..", "a\nb"] {
+    // A segment that would mean something else is refused, not encoded into it (EXT-08).
+    for bad in [
+        "", ".", "..", "a\nb", "a/b", "../x", "a\\b", "a%2Fb", "a%252Fb", "%2e%2e", "a?x=1", "a#f",
+        "a b", " a", "\u{0}",
+    ] {
         assert!(segment("namespace", bad).is_err(), "{bad:?}");
     }
-    // A slash cannot change the path: it is encoded.
-    assert_eq!(segment("name", "../x").unwrap(), "..%2Fx");
+    // Reserved characters and Unicode that are valid in a segment are kept, encoded.
+    for good in ["PKief", "vscode-yaml", "1.15.0", "C++", "a@b", "名前"] {
+        assert_eq!(segment("name", good).unwrap(), good);
+    }
+    assert_eq!(
+        api_url(&mirror, &["名前".into(), "C++".into()], &[]),
+        "https://mirror.example.com/openvsx/api/%E5%90%8D%E5%89%8D/C++"
+    );
     assert!(registry("http://open-vsx.org/")
         .unwrap_err()
         .starts_with("InsecureTransport"));
@@ -482,14 +492,16 @@ fn only_the_approved_cdn_origin_and_the_mirrors_own_paths_are_accepted() {
     ] {
         assert!(registry(bad).is_err(), "{bad}");
     }
-    // Query values and segments are encoded, so neither can add a parameter or a path.
+    // Query values are encoded, so none can add a parameter; segments that would add a path
+    // or a query are refused before a URL is built (EXT-08).
     let url = api_url(
         &mirror,
-        &[encode("a/../b"), encode("n?x=1#f")],
+        &["a".into(), "n".into()],
         &[("query", "a&size=1000#x".into())],
     );
     assert_eq!(
         url,
-        "https://mirror.example.com/openvsx/api/a%2F..%2Fb/n%3Fx%3D1%23f?query=a%26size%3D1000%23x"
+        "https://mirror.example.com/openvsx/api/a/n?query=a%26size%3D1000%23x"
     );
+    assert!(segment("name", "a/../b").is_err() && segment("name", "n?x=1#f").is_err());
 }

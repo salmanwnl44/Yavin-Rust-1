@@ -311,3 +311,94 @@ test("the editor theme setting offers extensions' themes and falls back to Yavin
   assert.equal(settings.get(EDITOR_SETTINGS.theme, null), "ext:acme.pack:0");
   assert.deepEqual(options(), ["Yavin Dark", "Yavin Light"]);
 });
+
+test("EXT-08 an update with the same theme and snippet paths is read again; rollback, disable and uninstall follow the copy", async () => {
+  const files: Record<string, string> = {
+    "acme.pack:theme.json": JSON.stringify({ colors: { "editor.background": "#111111" } }),
+    "acme.pack:js.json": JSON.stringify({ Log: { prefix: "log1", body: "one" } }),
+    "other.pack:theme.json": JSON.stringify({ colors: { "editor.background": "#222222" } }),
+  };
+  const t = setup(files);
+  const contributes = {
+    themes: [{ label: "Acme", uiTheme: "vs-dark", path: "theme.json" }],
+    snippets: [{ language: "javascript", path: "js.json" }],
+  };
+  t.add("acme", contributes);
+  t.add("other", { themes: [{ label: "Other", uiTheme: "vs", path: "theme.json" }] });
+  await settle();
+  const background = () =>
+    t.store.getSnapshot().themes.find((one) => one.extensionId === "acme.pack")?.colors[
+      "editor.background"
+    ];
+  const prefixes = () => t.store.getSnapshot().snippets.map((one) => one.prefix);
+  assert.equal(background(), "#111111");
+  assert.deepEqual(prefixes(), ["log1"]);
+
+  // Version 2, the same paths, other content, in its own copy (an update).
+  files["acme.pack:theme.json"] = JSON.stringify({ colors: { "editor.background": "#999999" } });
+  files["acme.pack:js.json"] = JSON.stringify({ Log: { prefix: "log2", body: "two" } });
+  const reads = t.reads.length;
+  const manifest = (version: string) => ({
+    publisher: "acme",
+    name: "pack",
+    version,
+    engines: { yavin: "^2.0.0" },
+    contributes,
+  });
+  t.registry.replace(
+    "acme.pack",
+    manifest("2.0.0"),
+    { kind: "folder", path: "/x/acme-2" },
+    "/x/acme-2",
+  );
+  await settle();
+  assert.equal(background(), "#999999", "the new copy's theme");
+  assert.deepEqual(prefixes(), ["log2"], "the new copy's snippets");
+  assert.ok(
+    t.reads.slice(reads).every((one) => one.startsWith("acme.pack:")),
+    `only the updated extension is read again: ${t.reads.slice(reads)}`,
+  );
+  // The theme id is kept: the user's choice still names it.
+  assert.equal(
+    t.store.getSnapshot().themes.find((one) => one.extensionId === "acme.pack")?.id,
+    "ext:acme.pack:0",
+  );
+
+  // Rolled back to the first copy: its content again.
+  files["acme.pack:theme.json"] = JSON.stringify({ colors: { "editor.background": "#111111" } });
+  files["acme.pack:js.json"] = JSON.stringify({ Log: { prefix: "log1", body: "one" } });
+  t.registry.replace(
+    "acme.pack",
+    manifest("1.0.0"),
+    { kind: "folder", path: "/x/acme" },
+    "/x/acme",
+  );
+  await settle();
+  assert.equal(background(), "#111111");
+  assert.deepEqual(prefixes(), ["log1"]);
+
+  // Reconciling again with nothing changed reads nothing and changes nothing.
+  const before = t.reads.length;
+  const snapshot = t.store.getSnapshot();
+  t.registry.setEnabled("other.pack", true);
+  t.registry.setGrants("acme.pack", { granted: [], previous: null });
+  await settle();
+  assert.equal(t.reads.length, before);
+  assert.equal(t.store.getSnapshot(), snapshot);
+
+  // Disabled, then uninstalled: gone, and the other extension's theme untouched.
+  t.registry.setEnabled("acme.pack", false);
+  await settle();
+  assert.equal(background(), undefined);
+  assert.deepEqual(prefixes(), []);
+  t.registry.setEnabled("acme.pack", true);
+  await settle();
+  assert.equal(background(), "#111111");
+  t.registry.remove("acme.pack", { forget: true });
+  await settle();
+  assert.deepEqual(
+    t.store.getSnapshot().themes.map((one) => one.extensionId),
+    ["other.pack"],
+  );
+  t.store.dispose();
+});

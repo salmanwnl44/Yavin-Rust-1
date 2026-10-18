@@ -98,14 +98,22 @@ export interface RegistrySnapshot {
   viewContainers: readonly (ViewContainerContribution & { extensionId: string })[];
   menus: readonly (MenuContribution & { extensionId: string })[];
   /** Enabled extensions' colour themes and snippets (EXT-04), in order of extension id. */
-  themes: readonly (ThemeContribution & { extensionId: string })[];
-  snippets: readonly (SnippetContribution & { extensionId: string })[];
+  /** `copy`: which installed copy contributes it (EXT-08) -- its folder and version. */
+  themes: readonly (ThemeContribution & { extensionId: string; copy: string })[];
+  snippets: readonly (SnippetContribution & { extensionId: string; copy: string })[];
   /**
    * Enabled extensions that cannot activate because of their dependencies (missing, disabled,
    * themselves unavailable, or in a cycle), with why. Their declarative contributions still apply.
    */
   unavailable: Readonly<Record<string, string>>;
 }
+
+/**
+ * Which installed copy an entry is (EXT-08): its folder and version. An update, a reinstall or
+ * a rollback is another copy (the store keeps each in a folder of its own), so what was read
+ * from the old one is never taken for the new one's.
+ */
+const copyOf = (entry: RegisteredExtension) => `${entry.origin}@${entry.manifest.version}`;
 
 export const DISABLED_KEY = "yavin.extensions.disabled";
 
@@ -288,12 +296,20 @@ export function createExtensionRegistry(options: {
       themes: [...enabled]
         .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
         .flatMap((one) =>
-          one.manifest.contributes.themes.map((theme) => ({ ...theme, extensionId: one.id })),
+          one.manifest.contributes.themes.map((theme) => ({
+            ...theme,
+            extensionId: one.id,
+            copy: copyOf(one),
+          })),
         ),
       snippets: [...enabled]
         .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
         .flatMap((one) =>
-          one.manifest.contributes.snippets.map((snippet) => ({ ...snippet, extensionId: one.id })),
+          one.manifest.contributes.snippets.map((snippet) => ({
+            ...snippet,
+            extensionId: one.id,
+            copy: copyOf(one),
+          })),
         ),
       unavailable: dependencyProblems(),
     };
