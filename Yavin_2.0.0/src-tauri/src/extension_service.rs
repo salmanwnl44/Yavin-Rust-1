@@ -192,6 +192,7 @@ struct Inner {
     /// Operations of this process whose native work is running now (a download).
     running: HashSet<String>,
     /// Operations of this process waiting for their window (staged, or committed), since when.
+    /// An operation in neither set has no owner: a step of it failed (EXT-06).
     waiting: HashMap<String, Instant>,
 }
 
@@ -511,7 +512,9 @@ impl ExtensionService {
     }
 
     /// Ends an idle operation of `id` before another starts: a staged one is discarded, a
-    /// committed one kept. One that is running refuses (`Busy`).
+    /// committed one kept. One that is running, or waiting for its window, refuses (`Busy`);
+    /// one waiting longer than `ABANDONED_AFTER`, or with no owner (a step of it failed, so
+    /// no window can go on with it), is ended now.
     fn settle(&self, inner: &mut Inner, paths: &Paths, id: &str) -> Result<(), String> {
         let found = inner.inventory.as_ref().and_then(|inv| {
             inv.operations
@@ -522,14 +525,14 @@ impl ExtensionService {
         let Some((op, state)) = found else {
             return Ok(());
         };
-        let abandoned = inner
+        let waiting = inner
             .waiting
             .get(&op)
-            .is_some_and(|since| since.elapsed() >= self.abandoned_after());
-        if inner.running.contains(&op) || !abandoned {
+            .is_some_and(|since| since.elapsed() < self.abandoned_after());
+        if inner.running.contains(&op) || waiting {
             return Err(format!("Busy: {id} is already being installed."));
         }
-        inner.waiting.remove(&op);
+        // Each end leaves `waiting` only once its write succeeded: a failed one is tried again.
         match state {
             OpState::Committed => self.finish_locked(inner, paths, &op, true),
             _ => {
@@ -537,6 +540,7 @@ impl ExtensionService {
                     inv.operations.remove(&op);
                     Ok(())
                 })?;
+                inner.waiting.remove(&op);
                 let _ = fs::remove_dir_all(paths.root.join(STAGING).join(&op));
                 Ok(())
             }
@@ -575,7 +579,16 @@ impl ExtensionService {
             );
             Ok(())
         })?;
-        fs::create_dir_all(&folder).map_err(|e| format!("InstallFailed: {e}"))?;
+        if let Err(e) = fs::create_dir_all(&folder) {
+            // Not left recorded. Should this write fail too, the operation has no owner and the
+            // next `settle` ends it.
+            let _ = Self::write(&mut inner, paths, |inv| {
+                inv.operations.remove(&op);
+                Ok(())
+            });
+            let _ = fs::remove_dir_all(&folder);
+            return Err(format!("InstallFailed: {e}"));
+        }
         inner.running.insert(op.clone());
         Ok((op, folder))
     }
@@ -801,7 +814,6 @@ impl ExtensionService {
                 folders_of(operation.before.as_ref()),
             )
         };
-        inner.waiting.remove(op);
         Self::write(inner, paths, |inv| {
             inv.operations.remove(op);
             if !keep {
@@ -816,6 +828,8 @@ impl ExtensionService {
             }
             Ok(())
         })?;
+        // Only now: a failed write leaves it the window's, to finish again.
+        inner.waiting.remove(op);
         for folder in gone.iter().filter(|f| !kept.contains(f)) {
             remove_copy(&paths.root, folder);
         }

@@ -1318,7 +1318,7 @@ The host reconciles on every registry change, and on demand (`reconcile()`, the 
 
 **Storage** is unchanged from IDE-07: `globalState` and `workspaceState` per extension, versioned records, 64 KiB, corrupt records kept aside. The host gets a snapshot at activation; writes go through `storage.update`.
 
-**Packaging.** The host ships with Yavin as a bundle resource, as the search tool does: `src-tauri/resources/extension-host/yavin-extension-host(.exe)` (built, never committed), put there by `scripts/build-extension-host.mjs`, which the Tauri build runs first (`beforeBuildCommand`, release; `beforeDevCommand`, debug) -- an installer cannot be built without it. Installed, Yavin looks only at `<resources>/resources/extension-host/`; a development build looks beside its own executable (the Cargo target folder), then in the source tree's resource folder; `YAVIN_EXTENSION_HOST` overrides both (`host_candidates`, unit-tested). A missing host is `HostUnavailable`, naming where it looked; the IDE is otherwise unaffected.
+**Packaging.** The host ships with Yavin as a bundle resource, as the search tool does: `src-tauri/resources/extension-host/yavin-extension-host(.exe)` (built, never committed), put there by `scripts/build-extension-host.mjs`, which the Tauri build runs first (`beforeBuildCommand`, release; `beforeDevCommand`, debug) -- an installer cannot be built without it. Installed, Yavin looks only at `<resources>/resources/extension-host/`; a development build looks beside its own executable (the Cargo target folder), then in the source tree's resource folder; `YAVIN_EXTENSION_HOST` overrides both in a development build only -- a release build never reads it (`host_candidates`, unit-tested; EXT-06). A missing host is `HostUnavailable`, naming where it looked; the IDE is otherwise unaffected.
 
 **Tests of the real host.** Three levels, none with a stand-in for the host:
 
@@ -1447,6 +1447,38 @@ Each path must resolve, by the archive's own name rules, to a plain file inside 
 
 **Not supported** (and not claimed): VS Code extension code (Node.js, the `vscode` API), commands, settings, keybindings, views, debuggers, tasks, language configuration, new languages, TextMate grammars, icon themes, workbench colours, extension packs and dependencies.
 
+### Extension security hardening (EXT-06)
+
+**URLs and redirects** (`marketplace.rs`: `split_url`, `redirect`, `url_on`). Every URL Yavin fetches or follows -- a registry's base, a redirect's `Location`, a file an Open VSX answer names -- passes one strict parser, and is compared by its whole **origin** (scheme, host and port), never by its host alone:
+
+| Refused                                                                                                         | Why                                                                                 |
+| --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| any scheme but HTTPS (HTTP to loopback only in tests)                                                           | no downgrade, on the first request or any hop                                       |
+| credentials (`user@host`), IPv6 literals, empty or invalid DNS labels                                           | the host is what it looks like                                                      |
+| a port that is not 1–65535, or a different port from the registry's                                             | another port is another server; the default port is the same origin (`:443` = none) |
+| whitespace, control characters, backslashes                                                                     | no smuggled characters                                                              |
+| a query or fragment (a registry base, a redirect, a named file)                                                 | no parameter injection; Yavin adds its own, encoded                                 |
+| `.` / `..` segments, written or percent-encoded (`%2e`), encoded `/` or `\` (`%2f`, `%5c`), `//`, malformed `%` | a path that starts with a registry's base stays inside it                           |
+
+Redirects are followed by Yavin, at most 3, each hop parsed and checked again. The allowed origins are the registry's own and, for `https://open-vsx.org` alone, `https://openvsx.eclipsecontent.org` (its CDN; another port, scheme or subdomain of it is not it). A mirror's files must be inside the mirror's base. Open VSX request paths and query values are built by `api_url`, each component percent-encoded. Nothing a user types is normalized into another origin: an input the parser does not accept is refused, not rewritten.
+
+**The extension host's executable.** A release build starts only the host in its own resources: `YAVIN_EXTENSION_HOST` is read in development builds only (`host_candidates`), and no setting names the program. The host is started with no arguments (`ServerProcess::spawn(program, &[], …)`), so there is nothing to inject. Both are unit-tested.
+
+**Permissions: there is no per-extension permission model.** What is enforced is ownership and scope: an extension registers only its own commands, views and providers, decorates through a fixed set of styles, reads and writes only its own storage and settings, and runs at all only in a trusted folder (the native gate). Within that, every extension that runs can:
+
+| API (`host.ts` methods)                                            | Reaches                                                                          | Threat                                                 |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| `fs.readFile`, `fs.exists`                                         | any file inside the workspace folder (contained: no absolute paths, no `..` out) | secrets in the workspace (`.env`, keys, `.git/config`) |
+| `documents.all`, `documents.get`, `documents.getText`              | every open document's text, including unsaved changes                            | the same, and what the user is typing                  |
+| `commands.execute`                                                 | any other extension's commands (activating it)                                   | confused deputy: one extension driving another         |
+| `editor.openLocation`, `editor.setSelection`, `editor.revealRange` | the editor: what is shown and selected                                           | UI spoofing, nuisance                                  |
+
+Extension code has no network, process, file-write or timer API (the QuickJS sandbox), so what it reads cannot leave the host by itself -- but it can reach another extension through `commands.execute`, and future APIs would widen this. A permission model needs: capabilities declared in the manifest (for example `workspace.read`, `documents.read`, `commands.execute: [ids]`), recorded per installed copy in the inventory, shown on install and enable, and enforced deny-by-default in every bridge call -- with tests per API. That is a module of its own, not part of EXT-06; until then, the boundary is trust in the folder and in the extension.
+
+**A failed install step never leaves an extension Busy** (`extension_service.rs`). An operation belongs to this process while it is downloading (`running`) or waiting for its window (`waiting`, until `ABANDONED_AFTER`); one in neither has lost its owner to a failed step (a staging folder that could not be made, an inventory write that failed) and the next install or uninstall of that id ends it at once -- its own staging only, never an installed copy, never another id's operation. `begin` un-records an operation whose folder failed; `finish` and `settle` let go of an operation only after their write succeeded, so a failed rollback can be asked again rather than being ended with the wrong choice.
+
+**Trust is decided by trust, never by text.** A hold is recorded with its kind (`ManagerSnapshot.heldBy`: `"trust"` or `"crashes"`) where it is made; `held` is only the message, and a crash's message can carry the host's last output -- an extension's words. The error code, Restart/Reload, granting trust and the Extensions view's label all read the kind. A native start refusal is recognized by its leading `TrustRequired:` code only.
+
 ### Installed-extension inventory (EXT-02)
 
 One native writer, `ExtensionService` (`extension_service.rs`), owns what is installed. Its record, `<app local data>/extensions/inventory.json`, is the single source of truth: the renderer's registry is built from its listing (`extensions_list`), and the extension host loads code only from the folder it chooses (`folder_of`, the same choice the listing reported). Discovery (`extensions.rs`) only reads manifests in a folder; it no longer decides anything.
@@ -1501,7 +1533,7 @@ The commit's id is the staged manifest's; the renderer's id must only name the s
 
 ### Marketplace security -- what is and is not guaranteed
 
-- **Transport:** HTTPS only, through the platform's TLS (Windows: SChannel, its certificate store). Every request is a path inside the configured registry; redirects are followed by Yavin, at most 3, only to the registry's own host and only over HTTPS; responses are size-bounded and content-type checked (an HTML error page is refused). Extension manifests never supply download URLs. Plain HTTP is accepted only for a loopback registry in a `test-registry` build (the end-to-end test's), which is never shipped.
+- **Transport:** HTTPS only, through the platform's TLS (Windows: SChannel, its certificate store). Every request is a path inside the configured registry; redirects are followed by Yavin, at most 3, each hop checked again, only to the registry's own origin (scheme, host and port: EXT-06) and only over HTTPS; responses are size-bounded and content-type checked (an HTML error page is refused). Extension manifests never supply download URLs. Plain HTTP is accepted only for a loopback registry in a `test-registry` build (the end-to-end test's), which is never shipped.
 - **Integrity:** each package's SHA-256 and size are published in the index and verified before anything is unpacked. This proves the package is the one the index lists -- not who wrote it.
 - **Signatures: none.** Packages and the index are **not cryptographically signed**. Trust in a package is trust in the registry and in the transport to it (for the default registry: GitHub serving Yavin's repository). A compromised registry can publish a malicious package with a matching checksum.
 - **Publisher identity:** the publisher is the id's prefix and the registry's display name; there is no verified-publisher mechanism.

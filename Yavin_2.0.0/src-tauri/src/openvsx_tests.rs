@@ -447,3 +447,49 @@ fn live_open_vsx_search_record_and_checksum() {
     let checksum = get_text(&r, &file_url(&meta, "sha256", &r).unwrap(), "checksum", 256).unwrap();
     assert_eq!(checksum.trim().len(), 64, "{checksum}");
 }
+
+/// EXT-06: the approved CDN is one whole origin, for open-vsx.org alone; a mirror's base and
+/// the URLs its answers name cannot climb out of it.
+#[test]
+fn only_the_approved_cdn_origin_and_the_mirrors_own_paths_are_accepted() {
+    let official = registry("https://open-vsx.org/").unwrap();
+    for refused in [
+        "https://openvsx.eclipsecontent.org:8443/a/b/1/x.vsix",
+        "http://openvsx.eclipsecontent.org/a/b/1/x.vsix",
+        "https://evil.openvsx.eclipsecontent.org/a/b/1/x.vsix",
+        "https://openvsx.eclipsecontent.org.evil.net/a/b/1/x.vsix",
+    ] {
+        assert!(redirect(&official, "u", refused).is_err(), "{refused}");
+        assert!(url_on(&official, refused).is_err(), "{refused}");
+    }
+    // open-vsx.org on another port is not open-vsx.org: no CDN for it.
+    let other_port = registry("https://open-vsx.org:8443/").unwrap();
+    assert!(other_port.file_origins.is_empty());
+    let mirror = registry("https://mirror.example.com/openvsx/").unwrap();
+    for escape in [
+        "https://mirror.example.com/openvsx/../admin/x.vsix",
+        "https://mirror.example.com/openvsx/%2e%2e/admin/x.vsix",
+        "https://mirror.example.com/openvsx/..%2fadmin/x.vsix",
+        "https://mirror.example.com/openvsx//x.vsix",
+        "https://mirror.example.com/openvsxx/x.vsix",
+    ] {
+        assert!(url_on(&mirror, escape).is_err(), "{escape}");
+    }
+    for bad in [
+        "https://mirror.example.com/openvsx/../",
+        "https://mirror.example.com/open%2fvsx/",
+        "https://mirror.example.com/openvsx/?x=1",
+    ] {
+        assert!(registry(bad).is_err(), "{bad}");
+    }
+    // Query values and segments are encoded, so neither can add a parameter or a path.
+    let url = api_url(
+        &mirror,
+        &[encode("a/../b"), encode("n?x=1#f")],
+        &[("query", "a&size=1000#x".into())],
+    );
+    assert_eq!(
+        url,
+        "https://mirror.example.com/openvsx/api/a%2F..%2Fb/n%3Fx%3D1%23f?query=a%26size%3D1000%23x"
+    );
+}

@@ -32,7 +32,15 @@ export interface ManagerSnapshot extends HostSnapshot {
   crashes: number;
   /** Why extensions are held off (trust revoked, crashed repeatedly), if they are. */
   held: string | null;
+  /**
+   * What holds them off, decided where the hold is made -- never read back from `held`, whose
+   * text can include an extension's own output (a crash's last line).
+   */
+  heldBy: HoldKind | null;
 }
+
+/** Workspace Trust (cleared by trusting the folder), or crashes (cleared by Restart/Reload). */
+export type HoldKind = "trust" | "crashes";
 
 export type ManagerOptions = Omit<ExtensionHostOptions, "generation" | "onCrash"> & {
   /** The workspace context's generation: host generations are derived from it. */
@@ -50,6 +58,11 @@ export function createExtensionHostManager(options: ManagerOptions) {
   let stopHost: (() => void) | null = null;
   let crashes: number[] = [];
   let held: string | null = null;
+  let heldBy: HoldKind | null = null;
+  const hold = (kind: HoldKind | null, why: string | null) => {
+    heldBy = kind;
+    held = kind ? why : null;
+  };
   let disposed = false;
   let lastHost: HostSnapshot | null = null;
   const events: ActivationEvent[] = [];
@@ -64,10 +77,10 @@ export function createExtensionHostManager(options: ManagerOptions) {
     statuses: {},
     views: {},
   });
-  let snapshot: ManagerSnapshot = { ...empty(), crashes: 0, held: null };
+  let snapshot: ManagerSnapshot = { ...empty(), crashes: 0, held: null, heldBy: null };
   const publish = () => {
     const base = host?.getSnapshot() ?? lastHost ?? empty();
-    snapshot = { ...base, crashes: crashes.length, held };
+    snapshot = { ...base, crashes: crashes.length, held, heldBy };
     for (const listener of [...listeners]) {
       try {
         listener();
@@ -82,7 +95,7 @@ export function createExtensionHostManager(options: ManagerOptions) {
     if (disposed) throw new ExtensionError("HostDisposed", null, "The workspace was closed.");
     if (held)
       throw new ExtensionError(
-        /trust/i.test(held) ? "TrustRequired" : "HostCrashedRepeatedly",
+        heldBy === "trust" ? "TrustRequired" : "HostCrashedRepeatedly",
         null,
         held,
       );
@@ -94,8 +107,12 @@ export function createExtensionHostManager(options: ManagerOptions) {
       onCrash: (reason) => {
         const at = now();
         crashes = [...crashes.filter((when) => at - when < CRASH_WINDOW_MS), at];
-        if (crashes.length >= CRASH_LIMIT)
-          held = `The extension host crashed ${crashes.length} times in a minute (last: ${reason}). Restart it from the Extensions view.`;
+        // A trust hold is not replaced by a crash hold: only trusting the folder ends it.
+        if (crashes.length >= CRASH_LIMIT && heldBy !== "trust")
+          hold(
+            "crashes",
+            `The extension host crashed ${crashes.length} times in a minute (last: ${reason}). Restart it from the Extensions view.`,
+          );
         lastHost = made.getSnapshot();
         publish();
       },
@@ -183,7 +200,7 @@ export function createExtensionHostManager(options: ManagerOptions) {
     /** Ends the host; extensions activate again, lazily, in a new one. Clears a crash hold. */
     async restart(): Promise<void> {
       crashes = [];
-      held = held && /trust/i.test(held) ? held : null;
+      if (heldBy === "crashes") hold(null, null);
       await end("Restarted.");
       resume();
     },
@@ -192,7 +209,7 @@ export function createExtensionHostManager(options: ManagerOptions) {
       await end("Reloaded.");
       await options.rediscover?.();
       crashes = [];
-      held = held && /trust/i.test(held) ? held : null;
+      if (heldBy === "crashes") hold(null, null);
       publish();
       resume();
     },
@@ -200,15 +217,17 @@ export function createExtensionHostManager(options: ManagerOptions) {
     async setTrusted(trusted: boolean): Promise<void> {
       if (!trusted) {
         // Revocation is said as such only when there was something to stop.
-        held =
+        hold(
+          "trust",
           host && !host.finished
             ? "This folder is no longer trusted: its extensions were stopped. Trust it again to run them."
-            : "This folder is not trusted, so its extensions' code does not run. Trust it from File › Manage Workspace Trust.";
+            : "This folder is not trusted, so its extensions' code does not run. Trust it from File › Manage Workspace Trust.",
+        );
         await end("Trust was revoked.");
         return;
       }
-      if (held && /trust/i.test(held)) {
-        held = null;
+      if (heldBy === "trust") {
+        hold(null, null);
         publish();
         resume();
       }

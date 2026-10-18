@@ -6,6 +6,7 @@
  */
 import type { RegisteredExtension } from "../registry.ts";
 import type { ExtensionStatus } from "../host.ts";
+import type { HoldKind } from "../manager.ts";
 import type { Operation } from "./installer.ts";
 import type { ExtensionUpdate } from "./types.ts";
 
@@ -47,6 +48,8 @@ export function displayStatus(input: {
   unavailable?: string;
   /** Why the workspace's host holds extensions off (not trusted, crashed repeatedly). */
   held?: string | null;
+  /** What holds them off (`ManagerSnapshot.heldBy`): the label never depends on `held`'s text. */
+  heldBy?: HoldKind | null;
   trusted: boolean;
   update?: ExtensionUpdate;
   operation?: Operation;
@@ -91,7 +94,7 @@ export function displayStatus(input: {
   }
   if (runs && input.held && runtime?.state !== "active")
     return {
-      label: /trust/i.test(input.held) ? "Untrusted" : "Host Unavailable",
+      label: input.heldBy === "trust" ? "Untrusted" : "Host Unavailable",
       tone: "warning",
       detail: input.held,
     };

@@ -48,6 +48,7 @@ export function statusOf(
     runtime: state.runtime.statuses[id],
     unavailable: state.registry.unavailable[id],
     held: state.runtime.held,
+    heldBy: state.runtime.heldBy,
     trusted,
     update: state.market.updates[id],
     operation: state.operations.operations[id],

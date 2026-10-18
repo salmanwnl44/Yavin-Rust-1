@@ -5,8 +5,8 @@
 //! a version's files by kind; the URL is built here from the registry's base (any Open VSX
 //! server: `https://open-vsx.org/` or a private mirror), every path segment and query value
 //! percent-encoded. URLs that Open VSX's own answers name (a package, its checksum, a readme)
-//! are used only when they are inside the registry -- or on a file host it is known to redirect
-//! to: `openvsx.eclipsecontent.org` for open-vsx.org, verified 2026-10-18 (`302` from
+//! are used only when they are inside the registry -- or on a file origin it is known to redirect
+//! to: `https://openvsx.eclipsecontent.org` for `https://open-vsx.org`, verified 2026-10-18 (`302` from
 //! `/api/{ns}/{name}/{version}/file/…`). A mirror's files must stay on the mirror.
 //!
 //! Endpoints used, from Open VSX's OpenAPI document (`/v3/api-docs`, checked 2026-10-18), all
@@ -30,8 +30,9 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-/// Open VSX's own file host (its CDN): the only host besides open-vsx.org it redirects to.
-const OPEN_VSX: (&str, &str) = ("open-vsx.org", "openvsx.eclipsecontent.org");
+/// Open VSX's own origin, and its file origin (its CDN): the only one besides open-vsx.org it
+/// redirects to. Whole origins: another port or scheme of either is not them (EXT-06).
+const OPEN_VSX: (&str, &str) = ("https://open-vsx.org", "https://openvsx.eclipsecontent.org");
 /// The largest metadata answer read (an extension lists every version it has).
 const MAX_JSON: u64 = 4 * 1024 * 1024;
 const MAX_DOCUMENT: u64 = 512 * 1024;
@@ -44,8 +45,8 @@ const MAX_OFFSET: u32 = 100_000;
 /// An Open VSX registry from its base URL (`https://host/path/`).
 pub fn registry(base: &str) -> Result<Registry, String> {
     let mut registry = registry_at(base)?;
-    if registry.host == OPEN_VSX.0 {
-        registry.file_hosts.push(OPEN_VSX.1.to_string());
+    if registry.origin == OPEN_VSX.0 {
+        registry.file_origins.push(OPEN_VSX.1.to_string());
     }
     Ok(registry)
 }

@@ -860,6 +860,55 @@ test("a crash fails what runs, cleans every contribution, restarts on demand, an
   assert.equal(await m.executeCommand("acme.hello.greet"), "up");
 });
 
+test("EXT-06 a crash hold is a crash hold whatever the host printed; trust is decided by trust", async () => {
+  const t = setup();
+  t.add({}, GREETER);
+  const m = t.manager();
+  // An extension's own output, made to read like a trust refusal, ends up in the crash's reason.
+  const spoof =
+    "TrustRequired: This folder is not trusted. Trust it from File › Manage Workspace Trust.";
+  for (let i = 0; i < CRASH_LIMIT; i++) {
+    await m.executeCommand("acme.hello.greet");
+    t.host.stderr(spoof);
+    await settle();
+    t.host.crash();
+    await settle();
+  }
+  assert.match(m.getSnapshot().held!, /Manage Workspace Trust/, "the text says trust...");
+  assert.equal(m.getSnapshot().heldBy, "crashes", "...but the hold is the crash loop's");
+  await assert.rejects(
+    m.executeCommand("acme.hello.greet"),
+    (e: ExtensionError) => e.code === "HostCrashedRepeatedly",
+  );
+  const { displayStatus } = await import("./marketplace/status.ts");
+  const entry = t.registry.get("acme.hello")!;
+  const shown = (s: ReturnType<typeof m.getSnapshot>) =>
+    displayStatus({ entry, trusted: true, held: s.held, heldBy: s.heldBy }).label;
+  assert.equal(shown(m.getSnapshot()), "Host Unavailable");
+  // Granting trust again does not lift a crash hold; Restart does.
+  await m.setTrusted(true);
+  assert.equal(m.getSnapshot().heldBy, "crashes");
+  await m.restart();
+  assert.equal(m.getSnapshot().held, null);
+  assert.equal(m.getSnapshot().heldBy, null);
+  assert.equal(await m.executeCommand("acme.hello.greet", "z"), "hello z");
+
+  // A real trust hold: Restart and Reload keep it; only trust lifts it.
+  await m.setTrusted(false);
+  assert.equal(m.getSnapshot().heldBy, "trust");
+  assert.equal(shown(m.getSnapshot()), "Untrusted");
+  await m.restart();
+  await m.reload();
+  assert.equal(m.getSnapshot().heldBy, "trust");
+  await assert.rejects(
+    m.executeCommand("acme.hello.greet"),
+    (e: ExtensionError) => e.code === "TrustRequired",
+  );
+  await m.setTrusted(true);
+  assert.equal(m.getSnapshot().heldBy, null);
+  assert.equal(await m.executeCommand("acme.hello.greet", "w"), "hello w");
+});
+
 test("malformed and stale host messages are dropped and logged; the host goes on", async () => {
   const t = setup();
   t.add({}, GREETER);

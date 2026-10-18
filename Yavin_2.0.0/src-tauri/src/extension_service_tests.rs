@@ -1028,3 +1028,108 @@ fn a_failed_switch_unpublishes_the_new_copy() {
     assert_eq!(staging_entries(&fx), 0);
     assert!(inventory(&fx).operations.is_empty());
 }
+
+/// Makes every inventory write fail until the returned closure puts the inventory back.
+fn block_inventory(fx: &Fixture) -> impl FnOnce() + '_ {
+    let saved = fs::read_to_string(fx.root.join(INVENTORY)).unwrap();
+    let blocker = fx.root.join(INVENTORY);
+    fs::remove_file(&blocker).unwrap();
+    fs::create_dir(&blocker).unwrap();
+    move || {
+        fs::remove_dir(&blocker).unwrap();
+        fs::write(&blocker, &saved).unwrap();
+    }
+}
+
+/// EXT-06 (F1): a staging folder that cannot be made leaves no operation recorded, so the
+/// extension is not Busy; what is installed is untouched.
+#[test]
+fn a_failed_staging_folder_leaves_nothing_busy() {
+    let fx = fixture("staging-fails");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    let copies = store_copies(&fx, "acme.hello");
+    // A file where the staging folder goes: every operation's folder fails.
+    let _ = fs::remove_dir_all(fx.root.join(STAGING));
+    fs::write(fx.root.join(STAGING), b"in the way").unwrap();
+    let error = service.begin("acme.hello", "2.0.0", "file").unwrap_err();
+    assert!(error.starts_with("InstallFailed"), "{error}");
+    assert!(inventory(&fx).operations.is_empty(), "nothing recorded");
+    let again = service.begin("acme.hello", "2.0.0", "file").unwrap_err();
+    assert!(again.starts_with("InstallFailed"), "not Busy: {again}");
+    fs::remove_file(fx.root.join(STAGING)).unwrap();
+    assert_eq!(version_listed(&service, "acme.hello"), "1.0.0");
+    assert_eq!(store_copies(&fx, "acme.hello"), copies);
+    install(&fx, &service, "acme.hello", "2.0.0");
+    assert_eq!(version_listed(&service, "acme.hello"), "2.0.0");
+}
+
+/// EXT-06 (F1): an operation a failed step left without an owner (here `staged`'s write) is
+/// ended by the next install of that id -- not Busy until a restart -- and only it: another
+/// extension's install in flight, and the installed version, are untouched.
+#[test]
+fn an_operation_left_without_an_owner_is_ended_by_the_next() {
+    let fx = fixture("ownerless");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    let copies = store_copies(&fx, "acme.hello");
+    let (other, other_folder) = service.begin("acme.other", "1.0.0", "file").unwrap();
+    let (op, folder) = service.begin("acme.hello", "2.0.0", "file").unwrap();
+    unpack(
+        &fx.package("acme.hello", "2.0.0"),
+        &folder.join("files"),
+        &LIMITS,
+    )
+    .unwrap();
+    let restore = block_inventory(&fx);
+    assert!(service.staged(&op, &"ab".repeat(32)).is_err());
+    restore();
+    // Recorded, but neither running nor waiting: nothing can go on with it.
+    assert!(inventory(&fx).operations.contains_key(&op));
+    let pkg = fx.package("acme.hello", "3.0.0");
+    let next = stage_file(&service, &pkg, "acme.hello", "3.0.0").unwrap();
+    assert!(!folder.exists(), "its staging was removed");
+    assert!(!inventory(&fx).operations.contains_key(&op));
+    assert!(service.commit(&op, "acme.hello").is_err(), "it is gone");
+    assert_eq!(version_listed(&service, "acme.hello"), "1.0.0");
+    assert_eq!(store_copies(&fx, "acme.hello"), copies);
+    // The other extension's download went on throughout.
+    assert!(other_folder.is_dir());
+    unpack(
+        &fx.package("acme.other", "1.0.0"),
+        &other_folder.join("files"),
+        &LIMITS,
+    )
+    .unwrap();
+    service.staged(&other, &"cd".repeat(32)).unwrap();
+    service.commit(&other, "acme.other").unwrap();
+    service.finish(&other, "acme.other", true).unwrap();
+    assert_eq!(version_listed(&service, "acme.other"), "1.0.0");
+    service.commit(&next, "acme.hello").unwrap();
+    service.finish(&next, "acme.hello", true).unwrap();
+    assert_eq!(version_listed(&service, "acme.hello"), "3.0.0");
+    assert_eq!(staging_entries(&fx), 0);
+}
+
+/// EXT-06 (F1): a `finish` whose write fails stays its window's: the rollback can be asked
+/// again (another install is Busy meanwhile, never ending it with the wrong choice).
+#[test]
+fn a_failed_finish_can_be_finished_again() {
+    let fx = fixture("finish-fails");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    let pkg = fx.package("acme.hello", "2.0.0");
+    let op = stage_file(&service, &pkg, "acme.hello", "2.0.0").unwrap();
+    service.commit(&op, "acme.hello").unwrap();
+    let restore = block_inventory(&fx);
+    assert!(service.finish(&op, "acme.hello", false).is_err());
+    restore();
+    let busy = stage_file(&service, &pkg, "acme.hello", "2.0.0").unwrap_err();
+    assert!(busy.starts_with("Busy"), "{busy}");
+    service.finish(&op, "acme.hello", false).unwrap();
+    assert_eq!(version_listed(&service, "acme.hello"), "1.0.0");
+    assert_eq!(store_copies(&fx, "acme.hello").len(), 1);
+    assert!(inventory(&fx).operations.is_empty());
+    install(&fx, &service, "acme.hello", "2.0.0");
+    assert_eq!(version_listed(&service, "acme.hello"), "2.0.0");
+}

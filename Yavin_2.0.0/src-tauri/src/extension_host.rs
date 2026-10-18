@@ -20,7 +20,9 @@
 //! `<resources>/resources/extension-host/yavin-extension-host(.exe)`, put there by
 //! `scripts/build-extension-host.mjs`, which the Tauri build runs first. A development build
 //! also looks beside its own executable (the Cargo target folder) and in the source tree's
-//! resource folder. `YAVIN_EXTENSION_HOST` overrides all of them.
+//! resource folder, and `YAVIN_EXTENSION_HOST` overrides both. A release build looks only in
+//! its own resources: no environment variable or setting chooses the executable it runs, and the
+//! host is started with no arguments (EXT-06).
 
 use crate::extension_service::ExtensionService;
 use crate::extensions::read_main;
@@ -47,9 +49,10 @@ pub const HOST_NAME: &str = if cfg!(windows) {
 /// The host's folder among Yavin's bundle resources (`bundle.resources` in tauri.conf.json).
 pub const HOST_RESOURCE: &str = "resources/extension-host";
 
-/// Where to look for the host, in order: an explicit override alone; else, packaged, the
-/// resource folder; in a development build, the Cargo target folder beside Yavin's executable
-/// (freshest), then the source tree's resource folder.
+/// Where to look for the host, in order. Packaged (a release build): its resource folder only --
+/// `explicit` (`YAVIN_EXTENSION_HOST`) is ignored, so nothing outside the installation picks
+/// the program it starts. In a development build: `explicit` alone if set; else the Cargo target
+/// folder beside Yavin's executable (freshest), then the source tree's resource folder.
 pub fn host_candidates(
     explicit: Option<PathBuf>,
     development: bool,
@@ -57,7 +60,7 @@ pub fn host_candidates(
     resources: Option<&Path>,
     source_tree: &Path,
 ) -> Vec<PathBuf> {
-    if let Some(path) = explicit {
+    if let Some(path) = explicit.filter(|_| development) {
         return vec![path];
     }
     let mut candidates = Vec::new();
@@ -426,6 +429,35 @@ mod tests {
             Path::new("C:/src"),
         );
         assert_eq!(found, vec![PathBuf::from("D:/host.exe")]);
+    }
+
+    /// A release build runs only its packaged host: an override from the environment is not
+    /// looked at (EXT-06), and the host is started with no arguments.
+    #[test]
+    fn a_release_build_ignores_the_override() {
+        let found = host_candidates(
+            Some(PathBuf::from("C:/Users/Public/evil.exe")),
+            false,
+            Some(Path::new("C:/Program Files/Yavin IDE/yavin-ide.exe")),
+            Some(Path::new("C:/Program Files/Yavin IDE")),
+            Path::new("C:/src"),
+        );
+        assert_eq!(
+            found,
+            vec![Path::new("C:/Program Files/Yavin IDE")
+                .join(HOST_RESOURCE)
+                .join(HOST_NAME)]
+        );
+        let source = include_str!("extension_host.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            code.contains(
+                "ServerProcess::spawn(
+            program,
+            &[],"
+            ),
+            "no arguments"
+        );
     }
 
     #[test]

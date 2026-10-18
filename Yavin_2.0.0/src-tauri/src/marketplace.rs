@@ -7,8 +7,8 @@
 //! - is HTTPS (plain `http://` to the loopback interface only in test builds, the
 //!   `test-registry` feature, for the end-to-end test's local registry);
 //! - stays inside its registry: a path is checked segment by segment and joined to the base;
-//!   redirects are followed here (at most 3), each one only to the registry's own host and
-//!   only over HTTPS;
+//!   redirects are followed here (at most 3), each hop parsed again and allowed only to the
+//!   registry's own origin -- scheme, host and port -- and only over HTTPS (EXT-06: `split_url`);
 //! - is bounded in time and size, its size counted as it arrives;
 //! - is refused when its content type is not what was asked for (an HTML error page, a captive
 //!   portal) and, for a package, when its size or SHA-256 differ from what the registry's
@@ -38,14 +38,14 @@ const MAX_INDEX: u64 = 4 * 1024 * 1024;
 const MAX_DOCUMENT: u64 = 512 * 1024;
 const MAX_ICON: u64 = 256 * 1024;
 
-/// A registry: where its documents are, and the hosts they may come from -- its own, plus any
-/// file hosts it is known to redirect downloads to (Open VSX's CDN, EXT-03).
+/// A registry: where its documents are, and the origins (scheme, host and port) they may come
+/// from -- its own, plus any file origins it is known to redirect downloads to (Open VSX's CDN,
+/// EXT-03). Origins are compared whole (EXT-06).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Registry {
     pub(crate) base: String,
-    origin: String,
-    pub(crate) host: String,
-    pub(crate) file_hosts: Vec<String>,
+    pub(crate) origin: String,
+    pub(crate) file_origins: Vec<String>,
     /// The longest one request may take, start to end.
     pub(crate) timeout: Duration,
 }
@@ -54,8 +54,25 @@ fn invalid(message: impl Into<String>) -> String {
     format!("InvalidRegistry: {}", message.into())
 }
 
-/// `scheme://authority` and the path of an absolute URL, or why it is not one Yavin accepts.
+/// `scheme://host[:port]` (the default port left out), the host, and the path of an absolute
+/// URL -- or why it is not one Yavin accepts (EXT-06). Strict, and never rewritten into another:
+///
+/// - HTTPS (plain HTTP to the loopback interface only where `loopback` allows it: tests);
+/// - a host of DNS labels (`a-z`, `0-9`, `-`; no empty label), no credentials (`user@`), and a
+///   port only if it is a number from 1 to 65535;
+/// - no whitespace, control characters or backslashes anywhere;
+/// - a path with no query or fragment, no `.` or `..` segment (written or percent-encoded), no
+///   encoded `/` or `\`, no empty segment (`//`), and only well-formed `%XX` escapes -- so a
+///   path that starts with a registry's base stays inside it.
 fn split_url(url: &str, loopback: bool) -> Result<(String, String, String), String> {
+    if url
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return Err(invalid(format!(
+            "\"{url}\" contains a space, a control character or a backslash"
+        )));
+    }
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| invalid(format!("\"{url}\" is not an absolute URL")))?;
@@ -65,37 +82,93 @@ fn split_url(url: &str, loopback: bool) -> Result<(String, String, String), Stri
             "InsecureTransport: \"{url}\" is not HTTPS; Yavin downloads extensions over HTTPS only."
         ));
     }
-    let (authority, path) = match rest.find('/') {
+    let (authority, path) = match rest.find(['/', '?', '#']) {
         Some(at) => (&rest[..at], &rest[at..]),
         None => (rest, "/"),
     };
-    if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
+    if authority.contains('@') {
+        return Err(invalid(format!("\"{url}\" names credentials (user@host)")));
+    }
+    if authority.contains('[') || authority.contains(']') {
+        return Err(invalid(format!(
+            "\"{url}\" has no plain host (an IP v6 literal)"
+        )));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            let port = port
+                .parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0 && port.bytes().all(|b| b.is_ascii_digit()))
+                .ok_or_else(|| invalid(format!("\"{url}\" has an invalid port")))?;
+            (host, Some(port))
+        }
+        None => (authority, None),
+    };
+    let host = host.to_ascii_lowercase();
+    let label_ok = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if host.is_empty() || host.len() > 253 || !host.split('.').all(label_ok) {
         return Err(invalid(format!("\"{url}\" has no plain host")));
     }
-    let host = authority
-        .rsplit_once(':')
-        .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
-        .map(|(host, _)| host)
-        .unwrap_or(authority)
-        .to_ascii_lowercase();
     let is_loopback = host == "127.0.0.1" || host == "localhost";
-    match scheme.as_str() {
-        "https" => {}
-        "http" if loopback && is_loopback => {}
+    let default_port = match scheme.as_str() {
+        "https" => 443,
+        "http" if loopback && is_loopback => 80,
         _ => {
             return Err(format!(
                 "InsecureTransport: \"{url}\" is not HTTPS; Yavin downloads extensions over HTTPS only."
             ))
         }
-    }
+    };
     if path.contains('?') || path.contains('#') {
         return Err(invalid(format!("\"{url}\" has a query or fragment")));
     }
-    Ok((
-        format!("{scheme}://{}", authority.to_ascii_lowercase()),
-        host,
-        path.to_string(),
-    ))
+    path_ok(path).map_err(|why| invalid(format!("\"{url}\" {why}")))?;
+    let origin = match port {
+        Some(port) if port != default_port => format!("{scheme}://{host}:{port}"),
+        _ => format!("{scheme}://{host}"),
+    };
+    Ok((origin, host, path.to_string()))
+}
+
+/// A URL path that means what it says: see `split_url`.
+fn path_ok(path: &str) -> Result<(), &'static str> {
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = path
+                .get(i + 1..i + 3)
+                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+            match hex.map(|h| h.to_ascii_lowercase()) {
+                None => return Err("has a malformed % escape"),
+                Some(h) if h == "2f" || h == "5c" => return Err("has an encoded path separator"),
+                Some(_) => i += 3,
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let segments: Vec<&str> = path.split('/').skip(1).collect();
+    for (n, segment) in segments.iter().enumerate() {
+        let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
+        if decoded == "." || decoded == ".." {
+            return Err("has a . or .. path segment");
+        }
+        // An empty segment is a `//`; only the last may be empty (a trailing `/`).
+        if segment.is_empty() && n + 1 < segments.len() {
+            return Err("has an empty path segment (//)");
+        }
+    }
+    Ok(())
 }
 
 /// A registry from its base URL (`https://host/path/`).
@@ -104,15 +177,14 @@ pub fn registry(base: &str) -> Result<Registry, String> {
 }
 
 fn registry_with(base: &str, loopback: bool) -> Result<Registry, String> {
-    let (origin, host, path) = split_url(base.trim(), loopback)?;
+    let (origin, _, path) = split_url(base.trim(), loopback)?;
     if !path.ends_with('/') {
         return Err(invalid(format!("\"{base}\" must end with \"/\"")));
     }
     Ok(Registry {
         base: format!("{origin}{path}"),
         origin,
-        host,
-        file_hosts: Vec::new(),
+        file_origins: Vec::new(),
         timeout: Duration::from_secs(120),
     })
 }
@@ -138,11 +210,11 @@ pub fn url_in(registry: &Registry, path: &str) -> Result<String, String> {
 }
 
 /// `url`, when it is a document of `registry`: HTTPS (loopback in tests), no query, and inside
-/// its base -- or on one of its file hosts. For URLs a registry's own answers name (Open VSX).
+/// its base -- or on one of its file origins. For URLs a registry's own answers name (Open VSX).
 pub fn url_on(registry: &Registry, url: &str) -> Result<String, String> {
-    let (origin, host, path) = split_url(url, LOOPBACK_ALLOWED)?;
+    let (origin, _, path) = split_url(url, LOOPBACK_ALLOWED)?;
     let whole = format!("{origin}{path}");
-    if whole.starts_with(&registry.base) || registry.file_hosts.contains(&host) {
+    if whole.starts_with(&registry.base) || registry.file_origins.contains(&origin) {
         Ok(whole)
     } else {
         Err(format!(
@@ -163,14 +235,14 @@ pub fn redirect(registry: &Registry, from: &str, location: &str) -> Result<Strin
             "UnexpectedRedirect: {from} redirected to \"{location}\", which is not allowed."
         ));
     };
-    let (_, host, _) = split_url(&target, LOOPBACK_ALLOWED)?;
-    if host != registry.host && !registry.file_hosts.contains(&host) {
+    let (origin, _, path) = split_url(&target, LOOPBACK_ALLOWED)?;
+    if origin != registry.origin && !registry.file_origins.contains(&origin) {
         return Err(format!(
-            "UnexpectedRedirect: {from} redirected to another host ({host}); only {} is trusted for this registry.",
-            registry.host
+            "UnexpectedRedirect: {from} redirected to {origin}; only {} is trusted for this registry.",
+            registry.origin
         ));
     }
-    Ok(target)
+    Ok(format!("{origin}{path}"))
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1065,5 +1137,133 @@ pub(crate) mod tests {
         .unwrap_err();
         assert!(missing.starts_with("PackageMissing"), "{missing}");
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// EXT-06: URLs and redirects, adversarially.
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use crate::marketplace::tests::serve;
+
+    #[test]
+    fn hostile_urls_and_registry_bases_are_refused() {
+        for (url, why) in [
+            ("https://user:secret@example.com/registry/", "credentials"),
+            ("https://example.com@evil.net/registry/", "credentials"),
+            ("https://example.com:0/registry/", "invalid port"),
+            ("https://example.com:99999/registry/", "invalid port"),
+            ("https://example.com:/registry/", "invalid port"),
+            ("https://example.com:44a3/registry/", "invalid port"),
+            ("https://[::1]/registry/", "no plain host"),
+            ("https:///registry/", "no plain host"),
+            ("https://exa_mple.com/registry/", "no plain host"),
+            ("https://example..com/registry/", "no plain host"),
+            ("https://-example.com/registry/", "no plain host"),
+            ("https://exa mple.com/registry/", "space"),
+            ("https://example.com/re\tgistry/", "control"),
+            ("https://example.com\registry/", "backslash"),
+            ("ftp://example.com/registry/", "InsecureTransport"),
+            ("http://example.com/registry/", "InsecureTransport"),
+            ("https://example.com/registry/../admin/", ". or .."),
+            ("https://example.com/registry/./", ". or .."),
+            ("https://example.com/registry/%2e%2e/admin/", ". or .."),
+            ("https://example.com/registry/%2E./admin/", ". or .."),
+            ("https://example.com/registry/.%2e/admin/", ". or .."),
+            (
+                "https://example.com/registry%2f..%2fadmin/",
+                "encoded path separator",
+            ),
+            (
+                "https://example.com/registry%5cadmin/",
+                "encoded path separator",
+            ),
+            ("https://example.com/registry%zz/", "malformed"),
+            ("https://example.com/registry%2/", "malformed"),
+            ("https://example.com//registry/", "empty path segment"),
+            ("https://example.com/registry//x/", "empty path segment"),
+            ("https://example.com/registry/?q=1", "query or fragment"),
+            ("https://example.com/registry/#top", "query or fragment"),
+            ("https://example.com?/registry/", "query or fragment"),
+            ("https://example.com/registry", "must end with"),
+        ] {
+            let error = registry_with(url, false).unwrap_err();
+            assert!(error.contains(why), "{url}: {error}");
+        }
+        // The default port is the same origin; nothing else is rewritten.
+        let plain = registry_with("https://Example.com/registry/", false).unwrap();
+        let explicit = registry_with("https://example.com:443/registry/", false).unwrap();
+        assert_eq!(plain, explicit);
+        assert_eq!(plain.base, "https://example.com/registry/");
+        let other_port = registry_with("https://example.com:8443/registry/", false).unwrap();
+        assert_eq!(other_port.origin, "https://example.com:8443");
+    }
+
+    #[test]
+    fn a_redirect_must_stay_on_the_registrys_whole_origin() {
+        let r = registry_with("https://example.com/registry/", false).unwrap();
+        assert_eq!(
+            redirect(&r, "u", "https://example.com:443/registry/x.yvx").unwrap(),
+            "https://example.com/registry/x.yvx"
+        );
+        for location in [
+            "https://example.com:8443/registry/x.yvx",
+            "https://cdn.example.com/registry/x.yvx",
+            "http://example.com/registry/x.yvx",
+            "https://user@example.com/registry/x.yvx",
+            "https://example.com/registry/../../etc/x",
+            "https://example.com/registry/%2e%2e/x",
+            "https://example.com/registry/x.yvx?token=1",
+            "//evil.net/x.yvx",
+            "x.yvx",
+            "javascript:alert(1)",
+        ] {
+            assert!(redirect(&r, "u", location).is_err(), "{location}");
+        }
+        // A relative location is checked as the URL it makes.
+        assert!(redirect(&r, "u", "/registry/%2e%2e/x").is_err());
+        assert!(redirect(&r, "u", "/registry/y.yvx").is_ok());
+    }
+
+    #[test]
+    fn a_redirect_chain_is_checked_hop_by_hop() {
+        // A second server: the same host, another port -- another origin.
+        let elsewhere = serve(|_| {
+            (
+                200,
+                vec![("Content-Type", "application/json".into())],
+                b"{}".to_vec(),
+            )
+        });
+        let other = elsewhere.trim_end_matches("registry/").to_string();
+        let base = serve(move |path| match path {
+            "/registry/a.json" => (302, vec![("Location", "/registry/b.json".into())], vec![]),
+            "/registry/b.json" => (
+                302,
+                vec![("Location", format!("{other}registry/c.json"))],
+                vec![],
+            ),
+            "/registry/loop.json" => (
+                302,
+                vec![("Location", "/registry/loop.json".into())],
+                vec![],
+            ),
+            "/registry/ok.json" => (302, vec![("Location", "/registry/end.json".into())], vec![]),
+            "/registry/end.json" => (
+                200,
+                vec![("Content-Type", "application/json".into())],
+                b"{}".to_vec(),
+            ),
+            _ => (404, vec![], vec![]),
+        });
+        let r = registry(&base).unwrap();
+        let get = |path: &str| fetch(&r, path, Kind::Text, 1024, &mut |_| Ok(()));
+        assert_eq!(get("ok.json").unwrap(), 2, "a same-origin hop is followed");
+        let error = get("a.json").unwrap_err();
+        assert!(
+            error.starts_with("UnexpectedRedirect") && error.contains(":"),
+            "{error}"
+        );
+        assert!(get("loop.json").unwrap_err().contains("more than 3 times"));
     }
 }

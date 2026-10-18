@@ -318,7 +318,8 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         starting = null;
         publish();
         throw new ExtensionError(
-          /TrustRequired/.test(hostReason) ? "TrustRequired" : "HostUnavailable",
+          // The native refusal's code, at the start of the message (never the host's output).
+          /^TrustRequired: /.test(hostReason) ? "TrustRequired" : "HostUnavailable",
           null,
           hostReason.replace(/^[A-Za-z]+: /, ""),
         );
