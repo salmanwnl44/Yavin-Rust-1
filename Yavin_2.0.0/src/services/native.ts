@@ -116,6 +116,8 @@ interface Commands {
         shadowed: { folder: string; version: string | null; reason: string }[];
         /** What it requests and what of it is allowed, for this copy (EXT-07). */
         permissions: NativePermissions | null;
+        /** What its package's signature was found to be when installed (EXT-09). */
+        signature: NativeSignature | null;
       }[];
       skipped: number;
       disabled: string[];
@@ -714,6 +716,31 @@ export function onGitChanged(handler: (event: GitChangeEvent) => void): () => vo
     cancelled = true;
     void pending.then((unlisten) => unlisten?.());
   };
+}
+
+/**
+ * What an installed copy's package signature was found to be (EXT-09, `package_trust.rs`),
+ * bound to its SHA-256. Only `registrySigned` and `publisherSigned` were checked under a
+ * pinned key; `missing` is a package with no signature (integrity by SHA-256 only).
+ */
+export interface NativeSignature {
+  status:
+    | "registrySigned"
+    | "publisherSigned"
+    | "missing"
+    | "invalid"
+    | "unknownKey"
+    | "keyRevoked"
+    | "keyExpired"
+    | "wrongNamespace"
+    | "malformed"
+    | "unavailable";
+  /** The registry's origin, or `file`. */
+  registry: string;
+  keyId?: string | null;
+  namespace: string;
+  sha256: string;
+  storeRevision: number;
 }
 
 /** An extension copy's permissions, as the native inventory holds them (EXT-07). */

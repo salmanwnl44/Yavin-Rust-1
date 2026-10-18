@@ -22,6 +22,7 @@
 
 use crate::extension_package::{self, unpack, Format, Unpacked, LIMITS};
 use crate::extension_service::{operation_id_ok, Committed, ExtensionService};
+use crate::package_trust::{SignatureRecord, SignatureStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -31,7 +32,7 @@ use std::time::Duration;
 use tauri::State;
 
 /// Whether `http://127.0.0.1` / `http://localhost` registries are accepted (tests only).
-const LOOPBACK_ALLOWED: bool = cfg!(any(test, feature = "test-registry"));
+pub(crate) const LOOPBACK_ALLOWED: bool = cfg!(any(test, feature = "test-registry"));
 const MAX_REDIRECTS: usize = 3;
 /// A registry index; a readme or changelog; an icon.
 const MAX_INDEX: u64 = 4 * 1024 * 1024;
@@ -602,7 +603,22 @@ pub fn stage(
     let (op, folder) = service.begin(expected_id, expected_version, &label)?;
     let archive = folder.join("package.yvx");
     let result = (|| {
-        let (sha256, size) = match source {
+        // What the package's signature is found to be (EXT-09): Open VSX packages must verify
+        // under a pinned key (`openvsx::download`); Yavin's registry and a file are not signed
+        // (their integrity is the index's SHA-256, or the user's choice of file).
+        let unsigned = |registry: &str, sha256: &str| SignatureRecord {
+            status: SignatureStatus::Missing,
+            registry: registry.to_string(),
+            key_id: None,
+            namespace: expected_id
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+            sha256: sha256.to_ascii_lowercase(),
+            store_revision: 0,
+        };
+        let (sha256, size, signature) = match source {
             PackageSource::Registry {
                 registry_url,
                 path,
@@ -647,7 +663,8 @@ pub fn stage(
                         "IntegrityFailed: the package's SHA-256 is {actual}, but the registry says {sha256}."
                     ));
                 }
-                (actual, read)
+                let signature = unsigned(&registry.origin, &actual);
+                (actual, read, signature)
             }
             PackageSource::File { path } => {
                 let from = PathBuf::from(&path);
@@ -657,7 +674,9 @@ pub fn stage(
                     return Err(format!("PackageMissing: {path} is not a file."));
                 }
                 fs::copy(&from, &archive).map_err(|e| format!("InstallFailed: {e}"))?;
-                (extension_package::sha256_file(&archive)?, meta.len())
+                let sha256 = extension_package::sha256_file(&archive)?;
+                let signature = unsigned("file", &sha256);
+                (sha256, meta.len(), signature)
             }
             PackageSource::OpenVsx {
                 registry_url,
@@ -696,10 +715,10 @@ pub fn stage(
         if format == Format::Vsix {
             crate::vsix::adapt(&files_dir, &manifest, expected_id, expected_version)?;
         }
-        Ok((sha256, size, files, bytes))
+        Ok((sha256, size, files, bytes, signature))
     })();
     let _ = fs::remove_file(&archive);
-    let (sha256, package_size, files, bytes) = match result {
+    let (sha256, package_size, files, bytes, signature) = match result {
         Ok(done) => done,
         Err(error) => {
             service.abort(&op);
@@ -707,7 +726,7 @@ pub fn stage(
         }
     };
     // The inventory checks that the unpacked manifest is the id and version asked for.
-    let manifest = service.staged(&op, &sha256)?;
+    let manifest = service.staged_with(&op, &sha256, Some(signature))?;
     Ok(Staged {
         token: op,
         manifest,

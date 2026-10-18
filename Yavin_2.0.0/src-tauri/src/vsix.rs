@@ -258,6 +258,8 @@ pub fn adapt(
             "supported": supported,
             "ignored": ignored,
             "rejected": rejected,
+            // Fixed: the manifest makes no signature claim; the inventory records what was
+            // found (EXT-09, `package_trust.rs`). Kept so installed copies still read.
             "signature": "not verified",
         },
     });

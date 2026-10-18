@@ -212,7 +212,41 @@ struct Published {
     metadata_id: (&'static str, &'static str),
     checksum: Option<String>,
     download_url: Option<String>,
+    /// Its signature (EXT-09).
+    signature: Sig,
 }
+
+/// How a version is signed (EXT-09), with the fixed test keys.
+#[derive(Clone)]
+enum Sig {
+    /// By the key pinned as `test-key` (`SEED_A`), over the package served.
+    Valid,
+    /// No signature listed.
+    Absent,
+    /// A valid signature, one bit changed.
+    Tampered,
+    /// By another key (`SEED_B`), under the pinned key's id.
+    OtherKey,
+    /// Valid, but the metadata names another key id.
+    KeyId(&'static str),
+    /// These bytes as the `.sigzip`.
+    Bytes(Vec<u8>),
+    /// Listed, but not served.
+    Unserved,
+    /// The key named on another server.
+    KeyElsewhere,
+}
+
+/// The trust store tests use: `test-key` (`SEED_A`) pinned for the fake registry at `base`.
+fn pinned(base: &str) -> Result<crate::package_trust::TrustStore, String> {
+    let origin = base
+        .trim_end_matches('/')
+        .trim_end_matches("/registry")
+        .to_string();
+    trust::store_of(vec![trust::anchor(&origin, "test-key", trust::SEED_A)])
+}
+
+use crate::package_trust::tests as trust;
 
 /// A VS Code package of `publisher.name` at `version` with a colour theme -- and code that
 /// would leave a mark if anything ran it while installing.
@@ -266,23 +300,62 @@ fn registry_of(published: Arc<Mutex<BTreeMap<String, Published>>>) -> String {
             let prefix = format!("/registry/api/acme/hello/{version}");
             if target == prefix {
                 let file = |name: &str| format!("{base}api/acme/hello/{version}/file/{name}");
+                let key = match &one.signature {
+                    Sig::KeyId(id) => format!("{base}api/-/public-key/{id}"),
+                    Sig::KeyElsewhere => {
+                        "https://keys.example.net/api/-/public-key/test-key".into()
+                    }
+                    _ => format!("{base}api/-/public-key/test-key"),
+                };
+                let mut files = json!({
+                    "download": one.download_url.clone().unwrap_or_else(|| file("acme.hello.vsix")),
+                    "sha256": file("acme.hello.sha256"),
+                    "publicKey": key,
+                });
+                if !matches!(one.signature, Sig::Absent) {
+                    files["signature"] = json!(file("acme.hello.sigzip"));
+                }
                 return json_answer(json!({
                     "namespace": one.metadata_id.0,
                     "name": one.metadata_id.1,
                     "version": version,
                     "engines": {"yavin": "^2.0.0"},
-                    "files": {
-                        "download": one.download_url.clone().unwrap_or_else(|| file("acme.hello.vsix")),
-                        "sha256": file("acme.hello.sha256"),
-                    },
+                    "files": files,
                 }));
+            }
+            if target == format!("{prefix}/file/acme.hello.sigzip") {
+                let sigzip = match &one.signature {
+                    Sig::Unserved => return (404, vec![], vec![]),
+                    Sig::OtherKey => trust::signed(trust::SEED_B, &one.package),
+                    Sig::Tampered => {
+                        use ed25519_dalek::Signer;
+                        let mut bytes = trust::signing(trust::SEED_A).sign(&one.package).to_bytes();
+                        bytes[0] ^= 1;
+                        trust::sigzip_with(&bytes)
+                    }
+                    Sig::Bytes(bytes) => bytes.clone(),
+                    _ => trust::signed(trust::SEED_A, &one.package),
+                };
+                return (
+                    200,
+                    vec![("Content-Type", "application/octet-stream".into())],
+                    sigzip,
+                );
             }
             if target == format!("{prefix}/file/acme.hello.sha256") {
                 let checksum = one.checksum.clone().unwrap_or_else(|| sha(&one.package));
-                return (200, vec![("Content-Type", "text/plain;charset=UTF-8".into())], checksum.into_bytes());
+                return (
+                    200,
+                    vec![("Content-Type", "text/plain;charset=UTF-8".into())],
+                    checksum.into_bytes(),
+                );
             }
             if target == format!("{prefix}/file/acme.hello.vsix") {
-                return (200, vec![("Content-Type", "application/octet-stream".into())], one.package.clone());
+                return (
+                    200,
+                    vec![("Content-Type", "application/octet-stream".into())],
+                    one.package.clone(),
+                );
             }
         }
         (404, vec![], b"{}".to_vec())
@@ -308,10 +381,22 @@ fn an_open_vsx_version_is_installed_through_the_inventory_with_its_origin() {
                 metadata_id: ("Acme", "Hello"),
                 checksum: None,
                 download_url: None,
+                signature: Sig::Valid,
             },
         );
     }
     let base = registry_of(published.clone());
+    let store = pinned(&base);
+    crate::package_trust::with_store(store, || installs_and_refuses(&dir, &base, published));
+}
+
+fn installs_and_refuses(
+    dir: &Path,
+    base: &str,
+    published: Arc<Mutex<BTreeMap<String, Published>>>,
+) {
+    let dir = dir.to_path_buf();
+    let base = base.to_string();
     let root = dir.join("extensions");
     let service = ExtensionService::new(root.clone(), Vec::new());
     *service.abandoned_after.lock().unwrap() = Some(Duration::ZERO);
@@ -328,6 +413,15 @@ fn an_open_vsx_version_is_installed_through_the_inventory_with_its_origin() {
     let op = install("1.0.0").unwrap();
     service.finish(&op, "acme.hello", true).unwrap();
     let record = inventory(&root).extensions["acme.hello"].clone();
+    // Its signature, found valid under the pinned key, kept with the copy -- bound to its bytes.
+    let signature = record.active.signature.clone().expect("a signature record");
+    assert_eq!(
+        signature.status,
+        crate::package_trust::SignatureStatus::RegistrySigned
+    );
+    assert_eq!(signature.key_id.as_deref(), Some("test-key"));
+    assert_eq!(Some(&signature.sha256), record.active.sha256.as_ref());
+    assert_eq!(signature.namespace, "acme");
     assert_eq!(record.active.source, format!("openvsx {base}"));
     assert_eq!(record.active.version, "1.0.0");
     assert!(record.active.sha256.is_some());
@@ -345,6 +439,7 @@ fn an_open_vsx_version_is_installed_through_the_inventory_with_its_origin() {
             metadata_id: ("acme", "hello"),
             checksum: None,
             download_url: None,
+            signature: Sig::Valid,
         };
         change(&mut one);
         all.insert("3.0.0".into(), one);
@@ -401,6 +496,35 @@ fn an_open_vsx_version_is_installed_through_the_inventory_with_its_origin() {
             .unwrap();
         },
         "InvalidPackage",
+    );
+    // EXT-09: what the signature is decides, before anything is replaced.
+    refused(&|one| one.signature = Sig::Absent, "SignatureMissing");
+    refused(&|one| one.signature = Sig::Tampered, "SignatureInvalid");
+    refused(&|one| one.signature = Sig::OtherKey, "SignatureInvalid");
+    refused(
+        &|one| one.signature = Sig::KeyId("rotated-key"),
+        "UntrustedKey",
+    );
+    refused(
+        &|one| one.signature = Sig::Bytes(b"not a zip".to_vec()),
+        "SignatureMalformed",
+    );
+    refused(
+        &|one| one.signature = Sig::Unserved,
+        "VerificationUnavailable",
+    );
+    refused(
+        &|one| one.signature = Sig::KeyElsewhere,
+        "SignatureMalformed",
+    );
+    // A genuine signature by the pinned key -- over other bytes (the package before a change
+    // the registry's checksum was updated to cover).
+    refused(
+        &|one| {
+            let before = [one.package.as_slice(), b"\0"].concat();
+            one.signature = Sig::Bytes(trust::signed(trust::SEED_A, &before));
+        },
+        "SignatureInvalid",
     );
     assert!(inventory(&root).operations.is_empty());
     let _ = fs::remove_dir_all(&dir);
@@ -504,4 +628,64 @@ fn only_the_approved_cdn_origin_and_the_mirrors_own_paths_are_accepted() {
         "https://mirror.example.com/openvsx/api/a/n?query=a%26size%3D1000%23x"
     );
     assert!(segment("name", "a/../b").is_err() && segment("name", "n?x=1#f").is_err());
+}
+
+/// The trust store decides, and only it: under a store that pins nothing for this registry, a
+/// revoked key, or no readable store at all, the same validly signed package is refused -- and
+/// what the window sends cannot say otherwise (a `verified` claim in the request is not read).
+#[test]
+fn only_the_pinned_store_can_make_a_package_trusted() {
+    let dir = temp("openvsx-trust");
+    let published = Arc::new(Mutex::new(BTreeMap::new()));
+    published.lock().unwrap().insert(
+        "1.0.0".to_string(),
+        Published {
+            package: yavin_package(&dir, "1.0.0"),
+            metadata_id: ("acme", "hello"),
+            checksum: None,
+            download_url: None,
+            signature: Sig::Valid,
+        },
+    );
+    let base = registry_of(published);
+    let root = dir.join("extensions");
+    let service = ExtensionService::new(root.clone(), Vec::new());
+    // The request as the window sends it, with claims of its own -- which are not read.
+    let source = || -> PackageSource {
+        serde_json::from_value(json!({
+            "kind": "openVsx", "registryUrl": base, "namespace": "acme", "name": "hello",
+            "verified": true, "signature": {"status": "registrySigned"}, "trusted": true,
+        }))
+        .unwrap()
+    };
+    let attempt = |store| {
+        crate::package_trust::with_store(store, || stage(&service, source(), "acme.hello", "1.0.0"))
+    };
+    let mut revoked = trust::anchor(
+        base.trim_end_matches('/').trim_end_matches("/registry"),
+        "test-key",
+        trust::SEED_A,
+    );
+    revoked["status"] = json!("revoked");
+    for (store, why) in [
+        (trust::store_of(vec![]), "UntrustedKey"),
+        (
+            trust::store_of(vec![trust::anchor(
+                "https://open-vsx.org",
+                "test-key",
+                trust::SEED_A,
+            )]),
+            "UntrustedKey",
+        ),
+        (trust::store_of(vec![revoked]), "KeyRevoked"),
+        (Err("unreadable".to_string()), "VerificationUnavailable"),
+    ] {
+        let error = attempt(store).err().unwrap();
+        assert!(error.starts_with(why), "{why}: {error}");
+        assert!(!root.join(INVENTORY).exists() || inventory(&root).extensions.is_empty());
+    }
+    // Pinned: installed.
+    let staged = attempt(pinned(&base)).unwrap();
+    service.commit(&staged.token, "acme.hello").unwrap();
+    let _ = fs::remove_dir_all(&dir);
 }

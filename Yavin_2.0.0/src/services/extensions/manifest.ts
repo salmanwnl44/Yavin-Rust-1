@@ -132,7 +132,10 @@ export interface VsixOrigin {
   supported: string[];
   ignored: string[];
   rejected: string[];
-  /** Open VSX signatures are not verified (ARCHITECTURE.md). */
+  /**
+   * Fixed: the manifest itself makes no claim about a signature. What the package's signature
+   * was found to be is the inventory's record (EXT-09, `NativeSignature`), never the manifest's.
+   */
   signature: "not verified";
 }
 

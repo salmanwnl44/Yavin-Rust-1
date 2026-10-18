@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "revision": 1,
+  "anchors": [
+    {
+      "registry": "https://open-vsx.org",
+      "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+      "algorithm": "ed25519",
+      "publicKey": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAje+vAaSS1zHV5WHCJSa5UXvxRo6+yerEU3IEmtuEuF4=\n-----END PUBLIC KEY-----\n",
+      "scope": "registry",
+      "namespaces": ["*"],
+      "status": "active",
+      "notAfter": null,
+      "added": "2026-10-18",
+      "provenance": "Open VSX's registry signing key (one key signs every package it publishes). Fetched over HTTPS from https://open-vsx.org/api/-/public-key/14ccb407-4e79-41ed-be5a-6d608325c45a on 2026-10-18 (twice, identical), and checked against a package it signed: redhat.vscode-yaml 2.1.2026101708 (SHA-256 e1897f3ae10ac101cc3263c440d54ef46991c0439ce94ca7bd17f3866d5699ae). It vouches that a package is the one open-vsx.org published -- not who its publisher is."
+    }
+  ]
+}

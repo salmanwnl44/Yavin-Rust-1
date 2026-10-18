@@ -6,6 +6,7 @@ use crate::extension_package::tests::package;
 use crate::extension_package::{unpack, LIMITS};
 use crate::extensions::MANIFEST_FILE;
 use crate::marketplace::{stage, PackageSource};
+use crate::package_trust::SignatureStatus;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -857,6 +858,7 @@ fn a_recorded_folder_outside_the_root_is_never_used_or_deleted() {
                 sha256: None,
                 source: "unknown".into(),
                 installed_at: 0,
+                signature: None,
             },
             previous: None,
             broken: None,
@@ -932,6 +934,7 @@ fn a_tampered_operation_cannot_name_a_path() {
                 state: OpState::Committed,
                 sha256: None,
                 before: None,
+                signature: None,
             },
         );
     }
@@ -944,6 +947,7 @@ fn a_tampered_operation_cannot_name_a_path() {
                 sha256: None,
                 source: "unknown".into(),
                 installed_at: 0,
+                signature: None,
             },
             previous: None,
             broken: None,
@@ -1675,6 +1679,18 @@ fn a_missing_malformed_or_truncated_inventory_is_restored_from_its_last_good_cop
     let fx = fixture("restore");
     drop(installed(&fx));
     let good = inventory(&fx);
+    // What each copy's signature was found to be is restored with it (EXT-09): a file is unsigned.
+    let signature = good.extensions["acme.hello"]
+        .active
+        .signature
+        .clone()
+        .unwrap();
+    assert_eq!(signature.status, SignatureStatus::Missing);
+    assert_eq!(signature.registry, "file");
+    assert_eq!(
+        Some(&signature.sha256),
+        good.extensions["acme.hello"].active.sha256.as_ref()
+    );
     let text = fs::read_to_string(fx.root.join(INVENTORY)).unwrap();
     let files = kept_files(&fx);
     for (damage, about) in [
@@ -1785,6 +1801,14 @@ fn assert_rebuilt(fx: &Fixture, service: &ExtensionService) {
         ["acme.hello", "acme.other"]
     );
     assert!(inv.grants.is_empty());
+    // Nor is what its signature was: a rebuilt copy is never taken for checked (EXT-09).
+    for record in inv.extensions.values() {
+        assert!(record.active.signature.is_none());
+        assert!(record
+            .previous
+            .as_ref()
+            .is_none_or(|p| p.signature.is_none()));
+    }
     assert!(service
         .host_copy("acme.hello")
         .unwrap_err()
@@ -1963,4 +1987,45 @@ fn a_failed_save_does_not_leave_the_last_good_copy_ahead() {
     assert_eq!(version_listed(&service, "acme.hello"), "1.0.0");
     assert!(inventory(&fx).grants.is_empty());
     assert!(recovered(&fx, "it was restored from its last good copy"));
+}
+
+/// A signature record holds only for the bytes it was checked against (EXT-09): one for other
+/// bytes is refused when staged, and one an inventory carries for another copy is not listed.
+#[test]
+fn a_signature_record_is_bound_to_its_package_bytes() {
+    let fx = fixture("signature-binding");
+    let service = fx.service();
+    let (op, _folder) = service.begin("acme.hello", "1.0.0", "file").unwrap();
+    let record = SignatureRecord {
+        status: SignatureStatus::RegistrySigned,
+        registry: "https://open-vsx.org".into(),
+        key_id: Some("k".into()),
+        namespace: "acme".into(),
+        sha256: "ab".repeat(32),
+        store_revision: 1,
+    };
+    let error = service
+        .staged_with(&op, &"cd".repeat(32), Some(record))
+        .unwrap_err();
+    assert!(error.starts_with("InstallFailed"), "{error}");
+    assert!(
+        inventory(&fx).operations.is_empty(),
+        "the operation was ended"
+    );
+
+    install(&fx, &service, "acme.hello", "1.0.0");
+    assert_eq!(
+        entry(&service, "acme.hello").signature.unwrap().status,
+        SignatureStatus::Missing
+    );
+    drop(service);
+    let mut inv = inventory(&fx);
+    let active = &mut inv.extensions.get_mut("acme.hello").unwrap().active;
+    let signature = active.signature.as_mut().unwrap();
+    signature.status = SignatureStatus::RegistrySigned;
+    signature.sha256 = "ef".repeat(32);
+    let text = serde_json::to_string(&inv).unwrap();
+    fs::write(fx.root.join(INVENTORY), &text).unwrap();
+    fs::write(fx.root.join(LAST_GOOD), &text).unwrap();
+    assert!(entry(&fx.service(), "acme.hello").signature.is_none());
 }

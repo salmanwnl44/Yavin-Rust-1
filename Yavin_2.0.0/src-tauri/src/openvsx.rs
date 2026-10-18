@@ -17,10 +17,17 @@
 //!
 //! **A package's checksum** is `files.sha256`: 64 hex digits computed by the registry, served
 //! from the same place as the package. It proves the package arrived as the registry holds it,
-//! not who made it: Open VSX's signatures (`files.signature`, `.sigzip`) are not verified yet.
+//! not who made it.
+//!
+//! **A package's signature** (EXT-09, `package_trust.rs`) is `files.signature`: a `.sigzip`
+//! holding Open VSX's Ed25519 signature over the whole `.vsix`. It must verify under a key Yavin
+//! pins for this registry -- `files.publicKey` only names which -- or the package is refused
+//! before anything is staged. It proves the package is the one the registry published; Open VSX
+//! has no publisher keys, so it does not prove who made it either.
 
 use crate::extension_package;
 use crate::marketplace::{fetch_url, registry as registry_at, url_on, Kind, Registry};
+use crate::package_trust::{self, SignatureRecord, SignatureStatus};
 use ide_workspace::extension_id::canonical_id;
 use serde::Deserialize;
 use serde_json::Value;
@@ -320,7 +327,7 @@ pub fn download(
     expected_id: &str,
     expected_version: &str,
     archive: &Path,
-) -> Result<(String, u64), String> {
+) -> Result<(String, u64, SignatureRecord), String> {
     let meta = version_metadata(registry, namespace, name, expected_version)?;
     let id = match (meta["namespace"].as_str(), meta["name"].as_str()) {
         (Some(ns), Some(n)) => canonical_id(&format!("{ns}.{n}")),
@@ -367,7 +374,78 @@ pub fn download(
             "IntegrityFailed: the package's SHA-256 is {actual}, but the registry says {published}."
         ));
     }
-    Ok((actual, size))
+    // Its signature (EXT-09): over these very bytes, under a key Yavin pins for this registry --
+    // or it is not installed. The metadata's key id only chooses among the pinned keys.
+    let publisher = expected_id.split('.').next().unwrap_or_default();
+    let status = signature_status(registry, &meta, publisher, archive, &label);
+    if !status.trusted() {
+        return Err(package_trust::refusal(status, &label, &registry.origin));
+    }
+    let key_id = key_id(&meta, registry);
+    Ok((
+        actual.clone(),
+        size,
+        SignatureRecord {
+            status,
+            registry: registry.origin.clone(),
+            key_id,
+            namespace: publisher.to_string(),
+            sha256: actual,
+            store_revision: package_trust::store().map(|s| s.revision).unwrap_or(0),
+        },
+    ))
+}
+
+/// The key id `files.publicKey` names: `.../api/-/public-key/<id>` on this registry.
+fn key_id(meta: &Value, registry: &Registry) -> Option<String> {
+    let url = file_url(meta, "publicKey", registry).ok()?;
+    let id = url.rsplit_once("/api/-/public-key/")?.1;
+    let ok =
+        (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    ok.then(|| id.to_string())
+}
+
+/// What the signature of the downloaded `archive` is found to be.
+fn signature_status(
+    registry: &Registry,
+    meta: &Value,
+    publisher: &str,
+    archive: &Path,
+    label: &str,
+) -> SignatureStatus {
+    if meta["files"]["signature"].is_null() {
+        return SignatureStatus::Missing;
+    }
+    let Ok(url) = file_url(meta, "signature", registry) else {
+        return SignatureStatus::Malformed;
+    };
+    let mut sigzip = Vec::new();
+    let fetched = fetch_url(
+        registry,
+        &url,
+        &format!("{label}'s signature"),
+        Kind::Package,
+        package_trust::MAX_SIGZIP,
+        &mut |chunk| {
+            sigzip.extend_from_slice(chunk);
+            Ok(())
+        },
+    );
+    if fetched.is_err() {
+        return SignatureStatus::Unavailable;
+    }
+    let Ok(package) = fs::read(archive) else {
+        return SignatureStatus::Unavailable;
+    };
+    package_trust::verify(
+        &package_trust::store(),
+        &registry.origin,
+        publisher,
+        key_id(meta, registry).as_deref(),
+        &package,
+        Some(&sigzip),
+        package_trust::today(),
+    )
 }
 
 // --- Commands --------------------------------------------------------------------------------

@@ -146,6 +146,8 @@ export type MarketplaceErrorCode =
   | "Incompatible"
   | "Cancelled"
   | "IntegrityFailed"
+  /** Its signature did not verify under a key Yavin pins (EXT-09). */
+  | "SignatureFailed"
   | "UnsafePackage"
   | "InvalidPackage"
   | "ManifestMismatch"
@@ -199,6 +201,35 @@ export function marketplaceErrorOf(error: unknown, fallback: MarketplaceErrorCod
     IntegrityFailed: [
       "IntegrityFailed",
       `${what} did not match its published checksum; it was not installed.`,
+    ],
+    // EXT-09: refused before anything was installed or replaced.
+    SignatureMissing: [
+      "SignatureFailed",
+      `${what} is not signed by its registry; it was not installed.`,
+    ],
+    SignatureInvalid: [
+      "SignatureFailed",
+      `${what}'s signature does not match the package; it was not installed.`,
+    ],
+    SignatureMalformed: [
+      "SignatureFailed",
+      `${what}'s signature could not be read; it was not installed.`,
+    ],
+    UntrustedKey: [
+      "SignatureFailed",
+      `${what} is signed with a key Yavin does not trust; it was not installed.`,
+    ],
+    KeyRevoked: [
+      "SignatureFailed",
+      `${what} is signed with a key Yavin no longer trusts; it was not installed.`,
+    ],
+    KeyExpired: [
+      "SignatureFailed",
+      `${what} is signed with a key Yavin no longer trusts; it was not installed.`,
+    ],
+    VerificationUnavailable: [
+      "Unavailable",
+      `${what}'s signature could not be checked; it was not installed. Try again later.`,
     ],
     UnsafePackage: ["UnsafePackage", `${what} contains unsafe files; it was not installed.`],
     MalformedPackage: ["InvalidPackage", `${what} is not a valid extension package.`],

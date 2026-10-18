@@ -396,6 +396,19 @@ test("native errors map to user messages; the technical detail is kept apart", (
     ["UnexpectedRedirect: redirected to another host (evil.com)", "InvalidResponse", /untrusted/],
     ["InsecureTransport: not HTTPS", "Unavailable", /securely/],
     ["ManifestMismatch: the package is acme.x", "ManifestMismatch", /not the extension it claims/],
+    [
+      "SignatureInvalid: acme.x 1.0.0 does not match its signature.",
+      "SignatureFailed",
+      /signature does not match/,
+    ],
+    [
+      "SignatureMissing: acme.x 1.0.0 is not signed.",
+      "SignatureFailed",
+      /not signed by its registry/,
+    ],
+    ["UntrustedKey: acme.x is signed with key k", "SignatureFailed", /does not trust/],
+    ["KeyRevoked: revoked", "SignatureFailed", /no longer trusts/],
+    ["VerificationUnavailable: no store", "Unavailable", /could not be checked/],
     ["something odd", "InstallFailed", /something went wrong/],
   ];
   for (const [native, code, message] of cases) {

@@ -27,6 +27,7 @@ mod localgit_restore;
 mod lsp;
 mod marketplace;
 mod openvsx;
+mod package_trust;
 mod paths;
 mod ports;
 mod session;

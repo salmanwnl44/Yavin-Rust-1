@@ -16,6 +16,7 @@ import {
   type SettingDefinition,
   type SettingsRegistry,
 } from "../settings/settings.ts";
+import type { NativeSignature } from "../native.ts";
 import { ExtensionError } from "./errors.ts";
 import {
   readManifest,
@@ -67,6 +68,11 @@ export interface RegisteredExtension {
   shadowed: readonly ShadowedCopy[];
   /** What the user allowed it (EXT-07): the native side decides; this shows it. */
   grants: GrantState;
+  /**
+   * What its package's signature was found to be when installed (EXT-09), as the native
+   * inventory said: null when it has not said (not recorded, or not listed yet).
+   */
+  signature: NativeSignature | null;
 }
 
 export interface RejectedExtension {
@@ -210,6 +216,7 @@ export function createExtensionRegistry(options: {
   const extensions = new Map<string, RegisteredExtension>();
   /** Grant states by id, as last confirmed (kept across a re-registration of the same copy). */
   const grantStates = new Map<string, GrantState>();
+  const signatureStates = new Map<string, NativeSignature | null>();
   let rejected: RejectedExtension[] = [];
   /** Settings registered for each enabled extension, to remove with it. */
   const settingRemovals = new Map<string, (() => void)[]>();
@@ -348,6 +355,14 @@ export function createExtensionRegistry(options: {
       settingDefinitions.delete(setting.id);
   };
 
+  const setSignature = (id: string, signature: NativeSignature | null) => {
+    signatureStates.set(id, signature);
+    const entry = extensions.get(id);
+    if (!entry || entry.signature === signature) return;
+    entry.signature = signature;
+    publish();
+  };
+
   const setGrants = (id: string, state: GrantState) => {
     grantStates.set(id, state);
     const entry = extensions.get(id);
@@ -401,6 +416,7 @@ export function createExtensionRegistry(options: {
         warnings: result.warnings.map(describe),
         shadowed,
         grants: grantStates.get(manifest.id) ?? NO_GRANTS,
+        signature: signatureStates.get(manifest.id) ?? null,
       };
       extensions.set(manifest.id, entry);
       if (entry.enabled) applySettings(entry);
@@ -444,7 +460,10 @@ export function createExtensionRegistry(options: {
             ? { version: previous.manifest.version, granted: previous.grants.granted }
             : previous.grants.previous,
         },
+        // The new copy's is not the old one's: unknown until the inventory lists it.
+        signature: null,
       };
+      signatureStates.delete(id);
       grantStates.set(id, entry.grants);
       extensions.set(id, entry);
       if (entry.enabled) applySettings(entry);
@@ -459,6 +478,7 @@ export function createExtensionRegistry(options: {
     remove(id: string, { forget = false }: { forget?: boolean } = {}) {
       const entry = extensions.get(id);
       if (forget) grantStates.delete(id);
+      if (forget) signatureStates.delete(id);
       if (forget && disabled.delete(id) && !options.persistEnabled) saveDisabled(id, true);
       if (!entry) return;
       if (entry.enabled) removeSettings(entry);
@@ -467,6 +487,8 @@ export function createExtensionRegistry(options: {
     },
     /** An extension's grants as the native inventory has them (discovery, a grant change). */
     setGrants,
+    /** What an extension copy's signature was found to be, as the native inventory said. */
+    setSignature,
     /**
      * Allows exactly `capabilities` (each one its manifest requests) and returns the state the
      * native side then holds -- shown only once it said so.

@@ -4,7 +4,7 @@
  * per id -- an installed copy over a development sample -- so each id arrives once, with the
  * copies it shadows; the extension host loads code only from the folder listed here.
  */
-import { native, type NativePermissions } from "../native.ts";
+import { native, type NativePermissions, type NativeSignature } from "../native.ts";
 import { DISABLED_KEY, readStoredDisabled, type ExtensionRegistry } from "./registry.ts";
 
 export interface DiscoveryReport {
@@ -22,6 +22,8 @@ export interface ListedExtension {
   shadowed?: { folder: string; version: string | null; reason: string }[];
   /** What the inventory allows this copy (EXT-07). */
   permissions?: NativePermissions | null;
+  /** What its package's signature was found to be when installed (EXT-09). */
+  signature?: NativeSignature | null;
 }
 
 export interface Listing {
@@ -85,7 +87,8 @@ async function nativeList(): Promise<Listing> {
 
 /**
  * The grants the inventory holds now, for every registered extension (EXT-07): after an
- * install or update, whose new copy starts with none.
+ * install or update, whose new copy starts with none -- and what each copy's signature was
+ * found to be (EXT-09).
  */
 export async function refreshGrants(
   registry: ExtensionRegistry,
@@ -93,11 +96,14 @@ export async function refreshGrants(
 ): Promise<void> {
   const found = await list();
   for (const one of found.extensions)
-    if (one.id && one.permissions && one.error === null && registry.get(one.id))
-      registry.setGrants(one.id, {
-        granted: one.permissions.granted,
-        previous: one.permissions.previous,
-      });
+    if (one.id && one.error === null && registry.get(one.id)) {
+      if (one.permissions)
+        registry.setGrants(one.id, {
+          granted: one.permissions.granted,
+          previous: one.permissions.previous,
+        });
+      registry.setSignature(one.id, one.signature ?? null);
+    }
 }
 
 export async function discoverExtensions(
@@ -131,6 +137,8 @@ export async function discoverExtensions(
         granted: one.permissions.granted,
         previous: one.permissions.previous,
       });
+    // And what its signature was found to be (EXT-09): only the native side says so.
+    if (one.id) registry.setSignature(one.id, one.signature ?? null);
     const result = registry.add(
       parsed,
       { kind: "folder", path: one.folder },

@@ -41,6 +41,10 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 # Resolving redirects and building request URLs (EXT-08): already in the build, through Tauri.
 url = "2.5"
+# Verifying Open VSX package signatures (EXT-09): Ed25519 (RFC 8032), verification only.
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
+# Decoding pinned keys (SPKI PEM): the workspace's own base64 (ide-terminal-protocol).
+base64 = "0.22"
 
 [target.'cfg(unix)'.dependencies]
 # A terminal's shell and everything it starts are ended as one process group (`killpg`).

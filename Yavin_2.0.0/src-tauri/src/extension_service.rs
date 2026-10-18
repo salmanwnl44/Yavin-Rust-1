@@ -57,6 +57,7 @@
 use crate::extension_package::identity;
 use crate::extension_permissions::{declared, grantable, Denial};
 use crate::extensions::{discover, read_manifest, read_resource};
+use crate::package_trust::SignatureRecord;
 use ide_workspace::durable::{json_version, read_versioned, remove_durably, write_durably, Loaded};
 use ide_workspace::extension_id::{canonical_id, is_canonical};
 use serde::{Deserialize, Serialize};
@@ -97,6 +98,11 @@ pub struct Copy {
     pub source: String,
     /// Seconds since the Unix epoch.
     pub installed_at: u64,
+    /// What its package's signature was found to be when installed (EXT-09), bound to the
+    /// package's SHA-256. None: installed before signatures were checked, adopted, or rebuilt
+    /// by a recovery -- never taken for verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<SignatureRecord>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -126,6 +132,9 @@ pub struct Operation {
     pub sha256: Option<String>,
     /// The record before `commit` changed it (for `finish`).
     pub before: Option<Record>,
+    /// Its package's signature, as `staged` was told (EXT-09).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<SignatureRecord>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -213,6 +222,8 @@ pub struct Listed {
     /// Which copy it is, for the host and for grants (not sent to the window).
     #[serde(skip)]
     pub copy: Option<CopyFacts>,
+    /// What its package's signature was found to be when installed (EXT-09).
+    pub signature: Option<SignatureRecord>,
 }
 
 /// The copy an entry is (EXT-07): what a grant is bound to.
@@ -571,6 +582,8 @@ impl ExtensionService {
                 sha256: None,
                 source: "unknown".into(),
                 installed_at: now(),
+                // Rebuilt from the folder alone: what its signature was is not known (EXT-09).
+                signature: None,
             };
             inventory.extensions.insert(
                 id.clone(),
@@ -794,6 +807,7 @@ impl ExtensionService {
                     state: OpState::Staging,
                     sha256: None,
                     before: None,
+                    signature: None,
                 },
             );
             Ok(())
@@ -814,7 +828,26 @@ impl ExtensionService {
 
     /// The package of `op` is unpacked into `<staging>/files`: its manifest must be what
     /// `begin` was asked for. Returns the manifest's text.
+    #[cfg(test)]
     pub fn staged(&self, op: &str, sha256: &str) -> Result<String, String> {
+        self.staged_with(op, sha256, None)
+    }
+
+    /// `staged`, with what the package's signature was found to be (EXT-09) -- bound to these
+    /// very package bytes (its SHA-256), or refused.
+    pub fn staged_with(
+        &self,
+        op: &str,
+        sha256: &str,
+        signature: Option<SignatureRecord>,
+    ) -> Result<String, String> {
+        if signature
+            .as_ref()
+            .is_some_and(|s| !s.sha256.eq_ignore_ascii_case(sha256))
+        {
+            self.abort(op);
+            return Err("InstallFailed: the signature checked is not this package's.".into());
+        }
         let (mut inner, paths) = self.lock()?;
         inner.running.remove(op);
         let operation = inner
@@ -850,6 +883,7 @@ impl ExtensionService {
             let operation = inv.operations.get_mut(op).ok_or("InstallFailed")?;
             operation.state = OpState::Staged;
             operation.sha256 = Some(sha256.to_ascii_lowercase());
+            operation.signature = signature.clone();
             Ok(())
         })?;
         inner.waiting.insert(op.to_string(), Instant::now());
@@ -954,6 +988,7 @@ impl ExtensionService {
             sha256: Some(sha256),
             source: operation.source.clone(),
             installed_at: now(),
+            signature: operation.signature.clone(),
         };
         let switched = Self::write(&mut inner, paths, |inv| {
             let record = match &before {
@@ -1343,6 +1378,7 @@ impl ExtensionService {
                     shadowed: Vec::new(),
                     permissions: None,
                     copy: None,
+                    signature: None,
                 }),
             }
         }
@@ -1384,6 +1420,7 @@ impl ExtensionService {
                             sha256: None,
                             source: "unknown".into(),
                             installed_at: now(),
+                            signature: None,
                         },
                         previous: None,
                         broken: None,
@@ -1413,6 +1450,15 @@ impl ExtensionService {
                 sha256: copy.sha256.clone(),
                 stored: Some(copy.folder.clone()),
             };
+            // A signature record holds only for the bytes it was checked against (EXT-09): one
+            // whose SHA-256 is not this copy's is not reported at all.
+            let signature_of = |copy: &Copy| {
+                copy.signature.clone().filter(|s| {
+                    copy.sha256
+                        .as_deref()
+                        .is_some_and(|sha| s.sha256.eq_ignore_ascii_case(sha))
+                })
+            };
             let mut entry = Listed {
                 id: Some(id.clone()),
                 folder: display(&join(root, &record.active.folder)),
@@ -1422,6 +1468,7 @@ impl ExtensionService {
                 shadowed: shadows.remove(&id).unwrap_or_default(),
                 permissions: None,
                 copy: Some(facts(&record.active)),
+                signature: signature_of(&record.active),
             };
             match usable(&record.active) {
                 Ok(text) => {
@@ -1456,6 +1503,7 @@ impl ExtensionService {
                             entry.folder = display(&join(root, &previous.folder));
                             entry.manifest = Some(text);
                             entry.copy = Some(facts(&previous));
+                            entry.signature = signature_of(&previous);
                         }
                         None => {
                             let reason = format!("The installed {id} {} cannot be used: {why}. Reinstall or uninstall it.", record.active.version);
@@ -1470,6 +1518,7 @@ impl ExtensionService {
                             }
                             entry.error = Some(reason);
                             entry.copy = None;
+                            entry.signature = None;
                         }
                     }
                 }
@@ -1498,6 +1547,7 @@ impl ExtensionService {
                         shadowed: Vec::new(),
                         permissions: None,
                         copy: None,
+                        signature: None,
                     });
                     continue;
                 };
@@ -1530,6 +1580,7 @@ impl ExtensionService {
                         sha256: None,
                         stored: None,
                     }),
+                    signature: None,
                 });
             }
         }

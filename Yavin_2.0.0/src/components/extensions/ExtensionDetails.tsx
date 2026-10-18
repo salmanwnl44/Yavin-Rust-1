@@ -10,6 +10,7 @@ import {
 } from "../../services/extensions/marketplace/types";
 import { compareVersions } from "../../services/extensions/marketplace/versions";
 import { EXTENSION_API } from "../../services/extensions/manifest";
+import { describeSignature } from "../../services/extensions/signature";
 import { openExternalUrl } from "../../services/git/remoteUrl";
 import { CardButton } from "./ExtensionCard";
 import { ExtensionIcon } from "./ExtensionIcon";
@@ -127,6 +128,7 @@ export function ExtensionDetails({
 
   const extension = listing.extension;
   const manifest = entry?.manifest;
+  const signature = describeSignature(entry?.signature);
   const name = manifest?.displayName ?? extension?.displayName ?? id;
   const status = statusOf(id, state, trusted, marketplace, extension);
   const operation = state.operations.operations[id];
@@ -396,6 +398,17 @@ export function ExtensionDetails({
                     : `Incompatible — ${compatibility.reasons.join(" ")}`}
                 </Row>
               )}
+              {entry?.source.kind === "folder" && (
+                <Row label="Signature">
+                  <span data-testid="extension-signature" data-signed={String(signature.signed)}>
+                    <span className={signature.signed ? "text-emerald-300" : "text-amber-300"}>
+                      {signature.label}
+                    </span>
+                    {" — "}
+                    {signature.detail}
+                  </span>
+                </Row>
+              )}
               {!trusted && (
                 <Row label="This folder">
                   Not trusted: installed extensions' code does not run here.
@@ -435,10 +448,6 @@ export function ExtensionDetails({
                     </ul>
                   </Row>
                 )}
-                <Row label="Signature">
-                  Not verified: Yavin checks the package's SHA-256 from its registry, not its
-                  publisher's signature.
-                </Row>
               </div>
             </Section>
           )}

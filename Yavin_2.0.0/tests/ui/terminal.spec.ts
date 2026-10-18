@@ -90,7 +90,13 @@ async function desktop(
     /** Discovery finds one Unix bash, the default: its folders are this POSIX workspace's. */
     unixShell?: boolean;
     /** Installed extensions' folders and manifest texts (IDE-07 discovery). */
-    extensions?: { folder: string; manifest: string | null; error: string | null }[];
+    extensions?: {
+      folder: string;
+      manifest: string | null;
+      error: string | null;
+      /** What the inventory recorded of its package's signature (EXT-09). */
+      signature?: Record<string, unknown> | null;
+    }[];
     /** Installed extensions' files, by `id:path` (EXT-04: themes, snippets). */
     extensionResources?: Record<string, string>;
     /** Copies of the sample the inventory shadows (EXT-02: it lists one entry per id). */
@@ -4011,6 +4017,14 @@ test("a VS Code extension adapted by Yavin: one card, what was installed and not
       {
         folder: `/data/extensions/.store/${id}/2.25.1-abcd1234`,
         error: null,
+        signature: {
+          status: "registrySigned",
+          registry: "https://open-vsx.org",
+          keyId: "14ccb407-4e79-41ed-be5a-6d608325c45a",
+          namespace: "dracula-theme",
+          sha256: "ab".repeat(32),
+          storeRevision: 1,
+        },
         manifest: JSON.stringify({
           manifestVersion: 1,
           publisher: "dracula-theme",
@@ -4058,7 +4072,11 @@ test("a VS Code extension adapted by Yavin: one card, what was installed and not
   const report = details.getByTestId("vsix-report");
   await expect(report).toContainText("VS Code ^1.13.0");
   await expect(report).toContainText("Yavin runs no VS Code extension code");
-  await expect(report).toContainText("Not verified");
+  // Its signature as the inventory recorded it (EXT-09): the registry's, and only that.
+  const signature = details.getByTestId("extension-signature");
+  await expect(signature).toHaveAttribute("data-signed", "true");
+  await expect(signature).toContainText("Signed by open-vsx.org");
+  await expect(signature).toContainText("does not verify the publisher's identity");
   // What of the theme the editor does not apply (the workbench's colours) is said.
   await expect(report).toContainText("activityBar.background");
   // The theme is offered beside Yavin's own, and installing it ran nothing.
@@ -4107,6 +4125,9 @@ test("details: an extension's page with its metadata, features and changelog; ba
   await details.getByRole("tab", { name: "Information" }).click();
   await expect(details).toContainText("acme.python-tools");
   await expect(details).not.toContainText("Downloads");
+  // Not installed: no signature is claimed for it.
+  await details.getByRole("tab", { name: "Requirements" }).click();
+  await expect(details.getByTestId("extension-signature")).toHaveCount(0);
   await details.getByRole("button", { name: "Back to Extensions" }).click();
   await expect(details).toHaveCount(0);
 });
