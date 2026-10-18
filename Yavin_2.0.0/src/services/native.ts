@@ -98,7 +98,8 @@ interface Commands {
   dap_stop_all: { args: Record<string, never>; result: void };
   /** Installed extensions' manifests (IDE-07, `src-tauri/src/extensions.rs`); never their code. */
   /** Extension host processes (IDE-08, `src-tauri/src/extension_host.rs`); trust-gated. */
-  ext_host_start: { args: Record<string, never>; result: number };
+  /** Starts a host in its OS sandbox (EXT-10), with the user's resources (bounded natively). */
+  ext_host_start: { args: { resources?: NativeHostResources }; result: number };
   ext_host_send: { args: { session: number; message: string }; result: void };
   ext_host_stop: { args: { session: number }; result: void };
   ext_host_stop_all: { args: Record<string, never>; result: void };
@@ -741,6 +742,15 @@ export interface NativeSignature {
   namespace: string;
   sha256: string;
   storeRevision: number;
+}
+
+/** The extension host's resources (EXT-10, `HostResources` in `extension_host.rs`). */
+export interface NativeHostResources {
+  memoryMb: number;
+  extensionMemoryMb: number;
+  cpuCores: number;
+  callMs: number;
+  loadMs: number;
 }
 
 /** An extension copy's permissions, as the native inventory holds them (EXT-07). */

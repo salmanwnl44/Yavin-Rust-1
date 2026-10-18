@@ -7,4 +7,5 @@ pub mod operations;
 pub mod process;
 pub mod recovery;
 pub mod resource_events;
+pub mod sandbox;
 pub mod watcher;

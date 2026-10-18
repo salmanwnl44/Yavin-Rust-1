@@ -21,6 +21,8 @@ export type ExtensionErrorCode =
   | "StorageReadOnly"
   | "HostDisposed"
   | "HostUnavailable"
+  /** Extension code runs only in Yavin's OS sandbox, which could not be set up (EXT-10). */
+  | "SandboxUnavailable"
   | "HostCrashed"
   | "HostCrashedRepeatedly"
   | "DependencyFailed"

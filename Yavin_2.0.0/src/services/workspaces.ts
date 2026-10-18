@@ -27,6 +27,7 @@ import { createDeclarativeContributions } from "./extensions/declarative.ts";
 import { createExtensionStorage } from "./extensions/storage.ts";
 import { createExtensionHostManager, type ExtensionHostManager } from "./extensions/manager.ts";
 import { createNativeHostTransport } from "./extensions/transport.ts";
+import { HOST_RESOURCE_SETTING_LIST, hostResources } from "./extensions/hostResources.ts";
 import { installedRoot, rediscoverExtensions, refreshGrants } from "./extensions/discovery.ts";
 import {
   createExtensionInstaller,
@@ -129,6 +130,7 @@ export const settings = createSettingsRegistry([
   TASK_DEFINITIONS,
   ...DEBUG_SETTING_LIST,
   ...MARKETPLACE_SETTING_LIST,
+  ...HOST_RESOURCE_SETTING_LIST,
 ]);
 
 /**
@@ -350,7 +352,8 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
           workspace: folders.length ? id : null,
           folder: folders[0] ?? null,
           workspaceGeneration: lifecycle.generation,
-          transport: createNativeHostTransport(),
+          // Each host starts with the user's resource settings (EXT-10).
+          transport: createNativeHostTransport(() => hostResources(settings)),
           window: windowProxy,
           decorations: extensionDecorations,
           providers: extensionProviders,

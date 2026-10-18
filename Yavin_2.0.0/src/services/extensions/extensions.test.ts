@@ -1777,3 +1777,32 @@ test("EXT-08 a host that ended removes only its own providers and decorations, n
   await second.dispose();
   assert.equal(t.providers.getSnapshot().length, 0);
 });
+
+test("EXT-10 without its sandbox, no extension code runs -- and it says so, typed", async () => {
+  const t = setup({
+    failStart:
+      "SandboxUnavailable: extension code runs only where Yavin can sandbox it, and this platform has no sandbox implemented.",
+  });
+  t.add({}, GREETER);
+  const m = t.manager();
+  await assert.rejects(
+    m.executeCommand("acme.hello.greet"),
+    (e: ExtensionError) =>
+      e.code === "SandboxUnavailable" &&
+      e.extensionId === "acme.hello" &&
+      /only where Yavin can sandbox it/.test(e.message),
+  );
+  // It stays failed until Restart (EXT-05), for the same reason.
+  await assert.rejects(m.executeCommand("acme.hello.greet"), (e: ExtensionError) =>
+    /only where Yavin can sandbox it/.test(e.message),
+  );
+  const { displayStatus } = await import("./marketplace/status.ts");
+  const entry = t.registry.get("acme.hello")!;
+  const shown = displayStatus({
+    entry,
+    trusted: true,
+    runtime: m.getSnapshot().statuses["acme.hello"],
+  });
+  assert.equal(shown.label, "Host Unavailable");
+  assert.match(shown.detail ?? "", /runs only in Yavin's sandbox/);
+});

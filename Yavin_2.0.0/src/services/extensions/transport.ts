@@ -8,7 +8,7 @@
  * `ext-host-denied`, saying which extension, method and capability.
  */
 import { listen } from "@tauri-apps/api/event";
-import { native } from "../native.ts";
+import { native, type NativeHostResources } from "../native.ts";
 
 export interface HostChannel {
   send(text: string): Promise<void>;
@@ -101,11 +101,12 @@ const stopLeftovers = () =>
     () => undefined,
   ));
 
-export function createNativeHostTransport(): HostTransport {
+/** `resources`: what each host is started with (the user's settings, EXT-10). */
+export function createNativeHostTransport(resources?: () => NativeHostResources): HostTransport {
   return {
     async start() {
       await Promise.all([ensureListening(), stopLeftovers()]);
-      const session = await native("ext_host_start", {});
+      const session = await native("ext_host_start", { resources: resources?.() });
       let stopping = false;
       let ended = false;
       const messageListeners = new Set<(text: string) => void>();

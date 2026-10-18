@@ -328,9 +328,14 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         hostReason = (error as Error)?.message ?? String(error);
         starting = null;
         publish();
+        // The native refusal's code, at the start of the message (never the host's output).
+        const code = /^([A-Za-z]+): /.exec(hostReason)?.[1];
         throw new ExtensionError(
-          // The native refusal's code, at the start of the message (never the host's output).
-          /^TrustRequired: /.test(hostReason) ? "TrustRequired" : "HostUnavailable",
+          code === "TrustRequired" ||
+            code === "SandboxUnavailable" ||
+            code === "HostCrashedRepeatedly"
+            ? code
+            : "HostUnavailable",
           null,
           hostReason.replace(/^[A-Za-z]+: /, ""),
         );
@@ -1075,8 +1080,10 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         clearContributions(id);
         one.activation = null;
         publish();
+        // A refusal to run any code (trust, no sandbox) stays what it is: not this extension's.
+        const code = (error as ExtensionError).code;
         throw new ExtensionError(
-          (error as ExtensionError).code === "TrustRequired" ? "TrustRequired" : "ActivationFailed",
+          code === "TrustRequired" || code === "SandboxUnavailable" ? code : "ActivationFailed",
           id,
           reason,
         );

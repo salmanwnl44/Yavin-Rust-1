@@ -4,9 +4,10 @@
 
 use crate::lsp_framing::{frame, FrameReader};
 use crate::process::{kill_tree, poll_interval};
+use crate::sandbox::{SandboxPolicy, SandboxedChild};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,10 +22,42 @@ pub trait ServerEvents: Send + Sync + 'static {
     fn exit(&self, code: Option<i32>, error: Option<String>);
 }
 
-/// A running server. Dropping it does not stop the process; `stop` does.
+/// A running server. Dropping it does not stop the process; `stop` does. (A sandboxed one
+/// ends when the last of it -- this, its reader -- is gone: its job closes.)
 pub struct ServerProcess {
-    child: Arc<Mutex<Child>>,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    child: Arc<Mutex<Process>>,
+    stdin: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+}
+
+/// The process behind a server: an ordinary child, or one in an OS sandbox (EXT-10).
+enum Process {
+    Plain(Child),
+    Sandboxed(SandboxedChild),
+}
+
+impl Process {
+    /// Ends it and everything it started.
+    fn end(&mut self) {
+        match self {
+            Process::Plain(child) => kill_tree(child),
+            Process::Sandboxed(child) => child.kill(),
+        }
+    }
+
+    /// `Some(code)` once it has ended (the code, if it has one).
+    fn ended(&mut self) -> std::io::Result<Option<Option<i32>>> {
+        match self {
+            Process::Plain(child) => Ok(child.try_wait()?.map(|status| status.code())),
+            Process::Sandboxed(child) => Ok(child.try_wait()?.map(Some)),
+        }
+    }
+
+    fn id(&self) -> u32 {
+        match self {
+            Process::Plain(child) => child.id(),
+            Process::Sandboxed(child) => child.id(),
+        }
+    }
 }
 
 /// Every language server, and everything it starts, lives in one Windows Job Object that ends
@@ -210,7 +243,46 @@ impl ServerProcess {
             .stderr
             .take()
             .ok_or("The server has no error output")?;
-        let stdin = child.stdin.take();
+        let stdin = child
+            .stdin
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Write + Send>);
+        Ok(Self::run(
+            Process::Plain(child),
+            stdin,
+            stdout,
+            stderr,
+            events,
+        ))
+    }
+
+    /// Starts `program` -- with no arguments -- in an operating-system sandbox with `policy`
+    /// (`crate::sandbox`, EXT-10): the extension host. It fails, and nothing runs, if the
+    /// sandbox cannot be set up; there is no unsandboxed fallback.
+    pub fn spawn_sandboxed(
+        program: &Path,
+        policy: &SandboxPolicy,
+        events: Arc<dyn ServerEvents>,
+    ) -> Result<ServerProcess, String> {
+        let spawned = crate::sandbox::spawn(program, &[], policy)?;
+        Ok(Self::run(
+            Process::Sandboxed(spawned.child),
+            Some(Box::new(spawned.stdin)),
+            spawned.stdout,
+            spawned.stderr,
+            events,
+        ))
+    }
+
+    /// Reads a started process's stderr (its log) and stdout (framed messages) on threads of
+    /// their own, and reports its end once.
+    fn run(
+        child: Process,
+        stdin: Option<Box<dyn Write + Send>>,
+        stdout: impl Read + Send + 'static,
+        stderr: impl Read + Send + 'static,
+        events: Arc<dyn ServerEvents>,
+    ) -> ServerProcess {
         let child = Arc::new(Mutex::new(child));
 
         let log = events.clone();
@@ -237,7 +309,7 @@ impl ServerProcess {
                             // The stream cannot be resynchronized: the session is over.
                             broken = Some(error.to_string());
                             if let Ok(mut child) = watched.lock() {
-                                kill_tree(&mut child);
+                                child.end();
                             }
                             break;
                         }
@@ -250,10 +322,10 @@ impl ServerProcess {
             events.exit(wait_for_exit(&watched), broken);
         });
 
-        Ok(ServerProcess {
+        ServerProcess {
             child,
             stdin: Arc::new(Mutex::new(stdin)),
-        })
+        }
     }
 
     /// Writes one message, framed. Fails once the server has gone.
@@ -272,7 +344,7 @@ impl ServerProcess {
             stdin.take();
         }
         if let Ok(mut child) = self.child.lock() {
-            kill_tree(&mut child);
+            child.end();
         }
     }
 
@@ -283,14 +355,14 @@ impl ServerProcess {
 
 /// The exit code once the process has ended, waiting a little for a process whose output has
 /// closed but which has not quite exited, and ending it if it lingers.
-fn wait_for_exit(child: &Arc<Mutex<Child>>) -> Option<i32> {
+fn wait_for_exit(child: &Arc<Mutex<Process>>) -> Option<i32> {
     let start = Instant::now();
     loop {
         if let Ok(mut guard) = child.lock() {
-            match guard.try_wait() {
-                Ok(Some(status)) => return status.code(),
+            match guard.ended() {
+                Ok(Some(code)) => return code,
                 Ok(None) if start.elapsed() > Duration::from_secs(5) => {
-                    kill_tree(&mut guard);
+                    guard.end();
                 }
                 Ok(None) => {}
                 Err(_) => return None,

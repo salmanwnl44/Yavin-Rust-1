@@ -21,12 +21,18 @@
 //! - **Identity.** Every message an extension sends is stamped here with its real extension id,
 //!   workspace and host generation, whatever the script put in it.
 //!
-//! What is not isolated: this is an OS process with the user's privileges. QuickJS confines the
-//! script, not the process; a bug in QuickJS itself is a bug in that confinement. The OS process
-//! is not sandboxed (no AppContainer or seccomp).
+//! - **Watchdog.** An entry still running at twice its deadline plus a second -- code QuickJS
+//!   could not interrupt -- ends this process (`watchdog`, EXT-10).
+//!
+//! **The OS sandbox (EXT-10).** Yavin starts this process in a Windows AppContainer with no
+//! capabilities, in a job of its own (`ide_workspace::sandbox`): no file but its program and the
+//! system's, no network, no child process, memory and CPU capped. It needs none of them: its
+//! input is stdin (extension code included, read by Yavin), its output stdout and stderr. A bug
+//! in QuickJS would still be a bug in the script's confinement -- inside that sandbox.
 
 pub mod protocol;
 mod runtime;
+pub mod watchdog;
 
 use ide_workspace::lsp_framing::{frame, FrameReader};
 use protocol::{HostLimits, Inbound, MAX_MESSAGE};
@@ -67,6 +73,7 @@ pub fn run(mut input: impl Read, mut output: impl Write) -> i32 {
     let mut buffer = vec![0u8; 64 * 1024];
     let mut identity: Option<Identity> = None;
     let mut extensions: HashMap<String, ExtensionRuntime> = HashMap::new();
+    let watchdog = watchdog::Watchdog::start();
     loop {
         let count = match input.read(&mut buffer) {
             Ok(0) | Err(_) => return 0,
@@ -150,6 +157,7 @@ pub fn run(mut input: impl Read, mut output: impl Write) -> i32 {
                                 .get("extensionPath")
                                 .and_then(Value::as_str)
                                 .map(str::to_string);
+                            watchdog.enter(host.limits.load_ms);
                             let created = ExtensionRuntime::load(
                                 &extension_id,
                                 &host.workspace_id,
@@ -160,6 +168,7 @@ pub fn run(mut input: impl Read, mut output: impl Write) -> i32 {
                                 code,
                                 &host.limits,
                             );
+                            watchdog.leave();
                             match created {
                                 Ok((runtime, sent)) => {
                                     for outgoing in sent {
@@ -190,7 +199,10 @@ pub fn run(mut input: impl Read, mut output: impl Write) -> i32 {
                                 );
                                 continue;
                             };
-                            for outgoing in runtime.deliver(&message, &host.limits) {
+                            watchdog.enter(host.limits.call_ms);
+                            let sent = runtime.deliver(&message, &host.limits);
+                            watchdog.leave();
+                            for outgoing in sent {
                                 write(&mut output, &stamp(outgoing));
                             }
                         }

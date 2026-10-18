@@ -13,4 +13,5 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [target.'cfg(windows)'.dependencies]
 # A Job Object: language servers (and whatever they start) end with Yavin, however it ends.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+# The extension host sandbox (EXT-10): AppContainer, file ACLs, pipes, process attributes.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }

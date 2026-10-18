@@ -88,6 +88,13 @@ export function displayStatus(input: {
     };
   if (runtime?.state === "failed") {
     const reason = runtime.reason ?? "It failed to activate.";
+    // EXT-10: no sandbox, no code -- said as such, never as a broken extension.
+    if (/SandboxUnavailable|sandbox/i.test(reason))
+      return {
+        label: "Host Unavailable",
+        tone: "error",
+        detail: `Extension code runs only in Yavin's sandbox, which is not available: ${reason.replace(/^[A-Za-z ]+: /, "")}`,
+      };
     if (/HostUnavailable|extension host .*(missing|not installed)/i.test(reason))
       return {
         label: "Host Unavailable",

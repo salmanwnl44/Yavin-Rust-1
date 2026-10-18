@@ -1187,3 +1187,199 @@ fn only_this_sessions_own_messages_are_passed_on() {
         Screened::Drop
     );
 }
+
+// --- EXT-10: the real host in its sandbox -----------------------------------------------------
+
+/// The real host runs in its sandbox -- an AppContainer, in a job -- and the sample works there.
+#[cfg(windows)]
+#[test]
+fn the_real_host_runs_in_its_sandbox() {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenIsAppContainer, TOKEN_QUERY};
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let yavin = Yavin::new("sandboxed", &[]);
+    let session = yavin.start();
+    yavin.handshake(session, 12001, 2000);
+    let pid = yavin.sessions.process_id(session).unwrap();
+    // SAFETY: handles opened here, queried into buffers of the size given, closed once.
+    let (in_container, in_job) = unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        assert!(!process.is_null());
+        let mut token: HANDLE = std::ptr::null_mut();
+        assert!(OpenProcessToken(process, TOKEN_QUERY, &mut token) != 0);
+        let (mut is, mut size) = (0u32, 0u32);
+        assert!(
+            GetTokenInformation(
+                token,
+                TokenIsAppContainer,
+                &mut is as *mut _ as _,
+                4,
+                &mut size
+            ) != 0
+        );
+        let mut job = 0;
+        assert!(IsProcessInJob(process, std::ptr::null_mut(), &mut job) != 0);
+        CloseHandle(token);
+        CloseHandle(process);
+        (is != 0, job != 0)
+    };
+    assert!(in_container, "the host's token is an AppContainer's");
+    assert!(in_job, "the host is in its job");
+    assert_eq!(yavin.load(session, 12001, SAMPLE)["type"], "loaded");
+    yavin.ask(
+        session,
+        12001,
+        SAMPLE,
+        "a",
+        "activate",
+        json!({"globalState": {}, "workspaceState": {}, "configuration": {}}),
+    );
+    let greeted = yavin
+        .ask(
+            session,
+            12001,
+            SAMPLE,
+            "g",
+            "command.run",
+            json!({"id": "yavin-samples.hello-world.greet", "args": []}),
+        )
+        .0;
+    assert_eq!(greeted["result"], "Hello, world!");
+}
+
+/// The host's memory is capped as a whole (its job): each extension stays within its own
+/// heap, yet together they cannot pass the process's limit -- the allocation that would is
+/// refused, and the host carries on.
+#[test]
+fn the_hosts_memory_is_capped_as_a_whole() {
+    let code = r#"var kept = [];
+        module.exports.activate = function (c, yavin) {
+            c.subscriptions.push(yavin.commands.registerCommand(EXT + ".grow", function () {
+                var buffer = new ArrayBuffer(100 * 1024 * 1024);
+                new Uint8Array(buffer).fill(1);
+                kept.push(buffer);
+                return "grew";
+            }));
+            c.subscriptions.push(yavin.commands.registerCommand(EXT + ".ok", function () { return "fine"; }));
+        };"#;
+    let ids = ["acme.big1", "acme.big2", "acme.big3"];
+    let sources: Vec<String> = ids
+        .iter()
+        .map(|id| format!("var EXT = \"{id}\";\n{code}"))
+        .collect();
+    let extensions: Vec<(&str, &str)> = ids
+        .iter()
+        .zip(&sources)
+        .map(|(id, source)| (*id, source.as_str()))
+        .collect();
+    let yavin = Yavin::new("memory", &extensions);
+    let session = yavin
+        .sessions
+        .start_with(
+            &built_host(),
+            HostResources {
+                memory_mb: 256,
+                extension_memory_mb: 128,
+                ..HostResources::default()
+            },
+            yavin.sink.clone(),
+            yavin.authority.clone(),
+        )
+        .unwrap();
+    yavin
+        .send(session, json!({"type": "init", "workspaceId": WS, "hostGeneration": 13001, "workspaceFolder": "C:/work", "apiVersion": "2.0.0", "limits": {"memoryBytes": 128u64 << 20, "loadMs": 3000, "callMs": 5000}}))
+        .unwrap();
+    assert_eq!(yavin.next_message(session)["type"], "ready");
+    for id in ids {
+        assert_eq!(yavin.load(session, 13001, id)["type"], "loaded");
+        assert_eq!(
+            yavin.ask(session, 13001, id, "a", "activate", json!({})).0["ok"],
+            true
+        );
+    }
+    let grow = |id: &str| {
+        yavin
+            .ask(
+                session,
+                13001,
+                id,
+                "g",
+                "command.run",
+                json!({"id": format!("{id}.grow"), "args": []}),
+            )
+            .0
+    };
+    assert_eq!(grow("acme.big1")["result"], "grew");
+    assert_eq!(grow("acme.big2")["result"], "grew");
+    // A third 100 MiB would pass the host's 256 MiB: refused, though within its own heap.
+    let third = grow("acme.big3");
+    assert_eq!(third["ok"], false, "{third}");
+    let fine = yavin
+        .ask(
+            session,
+            13001,
+            "acme.big1",
+            "o",
+            "command.run",
+            json!({"id": "acme.big1.ok", "args": []}),
+        )
+        .0;
+    assert_eq!(fine["result"], "fine", "the host carries on");
+}
+
+/// Hosts that keep ending on their own are not started again at once (EXT-10) -- a host
+/// stopped or replaced is not one of them.
+#[test]
+fn a_host_that_keeps_crashing_is_not_started_again_at_once() {
+    let yavin = Yavin::new("crashloop", &[]);
+    for _ in 0..(MAX_CRASHES + 1) {
+        let session = yavin.start();
+        yavin.sessions.stop(session);
+        yavin.exit_of(session);
+    }
+    for _ in 0..MAX_CRASHES {
+        let session = yavin.start();
+        yavin.handshake(session, 14001, 2000);
+        kill(yavin.sessions.process_id(session).unwrap());
+        yavin.exit_of(session);
+    }
+    let refused = yavin
+        .sessions
+        .start(&built_host(), yavin.sink.clone(), yavin.authority.clone())
+        .unwrap_err();
+    assert!(refused.starts_with("HostCrashedRepeatedly:"), "{refused}");
+    assert_eq!(yavin.sessions.running_hosts(), 0);
+}
+
+/// Many starts at once: one host runs, every other is retired -- none speaks.
+#[test]
+fn concurrent_starts_leave_one_host_running() {
+    let yavin = Yavin::new("concurrent", &[]);
+    let program = built_host();
+    let sessions: Vec<u32> = std::thread::scope(|scope| {
+        let started: Vec<_> = (0..8)
+            .map(|_| {
+                let (sessions, sink, authority, program) = (
+                    &yavin.sessions,
+                    yavin.sink.clone(),
+                    yavin.authority.clone(),
+                    &program,
+                );
+                scope.spawn(move || sessions.start(program, sink, authority).unwrap())
+            })
+            .collect();
+        started.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(yavin.sessions.running_hosts(), 1);
+    let init = |generation: u64| json!({"type": "init", "workspaceId": WS, "hostGeneration": generation, "workspaceFolder": "C:/work", "apiVersion": "2.0.0", "limits": {}});
+    let speaking: Vec<u32> = sessions
+        .iter()
+        .copied()
+        .filter(|&session| yavin.send(session, init(15000 + session as u64)).is_ok())
+        .collect();
+    assert_eq!(speaking.len(), 1, "{speaking:?} of {sessions:?}");
+    assert_eq!(yavin.next_message(speaking[0])["type"], "ready");
+}
