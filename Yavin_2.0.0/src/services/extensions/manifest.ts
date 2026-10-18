@@ -158,6 +158,8 @@ export interface ExtensionManifest {
   untrustedWorkspaces: boolean;
   /** Extensions that must be enabled, compatible and active first (`extensionDependencies`). */
   dependencies: string[];
+  /** Ones it uses when they are installed and enabled, and runs without (EXT-12). */
+  optionalDependencies: string[];
   /** Made from a VS Code package (EXT-04); null for a Yavin extension. */
   vsix: VsixOrigin | null;
   /** What it asks to be allowed (`permissions`, EXT-07): granted only by the user. */
@@ -295,7 +297,10 @@ export function readManifest(value: unknown): ManifestResult {
     else {
       engine = engines.yavin;
       const fits = satisfies(EXTENSION_API, engine);
-      if (fits === null) error("engines.yavin", `"${engine}" is not a range this Yavin reads.`);
+      // A range this simple reader does not know is not refused here: the native side decides
+      // (EXT-12, `extension_dependencies.rs`), with the semver rules this only approximates.
+      if (fits === null)
+        warn("engines.yavin", `"${engine}" is checked when it is installed and loaded.`);
       else if (!fits)
         error(
           "engines.yavin",
@@ -311,7 +316,17 @@ export function readManifest(value: unknown): ManifestResult {
   )
     error("main", "Must be a path inside the extension's folder.");
 
+  // An extension with code must say which API it supports (EXT-12): as natively.
+  if (raw.main !== undefined && raw.main !== null && raw.engines === undefined)
+    error(
+      "engines.yavin",
+      "An extension with code must state the extension API range it supports.",
+    );
+
   const dependencies: string[] = [];
+  const optionalDependencies: string[] = [];
+  const isId = (value: unknown): value is string =>
+    typeof value === "string" && /^[a-z0-9][a-z0-9-]{0,49}\.[a-z0-9][a-z0-9-]{0,49}$/.test(value);
   if (raw.extensionDependencies !== undefined) {
     if (!Array.isArray(raw.extensionDependencies))
       error("extensionDependencies", "Must be a list of extension ids.");
@@ -328,6 +343,57 @@ export function readManifest(value: unknown): ManifestResult {
           return error(field, `"${dependency}" is listed twice.`);
         dependencies.push(dependency);
       });
+  }
+  // EXT-12: `{"publisher.name": "<range>" | {"version": "<range>", "optional": true}}`. Ranges
+  // are checked natively; here only what each entry is.
+  if (raw.dependencies !== undefined) {
+    const map = raw.dependencies as Record<string, unknown> | null;
+    if (!map || typeof map !== "object" || Array.isArray(map))
+      error("dependencies", "Must be an object of extension ids and version ranges.");
+    else
+      for (const [dependency, spec] of Object.entries(map)) {
+        const field = `dependencies.${dependency}`;
+        if (!isId(dependency)) {
+          error(field, "Must be an extension id (publisher.name).");
+          continue;
+        }
+        if (dependency === id) {
+          error(field, "An extension cannot depend on itself.");
+          continue;
+        }
+        if (dependencies.includes(dependency) || optionalDependencies.includes(dependency)) {
+          error(field, `"${dependency}" is listed twice.`);
+          continue;
+        }
+        const object = spec as Record<string, unknown> | null;
+        const optional =
+          typeof spec === "object" && spec !== null && !Array.isArray(spec)
+            ? object!.optional === true
+            : false;
+        const range =
+          typeof spec === "string"
+            ? spec
+            : typeof spec === "object" && spec !== null && !Array.isArray(spec)
+              ? object!.version
+              : undefined;
+        if (!oneLine(range, 100)) {
+          error(field, "Must be a version range, or {version, optional}.");
+          continue;
+        }
+        (optional ? optionalDependencies : dependencies).push(dependency);
+      }
+  }
+  if (raw.incompatibilities !== undefined) {
+    const map = raw.incompatibilities as Record<string, unknown> | null;
+    if (!map || typeof map !== "object" || Array.isArray(map))
+      error("incompatibilities", "Must be an object of extension ids and version ranges.");
+    else
+      for (const [other, range] of Object.entries(map))
+        if (!isId(other) || other === id || !oneLine(range, 100))
+          error(
+            `incompatibilities.${other}`,
+            "Must be another extension's id and a version range.",
+          );
   }
 
   const capabilities = (raw.capabilities ?? {}) as Record<string, unknown>;
@@ -719,6 +785,8 @@ export function readManifest(value: unknown): ManifestResult {
     "capabilities",
     "permissions",
     "extensionDependencies",
+    "dependencies",
+    "incompatibilities",
     "license",
     "repository",
     "icon",
@@ -746,6 +814,7 @@ export function readManifest(value: unknown): ManifestResult {
       contributes,
       untrustedWorkspaces,
       dependencies,
+      optionalDependencies,
       vsix,
       permissions,
     },

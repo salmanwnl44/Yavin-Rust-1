@@ -1723,7 +1723,7 @@ fn two_windows_hold_different_extensions() {
 /// of another generation is stale -- and A's host carries on through all of it.
 #[test]
 fn another_windows_or_pages_identity_is_refused() {
-    let yavin = Yavin::new("forged", &[]);
+    let yavin = Yavin::new("forged-windows", &[]);
     let (a, b) = (Window::new("window-a"), Window::new("window-b"));
     let in_a = yavin.greeter_in(&a, 25_001);
     let in_b = yavin.greeter_in(&b, 26_001);
@@ -2026,4 +2026,113 @@ fn exiting_ends_every_window_once_and_starts_nothing_after() {
     assert_eq!(yavin.sessions.running_hosts(), 0);
     let refused = yavin.start_in(&b, None).unwrap_err();
     assert!(refused.starts_with("HostStopped"), "{refused}");
+}
+
+// --- EXT-12: dependencies in the real host ----------------------------------------------------
+
+const BASE: &str = r#"module.exports.activate = function (c, yavin) { c.subscriptions.push(yavin.commands.registerCommand("acme.base.hello", function () { return "base"; })); };"#;
+const APP: &str = r#"module.exports.activate = function (c, yavin) { c.subscriptions.push(yavin.commands.registerCommand("acme.app.hello", function () { return "app"; })); };"#;
+
+fn with_dependency(test: &str) -> Yavin {
+    Yavin::with(
+        test,
+        &[
+            ("acme.base", json!({}), BASE),
+            (
+                "acme.app",
+                json!({"dependencies": {"acme.base": "^1.0.0"}}),
+                APP,
+            ),
+        ],
+    )
+}
+
+/// A dependency with code loads first, in the same host: loading its dependent before it is
+/// refused natively (and leaves nothing behind -- the right order then works); a dependency
+/// disabled while both run holds at the dependent's next call.
+#[test]
+fn a_dependency_loads_first_in_the_same_host() {
+    let yavin = with_dependency("ext12-order");
+    let session = yavin.start();
+    yavin.handshake(session, 40_001, 2000);
+    let early = yavin
+        .send(session, json!({"type": "load", "extensionId": "acme.app", "workspaceId": WS, "hostGeneration": 40_001}))
+        .unwrap_err();
+    assert!(early.starts_with("DependencyNotLoaded"), "{early}");
+    assert!(early.contains("acme.base ^1.0.0"), "{early}");
+    assert_eq!(yavin.load(session, 40_001, "acme.base")["type"], "loaded");
+    assert_eq!(yavin.load(session, 40_001, "acme.app")["type"], "loaded");
+    for id in ["acme.base", "acme.app"] {
+        assert_eq!(
+            yavin.ask(session, 40_001, id, "a", "activate", json!({})).0["ok"],
+            true
+        );
+    }
+    let run = |id: &str| {
+        yavin.send(session, json!({"type": "request", "requestId": "r", "method": "command.run", "params": {"id": format!("{id}.hello"), "args": []}, "extensionId": id, "workspaceId": WS, "hostGeneration": 40_001}))
+    };
+    assert_eq!(
+        yavin
+            .ask(
+                session,
+                40_001,
+                "acme.app",
+                "h",
+                "command.run",
+                json!({"id": "acme.app.hello", "args": []})
+            )
+            .0["result"],
+        "app"
+    );
+    // Its dependency disabled: the dependent's code is refused at once; the dependency's too.
+    yavin.extensions.set_enabled("acme.base", false).unwrap();
+    let refused = run("acme.app").unwrap_err();
+    assert!(refused.starts_with("DependencyUnavailable"), "{refused}");
+    assert!(run("acme.base")
+        .unwrap_err()
+        .starts_with("ExtensionDisabled"));
+    // Enabled again: both run.
+    yavin.extensions.set_enabled("acme.base", true).unwrap();
+    assert_eq!(
+        yavin
+            .ask(
+                session,
+                40_001,
+                "acme.app",
+                "h2",
+                "command.run",
+                json!({"id": "acme.app.hello", "args": []})
+            )
+            .0["result"],
+        "app"
+    );
+}
+
+/// A dependency loaded in another window's host is not this window's (EXT-11): each host
+/// loads what its own extensions need.
+#[test]
+fn a_dependency_in_another_windows_host_does_not_count() {
+    let yavin = with_dependency("ext12-windows");
+    let (a, b) = (Window::new("window-a"), Window::new("window-b"));
+    let in_a = yavin.start_in(&a, None).unwrap();
+    let in_b = yavin.start_in(&b, None).unwrap();
+    yavin.handshake_in(&a, in_a, 41_001);
+    yavin.handshake_in(&b, in_b, 42_001);
+    assert_eq!(
+        yavin.load_in(&a, in_a, 41_001, "acme.base")["type"],
+        "loaded"
+    );
+    let refused = yavin
+        .send_in(&b, in_b, json!({"type": "load", "extensionId": "acme.app", "workspaceId": WS, "hostGeneration": 42_001}))
+        .unwrap_err();
+    assert!(refused.starts_with("DependencyNotLoaded"), "{refused}");
+    assert_eq!(
+        yavin.load_in(&b, in_b, 42_001, "acme.base")["type"],
+        "loaded"
+    );
+    assert_eq!(
+        yavin.load_in(&b, in_b, 42_001, "acme.app")["type"],
+        "loaded"
+    );
+    a.quiet();
 }

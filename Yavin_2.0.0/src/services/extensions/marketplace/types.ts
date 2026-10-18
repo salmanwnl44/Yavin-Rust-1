@@ -231,6 +231,32 @@ export function marketplaceErrorOf(error: unknown, fallback: MarketplaceErrorCod
       "Unavailable",
       `${what}'s signature could not be checked; it was not installed. Try again later.`,
     ],
+    // EXT-12: decided natively before anything is put in place; the detail says which.
+    IncompatibleApi: [
+      "Incompatible",
+      `${what} needs another version of Yavin's extension API; it was not installed.`,
+    ],
+    InvalidManifest: ["InvalidPackage", `${what} is not a valid extension package.`],
+    DependencyMissing: [
+      "Incompatible",
+      `${what} needs an extension that is not installed; it was not installed.`,
+    ],
+    DependencyConflict: [
+      "Incompatible",
+      `${what} needs versions of other extensions that are not installed; it was not installed.`,
+    ],
+    DependencyCycle: [
+      "Incompatible",
+      `${what}'s dependencies depend on each other in a cycle; it was not installed.`,
+    ],
+    WouldBreakDependents: [
+      "Incompatible",
+      `Updating ${what} would break an installed extension that needs it; nothing was changed.`,
+    ],
+    TooComplex: [
+      "Incompatible",
+      `${what}'s dependencies could not be resolved; it was not installed.`,
+    ],
     UnsafePackage: ["UnsafePackage", `${what} contains unsafe files; it was not installed.`],
     MalformedPackage: ["InvalidPackage", `${what} is not a valid extension package.`],
     InvalidPackage: ["InvalidPackage", `${what} is not a valid extension package.`],

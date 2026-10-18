@@ -409,6 +409,22 @@ test("native errors map to user messages; the technical detail is kept apart", (
     ["UntrustedKey: acme.x is signed with key k", "SignatureFailed", /does not trust/],
     ["KeyRevoked: revoked", "SignatureFailed", /no longer trusts/],
     ["VerificationUnavailable: no store", "Unavailable", /could not be checked/],
+    [
+      "WouldBreakDependents: acme.base 2.0.0 would break acme.app",
+      "Incompatible",
+      /would break an installed extension/,
+    ],
+    [
+      "DependencyMissing: acme.app needs acme.base ^1.0.0",
+      "Incompatible",
+      /needs an extension that is not installed/,
+    ],
+    [
+      "IncompatibleApi: acme.app 1.0.0: it needs extension API ^3.0.0",
+      "Incompatible",
+      /another version of Yavin's extension API/,
+    ],
+    ["DependencyCycle: a → b → a", "Incompatible", /cycle/],
     ["something odd", "InstallFailed", /something went wrong/],
   ];
   for (const [native, code, message] of cases) {

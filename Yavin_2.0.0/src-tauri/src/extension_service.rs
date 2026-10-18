@@ -54,6 +54,7 @@
 //! capabilities, never the copy. `authorize` is what the host bridge asks before every
 //! privileged request, from the inventory in memory: a revocation holds for the next request.
 
+use crate::extension_dependencies as deps;
 use crate::extension_package::identity;
 use crate::extension_permissions::{declared, grantable, Denial};
 use crate::extensions::{discover, read_manifest, read_resource};
@@ -266,6 +267,20 @@ pub struct HostCopy {
     pub sha256: Option<String>,
     pub stored: Option<String>,
     pub requested: BTreeSet<String>,
+    /// Its required dependencies (EXT-12): each must stay enabled, installed and in range for
+    /// its code to act. `installed`: it was an installed copy (not a development one) when
+    /// loaded.
+    pub requires: Vec<HostRequirement>,
+}
+
+/// A required dependency of a loaded copy (EXT-12).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostRequirement {
+    pub id: String,
+    pub range: deps::Range,
+    /// It has code: the host must have loaded it first (`extension_host::prepare`).
+    pub code: bool,
+    pub installed: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -390,6 +405,103 @@ fn read_copy(folder: &Path, id: &str, version: Option<&str>) -> Result<String, S
         }
     }
     Ok(text)
+}
+
+/// Every usable listed copy but `except`, as the resolver's candidates (EXT-12): its version,
+/// enabled or not, and what its manifest declares -- or why it cannot be used.
+fn installed_candidates(inner: &Inner, listed: &[Listed], except: &str) -> Vec<deps::Candidate> {
+    let disabled = |id: &str| {
+        inner
+            .inventory
+            .as_ref()
+            .is_some_and(|inv| inv.disabled.contains(id))
+    };
+    listed
+        .iter()
+        .filter(|one| one.error.is_none())
+        .filter_map(|one| {
+            let id = one.id.clone()?;
+            if id == except {
+                return None;
+            }
+            let version = semver::Version::parse(&one.copy.as_ref()?.version).ok()?;
+            let value: serde_json::Value = serde_json::from_str(one.manifest.as_deref()?).ok()?;
+            let (declared, unusable) = match deps::declared(&value, &id) {
+                Ok(declared) => (declared, None),
+                Err(why) => (
+                    deps::Declared::default(),
+                    Some(format!("its manifest cannot be read: {why}")),
+                ),
+            };
+            Some(deps::Candidate {
+                source: deps::Source::Installed {
+                    enabled: !disabled(&id),
+                },
+                id,
+                version,
+                declared,
+                unusable,
+            })
+        })
+        .collect()
+}
+
+/// What a load of `chosen` needs (EXT-12): its API this Yavin's, and each required dependency
+/// listed, usable, enabled, in range and itself API-compatible -- or why it cannot load.
+fn load_requirements(
+    inner: &Inner,
+    listed: &[Listed],
+    chosen: &Listed,
+    id: &str,
+) -> Result<Vec<HostRequirement>, String> {
+    let value: serde_json::Value = serde_json::from_str(chosen.manifest.as_deref().unwrap_or("{}"))
+        .map_err(|e| format!("InvalidManifest: {e}."))?;
+    let declared =
+        deps::declared(&value, id).map_err(|e| format!("InvalidManifest: {id}: {e}."))?;
+    deps::check_api(&declared).map_err(|e| format!("IncompatibleApi: {id}: {e}."))?;
+    let disabled = |dep: &str| {
+        inner
+            .inventory
+            .as_ref()
+            .is_some_and(|inv| inv.disabled.contains(dep))
+    };
+    let mut requires = Vec::new();
+    for need in declared.required() {
+        let unavailable = |why: String| {
+            format!(
+                "DependencyUnavailable: {id} needs {} {}: {why}.",
+                need.id, need.range.text
+            )
+        };
+        let Some(found) = listed
+            .iter()
+            .find(|one| one.id.as_deref() == Some(need.id.as_str()) && one.error.is_none())
+        else {
+            return Err(unavailable("it is not installed".into()));
+        };
+        if disabled(&need.id) {
+            return Err(unavailable("it is disabled".into()));
+        }
+        let version = found
+            .copy
+            .as_ref()
+            .map(|c| c.version.clone())
+            .unwrap_or_default();
+        if !semver::Version::parse(&version).is_ok_and(|v| need.range.matches(&v)) {
+            return Err(unavailable(format!("{version} is installed")));
+        }
+        let dependency: serde_json::Value =
+            serde_json::from_str(found.manifest.as_deref().unwrap_or("{}")).unwrap_or_default();
+        let declared = deps::declared(&dependency, &need.id).map_err(unavailable)?;
+        deps::check_api(&declared).map_err(unavailable)?;
+        requires.push(HostRequirement {
+            id: need.id.clone(),
+            range: need.range.clone(),
+            code: declared.code,
+            installed: found.source == "installed",
+        });
+    }
+    Ok(requires)
 }
 
 fn note(inventory: &mut Inventory, id: Option<&str>, reason: String) {
@@ -871,6 +983,20 @@ impl ExtensionService {
                 .map(|_| manifest)
                 .map_err(|why| format!("InvalidPackage: its permissions cannot be used: {why}."))
         });
+        // Its API and its dependencies (EXT-12): the whole graph, against what is installed,
+        // before anything is put in place -- or nothing is.
+        let checked = match checked {
+            Ok(manifest) => self
+                .resolvable(
+                    &mut inner,
+                    paths,
+                    &operation.id,
+                    &operation.version,
+                    &manifest,
+                )
+                .map(|()| manifest),
+            Err(error) => Err(error),
+        };
         let manifest = match checked {
             Ok(manifest) => manifest,
             Err(error) => {
@@ -889,6 +1015,51 @@ impl ExtensionService {
         inner.waiting.insert(op.to_string(), Instant::now());
         self.crash("staged")?;
         Ok(manifest)
+    }
+
+    /// Whether `id` `version` (its `manifest`) can be installed beside what is installed
+    /// (EXT-12): its API is this Yavin's, its declarations are valid, every required dependency
+    /// is installed, enabled, usable and in range (none is installed, replaced or enabled for
+    /// it), no cycle, no incompatibility, and no installed extension it would break.
+    fn resolvable(
+        &self,
+        inner: &mut Inner,
+        paths: &Paths,
+        id: &str,
+        version: &str,
+        manifest: &str,
+    ) -> Result<(), String> {
+        let value = serde_json::from_str::<serde_json::Value>(manifest)
+            .map_err(|e| format!("InvalidManifest: {e}."))?;
+        let declared = deps::declared(&value, id).map_err(|e| format!("InvalidManifest: {e}."))?;
+        deps::check_api(&declared).map_err(|e| format!("IncompatibleApi: {id} {version}: {e}."))?;
+        let version = semver::Version::parse(version)
+            .map_err(|e| format!("InvalidManifest: version {version}: {e}."))?;
+        let listed = self.reconcile(inner, paths)?.0;
+        let mut candidates = installed_candidates(inner, &listed, id);
+        candidates.push(deps::Candidate {
+            id: id.to_string(),
+            version: version.clone(),
+            source: deps::Source::Available,
+            declared,
+            unusable: None,
+        });
+        let plan = deps::resolve(id, &deps::Range::exactly(&version), &candidates)
+            .map_err(|conflict| conflict.text())?;
+        // Nothing is installed for it: what it needs must already be there.
+        let others: Vec<String> = plan
+            .install
+            .iter()
+            .filter(|(other, _)| other != id)
+            .map(|(other, v)| format!("{other} {v}"))
+            .collect();
+        if !others.is_empty() {
+            return Err(format!(
+                "DependencyMissing: {id} needs {}; install them first.",
+                others.join(", ")
+            ));
+        }
+        Ok(())
     }
 
     /// Ends `op` without installing anything (a failed download, a refused package).
@@ -1266,8 +1437,9 @@ impl ExtensionService {
             return Err(format!("ExtensionDisabled: {id} is disabled."));
         }
         let chosen = listed
-            .into_iter()
+            .iter()
             .find(|one| one.id.as_deref() == Some(id.as_str()) && one.error.is_none())
+            .cloned()
             .ok_or_else(|| format!("UnknownExtension: {id} is not installed."))?;
         let main = chosen
             .manifest
@@ -1275,9 +1447,11 @@ impl ExtensionService {
             .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
             .and_then(|value| value.get("main")?.as_str().map(str::to_string))
             .ok_or_else(|| format!("UnsupportedRuntime: {id} has no code (no \"main\")."))?;
-        let (Some(copy), Some(state)) = (chosen.copy, chosen.permissions) else {
+        let (Some(copy), Some(state)) = (chosen.copy.clone(), chosen.permissions.clone()) else {
             return Err(format!("UnknownExtension: {id} is not installed."));
         };
+        // Its API and its dependencies (EXT-12), natively, whatever the window believes.
+        let requires = load_requirements(&inner, &listed, &chosen, &id)?;
         Ok(HostCopy {
             id,
             folder: chosen.folder,
@@ -1286,6 +1460,7 @@ impl ExtensionService {
             sha256: copy.sha256,
             stored: copy.stored,
             requested: state.requested.into_iter().collect(),
+            requires,
         })
     }
 
@@ -1321,6 +1496,35 @@ impl ExtensionService {
                 "ExtensionChanged",
                 format!("The running code of {id} is no longer the installed copy; it must be reloaded."),
             ));
+        }
+        // Its required dependencies still there, enabled and in range (EXT-12).
+        for need in &copy.requires {
+            let gone = || {
+                Denial::new(
+                    "DependencyUnavailable",
+                    format!(
+                        "{id} needs {} {}, which is no longer available.",
+                        need.id, need.range.text
+                    ),
+                )
+            };
+            if inv.disabled.contains(&need.id) {
+                return Err(Denial::new(
+                    "DependencyUnavailable",
+                    format!("{id} needs {}, which is disabled.", need.id),
+                ));
+            }
+            match inv.extensions.get(&need.id) {
+                Some(record) => {
+                    let fits = semver::Version::parse(&record.active.version)
+                        .is_ok_and(|v| need.range.matches(&v));
+                    if !fits {
+                        return Err(gone());
+                    }
+                }
+                None if need.installed => return Err(gone()),
+                None => {}
+            }
         }
         let Some(capability) = capability else {
             return Ok(());

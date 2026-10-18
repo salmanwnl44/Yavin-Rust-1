@@ -70,7 +70,7 @@ impl Fixture {
 fn manifest(id: &str, version: &str) -> String {
     let (publisher, name) = id.split_once('.').unwrap();
     format!(
-        r#"{{"publisher":"{publisher}","name":"{name}","version":"{version}","main":"extension.js"}}"#
+        r#"{{"publisher":"{publisher}","name":"{name}","version":"{version}","engines":{{"yavin":"^2.0.0"}},"main":"extension.js"}}"#
     )
 }
 
@@ -467,7 +467,7 @@ fn s08_the_host_loads_the_inventorys_folder() {
     fx.folder(
         &fx.root,
         "aaa-broken",
-        r#"{"publisher":"acme","name":"hello","main":"evil.js"}"#,
+        r#"{"publisher":"acme","name":"hello","engines":{"yavin":"^2.0.0"},"main":"evil.js"}"#,
     );
     fx.folder(&fx.root, "aaa-other", &manifest("acme.hello", "9.0.0"));
     fx.folder(
@@ -1519,7 +1519,7 @@ fn an_unreadable_declaration_is_never_installed_or_loaded() {
     let at = fx.dir.join("packages").join("bad");
     fs::create_dir_all(&at).unwrap();
     let manifest = serde_json::json!({
-        "publisher": publisher, "name": name, "version": "1.0.0", "main": "extension.js",
+        "publisher": publisher, "name": name, "version": "1.0.0", "engines": {"yavin": "^2.0.0"}, "main": "extension.js",
         "permissions": {"version": 2, "request": ["documents.read"]},
     })
     .to_string();
@@ -1540,7 +1540,7 @@ fn an_unreadable_declaration_is_never_installed_or_loaded() {
     fx.folder(
         &fx.root,
         "acme.other",
-        r#"{"publisher":"acme","name":"other","version":"1.0.0","main":"extension.js","permissions":{"version":1,"request":["process.spawn"]}}"#,
+        r#"{"publisher":"acme","name":"other","version":"1.0.0","engines":{"yavin":"^2.0.0"},"main":"extension.js","permissions":{"version":1,"request":["process.spawn"]}}"#,
     );
     let listed = entry(&service, "acme.other");
     assert!(
@@ -1566,7 +1566,7 @@ fn a_development_copys_grant_is_its_own() {
     fx.folder(
         &fx.development,
         "acme.hello",
-        r#"{"publisher":"acme","name":"hello","version":"1.0.0","main":"extension.js","permissions":{"version":1,"request":["documents.read"]}}"#,
+        r#"{"publisher":"acme","name":"hello","version":"1.0.0","engines":{"yavin":"^2.0.0"},"main":"extension.js","permissions":{"version":1,"request":["documents.read"]}}"#,
     );
     let service = fx.service();
     assert_eq!(entry(&service, "acme.hello").source, "development");
@@ -2028,4 +2028,321 @@ fn a_signature_record_is_bound_to_its_package_bytes() {
     fs::write(fx.root.join(INVENTORY), &text).unwrap();
     fs::write(fx.root.join(LAST_GOOD), &text).unwrap();
     assert!(entry(&fx.service(), "acme.hello").signature.is_none());
+}
+
+// --- EXT-12: dependencies and the extension API, natively -------------------------------------
+
+/// A package of `id` at `version` whose manifest also has `extra` (its dependencies, ...).
+fn package_with(fx: &Fixture, id: &str, version: &str, extra: serde_json::Value) -> PathBuf {
+    let (publisher, name) = id.split_once('.').unwrap();
+    let at = fx.dir.join("packages").join(format!("{id}-{version}-x"));
+    fs::create_dir_all(&at).unwrap();
+    let mut manifest = serde_json::json!({"publisher": publisher, "name": name, "version": version, "engines": {"yavin": "^2.0.0"}, "main": "extension.js"});
+    for (key, value) in extra.as_object().unwrap() {
+        manifest[key] = value.clone();
+    }
+    package(
+        &at,
+        &[
+            (MANIFEST_FILE, manifest.to_string().as_bytes()),
+            ("extension.js", b"module.exports = {};"),
+        ],
+    )
+}
+
+/// Installs it through the whole pipeline (stage, commit, finish), or says why not.
+fn install_with(
+    fx: &Fixture,
+    service: &ExtensionService,
+    id: &str,
+    version: &str,
+    extra: serde_json::Value,
+) -> Result<(), String> {
+    let op = stage_file(service, &package_with(fx, id, version, extra), id, version)?;
+    service.commit(&op, id)?;
+    service.finish(&op, id, true)
+}
+
+/// What a refused install must leave: the inventory as it was, nothing staged or pending.
+fn unchanged(fx: &Fixture, before: &Inventory) {
+    let now = inventory(fx);
+    assert_eq!(now.extensions, before.extensions);
+    assert_eq!(now.disabled, before.disabled);
+    assert_eq!(now.grants, before.grants);
+    assert!(now.operations.is_empty());
+    assert_eq!(staging_entries(fx), 0);
+}
+
+#[test]
+fn ext12_an_install_needs_its_required_dependencies_installed_enabled_and_in_range() {
+    let fx = fixture("ext12-install");
+    let service = fx.service();
+    let needs_base = serde_json::json!({"dependencies": {"acme.base": "^1.2.0"}});
+    // None installed: refused, and nothing changed.
+    let error = install_with(&fx, &service, "acme.app", "1.0.0", needs_base.clone()).unwrap_err();
+    assert!(error.starts_with("DependencyMissing"), "{error}");
+    assert!(error.contains("acme.base ^1.2.0"), "{error}");
+    assert!(!fx.root.join(INVENTORY).exists() || inventory(&fx).extensions.is_empty());
+    // Installed in range: installed.
+    install_with(&fx, &service, "acme.base", "1.4.0", serde_json::json!({})).unwrap();
+    install_with(&fx, &service, "acme.app", "1.0.0", needs_base).unwrap();
+    // Out of range: refused, with which version is there.
+    let before = inventory(&fx);
+    let error = install_with(
+        &fx,
+        &service,
+        "acme.newer",
+        "1.0.0",
+        serde_json::json!({"dependencies": {"acme.base": "^2.0.0"}}),
+    )
+    .unwrap_err();
+    assert!(error.starts_with("DependencyConflict"), "{error}");
+    assert!(error.contains("acme.base 1.4.0 is not ^2.0.0"), "{error}");
+    unchanged(&fx, &before);
+    // Disabled: refused -- it is not enabled for it.
+    service.set_enabled("acme.base", false).unwrap();
+    let before = inventory(&fx);
+    let error = install_with(
+        &fx,
+        &service,
+        "acme.other",
+        "1.0.0",
+        serde_json::json!({"extensionDependencies": ["acme.base"]}),
+    )
+    .unwrap_err();
+    assert!(error.contains("disabled"), "{error}");
+    unchanged(&fx, &before);
+    service.set_enabled("acme.base", true).unwrap();
+    // An optional dependency that is not installed does not hold it back.
+    install_with(&fx, &service, "acme.extra", "1.0.0", serde_json::json!({"dependencies": {"acme.nowhere": {"version": "^1.0.0", "optional": true}}})).unwrap();
+}
+
+#[test]
+fn ext12_an_update_that_would_break_a_dependent_is_refused_and_changes_nothing() {
+    let fx = fixture("ext12-update");
+    let service = fx.service();
+    install_with(&fx, &service, "acme.base", "1.0.0", serde_json::json!({})).unwrap();
+    install_with(
+        &fx,
+        &service,
+        "acme.app",
+        "1.0.0",
+        serde_json::json!({"dependencies": {"acme.base": "^1.0.0"}}),
+    )
+    .unwrap();
+    service.set_grants("acme.base", None, &[]).unwrap();
+    let before = inventory(&fx);
+    let error =
+        install_with(&fx, &service, "acme.base", "2.0.0", serde_json::json!({})).unwrap_err();
+    assert!(error.starts_with("WouldBreakDependents"), "{error}");
+    assert!(
+        error.contains("would break acme.app 1.0.0, which needs acme.base ^1.0.0"),
+        "{error}"
+    );
+    unchanged(&fx, &before);
+    assert_eq!(
+        inventory(&fx).extensions["acme.base"].active.version,
+        "1.0.0"
+    );
+    // A compatible update goes ahead.
+    install_with(&fx, &service, "acme.base", "1.1.0", serde_json::json!({})).unwrap();
+    assert_eq!(
+        inventory(&fx).extensions["acme.base"].active.version,
+        "1.1.0"
+    );
+    // With the dependent disabled, the breaking update is the user's to make.
+    service.set_enabled("acme.app", false).unwrap();
+    install_with(&fx, &service, "acme.base", "2.0.0", serde_json::json!({})).unwrap();
+    // ...and the dependent then cannot load: what it needs is not there.
+    service.set_enabled("acme.app", true).unwrap();
+    let error = service.host_copy("acme.app").unwrap_err();
+    assert!(error.starts_with("DependencyUnavailable"), "{error}");
+    assert!(error.contains("2.0.0 is installed"), "{error}");
+}
+
+#[test]
+fn ext12_an_incompatible_api_or_an_invalid_declaration_is_never_installed() {
+    let fx = fixture("ext12-api");
+    let service = fx.service();
+    install_with(&fx, &service, "acme.base", "1.0.0", serde_json::json!({})).unwrap();
+    let before = inventory(&fx);
+    for (extra, code) in [
+        (
+            serde_json::json!({"engines": {"yavin": "^3.0.0"}}),
+            "IncompatibleApi",
+        ),
+        (
+            serde_json::json!({"engines": {"yavin": "^1.0.0"}}),
+            "IncompatibleApi",
+        ),
+        (
+            serde_json::json!({"engines": {"yavin": "latest"}}),
+            "InvalidManifest",
+        ),
+        (serde_json::json!({"engines": null}), "InvalidManifest"),
+        (
+            serde_json::json!({"dependencies": {"acme.base": "1.0.0 || 2.0.0"}}),
+            "InvalidManifest",
+        ),
+        (
+            serde_json::json!({"dependencies": {"acme.app": "*"}}),
+            "InvalidManifest",
+        ),
+        (
+            serde_json::json!({"extensionDependencies": ["acme.base", "acme.base"]}),
+            "InvalidManifest",
+        ),
+        (serde_json::json!({"manifestVersion": 9}), "InvalidManifest"),
+        (
+            serde_json::json!({"incompatibilities": {"acme.base": "*"}}),
+            "DependencyConflict",
+        ),
+    ] {
+        let error = install_with(&fx, &service, "acme.app", "1.0.0", extra.clone()).unwrap_err();
+        assert!(error.starts_with(code), "{extra}: {error}");
+        unchanged(&fx, &before);
+    }
+}
+
+#[test]
+fn ext12_a_cycle_among_installed_copies_is_refused() {
+    let fx = fixture("ext12-cycle");
+    // Two development copies that need each other (an installed pair could not be made so).
+    for (id, needs) in [("acme.a", "acme.b"), ("acme.b", "acme.a")] {
+        let (publisher, name) = id.split_once('.').unwrap();
+        fx.folder(
+            &fx.development,
+            id,
+            &serde_json::json!({"publisher": publisher, "name": name, "version": "1.0.0", "engines": {"yavin": "^2.0.0"}, "main": "extension.js", "extensionDependencies": [needs]}).to_string(),
+        );
+    }
+    let service = fx.service();
+    let error = install_with(
+        &fx,
+        &service,
+        "acme.c",
+        "1.0.0",
+        serde_json::json!({"extensionDependencies": ["acme.a"]}),
+    )
+    .unwrap_err();
+    assert!(error.starts_with("DependencyCycle"), "{error}");
+    assert!(error.contains("acme.a → acme.b → acme.a"), "{error}");
+}
+
+#[test]
+fn ext12_a_failed_update_or_a_rollback_keeps_the_graph_whole() {
+    let fx = fixture("ext12-rollback");
+    let service = fx.service();
+    install_with(&fx, &service, "acme.base", "1.0.0", serde_json::json!({})).unwrap();
+    install_with(
+        &fx,
+        &service,
+        "acme.app",
+        "1.0.0",
+        serde_json::json!({"dependencies": {"acme.base": "^1.0.0"}}),
+    )
+    .unwrap();
+    let before = inventory(&fx);
+    // A package that is not what it claims (it fails verification): nothing changes.
+    let wrong = package_with(&fx, "acme.base", "1.5.0", serde_json::json!({}));
+    let error = stage_file(&service, &wrong, "acme.base", "1.6.0").unwrap_err();
+    assert!(error.starts_with("ManifestMismatch"), "{error}");
+    unchanged(&fx, &before);
+    assert!(
+        service.host_copy("acme.app").is_ok(),
+        "its dependent still loads"
+    );
+    // An update whose registration fails is rolled back: the graph is as it was.
+    let op = stage_file(
+        &service,
+        &package_with(&fx, "acme.base", "1.2.0", serde_json::json!({})),
+        "acme.base",
+        "1.2.0",
+    )
+    .unwrap();
+    service.commit(&op, "acme.base").unwrap();
+    service.finish(&op, "acme.base", false).unwrap();
+    assert_eq!(
+        inventory(&fx).extensions["acme.base"].active.version,
+        "1.0.0"
+    );
+    let app = service.host_copy("acme.app").unwrap();
+    assert_eq!(app.requires.len(), 1);
+    assert!(service.authorize(&app, None).is_ok());
+}
+
+/// What the window believes is never asked: a load reads the manifest natively, so a code
+/// extension with no API range, an incompatible one, or one whose dependency is gone does not
+/// load -- and a dependency disabled, removed or replaced holds at the next request.
+#[test]
+fn ext12_loading_and_every_request_check_the_api_and_dependencies_natively() {
+    let fx = fixture("ext12-load");
+    for (folder, manifest) in [
+        (
+            "no-api",
+            r#"{"publisher":"acme","name":"noapi","version":"1.0.0","main":"extension.js"}"#,
+        ),
+        (
+            "future",
+            r#"{"publisher":"acme","name":"future","version":"1.0.0","engines":{"yavin":"^3.0.0"},"main":"extension.js"}"#,
+        ),
+    ] {
+        fx.folder(&fx.development, folder, manifest);
+    }
+    let service = fx.service();
+    assert!(service
+        .host_copy("acme.noapi")
+        .unwrap_err()
+        .starts_with("InvalidManifest"));
+    assert!(service
+        .host_copy("acme.future")
+        .unwrap_err()
+        .starts_with("IncompatibleApi"));
+    install_with(&fx, &service, "acme.base", "1.0.0", serde_json::json!({})).unwrap();
+    install_with(
+        &fx,
+        &service,
+        "acme.app",
+        "1.0.0",
+        serde_json::json!({"dependencies": {"acme.base": "^1.0.0"}}),
+    )
+    .unwrap();
+    let app = service.host_copy("acme.app").unwrap();
+    assert_eq!(
+        app.requires,
+        [HostRequirement {
+            id: "acme.base".into(),
+            range: crate::extension_dependencies::Range::parse("^1.0.0").unwrap(),
+            code: true,
+            installed: true,
+        }]
+    );
+    assert!(service.authorize(&app, None).is_ok());
+    // Disabled: its dependent's code is refused at once, and it does not load.
+    service.set_enabled("acme.base", false).unwrap();
+    assert_eq!(
+        service.authorize(&app, None).unwrap_err().code,
+        "DependencyUnavailable"
+    );
+    assert!(service
+        .host_copy("acme.app")
+        .unwrap_err()
+        .starts_with("DependencyUnavailable"));
+    service.set_enabled("acme.base", true).unwrap();
+    assert!(service.authorize(&app, None).is_ok());
+    // Removed: the same.
+    service.uninstall("acme.base").unwrap();
+    assert_eq!(
+        service.authorize(&app, None).unwrap_err().code,
+        "DependencyUnavailable"
+    );
+    assert!(service
+        .host_copy("acme.app")
+        .unwrap_err()
+        .contains("not installed"));
+    // Its own grants and copy are untouched by any of it (EXT-07).
+    assert_eq!(
+        inventory(&fx).extensions["acme.app"].active.version,
+        "1.0.0"
+    );
 }

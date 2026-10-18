@@ -45,6 +45,9 @@ url = "2.5"
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
 # Decoding pinned keys (SPKI PEM): the workspace's own base64 (ide-terminal-protocol).
 base64 = "0.22"
+# Extension version ranges and API compatibility (EXT-12): the crate Cargo itself uses, already in
+# the workspace (resolved 1.0.28) -- never hand-parsed versions.
+semver = "1"
 
 [target.'cfg(unix)'.dependencies]
 # A terminal's shell and everything it starts are ended as one process group (`killpg`).

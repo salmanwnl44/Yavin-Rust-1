@@ -1067,6 +1067,21 @@ fn prepare(shared: &Shared, message: &str) -> Result<String, String> {
     match (kind, id) {
         ("load", Some(id)) => {
             let copy = shared.authority.copy_of(&id)?;
+            // A dependency with code runs first, in this same host (EXT-12): loaded here, at a
+            // version in range -- never another window's or session's (EXT-11).
+            for need in copy.requires.iter().filter(|need| need.code) {
+                let loaded = shared.loaded(&need.id).and_then(|dependency| {
+                    semver::Version::parse(&dependency.version)
+                        .ok()
+                        .filter(|v| need.range.matches(v))
+                });
+                if loaded.is_none() {
+                    return Err(format!(
+                        "DependencyNotLoaded: {id} needs {} {}, which this host has not loaded; it loads first.",
+                        need.id, need.range.text
+                    ));
+                }
+            }
             let code = read_main(Path::new(&copy.folder), &copy.main)?;
             let object = value.as_object_mut().ok_or("MalformedMessage")?;
             object.insert("code".into(), Value::String(code));
@@ -1758,7 +1773,7 @@ mod tests {
         assert!(error.starts_with("HostFailed:"), "{error}");
     }
 
-    const PROBE_MANIFEST: &str = r#"{"publisher":"acme","name":"probe","version":"1.0.0","main":"extension.js","permissions":{"version":1,"request":["documents.read"]}}"#;
+    const PROBE_MANIFEST: &str = r#"{"publisher":"acme","name":"probe","version":"1.0.0","engines":{"yavin":"^2.0.0"},"main":"extension.js","permissions":{"version":1,"request":["documents.read"]}}"#;
 
     fn request(method: &str) -> String {
         json!({"type": "request", "requestId": "r", "method": method, "params": {"id": "acme.probe.go"}, "extensionId": "acme.probe", "workspaceId": "w", "hostGeneration": 1}).to_string()

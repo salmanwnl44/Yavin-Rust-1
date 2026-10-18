@@ -1806,3 +1806,35 @@ test("EXT-10 without its sandbox, no extension code runs -- and it says so, type
   assert.equal(shown.label, "Host Unavailable");
   assert.match(shown.detail ?? "", /runs only in Yavin's sandbox/);
 });
+
+test("EXT-12 dependencies: required and optional declared, the API stated by code, ranges left to the native side", async () => {
+  const { readManifest } = await import("./manifest.ts");
+  const read = readManifest(
+    manifest({
+      extensionDependencies: ["acme.base"],
+      dependencies: { "acme.util": "^1.2.0", "acme.extra": { version: ">=0.3.0", optional: true } },
+      incompatibilities: { "acme.old": "<2.0.0" },
+    }),
+  );
+  assert.ok(read.ok, JSON.stringify(!read.ok && read.problems));
+  assert.deepEqual(read.manifest.dependencies, ["acme.base", "acme.util"]);
+  assert.deepEqual(read.manifest.optionalDependencies, ["acme.extra"]);
+  assert.equal(read.warnings.length, 0, JSON.stringify(read.warnings));
+  // Code with no API range: refused, as natively.
+  const { engines: _, ...noApi } = manifest();
+  assert.equal(readManifest(noApi).ok, false);
+  // A range this reader cannot evaluate is the native side's to decide: warned, not refused.
+  const comma = readManifest(manifest({ engines: { yavin: ">=2.0.0, <3.0.0" } }));
+  assert.ok(comma.ok);
+  assert.match(JSON.stringify(comma.warnings), /checked when it is installed/);
+  // Malformed declarations: refused.
+  for (const bad of [
+    { dependencies: { "acme.hello": "^1.0.0" } },
+    { dependencies: { "Not An Id": "^1.0.0" } },
+    { dependencies: { "acme.base": 1 } },
+    { dependencies: ["acme.base"] },
+    { extensionDependencies: ["acme.base"], dependencies: { "acme.base": "^1.0.0" } },
+    { incompatibilities: { "acme.hello": "*" } },
+  ])
+    assert.equal(readManifest(manifest(bad)).ok, false, JSON.stringify(bad));
+});

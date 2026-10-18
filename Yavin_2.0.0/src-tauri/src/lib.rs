@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 mod checkers;
 mod config;
 mod dap;
+mod extension_dependencies;
 mod extension_host;
 mod extension_package;
 mod extension_permissions;
