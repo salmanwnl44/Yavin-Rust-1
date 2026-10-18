@@ -25,6 +25,7 @@ mod localgit;
 mod localgit_restore;
 mod lsp;
 mod marketplace;
+mod openvsx;
 mod paths;
 mod ports;
 mod session;
@@ -32,13 +33,16 @@ mod terminal;
 mod terminal_shell;
 mod terminal_stream;
 mod trust;
+mod vsix;
 mod workbench;
 use checkers::{available_checkers, cancel_checker, run_checker, Checks};
 use dap::{dap_send, dap_start, dap_stop, dap_stop_all, DapSessions};
 use extension_host::{
     ext_host_send, ext_host_start, ext_host_stop, ext_host_stop_all, ExtHostSessions,
 };
-use extension_service::{extensions_list, extensions_set_enabled, ExtensionService};
+use extension_service::{
+    extensions_list, extensions_read_resource, extensions_set_enabled, ExtensionService,
+};
 use external::open_external_url;
 use git::{
     git_cancel_repo, git_clone_repo, git_close_repo, git_exec, git_init_repo, git_open_repo,
@@ -833,6 +837,7 @@ pub fn run() {
             dap_stop_all,
             extensions_list,
             extensions_set_enabled,
+            extensions_read_resource,
             ext_host_start,
             ext_host_send,
             ext_host_stop,
@@ -845,6 +850,8 @@ pub fn run() {
             marketplace::extensions_finish,
             marketplace::extensions_discard,
             marketplace::extensions_uninstall,
+            openvsx::marketplace_openvsx,
+            openvsx::marketplace_openvsx_icon,
         ])
         .build(tauri::generate_context!())
         .map(|app| {

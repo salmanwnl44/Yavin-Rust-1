@@ -23,6 +23,7 @@ import { DEBUG_SETTING_LIST } from "./debug/config.ts";
 import { createNativeAdapterTransport } from "./debug/nativeTransport.ts";
 import { createDebugService, type DebugService } from "./debug/service.ts";
 import { createExtensionRegistry } from "./extensions/registry.ts";
+import { createDeclarativeContributions } from "./extensions/declarative.ts";
 import { createExtensionStorage } from "./extensions/storage.ts";
 import { createExtensionHostManager, type ExtensionHostManager } from "./extensions/manager.ts";
 import { createNativeHostTransport } from "./extensions/transport.ts";
@@ -31,7 +32,7 @@ import { createExtensionInstaller } from "./extensions/marketplace/installer.ts"
 import { createMarketplaceService } from "./extensions/marketplace/service.ts";
 import {
   configuredProvider,
-  MARKETPLACE_REGISTRY,
+  MARKETPLACE_PROVIDER_SETTINGS,
   MARKETPLACE_SETTING_LIST,
 } from "./extensions/marketplace/setup.ts";
 import {
@@ -158,7 +159,8 @@ export const extensionStorage = createExtensionStorage(undefined, (id, message) 
  */
 export const marketplace = createMarketplaceService(configuredProvider(settings));
 settings.subscribe(null, (change) => {
-  if (change.id === MARKETPLACE_REGISTRY.id) marketplace.setProvider(configuredProvider(settings));
+  if (MARKETPLACE_PROVIDER_SETTINGS.includes(change.id))
+    marketplace.setProvider(configuredProvider(settings));
 });
 export const extensionInstaller = createExtensionInstaller({
   service: marketplace,
@@ -170,6 +172,17 @@ export const extensionInstaller = createExtensionInstaller({
 /** Extensions' language providers and decorations, for the editor (IDE-08). */
 export const extensionProviders = createProviderRegistry();
 export const extensionDecorations = createDecorationStore();
+/**
+ * Enabled extensions' colour themes and snippets (EXT-04), read from their installed copy by
+ * the native side; the editor applies them (`editor/declarativeMonaco.ts`).
+ */
+export const declarativeContributions = createDeclarativeContributions({
+  registry: extensionRegistry,
+  read: (id, path) =>
+    isTauri()
+      ? native("extensions_read_resource", { id, path })
+      : Promise.reject(new Error("Open the desktop application to read extensions.")),
+});
 
 /**
  * What extensions may do to the window (documents, the editor, workspace files), provided by

@@ -316,10 +316,11 @@ test("invalid manifests are rejected with every reason; unknown fields only warn
         `${JSON.stringify(overrides)} -> ${JSON.stringify(result.problems)}`,
       );
   }
-  const warned = readManifest(manifest({ sponsor: "x", contributes: { themes: [] } }));
+  const warned = readManifest(manifest({ sponsor: "x", contributes: { grammars: [] } }));
   assert.ok(warned.ok);
   assert.deepEqual(
-    warned.warnings.filter((w) => w.field === "sponsor" || w.field === "contributes.themes").length,
+    warned.warnings.filter((w) => w.field === "sponsor" || w.field === "contributes.grammars")
+      .length,
     2,
   );
 });
@@ -1203,4 +1204,150 @@ test("EXT-02 uninstall forgets the disabled state: a reinstall starts enabled", 
   assert.equal("enabled" in added && added.enabled, true, "the window's old list is not read");
   native.setEnabled("acme.hello", false);
   assert.deepEqual(saved, [["acme.hello", false]]);
+});
+
+// --- EXT-05: lifecycle reconciliation ----------------------------------------------------------
+
+test("EXT-05 a failed activation keeps nothing: its code unloaded, its partial registrations gone, no retry loop", async () => {
+  const t = setup();
+  t.add(
+    {
+      name: "half",
+      activationEvents: ["onStartupFinished"],
+      contributes: { commands: [{ command: "acme.half.go", title: "Go" }] },
+    },
+    `module.exports.activate = function (c, yavin) {
+      c.subscriptions.push(yavin.commands.registerCommand("acme.half.go", function () { return "ran"; }));
+      throw new Error("half way");
+    };`,
+  );
+  const m = t.manager();
+  await m.fire({ kind: "startup" });
+  await until(() => m.getSnapshot().statuses["acme.half"]?.state === "failed", "failed");
+  await settle();
+  assert.deepEqual(t.host.resident(), [], "its code was unloaded from the host");
+  // What it registered before failing is not reachable, and using it does not try again.
+  await assert.rejects(
+    m.executeCommand("acme.half.go"),
+    (e: ExtensionError) => e.code === "ActivationFailed",
+  );
+  assert.deepEqual(t.host.resident(), [], "not loaded again in this host");
+  // A new host (Restart) tries once more, and cleans up the same way.
+  await m.restart();
+  await assert.rejects(
+    m.activate("acme.half"),
+    (e: ExtensionError) => e.code === "ActivationFailed",
+  );
+  await settle();
+  assert.deepEqual(t.host.resident(), []);
+});
+
+test("EXT-05 reconciliation: disable, uninstall, update and a lost dependency each stop the extension and clear it; repeated runs converge", async () => {
+  const t = setup();
+  t.add(
+    { name: "base", activationEvents: [], contributes: {} },
+    `module.exports.activate = function () {};`,
+  );
+  const greeter = (word: string) =>
+    `module.exports.activate = function (c, yavin) {
+      c.subscriptions.push(yavin.commands.registerCommand("acme.uses.go", function () { return "${word}"; }));
+      c.subscriptions.push(yavin.languages.registerHoverProvider("markdown", { provideHover: function () { return null; } }));
+    };`;
+  const uses = {
+    name: "uses",
+    activationEvents: ["onStartupFinished"],
+    extensionDependencies: ["acme.base"],
+    contributes: { commands: [{ command: "acme.uses.go", title: "Go" }] },
+  };
+  t.add(uses, greeter("v1"));
+  // Startup activates only what is enabled and can run: a disabled one never starts.
+  t.add(
+    { name: "off", activationEvents: ["onStartupFinished"], contributes: {} },
+    `module.exports.activate = function () {};`,
+  );
+  t.registry.setEnabled("acme.off", false);
+  const m = t.manager();
+  await m.fire({ kind: "startup" });
+  await until(() => m.getSnapshot().statuses["acme.uses"]?.state === "active", "active");
+  assert.deepEqual(t.host.resident(), ["acme.base", "acme.uses"]);
+  assert.equal(m.getSnapshot().statuses["acme.off"], undefined);
+  assert.equal(t.providers.getSnapshot().length, 1);
+
+  // Its dependency disabled: it cannot run any more, so it stops.
+  t.registry.setEnabled("acme.base", false);
+  await m.reconcile();
+  assert.deepEqual(t.host.resident(), []);
+  assert.equal(t.providers.getSnapshot().length, 0);
+  await assert.rejects(
+    m.executeCommand("acme.uses.go"),
+    (e: ExtensionError) => e.code === "DependencyFailed",
+  );
+  t.registry.setEnabled("acme.base", true);
+  assert.equal(await m.executeCommand("acme.uses.go"), "v1");
+
+  // Updated: the old version is gone from the host before the new one runs.
+  const id = "acme.uses";
+  t.codes[id] = greeter("v2");
+  t.registry.replace(
+    id,
+    manifest({ ...uses, version: "2.0.0" }),
+    { kind: "folder", path: "C:/e/v2" },
+    "C:/e/v2",
+  );
+  await m.reconcile();
+  assert.deepEqual(t.host.resident(), ["acme.base"], "v1 unloaded");
+  assert.equal(await m.executeCommand("acme.uses.go"), "v2");
+  assert.equal(t.providers.getSnapshot().length, 1, "one provider: the new version's");
+
+  // Reconciling again and again changes nothing.
+  for (let i = 0; i < 3; i++) await m.reconcile();
+  assert.deepEqual(t.host.resident(), ["acme.base", "acme.uses"]);
+  assert.equal(m.getSnapshot().statuses[id].state, "active");
+
+  // Disabled, then uninstalled: stopped, unloaded, its contributions gone.
+  t.registry.setEnabled(id, false);
+  await m.reconcile();
+  assert.deepEqual(t.host.resident(), ["acme.base"]);
+  assert.equal(t.providers.getSnapshot().length, 0);
+  t.registry.setEnabled(id, true);
+  await m.executeCommand("acme.uses.go");
+  t.registry.remove(id, { forget: true });
+  await m.reconcile();
+  assert.deepEqual(t.host.resident(), ["acme.base"]);
+  await assert.rejects(m.executeCommand("acme.uses.go"));
+});
+
+test("EXT-05 a restart registers nothing twice; a crash's reason carries the host's last output", async () => {
+  const t = setup();
+  t.add(
+    { activationEvents: ["onLanguage:markdown"] },
+    `module.exports.activate = function (c, yavin) {
+      c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", function () { return "up"; }));
+      c.subscriptions.push(yavin.languages.registerHoverProvider("markdown", { provideHover: function () { return null; } }));
+    };`,
+  );
+  const m = t.manager();
+  await m.fire({ kind: "language", id: "markdown" });
+  await until(() => t.providers.getSnapshot().length === 1, "provider");
+  for (let i = 0; i < 2; i++) {
+    await m.restart();
+    assert.equal(await m.executeCommand("acme.hello.greet"), "up");
+  }
+  await m.fire({ kind: "language", id: "markdown" });
+  await until(() => t.providers.getSnapshot().length === 1, "provider again");
+  await settle();
+  assert.equal(t.providers.getSnapshot().length, 1, "one provider, not one per restart");
+  assert.deepEqual(t.host.resident(), ["acme.hello"]);
+  // The host's stderr: in its output channel, and the last line in the crash's reason.
+  t.host.stderr("thread 'main' panicked at src/runtime.rs:42");
+  t.host.crash();
+  await settle();
+  const reason = m.getSnapshot().statuses["acme.hello"].reason ?? "";
+  assert.match(reason, /exited with code 3\. Its last output: thread 'main' panicked/);
+  assert.ok(
+    (t.logs.get("yavin.extension-host") ?? []).some((line) =>
+      line.includes("host: thread 'main' panicked"),
+    ),
+  );
+  assert.equal(t.providers.getSnapshot().length, 0, "a crash clears what it contributed");
 });

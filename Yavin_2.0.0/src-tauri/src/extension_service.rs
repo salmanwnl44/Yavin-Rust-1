@@ -38,7 +38,7 @@
 //! or unusable (recorded as a recovery), else reports the install as broken.
 
 use crate::extension_package::identity;
-use crate::extensions::{discover, read_manifest};
+use crate::extensions::{discover, read_manifest, read_resource};
 use ide_workspace::durable::{json_version, read_versioned, write_durably, Loaded};
 use ide_workspace::extension_id::{canonical_id, is_canonical};
 use serde::{Deserialize, Serialize};
@@ -886,6 +886,21 @@ impl ExtensionService {
         })
     }
 
+    /// A file of `id`'s copy -- the one `list` reports -- for the window to read: a theme or
+    /// snippets (EXT-04). Contained in that folder, a plain file, at most 1 MiB.
+    pub fn resource_of(&self, requested: &str, path: &str) -> Result<String, String> {
+        let id = canonical_id(requested)
+            .ok_or_else(|| format!("UnknownExtension: \"{requested}\" is not an extension id."))?;
+        let (mut inner, paths) = self.lock()?;
+        let (listed, _) = self.reconcile(&mut inner, paths)?;
+        drop(inner);
+        let chosen = listed
+            .into_iter()
+            .find(|one| one.id.as_deref() == Some(id.as_str()) && one.error.is_none())
+            .ok_or_else(|| format!("UnknownExtension: {id} is not installed."))?;
+        read_resource(Path::new(&chosen.folder), path)
+    }
+
     /// The folder and entry point the host loads for `id`: the copy `list` reports for it.
     pub fn folder_of(&self, requested: &str) -> Result<(PathBuf, String), String> {
         let id = canonical_id(requested)
@@ -1185,6 +1200,16 @@ pub fn extensions_list(
     legacy_disabled: Option<Vec<String>>,
 ) -> Result<Listing, String> {
     service.list(legacy_disabled)
+}
+
+/// One of an installed extension's files (its themes and snippets: EXT-04), as text.
+#[tauri::command(async)]
+pub fn extensions_read_resource(
+    service: State<'_, ExtensionService>,
+    id: String,
+    path: String,
+) -> Result<String, String> {
+    service.resource_of(&id, &path)
 }
 
 #[tauri::command(async)]

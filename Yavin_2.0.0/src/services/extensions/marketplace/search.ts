@@ -90,7 +90,16 @@ export function createSearchController(
         if (disposed || mine !== sequence) return; // stale
         publish({
           status: "loaded",
-          items: page === 0 ? result.items : [...snapshot.items, ...result.items],
+          // A registry's order can shift between pages: an id already shown is not shown twice.
+          items:
+            page === 0
+              ? result.items
+              : [
+                  ...snapshot.items,
+                  ...result.items.filter(
+                    (one) => !snapshot.items.some((shown) => shown.id === one.id),
+                  ),
+                ],
           total: result.total,
           pages: page + 1,
           loadingMore: false,

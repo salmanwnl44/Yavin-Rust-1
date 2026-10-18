@@ -110,6 +110,7 @@ import { clearProblems, publishProblems } from "./services/panel/problems";
 import {
   breakpoints,
   currentGit,
+  declarativeContributions,
   extensionDecorations,
   extensionProviders,
   extensionInstaller,
@@ -138,10 +139,12 @@ import {
 import { ExtensionDetails } from "./components/extensions/ExtensionDetails";
 import {
   MARKETPLACE_AUTO_CHECK,
+  MARKETPLACE_SOURCE,
   MARKETPLACE_RECOMMENDATIONS,
 } from "./services/extensions/marketplace/setup";
 import { ExtensionError } from "./services/extensions/errors";
 import { discoverInstalledOnce } from "./services/extensions/discovery";
+import { followContributedThemes } from "./editor/themes";
 import { documentInfoOf } from "./services/extensions/documentInfo";
 import type {
   DocumentEvent as ExtensionDocumentEvent,
@@ -1448,6 +1451,8 @@ export default function App() {
   useEffect(() => {
     void extensionHost.setTrusted(trust.trusted);
   }, [extensionHost, trust.trusted]);
+  // Extensions' colour themes (EXT-04), offered in the theme setting (the editor defines them).
+  useEffect(() => followContributedThemes(declarativeContributions), []);
   // Installed extensions' manifests, read once (the desktop app only); then, if the user wants
   // it, the marketplace is asked which of them have updates (never installed without them).
   useEffect(() => {
@@ -2057,6 +2062,7 @@ export default function App() {
       infoOf: documentInfoOf,
       contextCommands: editorContextCommands,
       onRunCommand: (command: string) => runExtensionCommandRef.current(command),
+      declarative: declarativeContributions,
     }),
     [editorContextCommands],
   );
@@ -3750,6 +3756,7 @@ export default function App() {
             onRunCommand={runExtensionCommand}
             onOpenDetails={openExtensionPage}
             onUninstall={confirmUninstall}
+            onChooseMarketplace={(source) => settings.set(MARKETPLACE_SOURCE, "user", source)}
           />
           {/* IDE-08: extensions' own Activity Bar containers. */}
           {extensionSnapshot.viewContainers.map((container) => (
@@ -3850,6 +3857,7 @@ export default function App() {
                 trusted={trust.trusted}
                 onClose={() => setExtensionPage(null)}
                 onUninstall={confirmUninstall}
+                declarative={declarativeContributions}
               />
             ) : settingsOpen ? (
               <SettingsView

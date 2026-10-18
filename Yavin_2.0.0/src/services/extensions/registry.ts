@@ -24,6 +24,8 @@ import {
   type ManifestProblem,
   type MenuContribution,
   type SettingContribution,
+  type SnippetContribution,
+  type ThemeContribution,
   type ViewContainerContribution,
   type ViewContribution,
 } from "./manifest.ts";
@@ -82,6 +84,9 @@ export interface RegistrySnapshot {
   views: readonly ContributedView[];
   viewContainers: readonly (ViewContainerContribution & { extensionId: string })[];
   menus: readonly (MenuContribution & { extensionId: string })[];
+  /** Enabled extensions' colour themes and snippets (EXT-04), in order of extension id. */
+  themes: readonly (ThemeContribution & { extensionId: string })[];
+  snippets: readonly (SnippetContribution & { extensionId: string })[];
   /**
    * Enabled extensions that cannot activate because of their dependencies (missing, disabled,
    * themselves unavailable, or in a cycle), with why. Their declarative contributions still apply.
@@ -189,6 +194,8 @@ export function createExtensionRegistry(options: {
     views: [],
     viewContainers: [],
     menus: [],
+    themes: [],
+    snippets: [],
     unavailable: {},
   };
 
@@ -258,6 +265,16 @@ export function createExtensionRegistry(options: {
         })),
       ),
       menus,
+      themes: [...enabled]
+        .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+        .flatMap((one) =>
+          one.manifest.contributes.themes.map((theme) => ({ ...theme, extensionId: one.id })),
+        ),
+      snippets: [...enabled]
+        .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+        .flatMap((one) =>
+          one.manifest.contributes.snippets.map((snippet) => ({ ...snippet, extensionId: one.id })),
+        ),
       unavailable: dependencyProblems(),
     };
   };

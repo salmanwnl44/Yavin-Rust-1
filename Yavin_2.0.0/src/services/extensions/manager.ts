@@ -153,6 +153,10 @@ export function createExtensionHostManager(options: ManagerOptions) {
     },
     // Async throughout: a held or closed manager rejects; it never throws at the caller.
     activate: async (id: string) => current().activate(id),
+    /** Makes the live host agree with the registry now (EXT-05); nothing to do without one. */
+    reconcile: async () => {
+      if (host && !host.finished) await host.reconcile();
+    },
     /**
      * An activation event. Startup and the workspace opening are remembered: a host made later
      * (after a crash, a restart, a reload) hears them too.

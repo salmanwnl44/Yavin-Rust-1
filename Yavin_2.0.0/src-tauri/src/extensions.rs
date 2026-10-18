@@ -103,6 +103,18 @@ const MAX_MAIN: u64 = 2 * 1024 * 1024;
 /// An extension's entry point: inside its folder (no `..`, no absolute path, no link out of
 /// it), a plain file, at most 2 MiB, UTF-8.
 pub fn read_main(folder: &Path, main: &str) -> Result<String, String> {
+    read_inside(folder, main, MAX_MAIN)
+}
+
+/// The largest file of an extension's own read for the window (a theme, snippets: EXT-04).
+const MAX_RESOURCE: u64 = 1024 * 1024;
+
+/// One of an extension's files, as `read_main` reads its entry point, at most 1 MiB.
+pub fn read_resource(folder: &Path, path: &str) -> Result<String, String> {
+    read_inside(folder, path, MAX_RESOURCE)
+}
+
+fn read_inside(folder: &Path, main: &str, max: u64) -> Result<String, String> {
     let relative = Path::new(main);
     if relative.is_absolute()
         || relative.components().any(|part| {
@@ -131,10 +143,10 @@ pub fn read_main(folder: &Path, main: &str) -> Result<String, String> {
     if !real.starts_with(&base) {
         return Err(format!("LoadFailed: {main} is outside the extension."));
     }
-    if metadata.len() > MAX_MAIN {
+    if metadata.len() > max {
         return Err(format!(
-            "LoadFailed: {main} is larger than {} MiB.",
-            MAX_MAIN / 1024 / 1024
+            "LoadFailed: {main} is larger than {} KiB.",
+            max / 1024
         ));
     }
     fs::read_to_string(&real).map_err(|e| format!("LoadFailed: {main} could not be read: {e}"))

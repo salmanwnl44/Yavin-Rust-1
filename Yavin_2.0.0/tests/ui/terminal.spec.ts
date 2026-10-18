@@ -89,6 +89,8 @@ async function desktop(
     unixShell?: boolean;
     /** Installed extensions' folders and manifest texts (IDE-07 discovery). */
     extensions?: { folder: string; manifest: string | null; error: string | null }[];
+    /** Installed extensions' files, by `id:path` (EXT-04: themes, snippets). */
+    extensionResources?: Record<string, string>;
     /** Copies of the sample the inventory shadows (EXT-02: it lists one entry per id). */
     sampleShadowed?: { folder: string; version: string | null; reason: string }[];
     /** Installed extensions' code, by extension id, as the native side reads it (IDE-08). */
@@ -722,6 +724,48 @@ async function desktop(
                 skipped: 0,
               };
             if (command === "marketplace_default_registry") return "https://registry.test/yavin/";
+            if (command === "extensions_read_resource") {
+              const text = setup.extensionResources?.[`${args.id}:${args.path}`];
+              if (text === undefined)
+                throw `LoadFailed: ${args.path} does not exist in the extension.`;
+              return text;
+            }
+            // Open VSX (EXT-03), as open-vsx.org answers (its search and extension records).
+            if (command === "marketplace_openvsx") {
+              // `raw`: the mock flattens a `request` argument for the terminal commands.
+              const request = raw.request as { kind: string; query?: string; offset?: number };
+              calls.push({ command: "openvsx:" + request.kind, args: request });
+              if (request.kind === "search" && request.query === "busy")
+                throw "RateLimited: try again in 30 s.";
+              const yaml = {
+                namespace: "redhat",
+                name: "vscode-yaml",
+                version: "1.15.0",
+                displayName: "YAML",
+                description: "YAML Language Support by Red Hat",
+                downloadCount: 8613164,
+                averageRating: 4.5,
+                verified: true,
+                timestamp: "2026-10-17T08:13:21Z",
+                files: {},
+              };
+              if (request.kind === "search")
+                return JSON.stringify({
+                  offset: request.offset ?? 0,
+                  totalSize: 1,
+                  extensions: [yaml],
+                });
+              if (request.kind === "extension")
+                return JSON.stringify({
+                  ...yaml,
+                  namespaceDisplayName: "Red Hat",
+                  license: "MIT",
+                  categories: ["Programming Languages", "Linters"],
+                  engines: { vscode: "^1.91.0" },
+                  allVersions: { latest: "x", "1.15.0": "x", "1.14.2": "x" },
+                });
+              if (request.kind === "document") throw "NotFound: no document.";
+            }
             if (command === "marketplace_get_text" || command === "marketplace_get_icon") {
               if (market.down)
                 throw "MarketplaceUnavailable: the marketplace could not be reached (offline).";
@@ -3687,6 +3731,116 @@ test("a duplicate extension is one card; its shadowed copy is named on the card 
   await expect(details.getByTestId("shadowed-copy")).toContainText(
     "C:/repo/extensions/samples/hello-world (version 2.0.0) — An installed copy takes precedence",
   );
+});
+
+test("Open VSX: browsed from the view, attributed; only themes and snippets install, and a language extension says so", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await view.getByRole("button", { name: "More actions" }).click();
+  await page.getByRole("menuitemcheckbox", { name: /Browse Open VSX/ }).click();
+  await expect(searchBox(view)).toHaveAttribute("placeholder", "Search Open VSX");
+  await searchBox(view).fill("yaml");
+  const results = view.getByRole("region", { name: "Marketplace results" });
+  await expect(results).toContainText("Open VSX");
+  const yaml = card(results, "YAML");
+  const install = yaml.getByRole("button", { name: "Install YAML" });
+  // A search entry does not say what it contributes: installable, saying what that means.
+  await expect(install).toBeEnabled();
+  await expect(install).toHaveAttribute(
+    "title",
+    /installs only its colour themes and snippets; its code never runs/,
+  );
+  await yaml.click();
+  const details = page.getByRole("region", { name: "Extension: YAML" });
+  // Its record does: a language extension, with nothing Yavin can install.
+  await details.getByRole("tab", { name: "Requirements" }).click();
+  await expect(details).toContainText("VS Code extension with no colour themes or snippets");
+  await details.getByRole("tab", { name: "Information" }).click();
+  await expect(details.getByTestId("extension-source")).toHaveText("Open VSX");
+  await expect(details).toContainText("8,613,164");
+  await expect(details).toContainText("1.14.2");
+  expect((await calls(page, "extensions_stage")).length).toBe(0);
+  // A rate limit is shown with the registry's wait, not as a broken marketplace.
+  await searchBox(view).fill("busy");
+  await expect(view.getByRole("region", { name: "Marketplace results" })).toContainText(
+    "try again in 30 s",
+  );
+});
+
+test("a VS Code extension adapted by Yavin: one card, what was installed and not, the theme offered", async ({
+  page,
+}) => {
+  const id = "dracula-theme.theme-dracula";
+  await desktop(page, {
+    extensions: [
+      {
+        folder: `/data/extensions/.store/${id}/2.25.1-abcd1234`,
+        error: null,
+        manifest: JSON.stringify({
+          manifestVersion: 1,
+          publisher: "dracula-theme",
+          name: "theme-dracula",
+          version: "2.25.1",
+          displayName: "Dracula Theme Official",
+          description: "A dark theme",
+          engines: { yavin: "^2.0.0" },
+          contributes: {
+            themes: [
+              { label: "Dracula", uiTheme: "vs-dark", path: "extension/theme/dracula.json" },
+            ],
+          },
+          vsix: {
+            publisher: "dracula-theme",
+            name: "theme-dracula",
+            vscode: "^1.13.0",
+            code: true,
+            supported: ['Colour theme "Dracula"'],
+            ignored: [
+              "Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+            ],
+            rejected: [],
+            signature: "not verified",
+          },
+        }),
+      },
+    ],
+    extensionResources: {
+      [`${id}:extension/theme/dracula.json`]: JSON.stringify({
+        colors: { "editor.background": "#282a36", "activityBar.background": "#343746" },
+        tokenColors: [{ scope: "comment", settings: { foreground: "#6272a4" } }],
+      }),
+    },
+  });
+  const view = await extensionsView(page);
+  const installed = view.getByRole("region", { name: "Installed extensions" });
+  await expect(installed.getByRole("group", { name: "Dracula Theme Official" })).toHaveCount(1);
+  await card(installed, "Dracula Theme Official").click();
+  const details = page.getByRole("region", { name: "Extension: Dracula Theme Official" });
+  await expect(details.getByTestId("vsix-notice")).toContainText(
+    'Yavin installed only Colour theme "Dracula". Its code does not run in Yavin',
+  );
+  await details.getByRole("tab", { name: "Requirements" }).click();
+  const report = details.getByTestId("vsix-report");
+  await expect(report).toContainText("VS Code ^1.13.0");
+  await expect(report).toContainText("Yavin runs no VS Code extension code");
+  await expect(report).toContainText("Not verified");
+  // What of the theme the editor does not apply (the workbench's colours) is said.
+  await expect(report).toContainText("activityBar.background");
+  // The theme is offered beside Yavin's own, and installing it ran nothing.
+  await expect
+    .poll(() =>
+      page.evaluate(async () => {
+        const module = "/src/editor/themes.ts";
+        const { editorThemes } = await import(/* @vite-ignore */ module);
+        return editorThemes.list().map((one: { label: string }) => one.label);
+      }),
+    )
+    .toEqual(["Yavin Dark", "Yavin Light", "Dracula"]);
+  // Nothing of it was ever sent to an extension host (the sample's host runs the sample).
+  const sent = (await calls(page, "ext_host_send")).map((call) => String(call.args.message));
+  expect(sent.some((message) => message.includes(id))).toBe(false);
 });
 
 test("an incompatible extension says why and cannot be installed", async ({ page }) => {

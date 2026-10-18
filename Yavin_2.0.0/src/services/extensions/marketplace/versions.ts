@@ -32,6 +32,8 @@ export interface Compatibility {
   compatible: boolean;
   /** Why not, for the user. */
   reasons: string[];
+  /** What to know when it is installable (a VS Code extension: EXT-04). */
+  notes?: string[];
 }
 
 /** Whether this Yavin can run `version`. */
@@ -44,8 +46,19 @@ export function compatibilityOf(
   const reasons: string[] = [];
   if (!isSemver(version.version)) reasons.push(`Its version "${version.version}" is not valid.`);
   const range = version.engines.yavin;
-  if (!range) reasons.push("It does not say which Yavin extension API it needs.");
-  else {
+  // A VS Code extension (Open VSX): only its colour themes and snippets install (EXT-04).
+  const notes: string[] = [];
+  if (version.packageFormat === "vsix") {
+    if (version.declarative === false)
+      reasons.push(
+        "It is a VS Code extension with no colour themes or snippets: Yavin installs only those from a VS Code extension, and runs none of its code.",
+      );
+    else
+      notes.push(
+        "A VS Code extension: Yavin installs only its colour themes and snippets; its code never runs.",
+      );
+  } else if (!range) reasons.push("It does not say which Yavin extension API it needs.");
+  if (range) {
     const fits = satisfies(api, range);
     if (fits === null) reasons.push(`Its required Yavin API ("${range}") cannot be read.`);
     else if (!fits)
@@ -57,7 +70,7 @@ export function compatibilityOf(
     reasons.push(
       `It is not available for this platform (${platform}); it supports ${version.platforms.join(", ")}.`,
     );
-  return { compatible: reasons.length === 0, reasons };
+  return { compatible: reasons.length === 0, reasons, ...(notes.length ? { notes } : {}) };
 }
 
 /** The newest version this Yavin can run, if any. */

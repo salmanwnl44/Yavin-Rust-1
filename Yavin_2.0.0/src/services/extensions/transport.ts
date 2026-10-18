@@ -13,6 +13,8 @@ export interface HostChannel {
   onMessage(listener: (text: string) => void): () => void;
   /** The process ended; `crashed` when Yavin did not stop it. */
   onExit(listener: (end: { reason: string; crashed: boolean }) => void): () => void;
+  /** A line the process wrote to its stderr (bounded natively; EXT-05). */
+  onLog?(listener: (line: string) => void): () => void;
   stop(): Promise<void>;
 }
 
@@ -27,12 +29,14 @@ const routes = {
     number,
     (payload: { session: number; code: number | null; error: string | null }) => void
   >(),
+  logs: new Map<number, (line: string) => void>(),
 };
 const early = new Map<
   number,
   (
     | { kind: "message"; message: string }
     | { kind: "exit"; code: number | null; error: string | null }
+    | { kind: "log"; line: string }
   )[]
 >();
 let listening: Promise<void> | null = null;
@@ -41,9 +45,13 @@ function deliver(
   session: number,
   item:
     | { kind: "message"; message: string }
-    | { kind: "exit"; code: number | null; error: string | null },
+    | { kind: "exit"; code: number | null; error: string | null }
+    | { kind: "log"; line: string },
 ) {
-  if (item.kind === "message") {
+  if (item.kind === "log") {
+    const route = routes.logs.get(session);
+    if (route) return route(item.line);
+  } else if (item.kind === "message") {
     const route = routes.messages.get(session);
     if (route) return route({ session, message: item.message });
   } else {
@@ -59,6 +67,9 @@ const ensureListening = () =>
   (listening ??= Promise.all([
     listen<Payload & { message: string }>("ext-host-message", (event) =>
       deliver(event.payload.session, { kind: "message", message: event.payload.message }),
+    ),
+    listen<Payload & { line: string }>("ext-host-log", (event) =>
+      deliver(event.payload.session, { kind: "log", line: event.payload.line }),
     ),
     listen<Payload & { code: number | null; error: string | null }>("ext-host-exit", (event) =>
       deliver(event.payload.session, {
@@ -86,6 +97,10 @@ export function createNativeHostTransport(): HostTransport {
       let ended = false;
       const messageListeners = new Set<(text: string) => void>();
       const exitListeners = new Set<(end: { reason: string; crashed: boolean }) => void>();
+      const logListeners = new Set<(line: string) => void>();
+      routes.logs.set(session, (line) => {
+        for (const listener of logListeners) listener(line);
+      });
       routes.messages.set(session, (payload) => {
         for (const listener of messageListeners) listener(payload.message);
       });
@@ -93,6 +108,7 @@ export function createNativeHostTransport(): HostTransport {
         ended = true;
         routes.messages.delete(session);
         routes.exits.delete(session);
+        routes.logs.delete(session);
         const reason =
           payload.error ??
           (payload.code === 0
@@ -110,6 +126,10 @@ export function createNativeHostTransport(): HostTransport {
         onExit(listener) {
           exitListeners.add(listener);
           return () => exitListeners.delete(listener);
+        },
+        onLog(listener) {
+          logListeners.add(listener);
+          return () => logListeners.delete(listener);
         },
         async stop() {
           stopping = true;

@@ -106,7 +106,13 @@ fn host_program(app: &AppHandle) -> Result<PathBuf, String> {
 pub trait HostEvents: Send + Sync + 'static {
     fn message(&self, session: u32, message: String);
     fn exit(&self, session: u32, code: Option<i32>, error: Option<String>);
+    /// A line the process wrote to stderr (a panic, a runtime error), bounded (EXT-05).
+    fn log(&self, _session: u32, _line: String) {}
 }
+
+/// The most stderr lines passed on per host, and the longest line.
+const MAX_LOG_LINES: usize = 200;
+const MAX_LOG_LINE: usize = 1000;
 
 type Live = Arc<Mutex<HashMap<u32, Arc<ServerProcess>>>>;
 
@@ -125,13 +131,26 @@ struct Session {
     session: u32,
     live: Live,
     events: Arc<dyn HostEvents>,
+    /// Lines of stderr passed on so far.
+    logged: AtomicU32,
 }
 
 impl ServerEvents for Session {
     fn message(&self, message: String) {
         self.events.message(self.session, message);
     }
-    fn log(&self, _line: String) {}
+    fn log(&self, line: String) {
+        let n = self.logged.fetch_add(1, Ordering::Relaxed) as usize;
+        if n < MAX_LOG_LINES {
+            let line: String = line.chars().take(MAX_LOG_LINE).collect();
+            self.events.log(self.session, line);
+        } else if n == MAX_LOG_LINES {
+            self.events.log(
+                self.session,
+                "(the extension host wrote more; the rest is not shown)".into(),
+            );
+        }
+    }
     fn exit(&self, code: Option<i32>, error: Option<String>) {
         if let Ok(mut live) = self.live.lock() {
             live.remove(&self.session);
@@ -152,6 +171,7 @@ impl ExtHostSessions {
                 session,
                 live: self.live.clone(),
                 events,
+                logged: AtomicU32::new(0),
             }),
         )
         .map_err(|why| format!("HostFailed: {why}"))?;
@@ -244,13 +264,20 @@ struct Message {
 }
 
 #[derive(Clone, Serialize)]
+struct Log {
+    session: u32,
+    line: String,
+}
+
+#[derive(Clone, Serialize)]
 struct Exit {
     session: u32,
     code: Option<i32>,
     error: Option<String>,
 }
 
-/// Events to the window: `ext-host-message`, `ext-host-exit`, by session.
+/// Events to the window: `ext-host-message`, `ext-host-log` (its stderr), `ext-host-exit`, by
+/// session.
 struct Emitting(AppHandle);
 
 impl HostEvents for Emitting {
@@ -258,6 +285,9 @@ impl HostEvents for Emitting {
         let _ = self
             .0
             .emit("ext-host-message", Message { session, message });
+    }
+    fn log(&self, session: u32, line: String) {
+        let _ = self.0.emit("ext-host-log", Log { session, line });
     }
     fn exit(&self, session: u32, code: Option<i32>, error: Option<String>) {
         let _ = self.0.emit(
@@ -317,6 +347,37 @@ pub fn ext_host_stop_all(sessions: State<'_, ExtHostSessions>) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host's stderr reaches the window, bounded: at most `MAX_LOG_LINES` lines, each cut to
+    /// `MAX_LOG_LINE` characters, then one notice -- never more (EXT-05).
+    #[test]
+    fn a_hosts_stderr_is_passed_on_bounded() {
+        #[derive(Default)]
+        struct Seen(Mutex<Vec<(u32, String)>>);
+        impl HostEvents for Seen {
+            fn message(&self, _: u32, _: String) {}
+            fn exit(&self, _: u32, _: Option<i32>, _: Option<String>) {}
+            fn log(&self, session: u32, line: String) {
+                self.0.lock().unwrap().push((session, line));
+            }
+        }
+        let seen = Arc::new(Seen::default());
+        let session = Session {
+            session: 7,
+            live: Live::default(),
+            events: seen.clone(),
+            logged: AtomicU32::new(0),
+        };
+        session.log("x".repeat(MAX_LOG_LINE + 50));
+        for n in 0..(MAX_LOG_LINES + 20) {
+            session.log(format!("line {n}"));
+        }
+        let lines = seen.0.lock().unwrap();
+        assert_eq!(lines.len(), MAX_LOG_LINES + 1);
+        assert!(lines.iter().all(|(s, _)| *s == 7));
+        assert_eq!(lines[0].1.chars().count(), MAX_LOG_LINE);
+        assert!(lines.last().unwrap().1.contains("the rest is not shown"));
+    }
 
     #[test]
     fn a_packaged_build_looks_only_in_its_resources() {

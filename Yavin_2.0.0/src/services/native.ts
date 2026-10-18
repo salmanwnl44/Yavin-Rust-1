@@ -121,15 +121,30 @@ interface Commands {
     };
   };
   extensions_set_enabled: { args: { id: string; enabled: boolean }; result: void };
+  /** One of an installed extension's files (its themes, snippets: EXT-04), contained. */
+  extensions_read_resource: { args: { id: string; path: string }; result: string };
   // --- Extension marketplace and installer (IDE-09) ---
   marketplace_default_registry: { args: Record<string, never>; result: string };
   marketplace_get_text: { args: { registryUrl: string; path: string }; result: string };
   marketplace_get_icon: { args: { registryUrl: string; path: string }; result: string };
+  /** Open VSX (EXT-03, `src-tauri/src/openvsx.rs`): an answer's text, validated by the caller. */
+  marketplace_openvsx: {
+    args: {
+      registryUrl: string;
+      request: import("./extensions/marketplace/openVsxProvider.ts").OpenVsxRequest;
+    };
+    result: string;
+  };
+  marketplace_openvsx_icon: {
+    args: { registryUrl: string; namespace: string; name: string; version: string };
+    result: string;
+  };
   extensions_stage: {
     args: {
       source:
         | { kind: "registry"; registryUrl: string; path: string; sha256: string; size: number }
-        | { kind: "file"; path: string };
+        | { kind: "file"; path: string }
+        | { kind: "openVsx"; registryUrl: string; namespace: string; name: string };
       expectedId: string;
       expectedVersion: string;
     };

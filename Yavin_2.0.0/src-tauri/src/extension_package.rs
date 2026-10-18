@@ -1,8 +1,11 @@
 //! Extension packages (IDE-09): validating one, unpacking it, and putting it in place.
 //!
-//! A package is a zip archive with the extension's files at its root, `yavin-extension.json`
-//! among them. Installing is a security boundary -- the archive comes from the network -- so
-//! nothing in it is trusted:
+//! A package is a zip archive: a Yavin package, with the extension's files at its root and
+//! `yavin-extension.json` among them, or a VS Code package (VSIX: `extension.vsixmanifest`,
+//! `extension/package.json`), whose declarative contributions `vsix.rs` adapts (EXT-04). Which
+//! one it is comes from what it holds (`Format`); an archive with the marks of both is refused.
+//! Installing is a security boundary -- the archive comes from the network -- so nothing in it
+//! is trusted:
 //!
 //! - every entry name is checked before anything is written: no absolute paths, drive letters,
 //!   UNC paths, `..`, backslashes, empty or dot-only components, alternate data streams,
@@ -61,10 +64,27 @@ const RATIO_FLOOR: u64 = 1024 * 1024;
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Unpacked {
+    /// The manifest's text: `yavin-extension.json`, or a VS Code package's `extension/package.json`.
     pub manifest: String,
+    pub format: Format,
     pub files: usize,
     pub bytes: u64,
 }
+
+/// Which kind of package an archive is, from what it holds -- never from where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Format {
+    /// `yavin-extension.json` at its root.
+    Yavin,
+    /// A VS Code extension (VSIX): `extension.vsixmanifest`, `extension/package.json` (EXT-04).
+    Vsix,
+}
+
+/// A VS Code package's manifest, inside the archive.
+pub const VSIX_MANIFEST: &str = "extension/package.json";
+/// The largest `extension/package.json` read (its `contributes` can be long).
+const MAX_VSIX_MANIFEST: u64 = 1024 * 1024;
 
 fn refuse(message: impl Into<String>) -> String {
     format!("UnsafePackage: {}", message.into())
@@ -234,11 +254,29 @@ fn unpack_inner(package: &Path, destination: &Path, limits: &Limits) -> Result<U
             }
         }
     }
-    if !files.contains(&MANIFEST_FILE.to_lowercase()) {
-        return Err(format!(
-            "InvalidPackage: it has no {MANIFEST_FILE} at its root"
-        ));
-    }
+    // A VS Code package is never taken for a Yavin one, nor the other way round: an archive
+    // with the marks of both is refused.
+    let yavin = files.contains(&MANIFEST_FILE.to_lowercase());
+    let vsix = files.contains("extension.vsixmanifest") || files.contains(VSIX_MANIFEST);
+    let format = match (yavin, vsix) {
+        (true, true) => {
+            return Err(format!(
+                "InvalidPackage: it is both a Yavin package ({MANIFEST_FILE}) and a VS Code package (extension/)"
+            ))
+        }
+        (true, false) => Format::Yavin,
+        (false, true) if files.contains(VSIX_MANIFEST) => Format::Vsix,
+        (false, true) => {
+            return Err(format!(
+                "InvalidPackage: it is a VS Code package without {VSIX_MANIFEST}"
+            ))
+        }
+        (false, false) => {
+            return Err(format!(
+                "InvalidPackage: it has no {MANIFEST_FILE} at its root"
+            ))
+        }
+    };
 
     fs::create_dir(destination).map_err(|e| format!("InstallFailed: {e}"))?;
     let mut total = 0u64;
@@ -300,16 +338,24 @@ fn unpack_inner(package: &Path, destination: &Path, limits: &Limits) -> Result<U
         }
         count += 1;
     }
-    let manifest_path = destination.join(MANIFEST_FILE);
+    let (name, max) = match format {
+        Format::Yavin => (MANIFEST_FILE, 64 * 1024),
+        Format::Vsix => (VSIX_MANIFEST, MAX_VSIX_MANIFEST),
+    };
+    let manifest_path = name
+        .split('/')
+        .fold(destination.to_path_buf(), |p, part| p.join(part));
     let manifest = fs::read_to_string(&manifest_path)
-        .map_err(|_| format!("InvalidPackage: its {MANIFEST_FILE} is not UTF-8 text"))?;
-    if manifest.len() > 64 * 1024 {
+        .map_err(|_| format!("InvalidPackage: its {name} is not UTF-8 text"))?;
+    if manifest.len() as u64 > max {
         return Err(format!(
-            "InvalidPackage: its {MANIFEST_FILE} is larger than 64 KiB"
+            "InvalidPackage: its {name} is larger than {} KiB",
+            max / 1024
         ));
     }
     Ok(Unpacked {
         manifest,
+        format,
         files: count,
         bytes: total,
     })

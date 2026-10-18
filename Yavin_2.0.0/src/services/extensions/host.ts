@@ -329,6 +329,15 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       }
       channel = started;
       stops.push(started.onMessage(receive), started.onExit(onExit));
+      // What the host process writes to stderr (a panic, a runtime error): to the Extension Host
+      // channel, and the last of it into a crash's reason (EXT-05).
+      if (started.onLog)
+        stops.push(
+          started.onLog((line) => {
+            lastOutput = line;
+            logHost(`host: ${line}`);
+          }),
+        );
       const ready = wait("ready", timeouts.start, "start");
       await send({
         type: "init",
@@ -477,9 +486,13 @@ export function createExtensionHost(options: ExtensionHostOptions) {
     }
   }
 
+  /** The host process's last line of output, for a crash's reason. */
+  let lastOutput: string | null = null;
   function onExit(end: { reason: string; crashed: boolean }) {
     if (finished) return;
-    void crash(end.crashed ? end.reason : "The extension host stopped.", end.crashed);
+    const reason =
+      end.crashed && lastOutput ? `${end.reason} Its last output: ${lastOutput}` : end.reason;
+    void crash(end.crashed ? reason : "The extension host stopped.", end.crashed);
   }
 
   /** The process is gone: everything of this host ends, bounded and once. */
@@ -965,6 +978,12 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         const reason = `Activation failed: ${(error as Error)?.message ?? String(error)}`;
         log(one, "error", reason);
         clearContributions(id);
+        // Its code is unloaded too: a failed extension keeps nothing in the host -- not its
+        // half-registered commands, not a pending promise -- until it is used again (EXT-05).
+        if (one.loaded && channel && !finished) {
+          one.loaded = false;
+          await send({ type: "unload", extensionId: id }).catch(() => undefined);
+        }
         if (one.status.state === "activating") move(one, "failed", reason);
         one.activation = null;
         publish();
@@ -1046,17 +1065,21 @@ export function createExtensionHost(options: ExtensionHostOptions) {
   };
 
   /**
-   * The registry is the source of truth (IDE-09): an extension disabled, uninstalled or
-   * replaced (updated: a new registry entry) stops here -- deactivated, its code unloaded from
-   * the host, its contributions (handlers, views' rows, providers, decorations) removed. Used
-   * again, it starts fresh from what the registry now has.
+   * Reconciliation (EXT-05): what runs here is made to agree with the registry -- itself the
+   * native inventory's choice (EXT-02). An extension stops -- deactivated, its code unloaded from
+   * the host, its contributions (handlers, views' rows, providers, decorations) removed -- when it
+   * is uninstalled, disabled, replaced by another version (a new registry entry), or can no
+   * longer run because of its dependencies. Used again, it starts fresh from what the registry
+   * now has. Run on every registry change; running it again changes nothing (an extension being
+   * retired is retired once), so it converges.
    */
   const retirements = new Map<string, Promise<void>>();
-  const followRegistry = () => {
-    if (finished) return;
+  const reconcile = (): Promise<void> => {
+    if (finished) return Promise.resolve();
+    const unavailable = options.registry.getSnapshot().unavailable;
     for (const [id, one] of [...running]) {
       const entry = options.registry.get(id);
-      if (entry && entry.enabled && entry === one.entry) continue;
+      if (entry && entry.enabled && entry === one.entry && !unavailable[id]) continue;
       if (retirements.has(id)) continue;
       const retirement = (async () => {
         try {
@@ -1065,11 +1088,13 @@ export function createExtensionHost(options: ExtensionHostOptions) {
             log(
               one,
               "info",
-              entry
-                ? entry.enabled
-                  ? "Replaced: it will start again from its new version."
-                  : "Disabled: stopped."
-                : "Uninstalled: stopped.",
+              !entry
+                ? "Uninstalled: stopped."
+                : !entry.enabled
+                  ? "Disabled: stopped."
+                  : entry !== one.entry
+                    ? "Replaced: it will start again from its new version."
+                    : `Stopped: ${unavailable[id]}`,
             );
           } else {
             if (one.loaded && channel && !finished)
@@ -1084,11 +1109,14 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       })();
       retirements.set(id, retirement);
     }
+    return Promise.all(retirements.values()).then(() => undefined);
   };
-  const stopFollowing = options.registry.subscribe(followRegistry);
+  const stopFollowing = options.registry.subscribe(() => void reconcile());
 
   const api = {
     getSnapshot: () => snapshot,
+    /** Makes what runs agree with the registry now; resolves when every retirement is done. */
+    reconcile,
     subscribe(listener: () => void) {
       listeners.add(listener);
       return () => {

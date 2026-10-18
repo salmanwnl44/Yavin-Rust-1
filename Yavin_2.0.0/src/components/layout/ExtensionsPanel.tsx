@@ -251,6 +251,7 @@ export function ExtensionsPanel({
   onRunCommand,
   onOpenDetails,
   onUninstall,
+  onChooseMarketplace,
 }: {
   registry: ExtensionRegistry;
   manager: ExtensionHostManager;
@@ -264,6 +265,8 @@ export function ExtensionsPanel({
   onRunCommand: (command: string) => void;
   onOpenDetails: (id: string) => void;
   onUninstall: (id: string) => void;
+  /** Chooses the marketplace browsed (EXT-03: Settings › Extensions › Marketplace). */
+  onChooseMarketplace?: (source: "yavin" | "openvsx") => void;
 }) {
   const state = useExtensionsState({ registry, manager, marketplace, installer });
   const { registry: known, runtime: running, market, operations } = state;
@@ -310,7 +313,7 @@ export function ExtensionsPanel({
   useEffect(() => {
     search.rerun();
     setCategories({ status: "idle", items: [] });
-  }, [market.providerId, search, attempt]);
+  }, [market.providerId, market.providerLabel, search, attempt]);
 
   // Recommendations: from the marketplace, without what is installed.
   const wantsRecommendations =
@@ -413,6 +416,21 @@ export function ExtensionsPanel({
       { label: "Check for Updates", onClick: () => (setView("updates"), checkUpdates()) },
       { label: "Reload Extensions", onClick: () => run(manager.reload()) },
       { label: "Restart Extension Host", onClick: () => run(manager.restart()) },
+      ...(onChooseMarketplace
+        ? ([
+            { divider: true },
+            {
+              label: "Browse Yavin Extensions",
+              checked: market.providerId !== "openvsx",
+              onClick: () => onChooseMarketplace("yavin"),
+            },
+            {
+              label: "Browse Open VSX (VS Code extensions, browse only)",
+              checked: market.providerId === "openvsx",
+              onClick: () => onChooseMarketplace("openvsx"),
+            },
+          ] as MenuItem[])
+        : []),
       { divider: true },
       {
         label: "Show Runtime Diagnostics",
@@ -550,7 +568,8 @@ export function ExtensionsPanel({
     const name = extension.displayName;
     const operation = operations.operations[extension.id];
     const latest = marketplace.latestCompatible(extension);
-    const why = latest ? undefined : marketplace.compatibility(extension).reasons[0];
+    const fits = marketplace.compatibility(extension);
+    const why = latest ? undefined : fits.reasons[0];
     const busyLabel =
       operation?.phase === "downloading"
         ? "Downloading…"
@@ -578,7 +597,7 @@ export function ExtensionsPanel({
             primary
             label={`Install ${name}`}
             disabled={!!operation || !latest}
-            title={why ?? `Install ${name}`}
+            title={why ?? fits.notes?.[0] ?? `Install ${name}`}
             onClick={() => run(installer.install(extension.id))}
           >
             {operation ? busyLabel : "Install"}

@@ -20,7 +20,7 @@
 //! registry index's, read here, never only the renderer's word. Installing never runs
 //! extension code.
 
-use crate::extension_package::{self, unpack, Unpacked, LIMITS};
+use crate::extension_package::{self, unpack, Format, Unpacked, LIMITS};
 use crate::extension_service::{operation_id_ok, Committed, ExtensionService};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,12 +38,16 @@ const MAX_INDEX: u64 = 4 * 1024 * 1024;
 const MAX_DOCUMENT: u64 = 512 * 1024;
 const MAX_ICON: u64 = 256 * 1024;
 
-/// A registry: where its documents are, and the one host they may come from.
+/// A registry: where its documents are, and the hosts they may come from -- its own, plus any
+/// file hosts it is known to redirect downloads to (Open VSX's CDN, EXT-03).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Registry {
-    base: String,
+    pub(crate) base: String,
     origin: String,
-    host: String,
+    pub(crate) host: String,
+    pub(crate) file_hosts: Vec<String>,
+    /// The longest one request may take, start to end.
+    pub(crate) timeout: Duration,
 }
 
 fn invalid(message: impl Into<String>) -> String {
@@ -108,6 +112,8 @@ fn registry_with(base: &str, loopback: bool) -> Result<Registry, String> {
         base: format!("{origin}{path}"),
         origin,
         host,
+        file_hosts: Vec::new(),
+        timeout: Duration::from_secs(120),
     })
 }
 
@@ -131,6 +137,21 @@ pub fn url_in(registry: &Registry, path: &str) -> Result<String, String> {
     Ok(format!("{}{path}", registry.base))
 }
 
+/// `url`, when it is a document of `registry`: HTTPS (loopback in tests), no query, and inside
+/// its base -- or on one of its file hosts. For URLs a registry's own answers name (Open VSX).
+pub fn url_on(registry: &Registry, url: &str) -> Result<String, String> {
+    let (origin, host, path) = split_url(url, LOOPBACK_ALLOWED)?;
+    let whole = format!("{origin}{path}");
+    if whole.starts_with(&registry.base) || registry.file_hosts.contains(&host) {
+        Ok(whole)
+    } else {
+        Err(format!(
+            "OutsideRegistry: \"{url}\" is not a file of this registry ({}).",
+            registry.base
+        ))
+    }
+}
+
 /// Where a redirect from `from` to `location` leads, if it stays on the registry's host.
 pub fn redirect(registry: &Registry, from: &str, location: &str) -> Result<String, String> {
     let target = if location.starts_with('/') && !location.starts_with("//") {
@@ -143,7 +164,7 @@ pub fn redirect(registry: &Registry, from: &str, location: &str) -> Result<Strin
         ));
     };
     let (_, host, _) = split_url(&target, LOOPBACK_ALLOWED)?;
-    if host != registry.host {
+    if host != registry.host && !registry.file_hosts.contains(&host) {
         return Err(format!(
             "UnexpectedRedirect: {from} redirected to another host ({host}); only {} is trusted for this registry.",
             registry.host
@@ -187,7 +208,7 @@ pub fn content_type_ok(kind: Kind, content_type: Option<&str>) -> bool {
     }
 }
 
-fn agent() -> ureq::Agent {
+fn agent(timeout: Duration) -> ureq::Agent {
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::NativeTls)
         .build();
@@ -197,7 +218,7 @@ fn agent() -> ureq::Agent {
         .max_redirects(0)
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_global(Some(Duration::from_secs(120)))
+        .timeout_global(Some(timeout))
         .user_agent(concat!("Yavin/", env!("CARGO_PKG_VERSION")))
         .build()
         .into()
@@ -212,8 +233,21 @@ pub fn fetch(
     max: u64,
     sink: &mut dyn FnMut(&[u8]) -> Result<(), String>,
 ) -> Result<u64, String> {
-    let agent = agent();
-    let mut url = url_in(registry, path)?;
+    fetch_url(registry, &url_in(registry, path)?, path, kind, max, sink)
+}
+
+/// The same for an absolute `url` Yavin built or checked (`url_on`) for `registry`; `path`
+/// names it in messages.
+pub fn fetch_url(
+    registry: &Registry,
+    url: &str,
+    path: &str,
+    kind: Kind,
+    max: u64,
+    sink: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Result<u64, String> {
+    let agent = agent(registry.timeout);
+    let mut url = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         let mut response = agent.get(&url).call().map_err(|e| {
             format!("MarketplaceUnavailable: the marketplace could not be reached ({e}).")
@@ -231,6 +265,17 @@ pub fn fetch(
         }
         if status == 404 {
             return Err(format!("NotFound: {path} is not in the marketplace."));
+        }
+        if status == 429 {
+            let after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            return Err(match after {
+                Some(seconds) => format!("RateLimited: try again in {seconds} s."),
+                None => "RateLimited: try again later.".into(),
+            });
         }
         if !(200..300).contains(&status) {
             return Err(format!(
@@ -324,7 +369,7 @@ pub fn marketplace_get_icon(registry_url: String, path: String) -> Result<String
     Ok(format!("data:image/png;base64,{}", base64(&bytes)))
 }
 
-fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -359,6 +404,14 @@ pub enum PackageSource {
     },
     #[serde(rename_all = "camelCase")]
     File { path: String },
+    /// A version on an Open VSX registry (EXT-03): its metadata is read natively, and gives the
+    /// package and its checksum.
+    #[serde(rename_all = "camelCase")]
+    OpenVsx {
+        registry_url: String,
+        namespace: String,
+        name: String,
+    },
 }
 
 #[derive(Serialize, Debug)]
@@ -428,6 +481,14 @@ pub fn stage(
     let label = match &source {
         PackageSource::Registry { registry_url, .. } => format!("registry {registry_url}"),
         PackageSource::File { .. } => "file".to_string(),
+        PackageSource::OpenVsx { registry_url, .. } => format!("openvsx {registry_url}"),
+    };
+    // What each source serves: Yavin's registry Yavin packages, Open VSX VS Code packages; a
+    // file may be either. The archive's contents decide its format, never this.
+    let expected = match source {
+        PackageSource::Registry { .. } => Some(Format::Yavin),
+        PackageSource::OpenVsx { .. } => Some(Format::Vsix),
+        PackageSource::File { .. } => None,
     };
     let (op, folder) = service.begin(expected_id, expected_version, &label)?;
     let archive = folder.join("package.yvx");
@@ -489,8 +550,43 @@ pub fn stage(
                 fs::copy(&from, &archive).map_err(|e| format!("InstallFailed: {e}"))?;
                 (extension_package::sha256_file(&archive)?, meta.len())
             }
+            PackageSource::OpenVsx {
+                registry_url,
+                namespace,
+                name,
+            } => crate::openvsx::download(
+                &crate::openvsx::registry(&registry_url)?,
+                &namespace,
+                &name,
+                expected_id,
+                expected_version,
+                &archive,
+            )?,
         };
-        let Unpacked { files, bytes, .. } = unpack(&archive, &folder.join("files"), &LIMITS)?;
+        let files_dir = folder.join("files");
+        let Unpacked {
+            manifest,
+            format,
+            files,
+            bytes,
+        } = unpack(&archive, &files_dir, &LIMITS)?;
+        match (expected, format) {
+            (Some(Format::Yavin), Format::Vsix) => {
+                return Err(format!(
+                    "UnsupportedPackage: {expected_id} {expected_version} from Yavin's registry is a VS Code package; the registry serves Yavin packages."
+                ))
+            }
+            (Some(Format::Vsix), Format::Yavin) => {
+                return Err(format!(
+                    "InvalidPackage: {expected_id} {expected_version} from Open VSX is not a VS Code package (.vsix)."
+                ))
+            }
+            _ => {}
+        }
+        // A VS Code package: its declarative contributions, adapted (EXT-04).
+        if format == Format::Vsix {
+            crate::vsix::adapt(&files_dir, &manifest, expected_id, expected_version)?;
+        }
         Ok((sha256, size, files, bytes))
     })();
     let _ = fs::remove_file(&archive);
@@ -565,7 +661,7 @@ pub fn extensions_uninstall(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::extension_package::tests::{package, temp, MANIFEST};
     use crate::extensions::MANIFEST_FILE;
@@ -785,7 +881,7 @@ mod tests {
     }
 
     /// A loopback HTTP server answering each request from `respond(path)`.
-    fn serve(
+    pub(crate) fn serve(
         respond: impl Fn(&str) -> (u16, Vec<(&'static str, String)>, Vec<u8>) + Send + 'static,
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -821,7 +917,7 @@ mod tests {
         format!("http://127.0.0.1:{port}/registry/")
     }
 
-    fn sha(bytes: &[u8]) -> String {
+    pub(crate) fn sha(bytes: &[u8]) -> String {
         extension_package::hex(&Sha256::digest(bytes))
     }
 

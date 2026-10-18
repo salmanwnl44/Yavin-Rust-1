@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import type { DeclarativeContributions } from "../../services/extensions/declarative";
 import type { ExtensionHostManager } from "../../services/extensions/manager";
 import type { ExtensionRegistry } from "../../services/extensions/registry";
 import type { ExtensionInstaller } from "../../services/extensions/marketplace/installer";
@@ -58,6 +59,7 @@ export function ExtensionDetails({
   trusted,
   onClose,
   onUninstall,
+  declarative,
 }: {
   id: string;
   registry: ExtensionRegistry;
@@ -67,8 +69,15 @@ export function ExtensionDetails({
   trusted: boolean;
   onClose: () => void;
   onUninstall: (id: string) => void;
+  /** Extensions' themes and snippets as applied (EXT-04): what could not be. */
+  declarative?: DeclarativeContributions;
 }) {
   const state = useExtensionsState({ registry, manager, marketplace, installer });
+  const applied = useSyncExternalStore(
+    (listener) => declarative?.subscribe(listener) ?? (() => undefined),
+    () => declarative?.getSnapshot() ?? null,
+    () => declarative?.getSnapshot() ?? null,
+  );
   const entry = state.registry.extensions.find((one) => one.id === id);
   const [listing, setListing] = useState<{
     status: "loading" | "loaded" | "error";
@@ -254,6 +263,19 @@ export function ExtensionDetails({
           </div>
         </header>
 
+        {manifest?.vsix && (
+          <p
+            role="note"
+            data-testid="vsix-notice"
+            className="mx-8 mt-3 rounded border border-amber-900/60 bg-amber-950/30 px-3 py-2 text-[12px] text-amber-200/90"
+          >
+            A VS Code extension: Yavin installed only {manifest.vsix.supported.join(", ")}.
+            {manifest.vsix.code &&
+              " Its code does not run in Yavin, so its commands and other features are not available."}{" "}
+            Details are under Requirements.
+          </p>
+        )}
+
         <nav
           role="tablist"
           aria-label="Extension details"
@@ -347,13 +369,15 @@ export function ExtensionDetails({
                 (this Yavin: {EXTENSION_API})
               </Row>
               <Row label="Kind">
-                {(manifest
-                  ? manifest.main
-                    ? "code"
-                    : "declarative"
-                  : extension?.extensionKind) === "declarative"
-                  ? "Declarative: it only contributes; no code runs."
-                  : "Runs code in Yavin's extension host (needs a trusted folder)."}
+                {manifest?.vsix || latest?.packageFormat === "vsix"
+                  ? "A VS Code extension: its code never runs in Yavin; only its colour themes and snippets install."
+                  : (manifest
+                        ? manifest.main
+                          ? "code"
+                          : "declarative"
+                        : extension?.extensionKind) === "declarative"
+                    ? "Declarative: it only contributes; no code runs."
+                    : "Runs code in Yavin's extension host (needs a trusted folder)."}
               </Row>
               {(manifest?.dependencies.length ?? 0) > 0 && (
                 <Row label="Depends on">{manifest!.dependencies.join(", ")}</Row>
@@ -364,7 +388,7 @@ export function ExtensionDetails({
               {compatibility && (
                 <Row label="Compatibility">
                   {compatibility.compatible
-                    ? "Compatible"
+                    ? ["Compatible", ...(compatibility.notes ?? [])].join(" — ")
                     : `Incompatible — ${compatibility.reasons.join(" ")}`}
                 </Row>
               )}
@@ -373,6 +397,45 @@ export function ExtensionDetails({
                   Not trusted: installed extensions' code does not run here.
                 </Row>
               )}
+            </Section>
+          )}
+          {tab === "requirements" && manifest?.vsix && (
+            <Section title="VS Code compatibility">
+              <div data-testid="vsix-report">
+                {manifest.vsix.vscode && <Row label="Made for">VS Code {manifest.vsix.vscode}</Row>}
+                <Row label="Installed">{manifest.vsix.supported.join("; ")}</Row>
+                {manifest.vsix.ignored.length > 0 && (
+                  <Row label="Not supported">
+                    <ul className="list-disc pl-4">
+                      {manifest.vsix.ignored.map((line) => (
+                        <li key={line}>{line}</li>
+                      ))}
+                    </ul>
+                  </Row>
+                )}
+                {manifest.vsix.rejected.length > 0 && (
+                  <Row label="Refused">
+                    <ul className="list-disc pl-4">
+                      {manifest.vsix.rejected.map((line) => (
+                        <li key={line}>{line}</li>
+                      ))}
+                    </ul>
+                  </Row>
+                )}
+                {(applied?.problems[id]?.length ?? 0) > 0 && (
+                  <Row label="Not applied">
+                    <ul className="list-disc pl-4">
+                      {applied!.problems[id].map((line) => (
+                        <li key={line}>{line}</li>
+                      ))}
+                    </ul>
+                  </Row>
+                )}
+                <Row label="Signature">
+                  Not verified: Yavin checks the package's SHA-256 from its registry, not its
+                  publisher's signature.
+                </Row>
+              </div>
             </Section>
           )}
 
@@ -430,6 +493,16 @@ export function ExtensionDetails({
                       {extension.homepage}
                     </button>
                   </Row>
+                )}
+                {extension && (
+                  <Row label="Source">
+                    <span data-testid="extension-source">
+                      {marketplace.getSnapshot().providerLabel}
+                    </span>
+                  </Row>
+                )}
+                {extension?.deprecated && (
+                  <Row label="Deprecated">Its publisher marked it deprecated.</Row>
                 )}
                 {entry && <Row label="Installed in">{entry.origin}</Row>}
                 {entry?.shadowed.map((copy) => (

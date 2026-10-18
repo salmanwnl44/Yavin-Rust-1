@@ -19,14 +19,19 @@ export interface InProcessHostOptions {
 
 export function createInProcessTransport(options: InProcessHostOptions) {
   let started = 0;
-  let live: { exit(crashed: boolean, reason: string): void; deliver(text: string): void } | null =
-    null;
+  let live: {
+    exit(crashed: boolean, reason: string): void;
+    deliver(text: string): void;
+    log(line: string): void;
+    resident(): string[];
+  } | null = null;
   const transport: HostTransport = {
     async start(): Promise<HostChannel> {
       if (options.failStart) throw new Error(options.failStart);
       started++;
       const messageListeners = new Set<(text: string) => void>();
       const exitListeners = new Set<(end: { reason: string; crashed: boolean }) => void>();
+      const logListeners = new Set<(line: string) => void>();
       let identity: {
         workspaceId: string;
         hostGeneration: number;
@@ -160,6 +165,10 @@ export function createInProcessTransport(options: InProcessHostOptions) {
         deliver(text) {
           for (const listener of [...messageListeners]) listener(text);
         },
+        log(line) {
+          for (const listener of [...logListeners]) listener(line);
+        },
+        resident: () => [...extensions.keys()].sort(),
       };
       const self = live;
       return {
@@ -177,6 +186,10 @@ export function createInProcessTransport(options: InProcessHostOptions) {
           exitListeners.add(listener);
           return () => exitListeners.delete(listener);
         },
+        onLog(listener) {
+          logListeners.add(listener);
+          return () => logListeners.delete(listener);
+        },
         async stop() {
           self.exit(false, "The extension host ended.");
         },
@@ -191,5 +204,9 @@ export function createInProcessTransport(options: InProcessHostOptions) {
     crash: (reason = "The extension host exited with code 3.") => live?.exit(true, reason),
     /** A raw message from the host, as if it had sent it (malformed, stale, spoofed...). */
     deliverRaw: (text: string) => live?.deliver(text),
+    /** A line on the current host's stderr. */
+    stderr: (line: string) => live?.log(line),
+    /** The extensions loaded in the current host process (EXT-05: what still holds code). */
+    resident: () => live?.resident() ?? [],
   };
 }

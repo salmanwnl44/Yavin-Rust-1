@@ -4,7 +4,13 @@
  * marketplace), and the provider they choose.
  */
 import { native } from "../../native.ts";
-import { booleanSetting, stringSetting, type SettingsRegistry } from "../../settings/settings.ts";
+import {
+  booleanSetting,
+  enumSetting,
+  stringSetting,
+  type SettingsRegistry,
+} from "../../settings/settings.ts";
+import { createOpenVsxProvider, OPEN_VSX_URL } from "./openVsxProvider.ts";
 import { createYavinRegistryProvider, YAVIN_REGISTRY_PROVIDER } from "./yavinRegistry.ts";
 import type { ExtensionMarketplaceProvider } from "./types.ts";
 
@@ -18,6 +24,32 @@ export const MARKETPLACE_REGISTRY = stringSetting({
     "The address (https://…/) of the extension registry to use. Empty: Yavin's own registry. Set it only to a registry you trust.",
   section: SECTION,
   default: "",
+  maxLength: 500,
+  scopes: USER_ONLY,
+});
+
+/** Which marketplace the Extensions view browses (EXT-03). */
+export const MARKETPLACE_SOURCE = enumSetting<"yavin" | "openvsx">({
+  id: "extensions.marketplace.source",
+  title: "Marketplace",
+  description:
+    "Which marketplace the Extensions view browses. Open VSX lists VS Code extensions: they can be browsed, but Yavin cannot install or run them yet.",
+  section: SECTION,
+  default: "yavin",
+  options: [
+    { value: "yavin", label: "Yavin Extensions" },
+    { value: "openvsx", label: "Open VSX (browse only)" },
+  ],
+  scopes: USER_ONLY,
+});
+
+export const MARKETPLACE_OPEN_VSX = stringSetting({
+  id: "extensions.marketplace.openVsxUrl",
+  title: "Open VSX registry",
+  description:
+    "The address (https://…/) of the Open VSX registry to browse: open-vsx.org, or a private mirror you trust.",
+  section: SECTION,
+  default: OPEN_VSX_URL,
   maxLength: 500,
   scopes: USER_ONLY,
 });
@@ -42,7 +74,9 @@ export const MARKETPLACE_RECOMMENDATIONS = booleanSetting({
 });
 
 export const MARKETPLACE_SETTING_LIST = [
+  MARKETPLACE_SOURCE,
   MARKETPLACE_REGISTRY,
+  MARKETPLACE_OPEN_VSX,
   MARKETPLACE_AUTO_CHECK,
   MARKETPLACE_RECOMMENDATIONS,
 ] as const;
@@ -82,8 +116,25 @@ const browserStorage = () => {
   }
 };
 
-/** The provider Settings choose now: the registry they name, or Yavin's own. */
+/** The settings that choose the provider: a change to any of them chooses again. */
+export const MARKETPLACE_PROVIDER_SETTINGS: readonly string[] = [
+  MARKETPLACE_SOURCE.id,
+  MARKETPLACE_REGISTRY.id,
+  MARKETPLACE_OPEN_VSX.id,
+];
+
+/** The label of an Open VSX registry: open-vsx.org's own, or a mirror's host. */
+export function openVsxLabel(url: string): string {
+  const host = /^https?:\/\/([^/:]+)/i.exec(url)?.[1]?.toLowerCase();
+  return !host || host === "open-vsx.org" ? "Open VSX" : `Open VSX (${host})`;
+}
+
+/** The provider Settings choose now: Open VSX, the registry they name, or Yavin's own. */
 export function configuredProvider(settings: SettingsRegistry): ExtensionMarketplaceProvider {
+  if (settings.get(MARKETPLACE_SOURCE, null) === "openvsx") {
+    const url = settings.get(MARKETPLACE_OPEN_VSX, null).trim() || OPEN_VSX_URL;
+    return createOpenVsxProvider(url, { label: openVsxLabel(url) });
+  }
   const named = settings.get(MARKETPLACE_REGISTRY, null).trim();
   return lazyProvider(
     async () => {

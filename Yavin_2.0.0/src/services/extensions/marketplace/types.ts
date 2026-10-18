@@ -9,10 +9,22 @@
 export interface MarketplaceVersion {
   version: string;
   publishedAt?: string;
-  /** The Yavin extension API range it needs (`engines.yavin`). */
-  engines: { yavin?: string };
+  /**
+   * The Yavin extension API range it needs (`engines.yavin`); a VS Code extension's VS Code
+   * range (`engines.vscode`), when its registry says (EXT-03).
+   */
+  engines: { yavin?: string; vscode?: string };
   /** Platforms it is published for (`win32`, `darwin`, `linux`); absent: all. */
   platforms?: string[];
+  /** `vsix`: a VS Code extension package (Open VSX): only its themes and snippets install (EXT-04). */
+  packageFormat?: "vsix";
+  /**
+   * A VS Code extension whose publisher lists it under Themes or Snippets -- what Yavin can use
+   * of one; false: neither; absent: not known yet (a search entry). The package decides.
+   */
+  declarative?: boolean;
+  /** Published as a pre-release. */
+  preRelease?: boolean;
 }
 
 export interface ContributionSummary {
@@ -42,8 +54,10 @@ export interface MarketplaceExtension {
   repository?: string;
   homepage?: string;
   license?: string;
-  /** The latest version's engine range. */
-  engines: { yavin?: string };
+  /** The latest version's engine ranges. */
+  engines: { yavin?: string; vscode?: string };
+  /** Its registry marks it deprecated. */
+  deprecated?: boolean;
   /** `code` runs in the extension host; `declarative` only contributes. */
   extensionKind?: "code" | "declarative";
   activationEvents?: string[];
@@ -79,7 +93,9 @@ export interface SearchResult {
 /** Where the installer gets a package from; the native side downloads and verifies it. */
 export type PackageSource =
   | { kind: "registry"; registryUrl: string; path: string; sha256: string; size: number }
-  | { kind: "file"; path: string };
+  | { kind: "file"; path: string }
+  /** An Open VSX version (EXT-03): the native side reads its metadata, package and checksum. */
+  | { kind: "openVsx"; registryUrl: string; namespace: string; name: string };
 
 export interface ExtensionPackage {
   id: string;
@@ -136,7 +152,8 @@ export type MarketplaceErrorCode =
   | "PackageMissing"
   | "InstallFailed"
   | "UninstallFailed"
-  | "Busy";
+  | "Busy"
+  | "RateLimited";
 
 /** A marketplace failure, with a message for the user and the technical detail apart. */
 export class MarketplaceError extends Error {
@@ -161,6 +178,11 @@ export function marketplaceErrorOf(error: unknown, fallback: MarketplaceErrorCod
   const detail = code ? text.slice(code.length + 1).trim() : text;
   const known: Record<string, [MarketplaceErrorCode, string]> = {
     MarketplaceUnavailable: ["Unavailable", "The extension marketplace is unavailable."],
+    RateLimited: ["RateLimited", "The extension marketplace is limiting requests."],
+    UnsupportedPackage: [
+      "Incompatible",
+      `${what} is a VS Code extension; Yavin cannot install VS Code extensions yet.`,
+    ],
     InsecureTransport: [
       "Unavailable",
       "The extension marketplace is not reachable securely (HTTPS).",
@@ -192,5 +214,8 @@ export function marketplaceErrorOf(error: unknown, fallback: MarketplaceErrorCod
     UnknownExtension: ["UninstallFailed", `${what} is not installed in Yavin's extensions folder.`],
   };
   const [mapped, message] = (code && known[code]) || [fallback, `${what}: something went wrong.`];
+  // The registry's own wait ("try again in 30 s.") is the useful part.
+  if (mapped === "RateLimited")
+    return new MarketplaceError(mapped, `${message.replace(/\.$/, "")}; ${detail}`, detail);
   return new MarketplaceError(mapped, message, detail);
 }

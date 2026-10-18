@@ -10,6 +10,13 @@ import {
   type SettingsRegistry,
 } from "../services/settings/settings.ts";
 import type { WorkspaceId } from "../services/terminalProtocol.ts";
+import {
+  BUILTIN_THEMES,
+  DEFAULT_THEME,
+  editorThemes,
+  EXTENSION_THEME,
+  monacoThemeName,
+} from "./themes.ts";
 
 /**
  * The editor's settings, in one place. The ones a user chooses are settings (IDE-03, below),
@@ -32,7 +39,8 @@ export interface EditorSettings {
   smoothScrolling: boolean;
   stickyScroll: boolean;
   folding: boolean;
-  theme: "yavin-dark" | "yavin-light";
+  /** A Monaco theme: Yavin's own, or an extension's (`ext:<id>:<n>`, EXT-04). */
+  theme: string;
 }
 
 export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
@@ -113,17 +121,7 @@ export const EDITOR_SETTINGS = {
     section: SECTION,
     default: false,
   }),
-  theme: enumSetting({
-    id: "editor.theme",
-    title: "Theme",
-    description: "The editor's colour theme.",
-    section: SECTION,
-    default: DEFAULT_EDITOR_SETTINGS.theme,
-    options: [
-      { value: "yavin-dark", label: "Yavin Dark" },
-      { value: "yavin-light", label: "Yavin Light" },
-    ],
-  }),
+  theme: themeSetting(),
   zoom: numberSetting({
     id: "editor.zoom",
     title: "Zoom",
@@ -137,6 +135,33 @@ export const EDITOR_SETTINGS = {
     scopes: ["user"],
   }),
 };
+
+/**
+ * The editor's colour theme: Yavin's, or one an extension contributes (EXT-04) -- offered while
+ * it is installed and enabled. A chosen extension theme stays chosen; while it is not there the
+ * editor shows Yavin Dark (`resolveEditorSettings`).
+ */
+function themeSetting(): SettingDefinition<string> {
+  return Object.freeze({
+    id: "editor.theme",
+    title: "Theme",
+    description: "The editor's colour theme: Yavin's, or one an installed extension contributes.",
+    section: SECTION,
+    default: DEFAULT_THEME,
+    scopes: ["user", "workspace"] as const,
+    parse: (value: unknown) =>
+      typeof value === "string" &&
+      (BUILTIN_THEMES.some((one) => one.id === value) || EXTENSION_THEME.test(value))
+        ? value
+        : undefined,
+    get control() {
+      return {
+        kind: "enum" as const,
+        options: editorThemes.list().map((one) => ({ value: one.id, label: one.label })),
+      };
+    },
+  });
+}
 
 /** Every editor setting, for the registry. */
 export const EDITOR_SETTING_LIST: readonly SettingDefinition<unknown>[] =
@@ -168,7 +193,7 @@ export function resolveEditorSettings(
       tabSize: get(EDITOR_SETTINGS.tabSize),
       insertSpaces: get(EDITOR_SETTINGS.insertSpaces),
       lineNumbers: get(EDITOR_SETTINGS.lineNumbers),
-      theme: get(EDITOR_SETTINGS.theme),
+      theme: editorThemes.resolve(get(EDITOR_SETTINGS.theme)),
       minimap,
     },
     wordWrap: get(EDITOR_SETTINGS.wordWrap),
@@ -184,7 +209,7 @@ export function editorOptions(
   return {
     ariaLabel: view.ariaLabel,
     readOnly: view.readOnly,
-    theme: settings.theme,
+    theme: monacoThemeName(settings.theme),
     fontFamily: settings.fontFamily,
     fontSize: Math.round(settings.fontSize * view.zoom),
     lineHeight: Math.round(settings.lineHeight * view.zoom),

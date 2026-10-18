@@ -7,6 +7,7 @@ import {
   resolveEditorSettings,
   type ResolvedEditorSettings,
 } from "./editorSettings";
+import { editorThemes } from "./themes";
 
 /**
  * What the editor shows in `workspace`, as the settings resolve there (IDE-03): re-rendering
@@ -23,12 +24,27 @@ export function useEditorSettings(
     const ids = new Set(EDITOR_SETTING_LIST.map((definition) => definition.id));
     let snapshot = resolveEditorSettings(registry, workspace, minimap);
     return {
-      subscribe: (listener: () => void) =>
-        registry.subscribe(workspace, (change) => {
-          if (!ids.has(change.id)) return;
+      subscribe: (listener: () => void) => {
+        const refresh = () => {
           snapshot = resolveEditorSettings(registry, workspace, minimap);
           listener();
-        }),
+        };
+        const offSettings = registry.subscribe(workspace, (change) => {
+          if (ids.has(change.id)) refresh();
+        });
+        // Extensions' themes come and go (EXT-04): only a change to the theme shown matters.
+        const offThemes = editorThemes.subscribe(() => {
+          const next = resolveEditorSettings(registry, workspace, minimap);
+          if (next.settings.theme !== snapshot.settings.theme) {
+            snapshot = next;
+            listener();
+          }
+        });
+        return () => {
+          offSettings();
+          offThemes();
+        };
+      },
       getSnapshot: () => snapshot,
     };
   }, [registry, workspace, minimap]);

@@ -91,6 +91,21 @@ export interface MenuContribution {
   when: WhenClause | null;
 }
 
+/** A colour theme (EXT-04): a VS Code colour theme file, applied to the editor. */
+export interface ThemeContribution {
+  label: string;
+  /** The Monaco base it builds on. */
+  uiTheme: "vs" | "vs-dark" | "hc-black" | "hc-light";
+  /** The theme file, relative to the extension's folder. */
+  path: string;
+}
+
+/** Snippets for one language (EXT-04): a VS Code snippets file. */
+export interface SnippetContribution {
+  language: string;
+  path: string;
+}
+
 export interface Contributions {
   commands: CommandContribution[];
   keybindings: KeybindingContribution[];
@@ -98,6 +113,26 @@ export interface Contributions {
   views: ViewContribution[];
   viewContainers: ViewContainerContribution[];
   menus: MenuContribution[];
+  themes: ThemeContribution[];
+  snippets: SnippetContribution[];
+}
+
+/**
+ * A VS Code package this manifest was made from (EXT-04, `src-tauri/src/vsix.rs`): its
+ * published spelling, and what of it Yavin uses, leaves out and refused.
+ */
+export interface VsixOrigin {
+  publisher: string | null;
+  name: string | null;
+  /** Its `engines.vscode` range. */
+  vscode: string | null;
+  /** It has code (`main`, `browser`), which never runs in Yavin. */
+  code: boolean;
+  supported: string[];
+  ignored: string[];
+  rejected: string[];
+  /** Open VSX signatures are not verified (ARCHITECTURE.md). */
+  signature: "not verified";
 }
 
 export interface ExtensionManifest {
@@ -119,6 +154,8 @@ export interface ExtensionManifest {
   untrustedWorkspaces: boolean;
   /** Extensions that must be enabled, compatible and active first (`extensionDependencies`). */
   dependencies: string[];
+  /** Made from a VS Code package (EXT-04); null for a Yavin extension. */
+  vsix: VsixOrigin | null;
 }
 
 /** One thing wrong with a manifest. `field` is a JSON path into it. */
@@ -184,7 +221,16 @@ const CONTRIBUTION_POINTS = new Set([
   "views",
   "viewsContainers",
   "menus",
+  "themes",
+  "snippets",
 ]);
+const UI_THEMES = new Set(["vs", "vs-dark", "hc-black", "hc-light"]);
+/** A path inside the extension's folder: no `..`, no drive, not absolute. */
+const insidePath = (value: unknown): value is string =>
+  oneLine(value, 300) &&
+  !/(^|[\\/])\.\.([\\/]|$)/.test(value) &&
+  !/^([a-z]:|[\\/])/i.test(value) &&
+  !value.includes("\\");
 const MENU_LOCATIONS = new Set<MenuLocation>([
   "commandPalette",
   "view/title",
@@ -316,6 +362,8 @@ export function readManifest(value: unknown): ManifestResult {
     views: [],
     viewContainers: [],
     menus: [],
+    themes: [],
+    snippets: [],
   };
   const rawContributes = (raw.contributes ?? {}) as Record<string, unknown>;
   if (typeof rawContributes !== "object" || Array.isArray(rawContributes))
@@ -562,6 +610,80 @@ export function readManifest(value: unknown): ManifestResult {
           });
         }
     }
+
+    // Colour themes and snippets (EXT-04): data files, read and checked when applied.
+    list("themes").forEach((entry, index) => {
+      const field = `contributes.themes[${index}]`;
+      const theme = entry as Record<string, unknown>;
+      if (!theme || typeof theme !== "object") return error(field, "Must be an object.");
+      if (!oneLine(theme.label, 100)) return error(`${field}.label`, "Needs a label (one line).");
+      if (typeof theme.uiTheme !== "string" || !UI_THEMES.has(theme.uiTheme))
+        return error(`${field}.uiTheme`, 'Must be "vs", "vs-dark", "hc-black" or "hc-light".');
+      if (!insidePath(theme.path))
+        return error(`${field}.path`, "Must be a path inside the extension's folder.");
+      if (contributes.themes.some((existing) => existing.label === theme.label))
+        return error(field, `The theme "${theme.label}" is contributed twice.`);
+      contributes.themes.push({
+        label: theme.label as string,
+        uiTheme: theme.uiTheme as ThemeContribution["uiTheme"],
+        path: theme.path,
+      });
+    });
+    list("snippets").forEach((entry, index) => {
+      const field = `contributes.snippets[${index}]`;
+      const snippet = entry as Record<string, unknown>;
+      if (!snippet || typeof snippet !== "object") return error(field, "Must be an object.");
+      if (typeof snippet.language !== "string" || !LANGUAGE.test(snippet.language))
+        return error(`${field}.language`, "Must be a language id.");
+      if (!insidePath(snippet.path))
+        return error(`${field}.path`, "Must be a path inside the extension's folder.");
+      contributes.snippets.push({ language: snippet.language, path: snippet.path });
+    });
+  }
+
+  // The VS Code package it was made from, if any (EXT-04): data only, bounded.
+  let vsix: VsixOrigin | null = null;
+  if (raw.vsix !== undefined) {
+    const origin = raw.vsix as Record<string, unknown>;
+    const lines = (value: unknown) =>
+      Array.isArray(value) && value.length <= 200 && value.every((one) => oneLine(one, 1000))
+        ? (value as string[])
+        : null;
+    const optional = (value: unknown) =>
+      value === null || value === undefined ? null : oneLine(value, 100) ? value : undefined;
+    const [supported, ignored, rejected] = [
+      origin?.supported,
+      origin?.ignored,
+      origin?.rejected,
+    ].map(lines);
+    const [publisher, name, vscode] = [origin?.publisher, origin?.name, origin?.vscode].map(
+      optional,
+    );
+    if (
+      !origin ||
+      typeof origin !== "object" ||
+      !supported ||
+      !ignored ||
+      !rejected ||
+      publisher === undefined ||
+      name === undefined ||
+      vscode === undefined ||
+      typeof origin.code !== "boolean" ||
+      origin.signature !== "not verified"
+    )
+      error("vsix", "Must be the report of a VS Code package Yavin adapted.");
+    else
+      vsix = {
+        publisher,
+        name,
+        vscode,
+        code: origin.code,
+        supported,
+        ignored,
+        rejected,
+        signature: "not verified",
+      };
+    if (main !== null) error("main", "A manifest made from a VS Code package has no code.");
   }
 
   for (const event of activationEvents)
@@ -589,6 +711,7 @@ export function readManifest(value: unknown): ManifestResult {
     "repository",
     "icon",
     "keywords",
+    "vsix",
   ]);
   for (const key of Object.keys(raw))
     if (!known.has(key)) warn(key, `"${key}" is not a manifest field this Yavin reads; ignored.`);
@@ -611,6 +734,7 @@ export function readManifest(value: unknown): ManifestResult {
       contributes,
       untrustedWorkspaces,
       dependencies,
+      vsix,
     },
   };
 }

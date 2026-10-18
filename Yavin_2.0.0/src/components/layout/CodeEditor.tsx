@@ -14,6 +14,8 @@ import { addReferencesAction, installLanguageFeatures } from "../../editor/lspMo
 import { createDiffView } from "../../editor/diff";
 import { attachDebugDecorations } from "../../editor/debugMonaco";
 import { attachExtensionEditor } from "../../editor/extensionMonaco";
+import { attachDeclarativeSnippets, defineDeclarativeThemes } from "../../editor/declarativeMonaco";
+import type { DeclarativeContributions } from "../../services/extensions/declarative";
 import type {
   DecorationStore,
   DocumentInfo,
@@ -139,6 +141,8 @@ export default function CodeEditor({
       when: { key: "resourceExtname" | "resourceLangId"; value: string } | null;
     }[];
     onRunCommand: (command: string) => void;
+    /** Extensions' snippets (EXT-04). */
+    declarative?: DeclarativeContributions;
   };
 }) {
   const container = useRef<HTMLDivElement>(null);
@@ -258,6 +262,19 @@ export default function CodeEditor({
       extensionInfo,
     );
   }, [bridge, extensionProviders, extensionDecorationStore, extensionInfo]);
+  // Extensions' snippets (EXT-04), for each document's own language.
+  const declarativeStore = extensions?.declarative;
+  useEffect(() => {
+    if (!declarativeStore) return;
+    return attachDeclarativeSnippets(bridge, declarativeStore);
+  }, [bridge, declarativeStore]);
+
+  // Extensions' colour themes (EXT-04), defined before the editor is made so one it is set to
+  // exists when it starts.
+  useEffect(() => {
+    if (!declarativeStore) return;
+    return defineDeclarativeThemes(declarativeStore);
+  }, [declarativeStore]);
 
   // The one Monaco editor.
   useEffect(() => {
