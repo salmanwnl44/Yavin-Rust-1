@@ -483,11 +483,12 @@ fn reveal_in_explorer(state: State<'_, Workspace>, path: String) -> Result<(), S
 #[tauri::command]
 fn open_folder_dialog(
     app: AppHandle,
+    webview: tauri::Webview,
     state: State<'_, Workspace>,
     watch: State<'_, Watch>,
 ) -> Result<Option<String>, String> {
     file_tree::pick_workspace_folder()?
-        .map(|path| enter_workspace(&app, &state, &watch, &path))
+        .map(|path| enter_workspace(&app, webview.label(), &state, &watch, &path))
         .transpose()
 }
 
@@ -508,6 +509,7 @@ fn workspace_for(path: &Path) -> Result<(WorkspaceManager, String), String> {
 /// Makes `path` the window's workspace and starts watching it, whichever way it was chosen.
 fn enter_workspace(
     app: &AppHandle,
+    window: &str,
     state: &State<'_, Workspace>,
     watch: &State<'_, Watch>,
     path: &str,
@@ -523,8 +525,15 @@ fn enter_workspace(
     // A debug session belongs to the workspace it debugs: the renderer ends it on leaving, and
     // whatever adapter (and debuggee) is left is ended here rather than outliving it (IDE-05).
     dap::stop_all(&app.state::<DapSessions>());
-    // So are the workspace's extension hosts: an extension of A never runs on in B (IDE-08).
-    extension_host::stop_all(&app.state::<ExtHostSessions>());
+    // So are the window's extension hosts: an extension of A never runs on in B (IDE-08) --
+    // and any host started in another workspace than this one (EXT-11).
+    let entered = state
+        .0
+        .lock()
+        .ok()
+        .and_then(|open| open.as_ref().map(|m| m.root().display().to_string()));
+    app.state::<ExtHostSessions>()
+        .workspace_entered(window, entered.as_deref());
     // Its terminals are not: switching workspace detaches their views and the workspace's
     // TerminalService keeps them (TERMINAL-03); the page and the application end them.
     watch_workspace(app, watch, &watched);
@@ -544,11 +553,12 @@ fn enter_workspace(
 #[tauri::command(async)]
 fn open_workspace(
     app: AppHandle,
+    webview: tauri::Webview,
     state: State<'_, Workspace>,
     watch: State<'_, Watch>,
     path: String,
 ) -> Result<String, String> {
-    enter_workspace(&app, &state, &watch, &path)
+    enter_workspace(&app, webview.label(), &state, &watch, &path)
 }
 
 // A side-effect-free folder picker: unlike `open_folder_dialog`, this never replaces
@@ -692,6 +702,22 @@ pub fn run() {
         .manage(LspSessions::default())
         .manage(DapSessions::default())
         .manage(ExtHostSessions::default())
+        // A window's extension hosts are its own (EXT-11): its page loading again ends what the
+        // earlier page started, and so does the window closing -- no other window's.
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                webview
+                    .state::<ExtHostSessions>()
+                    .page_loaded(webview.label());
+            }
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                window
+                    .state::<ExtHostSessions>()
+                    .window_closed(window.label());
+            }
+        })
         .manage(ExtensionService::default())
         .manage(Recovery::default())
         .manage(LocalGit::default())

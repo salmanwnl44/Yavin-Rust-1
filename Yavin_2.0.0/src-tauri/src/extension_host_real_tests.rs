@@ -1383,3 +1383,647 @@ fn concurrent_starts_leave_one_host_running() {
     assert_eq!(speaking.len(), 1, "{speaking:?} of {sessions:?}");
     assert_eq!(yavin.next_message(speaking[0])["type"], "ready");
 }
+
+// --- EXT-11: windows -----------------------------------------------------------------------------
+
+/// One window's side: its owner and the events sent to it (and only those).
+struct Window {
+    owner: HostOwner,
+    events: Receiver<(u32, Event)>,
+    sink: Arc<Channel>,
+    /// The sessions this window started: the only ones it may hear of.
+    mine: Mutex<std::collections::HashSet<u32>>,
+}
+
+impl Window {
+    fn new(label: &str) -> Window {
+        let (sender, events) = channel();
+        Window {
+            owner: HostOwner {
+                window: label.into(),
+                page: 0,
+            },
+            events,
+            sink: Arc::new(Channel(Mutex::new(sender))),
+            mine: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    fn own(&self, session: u32) {
+        self.mine.lock().unwrap().insert(session);
+    }
+
+    /// The next event -- which must be one of this window's own sessions'.
+    fn next(&self) -> (u32, Event) {
+        let (session, event) = self
+            .events
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the host answers in time");
+        assert!(
+            self.mine.lock().unwrap().contains(&session),
+            "{} got session {session}'s event, not its own: {event:?}",
+            self.owner.window
+        );
+        (session, event)
+    }
+
+    /// The next message of `session` (this window's other sessions' events are passed over).
+    fn next_message(&self, session: u32) -> Value {
+        loop {
+            match self.next() {
+                (s, Event::Message(value)) if s == session => return value,
+                (s, Event::Exit(code, error)) if s == session => {
+                    panic!("the host ended: {code:?} {error:?}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Nothing more arrived for this window.
+    fn quiet(&self) {
+        if let Ok((session, event)) = self.events.recv_timeout(Duration::from_millis(300)) {
+            panic!("{} got {event:?} of session {session}", self.owner.window);
+        }
+    }
+
+    fn exit_of(&self, session: u32) -> Option<i32> {
+        loop {
+            if let (s, Event::Exit(code, _)) = self.next() {
+                if s == session {
+                    return code;
+                }
+            }
+        }
+    }
+}
+
+impl Yavin {
+    fn start_in(&self, window: &Window, workspace: Option<&str>) -> Result<u32, String> {
+        let session = self.sessions.start_for(
+            &window.owner,
+            workspace.map(str::to_string),
+            &built_host(),
+            HostResources::default(),
+            window.sink.clone(),
+            self.authority.clone(),
+        )?;
+        window.own(session);
+        Ok(session)
+    }
+
+    fn send_in(&self, window: &Window, session: u32, message: Value) -> Result<(), String> {
+        self.sessions
+            .send_as(&window.owner, session, &message.to_string())
+    }
+
+    fn to_in(
+        &self,
+        window: &Window,
+        session: u32,
+        generation: u64,
+        extension: &str,
+        mut message: Value,
+    ) {
+        let object = message.as_object_mut().unwrap();
+        object.insert("extensionId".into(), json!(extension));
+        object.insert("workspaceId".into(), json!(WS));
+        object.insert("hostGeneration".into(), json!(generation));
+        self.send_in(window, session, message).unwrap();
+    }
+
+    fn handshake_in(&self, window: &Window, session: u32, generation: u64) {
+        self.send_in(window, session, json!({"type": "init", "workspaceId": WS, "hostGeneration": generation, "workspaceFolder": "C:/work", "apiVersion": "2.0.0", "limits": {}}))
+            .unwrap();
+        assert_eq!(window.next_message(session)["type"], "ready");
+    }
+
+    fn load_in(&self, window: &Window, session: u32, generation: u64, extension: &str) -> Value {
+        self.to_in(
+            window,
+            session,
+            generation,
+            extension,
+            json!({"type": "load"}),
+        );
+        loop {
+            let message = window.next_message(session);
+            if message["type"] == "loaded" || message["type"] == "error" {
+                return message;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ask_in(
+        &self,
+        window: &Window,
+        session: u32,
+        generation: u64,
+        extension: &str,
+        id: &str,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        self.to_in(
+            window,
+            session,
+            generation,
+            extension,
+            json!({"type": "request", "requestId": id, "method": method, "params": params}),
+        );
+        loop {
+            let message = window.next_message(session);
+            if message["type"] == "request" {
+                self.to_in(window, session, generation, extension, json!({"type": "response", "requestId": message["requestId"], "ok": true, "result": null}));
+                continue;
+            }
+            if message["type"] == "response" && message["requestId"] == json!(id) {
+                return message;
+            }
+        }
+    }
+
+    /// A window's host with the Hello World sample active in it.
+    fn greeter_in(&self, window: &Window, generation: u64) -> u32 {
+        let session = self.start_in(window, None).unwrap();
+        self.handshake_in(window, session, generation);
+        assert_eq!(
+            self.load_in(window, session, generation, SAMPLE)["type"],
+            "loaded"
+        );
+        let activated = self.ask_in(
+            window,
+            session,
+            generation,
+            SAMPLE,
+            "a",
+            "activate",
+            json!({"globalState": {}, "workspaceState": {}, "configuration": {}}),
+        );
+        assert_eq!(activated["ok"], true, "{activated}");
+        session
+    }
+
+    fn greet_in(&self, window: &Window, session: u32, generation: u64, id: &str) -> Value {
+        self.ask_in(
+            window,
+            session,
+            generation,
+            SAMPLE,
+            id,
+            "command.run",
+            json!({"id": "yavin-samples.hello-world.greet", "args": []}),
+        )
+    }
+}
+
+/// Whether `pid` runs in an AppContainer, in a job (EXT-10).
+#[cfg(windows)]
+fn sandboxed(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenIsAppContainer, TOKEN_QUERY};
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: handles opened here, queried into buffers of the size given, closed once.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let mut token: HANDLE = std::ptr::null_mut();
+        let (mut is, mut size, mut job) = (0u32, 0u32, 0);
+        let ok = OpenProcessToken(process, TOKEN_QUERY, &mut token) != 0
+            && GetTokenInformation(
+                token,
+                TokenIsAppContainer,
+                &mut is as *mut _ as _,
+                4,
+                &mut size,
+            ) != 0
+            && IsProcessInJob(process, std::ptr::null_mut(), &mut job) != 0;
+        CloseHandle(token);
+        CloseHandle(process);
+        ok && is != 0 && job != 0
+    }
+}
+
+/// Two windows run the same extension, each in its own host: the same command in both, each
+/// answered in its own window; every event goes to its owner alone; both hosts are sandboxed
+/// processes of their own (EXT-10).
+#[test]
+fn two_windows_run_the_same_extension_independently() {
+    let yavin = Yavin::new("two-windows", &[]);
+    let (a, b) = (Window::new("window-a"), Window::new("window-b"));
+    let in_a = yavin.greeter_in(&a, 21_001);
+    let in_b = yavin.greeter_in(&b, 22_001);
+    assert_ne!(in_a, in_b);
+    assert_eq!(
+        yavin.sessions.running_hosts(),
+        2,
+        "starting B did not retire A"
+    );
+    for round in 0..3 {
+        let id = format!("g{round}");
+        assert_eq!(
+            yavin.greet_in(&a, in_a, 21_001, &id)["result"],
+            "Hello, world!"
+        );
+        assert_eq!(
+            yavin.greet_in(&b, in_b, 22_001, &id)["result"],
+            "Hello, world!"
+        );
+    }
+    a.quiet();
+    b.quiet();
+    let (pa, pb) = (
+        yavin.sessions.process_id(in_a).unwrap(),
+        yavin.sessions.process_id(in_b).unwrap(),
+    );
+    assert_ne!(pa, pb, "a process each");
+    #[cfg(windows)]
+    assert!(sandboxed(pa) && sandboxed(pb), "each in its sandbox");
+}
+
+/// Two windows with different extensions: each host holds only what its window loaded -- the
+/// other's extension is not loaded there, and is refused at once (not passed on).
+#[test]
+fn two_windows_hold_different_extensions() {
+    let yavin = Yavin::new(
+        "two-extensions",
+        &[
+            (
+                "acme.one",
+                r#"module.exports.activate = function (c, yavin) { c.subscriptions.push(yavin.commands.registerCommand("acme.one.who", function () { return "one"; })); };"#,
+            ),
+            (
+                "acme.two",
+                r#"module.exports.activate = function (c, yavin) { c.subscriptions.push(yavin.commands.registerCommand("acme.two.who", function () { return "two"; })); };"#,
+            ),
+        ],
+    );
+    let (a, b) = (Window::new("window-a"), Window::new("window-b"));
+    let in_a = yavin.start_in(&a, None).unwrap();
+    let in_b = yavin.start_in(&b, None).unwrap();
+    yavin.handshake_in(&a, in_a, 23_001);
+    yavin.handshake_in(&b, in_b, 24_001);
+    assert_eq!(
+        yavin.load_in(&a, in_a, 23_001, "acme.one")["type"],
+        "loaded"
+    );
+    assert_eq!(
+        yavin.load_in(&b, in_b, 24_001, "acme.two")["type"],
+        "loaded"
+    );
+    assert_eq!(
+        yavin.ask_in(&a, in_a, 23_001, "acme.one", "a", "activate", json!({}))["ok"],
+        true
+    );
+    assert_eq!(
+        yavin.ask_in(&b, in_b, 24_001, "acme.two", "a", "activate", json!({}))["ok"],
+        true
+    );
+    assert_eq!(
+        yavin.ask_in(
+            &a,
+            in_a,
+            23_001,
+            "acme.one",
+            "w",
+            "command.run",
+            json!({"id": "acme.one.who", "args": []})
+        )["result"],
+        "one"
+    );
+    assert_eq!(
+        yavin.ask_in(
+            &b,
+            in_b,
+            24_001,
+            "acme.two",
+            "w",
+            "command.run",
+            json!({"id": "acme.two.who", "args": []})
+        )["result"],
+        "two"
+    );
+    // Window A asking for B's extension in its own host: not loaded there.
+    let refused = yavin
+        .send_in(&a, in_a, json!({"type": "request", "requestId": "x", "method": "command.run", "params": {"id": "acme.two.who", "args": []}, "extensionId": "acme.two", "workspaceId": WS, "hostGeneration": 23_001}))
+        .unwrap_err();
+    assert!(refused.starts_with("NotLoaded"), "{refused}");
+    a.quiet();
+    b.quiet();
+}
+
+/// What another window says about a host is refused natively: B cannot speak to, stop or
+/// answer A's host; an earlier page of A is not A; a session that is not one is not; a stamp
+/// of another generation is stale -- and A's host carries on through all of it.
+#[test]
+fn another_windows_or_pages_identity_is_refused() {
+    let yavin = Yavin::new("forged", &[]);
+    let (a, b) = (Window::new("window-a"), Window::new("window-b"));
+    let in_a = yavin.greeter_in(&a, 25_001);
+    let in_b = yavin.greeter_in(&b, 26_001);
+    let request = json!({"type": "request", "requestId": "f", "method": "command.run", "params": {"id": "yavin-samples.hello-world.greet", "args": []}, "extensionId": SAMPLE, "workspaceId": WS, "hostGeneration": 25_001});
+    for forged in [
+        request.clone(),
+        json!({"type": "response", "requestId": "r1", "ok": true, "result": null, "extensionId": SAMPLE, "workspaceId": WS, "hostGeneration": 25_001}),
+        json!({"type": "shutdown"}),
+    ] {
+        let refused = yavin.send_in(&b, in_a, forged).unwrap_err();
+        assert!(refused.starts_with("NotOwner"), "{refused}");
+    }
+    let refused = yavin.sessions.stop_as(&b.owner, in_a).unwrap_err();
+    assert!(refused.starts_with("NotOwner"), "{refused}");
+    // A window that is not one, a session that is not one.
+    let nobody = HostOwner {
+        window: "window-c".into(),
+        page: 0,
+    };
+    assert!(yavin
+        .sessions
+        .send_as(&nobody, in_a, "{}")
+        .unwrap_err()
+        .starts_with("NotOwner"));
+    assert!(yavin
+        .sessions
+        .send_as(&a.owner, 999_999, "{}")
+        .unwrap_err()
+        .starts_with("HostStopped"));
+    // A's own window, another generation: stale.
+    let stale = json!({"type": "request", "requestId": "s", "method": "command.run", "params": {"id": "yavin-samples.hello-world.greet", "args": []}, "extensionId": SAMPLE, "workspaceId": WS, "hostGeneration": 26_001});
+    assert!(yavin
+        .send_in(&a, in_a, stale)
+        .unwrap_err()
+        .starts_with("StaleGeneration"));
+    assert_eq!(
+        yavin.greet_in(&a, in_a, 25_001, "ok")["result"],
+        "Hello, world!"
+    );
+    assert_eq!(
+        yavin.greet_in(&b, in_b, 26_001, "ok")["result"],
+        "Hello, world!"
+    );
+    // A loads its page again: its earlier page's owner is no longer A, and that page's host ends.
+    yavin.sessions.page_loaded("window-a");
+    let _ = a.exit_of(in_a);
+    let refused = yavin.send_in(&a, in_a, request).unwrap_err();
+    assert!(
+        refused.starts_with("NotOwner") || refused.starts_with("HostStopped"),
+        "{refused}"
+    );
+    // A start the earlier page asked for is refused; the new page's starts.
+    assert!(yavin
+        .start_in(&a, None)
+        .unwrap_err()
+        .starts_with("NotOwner"));
+    let new_a = Window {
+        owner: yavin.sessions.owner_of("window-a"),
+        ..Window::new("window-a")
+    };
+    assert_eq!(new_a.owner.page, 1);
+    let again = yavin.greeter_in(&new_a, 25_002);
+    assert_eq!(
+        yavin.greet_in(&new_a, again, 25_002, "n")["result"],
+        "Hello, world!"
+    );
+    assert_eq!(
+        yavin.greet_in(&b, in_b, 26_001, "still")["result"],
+        "Hello, world!"
+    );
+}
+
+/// Closing one window ends its host -- reported once, to it -- and nothing of the other's.
+#[test]
+fn closing_one_window_leaves_the_other_working() {
+    let yavin = Yavin::new("close-one", &[]);
+    let (a, b) = (Window::new("window-a"), Window::new("window-b"));
+    let in_a = yavin.greeter_in(&a, 27_001);
+    let in_b = yavin.greeter_in(&b, 28_001);
+    yavin.sessions.window_closed("window-a");
+    let _ = a.exit_of(in_a);
+    a.quiet();
+    assert_eq!(yavin.sessions.running_hosts_of("window-a"), 0);
+    assert_eq!(yavin.sessions.running_hosts_of("window-b"), 1);
+    assert_eq!(
+        yavin.greet_in(&b, in_b, 28_001, "after")["result"],
+        "Hello, world!"
+    );
+    b.quiet();
+    // Closing it again changes nothing.
+    yavin.sessions.window_closed("window-a");
+    assert_eq!(
+        yavin.greet_in(&b, in_b, 28_001, "again")["result"],
+        "Hello, world!"
+    );
+}
+
+/// Restarting one window's host retires its old one -- nothing of it is heard or taken any
+/// more -- and the other window's host is not touched; a crash in one is that window's alone.
+#[test]
+fn restarting_or_crashing_one_window_does_not_touch_the_other() {
+    let yavin = Yavin::new("restart-one", &[]);
+    let (a, b) = (Window::new("window-a"), Window::new("window-b"));
+    let first = yavin.greeter_in(&a, 29_001);
+    let in_b = yavin.greeter_in(&b, 30_001);
+    let second = yavin.greeter_in(&a, 29_002);
+    let refused = yavin
+        .send_in(&a, first, json!({"type": "shutdown"}))
+        .unwrap_err();
+    assert!(
+        refused.starts_with("HostRetired") || refused.starts_with("HostStopped"),
+        "{refused}"
+    );
+    assert_eq!(
+        yavin.greet_in(&a, second, 29_002, "g")["result"],
+        "Hello, world!"
+    );
+    assert_eq!(
+        yavin.greet_in(&b, in_b, 30_001, "g")["result"],
+        "Hello, world!"
+    );
+    // A's crashes hold A's starts, not B's.
+    for _ in 0..MAX_CRASHES {
+        let session = yavin.start_in(&a, None).unwrap();
+        yavin.handshake_in(&a, session, 29_100);
+        kill(yavin.sessions.process_id(session).unwrap());
+        loop {
+            if let (s, Event::Exit(..)) = a.next() {
+                if s == session {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(yavin
+        .start_in(&a, None)
+        .unwrap_err()
+        .starts_with("HostCrashedRepeatedly"));
+    assert_eq!(
+        yavin.greet_in(&b, in_b, 30_001, "after")["result"],
+        "Hello, world!"
+    );
+    let c = Window::new("window-c");
+    assert!(yavin.start_in(&c, None).is_ok(), "another window starts");
+}
+
+/// Starts at once: for one window, one host runs; for different windows, one each.
+#[test]
+fn concurrent_starts_are_one_per_window() {
+    let yavin = Yavin::new("concurrent-windows", &[]);
+    let (a, b) = (Window::new("window-a"), Window::new("window-b"));
+    let program = built_host();
+    std::thread::scope(|scope| {
+        let mut started = Vec::new();
+        for window in [&a, &b, &a, &b, &a, &b, &a, &b] {
+            let (sessions, sink, authority, program) = (
+                &yavin.sessions,
+                window.sink.clone(),
+                yavin.authority.clone(),
+                &program,
+            );
+            let owner = window.owner.clone();
+            started.push((
+                window,
+                scope.spawn(move || {
+                    sessions
+                        .start_for(
+                            &owner,
+                            None,
+                            program,
+                            HostResources::default(),
+                            sink,
+                            authority,
+                        )
+                        .unwrap()
+                }),
+            ));
+        }
+        for (window, handle) in started {
+            window.own(handle.join().unwrap());
+        }
+    });
+    assert_eq!(yavin.sessions.running_hosts_of("window-a"), 1);
+    assert_eq!(yavin.sessions.running_hosts_of("window-b"), 1);
+    assert_eq!(yavin.sessions.running_hosts(), 2);
+}
+
+/// Entering a workspace ends the entering window's hosts, and any host started in another
+/// workspace than the one entered (Yavin's native workspace is one); another window's host in
+/// that workspace carries on.
+#[test]
+fn entering_a_workspace_ends_only_what_it_must() {
+    let yavin = Yavin::new("workspaces", &[]);
+    let (a, b) = (Window::new("window-a"), Window::new("window-b"));
+    let in_a = yavin.start_in(&a, Some("C:/w1")).unwrap();
+    let in_b = yavin.start_in(&b, Some("C:/w1")).unwrap();
+    yavin.handshake_in(&a, in_a, 31_001);
+    yavin.handshake_in(&b, in_b, 32_001);
+    // A opens the same workspace again: its host ends, B's does not.
+    yavin.sessions.workspace_entered("window-a", Some("C:/w1"));
+    let _ = a.exit_of(in_a);
+    assert_eq!(yavin.sessions.running_hosts_of("window-b"), 1);
+    assert!(yavin.send_in(&b, in_b, json!({"type": "init", "workspaceId": WS, "hostGeneration": 32_001, "apiVersion": "2.0.0"})).is_ok());
+    // A moves to another workspace: B's host, in the workspace Yavin left, ends too.
+    let in_a = yavin.start_in(&a, Some("C:/w1")).unwrap();
+    yavin.sessions.workspace_entered("window-a", Some("C:/w2"));
+    let _ = a.exit_of(in_a);
+    let _ = b.exit_of(in_b);
+    assert_eq!(yavin.sessions.running_hosts(), 0);
+}
+
+/// Revoking trust holds in every window at once (it is the application's); restoring it,
+/// every window's host acts again. A window cannot use another's pending request either.
+#[test]
+fn a_revocation_holds_in_every_window_and_pending_requests_stay_with_their_window() {
+    let yavin = Yavin::new("revoke-windows", &[]);
+    let (a, b) = (Window::new("window-a"), Window::new("window-b"));
+    let in_a = yavin.greeter_in(&a, 33_001);
+    let in_b = yavin.greeter_in(&b, 34_001);
+    yavin.authority.trusted.store(false, Ordering::SeqCst);
+    for (window, session, generation) in [(&a, in_a, 33_001), (&b, in_b, 34_001)] {
+        let refused = yavin
+            .send_in(window, session, json!({"type": "request", "requestId": "r", "method": "command.run", "params": {"id": "yavin-samples.hello-world.greet", "args": []}, "extensionId": SAMPLE, "workspaceId": WS, "hostGeneration": generation}))
+            .unwrap_err();
+        assert!(refused.starts_with("TrustRequired"), "{refused}");
+    }
+    yavin.authority.trusted.store(true, Ordering::SeqCst);
+    assert_eq!(
+        yavin.greet_in(&a, in_a, 33_001, "back")["result"],
+        "Hello, world!"
+    );
+    assert_eq!(
+        yavin.greet_in(&b, in_b, 34_001, "back")["result"],
+        "Hello, world!"
+    );
+}
+
+/// Yavin exiting during a start and an active request: every host of every window ends, each
+/// end reported once, and nothing starts afterwards.
+#[test]
+fn exiting_ends_every_window_once_and_starts_nothing_after() {
+    let yavin = Yavin::new(
+        "exit-windows",
+        &[(
+            "acme.spin",
+            r#"module.exports.activate = function (c, yavin) { c.subscriptions.push(yavin.commands.registerCommand("acme.spin.spin", function () { while (true) {} })); };"#,
+        )],
+    );
+    let (a, b) = (Window::new("window-a"), Window::new("window-b"));
+    let in_a = yavin.start_in(&a, None).unwrap();
+    yavin.handshake_in(&a, in_a, 35_001);
+    assert_eq!(
+        yavin.load_in(&a, in_a, 35_001, "acme.spin")["type"],
+        "loaded"
+    );
+    assert_eq!(
+        yavin.ask_in(&a, in_a, 35_001, "acme.spin", "a", "activate", json!({}))["ok"],
+        true
+    );
+    // A request running in A's host...
+    yavin.to_in(&a, in_a, 35_001, "acme.spin", json!({"type": "request", "requestId": "spin", "method": "command.run", "params": {"id": "acme.spin.spin", "args": []}}));
+    let program = built_host();
+    std::thread::scope(|scope| {
+        // ...and B starting while Yavin exits.
+        let starting = {
+            let (sessions, sink, authority, owner, program) = (
+                &yavin.sessions,
+                b.sink.clone(),
+                yavin.authority.clone(),
+                b.owner.clone(),
+                &program,
+            );
+            scope.spawn(move || {
+                sessions.start_for(
+                    &owner,
+                    None,
+                    program,
+                    HostResources::default(),
+                    sink,
+                    authority,
+                )
+            })
+        };
+        yavin.sessions.stop_all();
+        if let Ok(in_b) = starting.join().unwrap() {
+            // It started before the exit: ended with the rest.
+            b.own(in_b);
+            let _ = b.exit_of(in_b);
+        }
+    });
+    let mut ends = 0;
+    while let Ok((session, event)) = a.events.recv_timeout(Duration::from_secs(5)) {
+        if let Event::Exit(..) = event {
+            assert_eq!(session, in_a);
+            ends += 1;
+        }
+    }
+    assert_eq!(ends, 1, "its end is reported once");
+    b.quiet();
+    assert_eq!(yavin.sessions.running_hosts(), 0);
+    let refused = yavin.start_in(&b, None).unwrap_err();
+    assert!(refused.starts_with("HostStopped"), "{refused}");
+}

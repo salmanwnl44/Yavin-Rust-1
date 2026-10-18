@@ -7,7 +7,7 @@
  * extension makes (EXT-07): one it refuses never arrives as a message, only as
  * `ext-host-denied`, saying which extension, method and capability.
  */
-import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { native, type NativeHostResources } from "../native.ts";
 
 export interface HostChannel {
@@ -72,8 +72,15 @@ function deliver(session: number, item: Item) {
   early.set(session, held);
 }
 
-const ensureListening = () =>
-  (listening ??= Promise.all([
+/**
+ * The host events of this window's own hosts (EXT-11): the native side sends each host's events
+ * to the window that owns it alone, so this listens as this window, not to every window's.
+ */
+const ensureListening = () => {
+  if (listening) return listening;
+  const window = getCurrentWebviewWindow();
+  const listen: typeof window.listen = (event, handler) => window.listen(event, handler);
+  return (listening = Promise.all([
     listen<Payload & { message: string }>("ext-host-message", (event) =>
       deliver(event.payload.session, { kind: "message", message: event.payload.message }),
     ),
@@ -92,6 +99,7 @@ const ensureListening = () =>
       }),
     ),
   ]).then(() => undefined));
+};
 
 /** Hosts an earlier page left running are ended, once, before this page starts its first. */
 let leftoversStopped: Promise<void> | null = null;

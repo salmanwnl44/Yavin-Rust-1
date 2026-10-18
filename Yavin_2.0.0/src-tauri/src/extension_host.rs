@@ -37,6 +37,13 @@
 //!   sends is bounded here too: requests waiting for the window (`MAX_PENDING`), messages per
 //!   second (`Budget`), and hosts that keep crashing are not started again at once.
 //!
+//! - **owned by a window (EXT-11).** Every host belongs to the window that started it: its
+//!   native label (from the IPC call, never the renderer's word) and that window's page
+//!   generation (`HostOwner`). Only its owner can speak to it or stop it (`NotOwner`), its
+//!   events go to that window alone (`emit_to`), and starting one retires only its owner's
+//!   others. A page load or a closed window ends that window's hosts; a host is bound to the
+//!   workspace it started in, and its authority refuses once that is no longer the workspace.
+//!
 //! The work is done by `ExtHostSessions` (no Tauri in it, so the real host is tested through
 //! the same code the application runs); the commands add trust, the inventory's choices and
 //! the window's events (`AppAuthority`). Errors are `Code: message`, mapped by the renderer to
@@ -555,11 +562,31 @@ const MAX_LOG_LINE: usize = 1000;
 /// `MAX_LOG_LINES`, so what it said last -- before a crash -- is not lost. Bounded.
 const RECENT_LINES: usize = 20;
 
-/// A running host: its process and its permission state.
+/// Who a host belongs to (EXT-11): a window -- its native label -- and that window's page
+/// generation (a reload is a new page: what the old one started is not the new one's).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HostOwner {
+    pub window: String,
+    pub page: u64,
+}
+
+/// The owner tests speak as: the one window of a test (page 0, never reloaded).
+#[cfg(test)]
+pub fn test_owner() -> HostOwner {
+    HostOwner {
+        window: "main".into(),
+        page: 0,
+    }
+}
+
+/// A running host: its process, its permission state, whose it is and where it runs.
 #[derive(Clone)]
 struct Host {
     process: Arc<ServerProcess>,
     shared: Arc<Shared>,
+    owner: HostOwner,
+    /// The workspace it was started in (EXT-11).
+    workspace: Option<String>,
 }
 
 type Live = Arc<Mutex<HashMap<u32, Host>>>;
@@ -575,9 +602,13 @@ pub struct ExtHostSessions {
     live: Live,
     crashes: Crashes,
     spawn: Spawner,
-    /// Held while a host is started (EXT-10): retiring the others, starting it and recording
-    /// it are one step, so two starts at once cannot each find no other and both run.
+    /// Held while a host is started (EXT-10): retiring the owner's others, starting it and
+    /// recording it are one step, so two starts at once cannot each find no other and both run.
     starting: Mutex<()>,
+    /// Each window's page generation (EXT-11): raised when its page loads.
+    pages: Mutex<HashMap<String, u64>>,
+    /// Yavin is exiting: no host starts any more (EXT-11).
+    exiting: std::sync::atomic::AtomicBool,
 }
 
 impl Default for ExtHostSessions {
@@ -600,9 +631,12 @@ struct Session {
     answers: std::sync::mpsc::SyncSender<String>,
     /// When hosts ended on their own (EXT-10), shared by every session.
     crashes: Crashes,
+    /// The window that owns it (EXT-11): its crashes are that window's.
+    window: String,
 }
 
-type Crashes = Arc<Mutex<std::collections::VecDeque<std::time::Instant>>>;
+/// When hosts ended on their own, per window (EXT-10, EXT-11).
+type Crashes = Arc<Mutex<HashMap<String, std::collections::VecDeque<std::time::Instant>>>>;
 
 /// The most refusals waiting to be answered; more are dropped (a flood is not answered).
 const MAX_ANSWERS: usize = 1024;
@@ -673,7 +707,10 @@ impl ServerEvents for Session {
         }
         // Not stopped, not replaced: it ended on its own.
         if !self.shared.retired() {
-            held(&self.crashes).push_back(std::time::Instant::now());
+            held(&self.crashes)
+                .entry(self.window.clone())
+                .or_default()
+                .push_back(std::time::Instant::now());
         }
         // Whatever it held is let go: nothing it asked waits for an answer.
         held(&self.shared.pending).clear();
@@ -700,10 +737,42 @@ impl ExtHostSessions {
             crashes: Crashes::default(),
             spawn,
             starting: Mutex::new(()),
+            pages: Mutex::new(HashMap::new()),
+            exiting: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// Hosts running and not retired: one at most (EXT-08).
+    /// The owner a window is now: its label and its current page (EXT-11).
+    pub fn owner_of(&self, window: &str) -> HostOwner {
+        HostOwner {
+            window: window.to_string(),
+            page: held(&self.pages).get(window).copied().unwrap_or(0),
+        }
+    }
+
+    /// `window` loaded a page: a new page generation, and what the old page started ends.
+    pub fn page_loaded(&self, window: &str) {
+        *held(&self.pages).entry(window.to_string()).or_insert(0) += 1;
+        self.stop_window(window);
+    }
+
+    /// `window` closed: its hosts end, and it is forgotten.
+    pub fn window_closed(&self, window: &str) {
+        self.stop_window(window);
+        held(&self.pages).remove(window);
+        held(&self.crashes).remove(window);
+    }
+
+    /// Hosts of `window` running and not retired: one at most (EXT-08, per window: EXT-11).
+    #[cfg(test)]
+    pub fn running_hosts_of(&self, window: &str) -> usize {
+        held(&self.live)
+            .values()
+            .filter(|host| !host.shared.retired() && host.owner.window == window)
+            .count()
+    }
+
+    /// Hosts running and not retired, every window's.
     #[cfg(test)]
     pub fn running_hosts(&self) -> usize {
         held(&self.live)
@@ -724,7 +793,8 @@ impl ExtHostSessions {
         self.start_with(program, HostResources::default(), events, authority)
     }
 
-    /// `start`, with `resources` (bounded here) -- in its sandbox, or not at all.
+    /// `start`, with `resources` (tests: the test window's).
+    #[cfg(test)]
     pub fn start_with(
         &self,
         program: &Path,
@@ -732,12 +802,38 @@ impl ExtHostSessions {
         events: Arc<dyn HostEvents>,
         authority: Arc<dyn HostAuthority>,
     ) -> Result<u32, String> {
+        self.start_for(&test_owner(), None, program, resources, events, authority)
+    }
+
+    /// Starts a host owned by `owner`, in `workspace`, with `resources` (bounded here) -- in
+    /// its sandbox, or not at all. Only `owner`'s other hosts are retired (EXT-11).
+    pub fn start_for(
+        &self,
+        owner: &HostOwner,
+        workspace: Option<String>,
+        program: &Path,
+        resources: HostResources,
+        events: Arc<dyn HostEvents>,
+        authority: Arc<dyn HostAuthority>,
+    ) -> Result<u32, String> {
         let resources = resources.bounded();
         let _one = held(&self.starting);
-        // A host that keeps ending on its own is not started again at once (EXT-10).
+        if self.exiting.load(Ordering::SeqCst) {
+            return Err("HostStopped: Yavin is exiting; no extension host starts.".into());
+        }
+        // A start the window's previous page asked for is not the new page's (EXT-11).
+        if self.owner_of(&owner.window) != *owner {
+            return Err(
+                "NotOwner: this window has loaded again since; the extension host was not started."
+                    .into(),
+            );
+        }
+        // A host that keeps ending on its own is not started again at once (EXT-10) -- per
+        // window: one window's crash loop does not hold another's extensions off (EXT-11).
         {
             let now = std::time::Instant::now();
-            let mut crashes = held(&self.crashes);
+            let mut all = held(&self.crashes);
+            let crashes = all.entry(owner.window.clone()).or_default();
             while crashes
                 .front()
                 .is_some_and(|at| now.duration_since(*at) >= CRASH_WINDOW)
@@ -753,9 +849,10 @@ impl ExtHostSessions {
             }
         }
         let session = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-        // One host at a time (EXT-08): every other is retired -- not heard, not spoken to, ended
-        // -- before this one exists, whether or not the window stopped it.
-        self.retire_others(session);
+        // One host at a time per window (EXT-08, EXT-11): the owner's every other is retired --
+        // not heard, not spoken to, ended -- before this one exists, whether or not the window
+        // stopped it. Other windows' hosts are not touched.
+        self.retire_where(|host| host.owner.window == owner.window);
         let shared = Arc::new(Shared::with(authority, resources.clone()));
         // Refusals are answered on a thread of their own: the thread reading the host's output
         // never waits to write its input (with both pipes full, that would deadlock). It ends
@@ -786,6 +883,7 @@ impl ExtHostSessions {
                 shared: shared.clone(),
                 answers,
                 crashes: self.crashes.clone(),
+                window: owner.window.clone(),
             }),
         )
         .map_err(|why| {
@@ -800,6 +898,8 @@ impl ExtHostSessions {
             Host {
                 process: Arc::new(process),
                 shared,
+                owner: owner.clone(),
+                workspace,
             },
         );
         Ok(session)
@@ -814,21 +914,27 @@ impl ExtHostSessions {
             .ok_or_else(|| "HostStopped: The extension host has stopped.".to_string())
     }
 
-    /// Retires every live host but `keep`: marked first (nothing more of it is heard), then
-    /// ended. Idempotent.
-    fn retire_others(&self, keep: u32) {
-        let others: Vec<Host> = match self.live.lock() {
-            Ok(live) => live
-                .iter()
-                .filter(|(session, _)| **session != keep)
-                .map(|(_, host)| host.clone())
-                .collect(),
+    /// Retires every live host `which` picks: marked first (nothing more of it is heard),
+    /// then ended. Idempotent.
+    fn retire_where(&self, which: impl Fn(&Host) -> bool) {
+        let picked: Vec<Host> = match self.live.lock() {
+            Ok(live) => live.values().filter(|host| which(host)).cloned().collect(),
             Err(_) => return,
         };
-        for host in others {
+        for host in picked {
             host.shared.retired.store(true, Ordering::SeqCst);
             host.process.stop();
         }
+    }
+
+    /// `session`, if `owner` owns it; another window's (or an earlier page's) is not its to
+    /// speak to or stop (EXT-11).
+    fn owned(&self, owner: &HostOwner, session: u32) -> Result<Host, String> {
+        let host = self.live(session)?;
+        if host.owner != *owner {
+            return Err("NotOwner: this extension host belongs to another window.".into());
+        }
+        Ok(host)
     }
 
     /// Test only: marks `session` retired without ending it -- a host that outlives its
@@ -842,8 +948,14 @@ impl ExtHostSessions {
 
     /// Sends one protocol message, checked (EXT-07, EXT-08); a `load` gets its extension's code
     /// from the copy the authority names for it (and the entry point its manifest names).
+    #[cfg(test)]
     pub fn send(&self, session: u32, message: &str) -> Result<(), String> {
-        let host = self.live(session)?;
+        self.send_as(&test_owner(), session, message)
+    }
+
+    /// `send`, as `owner`: only to a host it owns (EXT-11).
+    pub fn send_as(&self, owner: &HostOwner, session: u32, message: &str) -> Result<(), String> {
+        let host = self.owned(owner, session)?;
         if host.shared.retired() {
             return Err(
                 "HostRetired: this extension host was replaced or stopped; it takes no more messages."
@@ -864,15 +976,39 @@ impl ExtHostSessions {
 
     /// Ends a host and everything it started (its exit is still reported); nothing more of it
     /// is heard meanwhile.
+    #[cfg(test)]
     pub fn stop(&self, session: u32) {
-        if let Ok(host) = self.live(session) {
-            host.shared.retired.store(true, Ordering::SeqCst);
-            host.process.stop();
-        }
+        let _ = self.stop_as(&test_owner(), session);
     }
 
-    /// Ends every host: the window is closing, the page reloaded, or the workspace changed.
+    /// `stop`, as `owner`: only a host it owns (EXT-11).
+    pub fn stop_as(&self, owner: &HostOwner, session: u32) -> Result<(), String> {
+        let host = self.owned(owner, session)?;
+        host.shared.retired.store(true, Ordering::SeqCst);
+        host.process.stop();
+        Ok(())
+    }
+
+    /// Ends every host of `window`, whatever its page: its page reloaded or it closed.
+    pub fn stop_window(&self, window: &str) {
+        self.retire_where(|host| host.owner.window == window);
+    }
+
+    /// `window` entered `workspace` (EXT-11): its hosts end -- an extension of A never runs on
+    /// in B (IDE-08) -- and so does any other window's host started in another workspace than
+    /// `workspace`: Yavin's native workspace is one for the whole application, so such a host
+    /// has lost its own. Other windows' hosts in `workspace` carry on.
+    pub fn workspace_entered(&self, window: &str, workspace: Option<&str>) {
+        self.retire_where(|host| {
+            host.owner.window == window || host.workspace.as_deref() != workspace
+        });
+    }
+
+    /// Ends every host of every window: Yavin is exiting. No host starts after it -- a start
+    /// under way finishes first (the start lock), and is ended here with the rest (EXT-11).
     pub fn stop_all(&self) {
+        let _one = held(&self.starting);
+        self.exiting.store(true, Ordering::SeqCst);
         let all: Vec<_> = match self.live.lock() {
             Ok(mut live) => live.drain().map(|(_, host)| host).collect(),
             Err(_) => return,
@@ -999,14 +1135,42 @@ fn prepare(shared: &Shared, message: &str) -> Result<String, String> {
 
 /// The application's authority (EXT-07): Workspace Trust and the extension inventory, both
 /// native, asked every time.
-struct AppAuthority(AppHandle);
+struct AppAuthority {
+    app: AppHandle,
+    /// The workspace its host was started in (EXT-11): its code may act only while that is
+    /// still the workspace.
+    workspace: Option<String>,
+}
+
+/// The workspace Yavin has open now, as a host is bound to it.
+fn current_workspace(app: &AppHandle) -> Option<String> {
+    let state = app.state::<Workspace>();
+    let open = state.0.lock().ok()?;
+    open.as_ref()
+        .map(|manager| manager.root().display().to_string())
+}
+
+/// Whether a host started in `bound` may act while Yavin has `now` open (EXT-11).
+fn still_in(bound: Option<&str>, now: Option<&str>) -> Result<(), Denial> {
+    if bound != now {
+        return Err(Denial::new(
+            "WorkspaceChanged",
+            "This extension host was started for another workspace.",
+        ));
+    }
+    Ok(())
+}
 
 impl AppAuthority {
     fn trusted(&self) -> Result<(), Denial> {
+        still_in(
+            self.workspace.as_deref(),
+            current_workspace(&self.app).as_deref(),
+        )?;
         require_trust(
-            &self.0,
-            &self.0.state::<Workspace>(),
-            &self.0.state::<Trust>(),
+            &self.app,
+            &self.app.state::<Workspace>(),
+            &self.app.state::<Trust>(),
         )
         .map_err(|why| Denial::new("TrustRequired", why))
     }
@@ -1015,11 +1179,11 @@ impl AppAuthority {
 impl HostAuthority for AppAuthority {
     fn copy_of(&self, id: &str) -> Result<HostCopy, String> {
         self.trusted().map_err(refused)?;
-        self.0.state::<ExtensionService>().host_copy(id)
+        self.app.state::<ExtensionService>().host_copy(id)
     }
     fn allow(&self, copy: &HostCopy, capability: Option<&str>) -> Result<(), Denial> {
         self.trusted()?;
-        self.0
+        self.app
             .state::<ExtensionService>()
             .authorize(copy, capability)
     }
@@ -1053,26 +1217,37 @@ struct Exit {
     error: Option<String>,
 }
 
-/// Events to the window: `ext-host-message`, `ext-host-log` (its stderr), `ext-host-denied` (a
-/// refused request, EXT-07), `ext-host-exit`, by session.
-struct Emitting(AppHandle);
+/// Events to the window that owns the host -- that window alone (EXT-11), never broadcast:
+/// `ext-host-message`, `ext-host-log` (its stderr), `ext-host-denied` (a refused request,
+/// EXT-07), `ext-host-exit`, by session.
+struct Emitting {
+    app: AppHandle,
+    window: String,
+}
 
 impl HostEvents for Emitting {
     fn message(&self, session: u32, message: String) {
-        let _ = self
-            .0
-            .emit("ext-host-message", Message { session, message });
+        let _ = self.app.emit_to(
+            self.window.as_str(),
+            "ext-host-message",
+            Message { session, message },
+        );
     }
     fn log(&self, session: u32, line: String) {
-        let _ = self.0.emit("ext-host-log", Log { session, line });
+        let _ = self
+            .app
+            .emit_to(self.window.as_str(), "ext-host-log", Log { session, line });
     }
     fn denied(&self, session: u32, denied: Denied) {
-        let _ = self
-            .0
-            .emit("ext-host-denied", DeniedEvent { session, denied });
+        let _ = self.app.emit_to(
+            self.window.as_str(),
+            "ext-host-denied",
+            DeniedEvent { session, denied },
+        );
     }
     fn exit(&self, session: u32, code: Option<i32>, error: Option<String>) {
-        let _ = self.0.emit(
+        let _ = self.app.emit_to(
+            self.window.as_str(),
             "ext-host-exit",
             Exit {
                 session,
@@ -1088,6 +1263,7 @@ impl HostEvents for Emitting {
 #[tauri::command]
 pub async fn ext_host_start(
     app: AppHandle,
+    webview: tauri::Webview,
     state: State<'_, Workspace>,
     trust: State<'_, Trust>,
     sessions: State<'_, ExtHostSessions>,
@@ -1095,40 +1271,61 @@ pub async fn ext_host_start(
 ) -> Result<u32, String> {
     require_trust(&app, &state, &trust).map_err(|why| format!("TrustRequired: {why}"))?;
     let program = host_program(&app)?;
-    // The user's settings, as the window sends them -- bounded natively (`start_with`).
-    sessions.start_with(
+    // Its owner is the window that asked, as Tauri says it (EXT-11); its workspace is
+    // Yavin's now.
+    let owner = sessions.owner_of(webview.label());
+    let workspace = current_workspace(&app);
+    // The user's settings, as the window sends them -- bounded natively (`start_for`).
+    sessions.start_for(
+        &owner,
+        workspace.clone(),
         &program,
         resources.unwrap_or_default(),
-        Arc::new(Emitting(app.clone())),
-        Arc::new(AppAuthority(app.clone())),
+        Arc::new(Emitting {
+            app: app.clone(),
+            window: owner.window.clone(),
+        }),
+        Arc::new(AppAuthority {
+            app: app.clone(),
+            workspace,
+        }),
     )
 }
 
-/// Sends one protocol message to a host (framing is added by the process host).
+/// Sends one protocol message to a host of the calling window (framing is added by the
+/// process host).
 #[tauri::command(async)]
 pub fn ext_host_send(
+    webview: tauri::Webview,
     sessions: State<'_, ExtHostSessions>,
     session: u32,
     message: String,
 ) -> Result<(), String> {
-    sessions.send(session, &message)
+    sessions.send_as(&sessions.owner_of(webview.label()), session, &message)
 }
 
-/// Ends a host and everything it started.
+/// Ends a host of the calling window and everything it started.
 #[tauri::command(async)]
-pub fn ext_host_stop(sessions: State<'_, ExtHostSessions>, session: u32) -> Result<(), String> {
-    sessions.stop(session);
-    Ok(())
+pub fn ext_host_stop(
+    webview: tauri::Webview,
+    sessions: State<'_, ExtHostSessions>,
+    session: u32,
+) -> Result<(), String> {
+    sessions.stop_as(&sessions.owner_of(webview.label()), session)
 }
 
-/// Ends every host: the window is closing, the page reloaded, or the workspace changed.
+/// Ends every host of every window: Yavin is exiting.
 pub fn stop_all(sessions: &ExtHostSessions) {
     sessions.stop_all();
 }
 
+/// Ends the calling window's hosts (an earlier page's left running) -- no other window's.
 #[tauri::command(async)]
-pub fn ext_host_stop_all(sessions: State<'_, ExtHostSessions>) -> Result<(), String> {
-    stop_all(&sessions);
+pub fn ext_host_stop_all(
+    webview: tauri::Webview,
+    sessions: State<'_, ExtHostSessions>,
+) -> Result<(), String> {
+    sessions.stop_window(webview.label());
     Ok(())
 }
 
@@ -1198,6 +1395,7 @@ mod tests {
             )))),
             answers: std::sync::mpsc::sync_channel(1).0,
             crashes: Crashes::default(),
+            window: "main".into(),
         };
         session.log("x".repeat(MAX_LOG_LINE + 50));
         for n in 0..(MAX_LOG_LINES + 20) {
@@ -1299,7 +1497,7 @@ mod tests {
         // The body of `ExtHostSessions::start_with` (not this test's own text): the program and
         // its sandbox policy, nothing else -- through the sandboxed spawn, which passes no
         // arguments (EXT-06, EXT-10).
-        let start = source.find("    pub fn start_with(").unwrap();
+        let start = source.find("    pub fn start_for(").unwrap();
         let code = &source[start..start + source[start..].find("\n    }\n").unwrap()];
         assert!(
             code.contains(
@@ -1326,6 +1524,21 @@ mod tests {
         std::fs::write(folder.join("extension.js"), "module.exports = {};").unwrap();
         let service = ExtensionService::new(dir.join("extensions"), vec![dir.join("samples")]);
         (dir, ServiceAuthority::new(Arc::new(service)))
+    }
+
+    /// A host is bound to the workspace it started in (EXT-11): in any other -- or none -- its
+    /// code is refused, whichever window asks.
+    #[test]
+    fn a_host_acts_only_in_the_workspace_it_started_in() {
+        assert!(still_in(Some("C:/w1"), Some("C:/w1")).is_ok());
+        assert!(still_in(None, None).is_ok());
+        for (bound, now) in [
+            (Some("C:/w1"), Some("C:/w2")),
+            (Some("C:/w1"), None),
+            (None, Some("C:/w1")),
+        ] {
+            assert_eq!(still_in(bound, now).unwrap_err().code, "WorkspaceChanged");
+        }
     }
 
     // --- EXT-10: resources, bounds, and a sandbox that cannot be set up ---------------------
