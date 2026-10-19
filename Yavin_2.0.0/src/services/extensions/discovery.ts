@@ -4,7 +4,13 @@
  * per id -- an installed copy over a development sample -- so each id arrives once, with the
  * copies it shadows; the extension host loads code only from the folder listed here.
  */
-import { native, type NativePermissions, type NativeSignature } from "../native.ts";
+import {
+  native,
+  type NativeIntegrity,
+  type NativePermissions,
+  type NativeReplaced,
+  type NativeSignature,
+} from "../native.ts";
 import { DISABLED_KEY, readStoredDisabled, type ExtensionRegistry } from "./registry.ts";
 import { profileStore, type ProfilesView } from "./profiles.ts";
 
@@ -25,6 +31,10 @@ export interface ListedExtension {
   permissions?: NativePermissions | null;
   /** What its package's signature was found to be when installed (EXT-09). */
   signature?: NativeSignature | null;
+  /** Whether its files are the package's (EXT-17). */
+  integrity?: NativeIntegrity | null;
+  /** The copy its intact previous one replaced (EXT-17). */
+  replaced?: NativeReplaced | null;
 }
 
 export interface Listing {
@@ -106,6 +116,7 @@ export async function refreshGrants(
           previous: one.permissions.previous,
         });
       registry.setSignature(one.id, one.signature ?? null);
+      registry.setIntegrity(one.id, one.integrity ?? null, one.replaced ?? null);
     }
 }
 
@@ -143,6 +154,8 @@ export async function discoverExtensions(
       });
     // And what its signature was found to be (EXT-09): only the native side says so.
     if (one.id) registry.setSignature(one.id, one.signature ?? null);
+    // And what is known of its files (EXT-17): again only the native side says so.
+    if (one.id) registry.setIntegrity(one.id, one.integrity ?? null, one.replaced ?? null);
     const result = registry.add(
       parsed,
       { kind: "folder", path: one.folder },

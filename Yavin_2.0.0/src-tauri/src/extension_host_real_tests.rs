@@ -2362,3 +2362,80 @@ fn a_secret_store_failure_is_recorded_without_the_secret() {
     assert!(!files.is_empty(), "the diagnostics are kept on disk");
     assert!(files.iter().all(|text| !text.contains(value)));
 }
+
+// --- EXT-16: a revocation while a request is in flight, through the real host -----------------
+
+/// Asks for a document's text; returns it, or the refusal's code.
+const READER: &str = r#"
+module.exports.activate = function (c, yavin) {
+  c.subscriptions.push(yavin.commands.registerCommand(c.extensionId + ".read", async function () {
+    try { return { text: await yavin.documents.getText("file:///c:/work/a.txt") }; }
+    catch (e) { return { refused: e.code || String(e) }; }
+  }));
+};
+"#;
+
+impl Yavin {
+    /// Runs the reader's command; when its request reaches the window, `meanwhile` runs (the
+    /// user acting) and then the window answers it with `text`. What the extension got.
+    fn read_while(&self, session: u32, generation: u64, meanwhile: impl FnOnce()) -> Value {
+        self.to(
+            session,
+            generation,
+            "acme.reader",
+            json!({"type": "request", "requestId": "rd", "method": "command.run", "params": {"id": "acme.reader.read", "args": []}}),
+        );
+        let mut meanwhile = Some(meanwhile);
+        loop {
+            match self.next() {
+                (s, Event::Message(message)) if s == session => {
+                    if message["type"] == "request" && message["method"] == "documents.getText" {
+                        (meanwhile.take().expect("asked once"))();
+                        self.to(session, generation, "acme.reader", json!({"type": "response", "requestId": message["requestId"], "ok": true, "result": "THE DOCUMENT TEXT"}));
+                    } else if message["type"] == "response" && message["requestId"] == "rd" {
+                        assert_eq!(message["ok"], true, "{message}");
+                        return message["result"].clone();
+                    }
+                }
+                (s, Event::Exit(code, error)) if s == session => {
+                    panic!("the host ended: {code:?} {error:?}")
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A running extension's request, allowed and waiting for the window, when the user revokes
+/// what it needed: the window's answer does not reach the extension (it is told
+/// `PermissionDenied`), and its next request is refused before the window sees it. Granted
+/// again, it reads again -- in the same host, without a reload.
+#[test]
+fn a_revocation_while_a_request_is_in_flight_withholds_the_answer() {
+    let yavin = Yavin::with(
+        "inflight",
+        &[("acme.reader", permissions(&["documents.read"]), READER)],
+    );
+    yavin.grant("acme.reader", &["documents.read"]);
+    let session = yavin.ready(27_001, "acme.reader");
+    let allowed = yavin.read_while(session, 27_001, || {});
+    assert_eq!(allowed["text"], "THE DOCUMENT TEXT", "{allowed}");
+    let revoked = yavin.read_while(session, 27_001, || yavin.grant("acme.reader", &[]));
+    assert_eq!(revoked["refused"], "PermissionDenied", "{revoked}");
+    assert!(!revoked.to_string().contains("THE DOCUMENT TEXT"));
+    // The next one never reaches the window.
+    let (answer, asked, denied) = yavin.ask_seeing(
+        session,
+        27_001,
+        "acme.reader",
+        "n",
+        "command.run",
+        json!({"id": "acme.reader.read", "args": []}),
+    );
+    assert_eq!(answer["result"]["refused"], "PermissionDenied", "{answer}");
+    assert!(asked.is_empty(), "the window saw it: {asked:?}");
+    assert_eq!(denied[0].capability.as_deref(), Some("documents.read"));
+    yavin.grant("acme.reader", &["documents.read"]);
+    let again = yavin.read_while(session, 27_001, || {});
+    assert_eq!(again["text"], "THE DOCUMENT TEXT", "{again}");
+}

@@ -180,6 +180,89 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The most files and bytes a copy's files digest reads (an installed copy is within the
+/// package limits; a folder grown past these is not the copy that was installed).
+const TREE_FILES: usize = 10_000;
+const TREE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Every plain file under `folder`, by its `/`-separated path, sorted -- or why the folder is
+/// not a plain tree of files (a link, a reparse point, too much).
+fn tree_files(folder: &Path) -> Result<Vec<(String, std::path::PathBuf, fs::Metadata)>, String> {
+    let mut found = Vec::new();
+    let mut pending = vec![(String::new(), folder.to_path_buf())];
+    let mut total = 0u64;
+    while let Some((prefix, dir)) = pending.pop() {
+        let entries = fs::read_dir(&dir).map_err(|e| format!("its files cannot be read ({e})"))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("its files cannot be read ({e})"))?;
+            let meta = fs::symlink_metadata(entry.path())
+                .map_err(|e| format!("its files cannot be read ({e})"))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            #[cfg(windows)]
+            let reparse = {
+                use std::os::windows::fs::MetadataExt;
+                meta.file_attributes() & 0x400 != 0
+            };
+            #[cfg(not(windows))]
+            let reparse = false;
+            if meta.file_type().is_symlink() || reparse {
+                return Err(format!("it holds a link ({path})"));
+            }
+            if meta.is_dir() {
+                pending.push((path, entry.path()));
+            } else if meta.is_file() {
+                total += meta.len();
+                found.push((path, entry.path(), meta));
+                if found.len() > TREE_FILES || total > TREE_BYTES {
+                    return Err("it holds more than an installed copy can".into());
+                }
+            } else {
+                return Err(format!("it holds something that is not a file ({path})"));
+            }
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(found)
+}
+
+/// A digest of an installed copy's files (EXT-15): every file's path, size and SHA-256, in path
+/// order. The package's signature and checksum authenticate the archive; this is what binds the
+/// files unpacked from it -- recorded when the copy is put in place, checked whenever it is used.
+pub fn tree_digest(folder: &Path) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    for (path, file, meta) in tree_files(folder)? {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(meta.len().to_le_bytes());
+        hasher.update(sha256_file(&file)?.as_bytes());
+        hasher.update(b"\n");
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// What changes when any file under `folder` changes, cheaply: paths, sizes and modification
+/// times (not contents) -- to know when `tree_digest` must be computed again.
+pub fn tree_fingerprint(folder: &Path) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    for (path, _, meta) in tree_files(folder)? {
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(meta.len().to_le_bytes());
+        hasher.update(modified.to_le_bytes());
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
 /// Validates `package` and unpacks it into `destination`, which must not exist yet. On any
 /// refusal, whatever was unpacked is removed.
 pub fn unpack(package: &Path, destination: &Path, limits: &Limits) -> Result<Unpacked, String> {

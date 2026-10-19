@@ -396,7 +396,9 @@ test("permissions, natively: refused without a grant, allowed on its page, refus
     await palette(page, "Word Count: Count Words in Active File");
     await expect(alert(page)).toContainText("is not allowed for yavin.word-count 1.0.1");
     await extensionsView(page);
-    await expect(installed.getByTestId("extension-state")).toHaveText(/^Permission Needed/);
+    // It runs (its command did): Active, the blocked request said beside it (EXT-16).
+    await expect(installed.getByTestId("extension-state")).toHaveText("Active");
+    await expect(installed.getByTestId("extension-notice")).toHaveText(/^Permission Needed/);
     // Allowed on its page: granted natively, and it works at once, in the same host.
     await installed.click();
     const permissions = page
@@ -414,13 +416,152 @@ test("permissions, natively: refused without a grant, allowed on its page, refus
     // Revoked: the next request is refused again.
     await installed.click();
     await permissions.getByRole("button", { name: "Revoke: Read your open documents" }).click();
+    // Confirmed once the native inventory has it (EXT-16).
+    await expect(permissions.getByRole("status")).toContainText(
+      "Revoked: Read your open documents.",
+    );
     await expect(permissions.getByTestId("permission-state")).toHaveText("Not allowed");
     expect(grantOf("yavin.word-count")).toBeUndefined();
     await page.getByRole("button", { name: "Back to Extensions" }).click();
     await palette(page, "Word Count: Count Words in Active File");
     await expect(alert(page)).toContainText("is not allowed for yavin.word-count 1.0.1");
+    // The same host, still running: Active, the block said beside it and marked on its page.
+    expect(hostProcesses(app.pid!).map((one) => one.id)).toEqual(hosts);
+    await extensionsView(page);
+    await expect(installed.getByTestId("extension-state")).toHaveText("Active");
+    await expect(installed.getByTestId("extension-notice")).toContainText(
+      "Permission Needed — Yavin blocked its request to read your open documents",
+    );
+    await installed.click();
+    await expect(permissions.getByTestId("permission-blocked")).toContainText("Blocked:");
     await close(running);
   } finally {
     if (app.exitCode === null) app.kill();
+  }
+});
+
+/** The inventory as a Yavin before EXT-15 wrote it (version 1: no files digests). */
+function asVersion1() {
+  for (const name of ["inventory.json", "inventory.last-good.json"]) {
+    const file = join(EXTENSIONS, name);
+    const value = JSON.parse(readFileSync(file, "utf8"));
+    value.version = 1;
+    for (const record of Object.values(value.extensions) as Record<string, unknown>[]) {
+      for (const key of ["active", "previous"]) {
+        const copy = record[key] as Record<string, unknown> | null;
+        if (copy) {
+          delete copy.filesSha256;
+          delete copy.unchecked;
+        }
+      }
+      delete record.replaced;
+    }
+    writeFileSync(file, JSON.stringify(value, null, 2));
+  }
+}
+
+/** Yavin started again over the same profile: its folder is already trusted (not asked), and
+ *  it reopens what it had open (a sidebar, an editor), so only the window itself is waited for. */
+async function restart() {
+  const running = await launch({ YAVIN_TEST_REGISTRY: base });
+  await expect(
+    running.page.getByTitle("Extensions & Plugins (Ctrl+Shift+X)", { exact: true }),
+  ).toBeVisible({ timeout: 30_000 });
+  await expect(running.page.getByRole("button", { name: "Yes, I trust the authors" })).toHaveCount(
+    0,
+  );
+  return running;
+}
+
+test("EXT-17 an older inventory: upgraded, its copy not checked but running; reinstalled, checked; recovered, its code refused until reinstalled", async () => {
+  let running = await start();
+  try {
+    const { page } = running;
+    const view = await extensionsView(page);
+    await card(view.getByRole("region", { name: "Recommended extensions" }), "Word Count")
+      .getByRole("button", { name: "Install Word Count" })
+      .click();
+    await review(page, "Install and allow");
+    await close(running);
+    asVersion1();
+
+    // Upgraded at start: the copy is not checked -- it runs, and says so; no signature shown.
+    running = await restart();
+    let installed = card(
+      (await extensionsView(running.page)).getByRole("region", { name: "Installed extensions" }),
+      "Word Count",
+    );
+    await expect(installed.getByTestId("extension-notice")).toContainText("Not Checked");
+    const inventory = JSON.parse(readFileSync(join(EXTENSIONS, "inventory.json"), "utf8"));
+    expect(inventory.version).toBe(2);
+    expect(inventory.extensions["yavin.word-count"].active.unchecked).toBe("legacy");
+    expect(readdirSync(EXTENSIONS).some((n) => n.startsWith("inventory.json.v1-migrated-"))).toBe(
+      true,
+    );
+    await installed.click();
+    const details = running.page.getByRole("region", { name: "Extension: Word Count" });
+    await expect(details.getByTestId("extension-integrity-runs")).toHaveText("Its code may run.");
+    await details.getByRole("tab", { name: "Requirements" }).click();
+    await expect(details.getByTestId("extension-signature")).toContainText("Not shown");
+    await running.page.getByRole("button", { name: "Back to Extensions" }).click();
+    await running.page.getByTitle("Explorer (Ctrl+Shift+E)", { exact: true }).click();
+    await running.page
+      .getByRole("tree", { name: "Files" })
+      .getByText("notes.md", { exact: true })
+      .click();
+    await palette(running.page, "Word Count: Count Words in Active File");
+    await expect(message(running.page)).toContainText("notes.md:");
+
+    // Reinstalled from its registry: its files are checked and bound.
+    await extensionsView(running.page);
+    await installed.click();
+    await details
+      .getByTestId("extension-integrity")
+      .getByRole("button", { name: "Reinstall Word Count 1.0.1" })
+      .click();
+    await review(running.page, "Install and allow");
+    await expect(details.getByTestId("extension-integrity")).toHaveCount(0);
+    await details.getByRole("tab", { name: "Requirements" }).click();
+    await expect(details.getByTestId("extension-files")).toContainText("Verified Files");
+    await expect(details.getByTestId("extension-signature")).toContainText("Unsigned");
+    const bound = JSON.parse(readFileSync(join(EXTENSIONS, "inventory.json"), "utf8"));
+    expect(bound.extensions["yavin.word-count"].active.filesSha256).toMatch(/^[0-9a-f]{64}$/);
+    await close(running);
+
+    // The inventory and its last good copy lost: rebuilt from the folders -- disabled, and its
+    // code refused even when enabled, until it is reinstalled.
+    for (const name of ["inventory.json", "inventory.last-good.json"])
+      writeFileSync(join(EXTENSIONS, name), "{ not json");
+    running = await restart();
+    installed = card(
+      (await extensionsView(running.page)).getByRole("region", { name: "Installed extensions" }),
+      "Word Count",
+    );
+    await expect(installed.getByTestId("extension-state")).toHaveText("Disabled");
+    await expect(installed.getByTestId("extension-notice")).toContainText("Not Verified");
+    await installed.getByRole("button", { name: "Enable Word Count" }).click();
+    await expect(installed.getByTestId("extension-state")).toHaveText(/^Not Verified/);
+    await running.page.getByTitle("Explorer (Ctrl+Shift+E)", { exact: true }).click();
+    await running.page
+      .getByRole("tree", { name: "Files" })
+      .getByText("notes.md", { exact: true })
+      .click();
+    await palette(running.page, "Word Count: Count Words in Active File");
+    await expect(alert(running.page)).toContainText("its code does not run");
+    expect(hostProcesses(running.app.pid!).length).toBeLessThanOrEqual(1);
+    await extensionsView(running.page);
+    await installed.click();
+    await running.page
+      .getByRole("region", { name: "Extension: Word Count" })
+      .getByTestId("extension-integrity")
+      .getByRole("button", { name: "Reinstall Word Count 1.0.1" })
+      .click();
+    await review(running.page, "Install and allow");
+    await running.page.getByRole("button", { name: "Back to Extensions" }).click();
+    await palette(running.page, "Word Count: Count Words in Active File");
+    await expect(message(running.page)).toContainText("notes.md:");
+    await close(running);
+  } finally {
+    if (running.app.exitCode === null) running.app.kill();
   }
 });

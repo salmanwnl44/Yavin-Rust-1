@@ -22,8 +22,11 @@
 //!   why) here, and the window is told that it was refused (`ext-host-denied`). Events the
 //!   window sends an extension pass the same check (`documents.*` needs `documents.read`), and
 //!   so does every call into an extension's code (`activate`, `command.run`, ...): none for a
-//!   disabled extension or an untrusted folder, except its `deactivate`. The window's answers
-//!   to an extension's requests are not checked again: each answers a checked request;
+//!   disabled extension or an untrusted folder, except its `deactivate`. The window's answer
+//!   to an extension's request is checked again when it comes back (EXT-16): it is delivered
+//!   only for a request this session passed to the window and is still waiting on, and only if
+//!   what that request needed is still allowed -- else the extension is answered why, with
+//!   nothing of what the window found;
 //! - **one host at a time (EXT-08).** A session is a host's identity (never reused; its own
 //!   pipes). Starting one retires every other -- marked (nothing it says is passed on, nothing is
 //!   sent to it), then ended. Every message must carry its session's `init` identity, and what
@@ -300,6 +303,10 @@ pub trait HostAuthority: Send + Sync + 'static {
     fn secret(&self, copy: &HostCopy, method: &str, params: &Value) -> Result<Value, Denial>;
     /// Records what happened (EXT-14). Best effort: never fails, never decides.
     fn note(&self, _event: Event) {}
+    /// Changes whenever a grant does (EXT-16): a refusal is told again after one. Never decides.
+    fn revision(&self) -> u64 {
+        0
+    }
 }
 
 /// One host's permission state: its authority, and what each extension it loaded is.
@@ -316,12 +323,14 @@ struct Shared {
     loaded: Mutex<HashMap<String, HostCopy>>,
     /// Loads sent and not yet answered: the host keeps what it had until a load succeeds.
     loading: Mutex<HashMap<String, HostCopy>>,
-    /// Refusals the window was told of, and the last one (repeats are not told again).
-    told: Mutex<(usize, Option<Denied>)>,
+    /// Refusals the window was told of, and the last one with the grants' revision then
+    /// (repeats are not told again -- unless a grant changed since: EXT-16).
+    told: Mutex<(usize, Option<(Denied, u64)>)>,
     /// Its resources (EXT-10): the ceiling of what its `init` may ask.
     resources: HostResources,
-    /// Requests of its extensions passed to the window and not yet answered: (id, requestId).
-    pending: Mutex<std::collections::HashSet<(String, String)>>,
+    /// Requests of its extensions passed to the window and not yet answered, by (id,
+    /// requestId), with the capability each needed (EXT-16: checked again on the answer).
+    pending: Mutex<HashMap<(String, String), Option<String>>>,
     /// Its messages' budget.
     budget: Mutex<Budget>,
     /// Its window and session, for what it records (EXT-14).
@@ -346,7 +355,7 @@ impl Shared {
     fn with(authority: Arc<dyn HostAuthority>, resources: HostResources) -> Shared {
         Shared {
             resources,
-            pending: Mutex::new(std::collections::HashSet::new()),
+            pending: Mutex::new(HashMap::new()),
             budget: Mutex::new(Budget::new()),
             owner: Mutex::new(None),
             authority,
@@ -407,24 +416,31 @@ impl Shared {
         workspace_ok && generation_ok
     }
 
-    /// Whether the window is told of `denied`: not a repeat of the last, not past `MAX_TOLD`.
+    /// Whether the window is told of `denied`: not a repeat of the last with no grant changed
+    /// since (the window forgets a refusal once what it needed is allowed), not past `MAX_TOLD`.
     fn tell(&self, denied: &Denied) -> bool {
+        let revision = self.authority.revision();
         let mut told = held(&self.told);
-        if told.1.as_ref() == Some(denied) || told.0 >= MAX_TOLD {
+        let repeat = told
+            .1
+            .as_ref()
+            .is_some_and(|(last, then)| last == denied && *then == revision);
+        if repeat || told.0 >= MAX_TOLD {
             return false;
         }
         told.0 += 1;
-        told.1 = Some(denied.clone());
+        told.1 = Some((denied.clone(), revision));
         true
     }
 
-    /// What a request of an extension needs, decided: `Ok` to pass it to the window.
+    /// What a request of an extension needs, decided: `Ok` (with the capability it needed, if
+    /// any) to pass it to the window.
     fn decide(
         &self,
         id: &str,
         method: &str,
         params: &Value,
-    ) -> Result<(), (Denial, Option<String>)> {
+    ) -> Result<Option<String>, (Denial, Option<String>)> {
         let copy = self.loaded(id).ok_or_else(|| {
             (
                 Denial::new("NotLoaded", format!("{id} is not loaded in this host.")),
@@ -436,11 +452,12 @@ impl Shared {
             Need::Nothing => self
                 .authority
                 .allow(&copy, None)
+                .map(|()| None)
                 .map_err(|denial| (denial, None)),
-            Need::Capability(capability) => self
-                .authority
-                .allow(&copy, Some(&capability))
-                .map_err(|denial| (denial, Some(capability))),
+            Need::Capability(capability) => match self.authority.allow(&copy, Some(&capability)) {
+                Ok(()) => Ok(Some(capability)),
+                Err(denial) => Err((denial, Some(capability))),
+            },
             Need::NotOwned(why) => Err((Denial::new("NotOwned", why), None)),
             Need::Invalid(why) => Err((Denial::new("InvalidRequest", why), None)),
             Need::Unknown => Err((
@@ -484,7 +501,7 @@ impl Shared {
             ("unloaded", Some(id)) => {
                 return if held(&self.unloading).remove(id) {
                     // Its requests will not be answered to it any more: they wait no longer.
-                    held(&self.pending).retain(|(of, _)| of != id);
+                    held(&self.pending).retain(|(of, _), _| of != id);
                     Screened::Pass
                 } else {
                     Screened::Drop
@@ -515,7 +532,7 @@ impl Shared {
         // Its secrets (EXT-13): allowed like any request, then done here -- the window never
         // sees the request or its answer.
         if method.starts_with("secrets.") {
-            let result = self.decide(id, method, &params).and_then(|()| {
+            let result = self.decide(id, method, &params).and_then(|_| {
                 let copy = self.loaded(id).ok_or_else(|| {
                     (
                         Denial::new("NotLoaded", format!("{id} is not loaded in this host.")),
@@ -560,11 +577,11 @@ impl Shared {
             };
             return Screened::Refuse(answer.to_string(), told);
         }
-        let decided = self.decide(id, method, &params).and_then(|()| {
+        let decided = self.decide(id, method, &params).and_then(|capability| {
             // Allowed: it waits for the window, within the bound (EXT-10).
             let key = (id.to_string(), request_key(&value));
             let mut pending = held(&self.pending);
-            if pending.len() >= MAX_PENDING && !pending.contains(&key) {
+            if pending.len() >= MAX_PENDING && !pending.contains_key(&key) {
                 return Err((
                     Denial::new(
                         "TooManyRequests",
@@ -573,7 +590,7 @@ impl Shared {
                     None,
                 ));
             }
-            pending.insert(key);
+            pending.insert(key, capability);
             Ok(())
         });
         let Err((denial, capability)) = decided else {
@@ -1272,14 +1289,43 @@ fn prepare(shared: &Shared, message: &str) -> Result<String, String> {
             }
             Ok(message.to_string())
         }
-        // An answer to an extension's request: only to one this session loaded. It is no
-        // longer waiting.
+        // An answer to an extension's request: only to one this session loaded, and only to a
+        // request it passed to the window and is still waiting on. It is no longer waiting.
         ("response", Some(id)) if shared.loaded(&id).is_none() => {
             Err(format!("NotLoaded: {id} is not loaded in this host."))
         }
         ("response", Some(id)) => {
-            held(&shared.pending).remove(&(id, request_key(&value)));
-            Ok(message.to_string())
+            let Some(capability) = held(&shared.pending).remove(&(id.clone(), request_key(&value)))
+            else {
+                return Err(format!(
+                    "NotPending: {id} is not waiting for an answer to this request."
+                ));
+            };
+            // What the request needed, checked again now (EXT-16): revoked, disabled, replaced
+            // or untrusted since it was passed on, the extension gets the refusal -- not the
+            // answer. (What the window did for it is done; what it found is not delivered.)
+            let copy = shared
+                .loaded(&id)
+                .ok_or_else(|| format!("NotLoaded: {id} is not loaded in this host."))?;
+            match shared.authority.allow(&copy, capability.as_deref()) {
+                Ok(()) => Ok(message.to_string()),
+                Err(denial) => {
+                    shared.note(
+                        denial.code,
+                        "request",
+                        Some(&id),
+                        Some("an answer withheld: no longer allowed".into()),
+                    );
+                    let object = value.as_object_mut().ok_or("MalformedMessage")?;
+                    object.remove("result");
+                    object.insert("ok".into(), Value::Bool(false));
+                    object.insert(
+                        "error".into(),
+                        json!({"code": denial.code, "message": denial.message}),
+                    );
+                    Ok(value.to_string())
+                }
+            }
         }
         _ => Ok(message.to_string()),
     }
@@ -1350,6 +1396,9 @@ impl HostAuthority for AppAuthority {
         self.app
             .state::<ExtensionService>()
             .authorize(copy, capability)
+    }
+    fn revision(&self) -> u64 {
+        self.app.state::<ExtensionService>().grants_revision()
     }
 }
 
@@ -1539,6 +1588,9 @@ impl HostAuthority for ServiceAuthority {
     fn allow(&self, copy: &HostCopy, capability: Option<&str>) -> Result<(), Denial> {
         self.trusted()?;
         self.service.authorize(copy, capability)
+    }
+    fn revision(&self) -> u64 {
+        self.service.grants_revision()
     }
 }
 
@@ -2098,6 +2150,155 @@ mod tests {
             .refused()
             .1
             .is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- EXT-16: revocation and requests in flight ------------------------------------------
+
+    fn probe_loaded(name: &str) -> (PathBuf, Arc<ServiceAuthority>, Shared) {
+        let (dir, authority) = scratch_authority(name, PROBE_MANIFEST);
+        let shared = Shared::new(authority.clone());
+        let load = json!({"type": "load", "extensionId": "acme.probe", "workspaceId": "w", "hostGeneration": 1}).to_string();
+        prepare(&shared, &load).unwrap();
+        assert!(shared
+            .screen(&json!({"type": "loaded", "extensionId": "acme.probe"}).to_string())
+            .is_pass());
+        (dir, authority, shared)
+    }
+
+    fn read_text(request: &str) -> String {
+        json!({"type": "request", "requestId": request, "method": "documents.getText", "params": {"uri": "file:///C:/w/a.txt"}, "extensionId": "acme.probe", "workspaceId": "w", "hostGeneration": 1}).to_string()
+    }
+
+    fn answer(request: &str, text: &str) -> String {
+        json!({"type": "response", "requestId": request, "ok": true, "result": text, "extensionId": "acme.probe", "workspaceId": "w", "hostGeneration": 1}).to_string()
+    }
+
+    /// A request allowed before a revocation and still waiting for the window does not carry
+    /// the window's answer back once the capability is revoked: the extension is answered
+    /// `PermissionDenied`, with nothing of what the window found. Allowed throughout, it passes.
+    #[test]
+    fn ext16_an_answer_to_a_request_revoked_meanwhile_carries_nothing() {
+        let (dir, authority, shared) = probe_loaded("ext16-answer");
+        let grant = |caps: &[&str]| {
+            let caps: Vec<String> = caps.iter().map(|c| c.to_string()).collect();
+            authority
+                .service
+                .set_grants("acme.probe", None, &caps)
+                .unwrap();
+        };
+        grant(&["documents.read"]);
+        assert!(shared.screen(&read_text("r1")).is_pass());
+        grant(&[]);
+        let sent: Value =
+            serde_json::from_str(&prepare(&shared, &answer("r1", "THE DOCUMENT TEXT")).unwrap())
+                .unwrap();
+        assert!(!sent.to_string().contains("THE DOCUMENT TEXT"), "{sent}");
+        assert_eq!(sent["ok"], json!(false));
+        assert_eq!(sent["error"]["code"], json!("PermissionDenied"));
+        assert_eq!(sent["requestId"], json!("r1"));
+        assert!(held(&shared.pending).is_empty(), "no longer waiting");
+        // Allowed throughout: the answer passes as it is.
+        grant(&["documents.read"]);
+        assert!(shared.screen(&read_text("r2")).is_pass());
+        let passed = prepare(&shared, &answer("r2", "THE DOCUMENT TEXT")).unwrap();
+        assert!(passed.contains("THE DOCUMENT TEXT"));
+        // Disabled meanwhile: nothing carried either.
+        assert!(shared.screen(&read_text("r3")).is_pass());
+        authority.service.set_enabled("acme.probe", false).unwrap();
+        let sent = prepare(&shared, &answer("r3", "THE DOCUMENT TEXT")).unwrap();
+        assert!(
+            !sent.contains("THE DOCUMENT TEXT") && sent.contains("ExtensionDisabled"),
+            "{sent}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An answer to a request this session never passed to the window (or already answered)
+    /// is not delivered: nothing reaches an extension that was not asked for and checked.
+    #[test]
+    fn ext16_an_answer_to_no_waiting_request_is_refused() {
+        let (dir, authority, shared) = probe_loaded("ext16-unasked");
+        authority
+            .service
+            .set_grants("acme.probe", None, &["documents.read".to_string()])
+            .unwrap();
+        let refused = prepare(&shared, &answer("never-asked", "THE DOCUMENT TEXT")).unwrap_err();
+        assert!(refused.starts_with("NotPending"), "{refused}");
+        assert!(shared.screen(&read_text("r1")).is_pass());
+        prepare(&shared, &answer("r1", "first")).unwrap();
+        let again = prepare(&shared, &answer("r1", "second")).unwrap_err();
+        assert!(again.starts_with("NotPending"), "{again}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Revoking one capability leaves every other as it was (and its requests passing).
+    #[test]
+    fn ext16_revoking_one_capability_leaves_the_others() {
+        let manifest = PROBE_MANIFEST.replace(
+            r#""request":["documents.read"]"#,
+            r#""request":["documents.read","editor.control"]"#,
+        );
+        let (dir, authority) = scratch_authority("ext16-one", &manifest);
+        let shared = Shared::new(authority.clone());
+        let load = json!({"type": "load", "extensionId": "acme.probe", "workspaceId": "w", "hostGeneration": 1}).to_string();
+        prepare(&shared, &load).unwrap();
+        shared.screen(&json!({"type": "loaded", "extensionId": "acme.probe"}).to_string());
+        let both = vec!["documents.read".to_string(), "editor.control".to_string()];
+        authority
+            .service
+            .set_grants("acme.probe", None, &both)
+            .unwrap();
+        let reveal = |id: &str| {
+            json!({"type": "request", "requestId": id, "method": "editor.revealRange", "params": {}, "extensionId": "acme.probe", "workspaceId": "w", "hostGeneration": 1}).to_string()
+        };
+        assert!(shared.screen(&reveal("e1")).is_pass());
+        assert!(shared.screen(&read_text("d1")).is_pass());
+        authority
+            .service
+            .set_grants("acme.probe", None, &["editor.control".to_string()])
+            .unwrap();
+        let (_, told) = shared.screen(&read_text("d2")).refused();
+        assert_eq!(told.unwrap().capability.as_deref(), Some("documents.read"));
+        assert!(shared.screen(&reveal("e2")).is_pass());
+        // The answer to the request of the one still allowed passes.
+        let ok = json!({"type": "response", "requestId": "e1", "ok": true, "result": null, "extensionId": "acme.probe", "workspaceId": "w", "hostGeneration": 1}).to_string();
+        assert!(prepare(&shared, &ok).unwrap().contains(r#""ok":true"#));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Refused, allowed, revoked, refused again: the second refusal is told to the window
+    /// too (it forgot the first when the permission was allowed). A repeat with no change of
+    /// grants in between is still told once.
+    #[test]
+    fn ext16_a_refusal_after_a_revocation_is_told_again() {
+        let (dir, authority, shared) = probe_loaded("ext16-told");
+        let grant = |caps: &[&str]| {
+            let caps: Vec<String> = caps.iter().map(|c| c.to_string()).collect();
+            authority
+                .service
+                .set_grants("acme.probe", None, &caps)
+                .unwrap();
+        };
+        assert!(shared.screen(&read_text("a")).refused().1.is_some(), "told");
+        assert!(
+            shared.screen(&read_text("b")).refused().1.is_none(),
+            "a repeat: not again"
+        );
+        grant(&["documents.read"]);
+        assert!(shared.screen(&read_text("c")).is_pass());
+        grant(&[]);
+        let told = shared.screen(&read_text("d")).refused().1;
+        assert_eq!(
+            told.expect("told again after the revocation")
+                .capability
+                .as_deref(),
+            Some("documents.read")
+        );
+        assert!(
+            shared.screen(&read_text("e")).refused().1.is_none(),
+            "a repeat: not again"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

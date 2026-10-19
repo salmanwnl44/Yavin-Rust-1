@@ -859,9 +859,12 @@ fn a_recorded_folder_outside_the_root_is_never_used_or_deleted() {
                 source: "unknown".into(),
                 installed_at: 0,
                 signature: None,
+                files_sha256: None,
+                unchecked: Some(Unchecked::Adopted),
             },
             previous: None,
             broken: None,
+            replaced: None,
         },
     );
     fs::write(
@@ -948,9 +951,12 @@ fn a_tampered_operation_cannot_name_a_path() {
                 source: "unknown".into(),
                 installed_at: 0,
                 signature: None,
+                files_sha256: None,
+                unchecked: Some(Unchecked::Adopted),
             },
             previous: None,
             broken: None,
+            replaced: None,
         },
     );
     fs::write(
@@ -2979,4 +2985,747 @@ fn ext14_safe_mode_refuses_code_and_changes_nothing_else() {
     service.set_safe_mode(false);
     assert_eq!(service.host_copy("acme.one").unwrap(), copy);
     assert!(service.authorize(&copy, Some("documents.read")).is_ok());
+}
+
+// --- EXT-15: installed bytes, sources and reconstructed copies ----------------------------------
+
+#[test]
+fn ext15_a_changed_active_copy_falls_back_to_its_intact_previous_one() {
+    let fx = fixture("ext15-fallback");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    install(&fx, &service, "acme.hello", "2.0.0");
+    let record = inventory(&fx).extensions["acme.hello"].clone();
+    let active = join(&fx.root, &record.active.folder);
+    fs::write(
+        active.join("extension.js"),
+        "module.exports.version = 'tampered';",
+    )
+    .unwrap();
+    // Not used: the intact previous version is, and that is said.
+    assert_eq!(version_listed(&service, "acme.hello"), "1.0.0");
+    assert!(recovered(&fx, "files changed"));
+    let copy = service.host_copy("acme.hello").unwrap();
+    assert_eq!(copy.version, "1.0.0");
+    // The changed copy's grants are not applied to it -- it is not the copy in use.
+    assert_eq!(
+        inventory(&fx).extensions["acme.hello"].active.version,
+        "1.0.0"
+    );
+}
+
+#[test]
+fn ext15_a_local_file_is_never_signed_and_a_record_naming_another_source_is_not_shown() {
+    let fx = fixture("ext15-file");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    let record = inventory(&fx).extensions["acme.hello"].active.clone();
+    let signature = record.signature.clone().unwrap();
+    assert_eq!(signature.status, SignatureStatus::Missing);
+    assert_eq!(signature.registry, "file");
+    assert_eq!(record.source, "file");
+    assert_eq!(
+        entry(&service, "acme.hello").signature.unwrap().status,
+        SignatureStatus::Missing
+    );
+    // A record that says "signed by a registry" for a copy installed from a file -- bytes and
+    // all matching -- is not this copy's: not listed.
+    drop(service);
+    let mut inv = inventory(&fx);
+    let active = &mut inv.extensions.get_mut("acme.hello").unwrap().active;
+    let forged = active.signature.as_mut().unwrap();
+    forged.status = SignatureStatus::RegistrySigned;
+    forged.registry = "https://open-vsx.org".into();
+    let text = serde_json::to_string(&inv).unwrap();
+    fs::write(fx.root.join(INVENTORY), &text).unwrap();
+    fs::write(fx.root.join(LAST_GOOD), &text).unwrap();
+    assert!(entry(&fx.service(), "acme.hello").signature.is_none());
+}
+
+#[test]
+fn ext15_a_different_package_whose_hash_starts_the_same_gets_a_folder_of_its_own() {
+    let fx = fixture("ext15-prefix");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    // Pretend the installed copy is other bytes, with the same version and hash prefix (a
+    // 32-bit collision): its folder name is the one the next package would take.
+    drop(service);
+    let mut inv = inventory(&fx);
+    let real = inv.extensions["acme.hello"].active.sha256.clone().unwrap();
+    let pretend = format!("{}{}", &real[..8], "0".repeat(56));
+    inv.extensions.get_mut("acme.hello").unwrap().active.sha256 = Some(pretend.clone());
+    let text = serde_json::to_string(&inv).unwrap();
+    fs::write(fx.root.join(INVENTORY), &text).unwrap();
+    fs::write(fx.root.join(LAST_GOOD), &text).unwrap();
+    let service = fx.service();
+    // The same version again (the real bytes): not taken for the copy in place.
+    let op = stage_file(
+        &service,
+        &fx.package("acme.hello", "1.0.0"),
+        "acme.hello",
+        "1.0.0",
+    )
+    .unwrap();
+    service.commit(&op, "acme.hello").unwrap();
+    service.finish(&op, "acme.hello", true).unwrap();
+    let record = inventory(&fx).extensions["acme.hello"].clone();
+    assert_eq!(record.active.sha256.as_deref(), Some(real.as_str()));
+    assert!(
+        record.active.folder.ends_with(&real),
+        "{}",
+        record.active.folder
+    );
+    assert_eq!(
+        record.previous.as_ref().unwrap().sha256.as_deref(),
+        Some(pretend.as_str())
+    );
+    assert_ne!(
+        record.active.folder,
+        record.previous.as_ref().unwrap().folder
+    );
+    assert_eq!(version_listed(&service, "acme.hello"), "1.0.0");
+}
+
+#[test]
+fn ext15_copies_installed_before_files_were_bound_still_load_and_recovery_binds_nothing() {
+    let fx = fixture("ext15-legacy");
+    drop(installed(&fx));
+    // An inventory from before EXT-15 (version 1): no files digest. Still used (it cannot be
+    // checked) -- as a legacy copy since EXT-17, never as a verified one.
+    let text = as_version_1(&fx);
+    assert!(!text.contains("filesSha256"));
+    let service = fx.service();
+    assert_eq!(version_listed(&service, "acme.hello"), "2.0.0");
+    assert_eq!(
+        entry(&service, "acme.hello").integrity.unwrap().reason,
+        Some("legacy")
+    );
+    service
+        .host_copy("acme.hello")
+        .expect("a legacy copy loads");
+    // A rebuild from the folders alone: no signature, no files digest -- nothing it cannot know.
+    drop(service);
+    damage_beyond_the_last_good_copy(&fx);
+    let service = fx.service();
+    service.list(None).unwrap();
+    for record in inventory(&fx).extensions.values() {
+        assert!(record.active.signature.is_none() && record.active.files_sha256.is_none());
+    }
+}
+
+#[test]
+fn ext15_a_copy_restored_from_the_last_good_inventory_is_still_checked() {
+    let fx = fixture("ext15-restore");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    let folder = join(
+        &fx.root,
+        &inventory(&fx).extensions["acme.hello"].active.folder,
+    );
+    drop(service);
+    fs::write(fx.root.join(INVENTORY), "{ not json").unwrap();
+    fs::write(folder.join("extension.js"), "module.exports = 'changed';").unwrap();
+    let service = fx.service();
+    let listed = entry(&service, "acme.hello");
+    assert!(
+        listed
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("files changed"),
+        "{:?}",
+        listed.error
+    );
+    assert!(listed.signature.is_none());
+    assert!(service.host_copy("acme.hello").is_err());
+}
+
+#[test]
+fn ext15_a_rebuild_keeps_a_copy_in_a_full_hash_folder() {
+    let fx = fixture("ext15-rebuild-full");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    drop(service);
+    // The folder a commit uses when the short name was another package's.
+    let long = format!("1.1.0-{}", "ab".repeat(32));
+    fx.folder(
+        &fx.root.join(STORE).join("acme.hello"),
+        &long,
+        &manifest("acme.hello", "1.1.0"),
+    );
+    fs::write(fx.root.join(INVENTORY), "{ not json").unwrap();
+    fs::write(fx.root.join(LAST_GOOD), "{ not json either").unwrap();
+    let service = fx.service();
+    assert_eq!(version_listed(&service, "acme.hello"), "1.1.0");
+    let record = inventory(&fx).extensions["acme.hello"].clone();
+    assert_eq!(record.active.folder, format!("{STORE}/acme.hello/{long}"));
+    assert!(record.active.signature.is_none() && record.active.files_sha256.is_none());
+}
+
+// --- EXT-16: revocation and operations in flight -----------------------------------------------
+
+/// A store whose next read waits until it is let go (and says when it started).
+#[derive(Default)]
+struct Gated {
+    inner: MemoryBackend,
+    armed: std::sync::atomic::AtomicBool,
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl crate::extension_secrets::SecretBackend for Gated {
+    fn read(&self, target: &str) -> Result<Option<Vec<u8>>, String> {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                entered.send(()).unwrap();
+            }
+            if let Some(release) = self.release.lock().unwrap().take() {
+                release.recv().unwrap();
+            }
+        }
+        self.inner.read(target)
+    }
+    fn write(&self, target: &str, comment: &str, blob: &[u8]) -> Result<(), String> {
+        self.inner.write(target, comment, blob)
+    }
+    fn delete(&self, target: &str) -> Result<bool, String> {
+        self.inner.delete(target)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>, String> {
+        self.inner.list(prefix)
+    }
+}
+
+/// A secret operation allowed before a revocation completes, and the revocation returns only
+/// after it has: once \`set_grants\` answers, no operation it revoked is still running, and the
+/// next one is refused. (Before EXT-16 the check and the operation were not one step: a
+/// revocation could complete while an operation it should have stopped was still to run.)
+#[test]
+fn ext16_a_revocation_waits_for_the_secret_operation_already_allowed_and_stops_the_next() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let fx = fixture("ext16-secret-race");
+    let service = fx.service();
+    let backend = std::sync::Arc::new(Gated::default());
+    service.use_secret_backend(backend.clone());
+    let one = secret_keeper(&fx, &service, "acme.one");
+    let get = || {
+        secret(
+            &service,
+            &one,
+            None,
+            "secrets.get",
+            serde_json::json!({"key": "token"}),
+        )
+    };
+    secret(
+        &service,
+        &one,
+        None,
+        "secrets.store",
+        serde_json::json!({"key": "token", "value": "the-token"}),
+    )
+    .unwrap();
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    *backend.entered.lock().unwrap() = Some(entered_tx);
+    *backend.release.lock().unwrap() = Some(release_rx);
+    backend.armed.store(true, Ordering::SeqCst);
+    let revoked = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let reading = scope.spawn(get);
+        entered.recv().unwrap();
+        let revoking = scope.spawn(|| {
+            service.set_grants("acme.one", None, &[]).unwrap();
+            revoked.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let answered_early = revoked.load(Ordering::SeqCst);
+        // Let the operation go before anything can fail (a failure must not leave it waiting).
+        release.send(()).unwrap();
+        assert!(
+            !answered_early,
+            "the revocation answered while an operation it covers was still running"
+        );
+        // Allowed before the revocation: it completes.
+        assert_eq!(reading.join().unwrap().unwrap(), "the-token");
+        revoking.join().unwrap();
+    });
+    assert!(revoked.load(Ordering::SeqCst));
+    assert_eq!(get().unwrap_err().code, "PermissionDenied");
+}
+
+/// A revocation is of that one capability of that one extension: the others it was allowed,
+/// other extensions' grants and every signature record are as they were. It holds after an
+/// application restart (a new service over the same folder), and a profile switch there and
+/// back does not bring it back.
+#[test]
+fn ext16_a_revocation_touches_nothing_else_and_survives_a_restart_and_profile_switches() {
+    let fx = fixture("ext16-revoke-scope");
+    let service = fx.service();
+    let both = ["documents.read", "workspace.fs.read"];
+    for id in ["acme.one", "acme.two"] {
+        let op = install_requesting(&fx, &service, id, "1.0.0", &both);
+        service.finish(&op, id, true).unwrap();
+        service.set_grants(id, None, &strings(&both)).unwrap();
+    }
+    let before = inventory(&fx);
+    let state = service
+        .set_grants("acme.one", None, &strings(&["workspace.fs.read"]))
+        .unwrap();
+    assert_eq!(state.granted, ["workspace.fs.read"]);
+    let after = inventory(&fx);
+    for id in ["acme.one", "acme.two"] {
+        assert_eq!(
+            after.extensions[id], before.extensions[id],
+            "{id}: its copies and signature record are untouched"
+        );
+    }
+    assert_eq!(after.grants["acme.two"], before.grants["acme.two"]);
+    let check = |service: &ExtensionService| {
+        let one = service.host_copy("acme.one").unwrap();
+        let two = service.host_copy("acme.two").unwrap();
+        assert_eq!(
+            service
+                .authorize(&one, Some("documents.read"))
+                .unwrap_err()
+                .code,
+            "PermissionDenied"
+        );
+        service.authorize(&one, Some("workspace.fs.read")).unwrap();
+        for capability in both {
+            service.authorize(&two, Some(capability)).unwrap();
+        }
+    };
+    check(&service);
+    // Yavin restarted.
+    drop(service);
+    let service = fx.service();
+    check(&service);
+    // Another profile and back: profiles never grant (EXT-13).
+    service.create_profile("Work").unwrap();
+    service.select_profile("work").unwrap();
+    check(&service);
+    service.select_profile("default").unwrap();
+    check(&service);
+    // Revoking the last one removes the grant; the other extension keeps all of its own.
+    service.set_grants("acme.one", None, &[]).unwrap();
+    assert!(!inventory(&fx).grants.contains_key("acme.one"));
+    assert_eq!(inventory(&fx).grants["acme.two"], before.grants["acme.two"]);
+}
+
+// --- EXT-17: inventory migration, legacy integrity and recovery --------------------------------
+
+/// The inventory as a version-1 Yavin (before EXT-15) would have written it: no files
+/// digests, no `unchecked`, no `replaced`.
+fn as_version_1(fx: &Fixture) -> String {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(fx.root.join(INVENTORY)).unwrap()).unwrap();
+    value["version"] = serde_json::json!(1);
+    for record in value["extensions"].as_object_mut().unwrap().values_mut() {
+        for key in ["active", "previous"] {
+            if let Some(copy) = record.get_mut(key).and_then(|c| c.as_object_mut()) {
+                copy.remove("filesSha256");
+                copy.remove("unchecked");
+            }
+        }
+        record.as_object_mut().unwrap().remove("replaced");
+    }
+    let text = serde_json::to_string_pretty(&value).unwrap();
+    fs::write(fx.root.join(INVENTORY), &text).unwrap();
+    fs::write(fx.root.join(LAST_GOOD), &text).unwrap();
+    text
+}
+
+fn backups(fx: &Fixture, prefix: &str) -> Vec<String> {
+    fs::read_dir(&fx.root)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(prefix))
+        .collect()
+}
+
+/// A version-1 inventory is upgraded once: its copies without a files digest are marked
+/// unchecked (legacy), nothing is raised -- their signature records are kept but not shown,
+/// grants, enabled state and profiles are as they were -- the original is kept beside it, and
+/// the new version is written at once. A legacy copy still runs. A second start changes nothing.
+#[test]
+fn ext17_a_version_1_inventory_is_upgraded_once_marked_unchecked_and_kept() {
+    let fx = fixture("ext17-migrate");
+    let service = installed(&fx);
+    service.create_profile("Work").unwrap();
+    drop(service);
+    let before = inventory(&fx);
+    let original = as_version_1(&fx);
+    let service = fx.service();
+    let listed = entry(&service, "acme.hello");
+    let integrity = listed.integrity.clone().unwrap();
+    assert_eq!(
+        (integrity.state, integrity.reason, integrity.runs),
+        ("unchecked", Some("legacy"), true)
+    );
+    assert!(
+        listed.signature.is_none(),
+        "never shown for files that were not checked"
+    );
+    service
+        .host_copy("acme.hello")
+        .expect("a legacy copy still runs");
+    let after = inventory(&fx);
+    assert_eq!(after.version, 2);
+    let active = &after.extensions["acme.hello"].active;
+    assert_eq!(active.unchecked, Some(Unchecked::Legacy));
+    assert!(active.files_sha256.is_none(), "no digest is made up");
+    assert_eq!(
+        active.signature, before.extensions["acme.hello"].active.signature,
+        "the record is kept as it was"
+    );
+    assert_eq!(after.grants, before.grants);
+    assert_eq!(after.disabled, before.disabled);
+    assert_eq!(after.profiles, before.profiles);
+    assert!(recovered(&fx, "upgraded from version 1"));
+    let kept = backups(&fx, "inventory.json.v1-migrated-");
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(
+        fs::read_to_string(fx.root.join(&kept[0])).unwrap(),
+        original
+    );
+    // Again: nothing more to migrate, nothing more kept.
+    drop(service);
+    let service = fx.service();
+    service.list(None).unwrap();
+    assert_eq!(backups(&fx, "inventory.json.v1-migrated-").len(), 1);
+    assert_eq!(inventory(&fx).extensions, after.extensions);
+}
+
+/// Reinstalling a legacy copy (the same package, verified again) checks its files: as
+/// installed, they are bound -- the copy is verified and its fresh signature record shown.
+#[test]
+fn ext17_reinstalling_a_legacy_copy_binds_its_files() {
+    let fx = fixture("ext17-bind");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    let folder = inventory(&fx).extensions["acme.hello"]
+        .active
+        .folder
+        .clone();
+    drop(service);
+    as_version_1(&fx);
+    let service = fx.service();
+    assert_eq!(
+        entry(&service, "acme.hello").integrity.unwrap().state,
+        "unchecked"
+    );
+    install(&fx, &service, "acme.hello", "1.0.0");
+    let record = inventory(&fx).extensions["acme.hello"].clone();
+    assert_eq!(record.active.folder, folder, "the same copy, now bound");
+    assert!(record.active.files_sha256.is_some());
+    assert_eq!(record.active.unchecked, None);
+    let listed = entry(&service, "acme.hello");
+    assert_eq!(listed.integrity.unwrap().state, "verified");
+    assert_eq!(
+        listed.signature.unwrap().status,
+        SignatureStatus::Missing,
+        "a file: unsigned, said so"
+    );
+}
+
+/// Reinstalling over legacy files that are no longer the package's: the verified package gets
+/// a folder of its own; the changed copy is neither reused nor kept to fall back on, and is
+/// removed once the install is kept.
+#[test]
+fn ext17_reinstalling_over_changed_legacy_files_never_reuses_or_falls_back_to_them() {
+    let fx = fixture("ext17-replace");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    let old = inventory(&fx).extensions["acme.hello"]
+        .active
+        .folder
+        .clone();
+    drop(service);
+    as_version_1(&fx);
+    fs::write(
+        join(&fx.root, &old).join("extension.js"),
+        "module.exports.version = 'changed';",
+    )
+    .unwrap();
+    let service = fx.service();
+    // Unchecked: nothing can tell it changed -- it runs, and says it is not checked.
+    assert_eq!(
+        entry(&service, "acme.hello").integrity.unwrap().reason,
+        Some("legacy")
+    );
+    install(&fx, &service, "acme.hello", "1.0.0");
+    let record = inventory(&fx).extensions["acme.hello"].clone();
+    assert_ne!(record.active.folder, old);
+    assert!(
+        record.previous.is_none(),
+        "the changed copy is not kept to fall back on"
+    );
+    assert_eq!(
+        entry(&service, "acme.hello").integrity.unwrap().state,
+        "verified"
+    );
+    let code =
+        fs::read_to_string(join(&fx.root, &record.active.folder).join("extension.js")).unwrap();
+    assert_eq!(code, "module.exports.version = '1.0.0';");
+    assert!(
+        !join(&fx.root, &old).exists(),
+        "removed once the install was kept"
+    );
+}
+
+/// A rebuilt copy (the inventory and its last good copy lost) cannot be checked: listed as
+/// such, its code does not run -- even enabled -- until it is reinstalled.
+#[test]
+fn ext17_a_rebuilt_copy_does_not_run_until_reinstalled() {
+    let fx = fixture("ext17-rebuilt");
+    drop(installed(&fx));
+    damage_beyond_the_last_good_copy(&fx);
+    let service = fx.service();
+    let listed = entry(&service, "acme.hello");
+    let integrity = listed.integrity.unwrap();
+    assert_eq!(
+        (integrity.state, integrity.reason, integrity.runs),
+        ("unchecked", Some("rebuilt"), false)
+    );
+    assert!(listed.signature.is_none());
+    service.set_enabled("acme.hello", true).unwrap();
+    let refused = service.host_copy("acme.hello").unwrap_err();
+    assert!(refused.starts_with("IntegrityUnverified"), "{refused}");
+    // Restarted: still refused.
+    drop(service);
+    let service = fx.service();
+    assert!(service
+        .host_copy("acme.hello")
+        .unwrap_err()
+        .starts_with("IntegrityUnverified"));
+    install(&fx, &service, "acme.hello", "2.0.0");
+    service
+        .host_copy("acme.hello")
+        .expect("reinstalled: it runs");
+    assert_eq!(
+        entry(&service, "acme.hello").integrity.unwrap().state,
+        "verified"
+    );
+}
+
+/// An IDE-09 root folder adopted where it is: unchecked (no package on record), it runs, and
+/// it is never shown as signed.
+#[test]
+fn ext17_an_adopted_folder_is_unchecked_and_never_signed() {
+    let fx = fixture("ext17-adopted");
+    fx.folder(&fx.root, "acme.hello", &manifest("acme.hello", "1.0.0"));
+    let service = fx.service();
+    let listed = entry(&service, "acme.hello");
+    let integrity = listed.integrity.unwrap();
+    assert_eq!(
+        (integrity.state, integrity.reason, integrity.runs),
+        ("unchecked", Some("adopted"), true)
+    );
+    assert!(listed.signature.is_none());
+    assert_eq!(
+        inventory(&fx).extensions["acme.hello"].active.unchecked,
+        Some(Unchecked::Adopted)
+    );
+}
+
+/// An inventory a newer Yavin wrote is refused -- and refused again on every start: nothing
+/// is restored or rebuilt over it, no copy is moved or disabled.
+#[test]
+fn ext17_a_newer_inventory_is_refused_on_every_start_and_nothing_is_rebuilt() {
+    let fx = fixture("ext17-newer");
+    drop(installed(&fx));
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(fx.root.join(INVENTORY)).unwrap()).unwrap();
+    value["version"] = serde_json::json!(3);
+    value["somethingNew"] = serde_json::json!({"kept": true});
+    let text = value.to_string();
+    fs::write(fx.root.join(INVENTORY), &text).unwrap();
+    fs::write(fx.root.join(LAST_GOOD), &text).unwrap();
+    let store: Vec<_> = fs::read_dir(fx.root.join(STORE).join("acme.hello"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    for _ in 0..3 {
+        let refused = fx.service().list(None).unwrap_err();
+        assert!(refused.starts_with("InventoryUnsupported"), "{refused}");
+    }
+    assert!(
+        backups(&fx, ".unrecovered").is_empty(),
+        "nothing was rebuilt"
+    );
+    let after: Vec<_> = fs::read_dir(fx.root.join(STORE).join("acme.hello"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(after, store);
+    let kept: Vec<_> = backups(&fx, "inventory.")
+        .into_iter()
+        .filter(|n| n.contains(".v3-"))
+        .collect();
+    assert!(!kept.is_empty());
+    for name in kept {
+        assert_eq!(
+            fs::read_to_string(fx.root.join(name)).unwrap(),
+            text,
+            "kept byte for byte"
+        );
+    }
+}
+
+/// When the active copy cannot be used and its intact previous one takes its place, the
+/// listing says which copy was replaced and why -- after a restart too -- until the next install.
+#[test]
+fn ext17_a_fallback_says_which_copy_it_replaced_and_why() {
+    let fx = fixture("ext17-fallback");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    install(&fx, &service, "acme.hello", "2.0.0");
+    let active = inventory(&fx).extensions["acme.hello"]
+        .active
+        .folder
+        .clone();
+    fs::write(
+        join(&fx.root, &active).join("extension.js"),
+        "module.exports = 'changed';",
+    )
+    .unwrap();
+    let listed = entry(&service, "acme.hello");
+    assert_eq!(
+        identity(listed.manifest.as_deref().unwrap()).unwrap().1,
+        "1.0.0"
+    );
+    assert_eq!(
+        listed.integrity.unwrap().state,
+        "verified",
+        "the copy used is intact"
+    );
+    let replaced = listed.replaced.unwrap();
+    assert_eq!(replaced.version, "2.0.0");
+    assert!(
+        replaced.reason.contains("files changed"),
+        "{}",
+        replaced.reason
+    );
+    drop(service);
+    let service = fx.service();
+    assert_eq!(
+        entry(&service, "acme.hello").replaced.unwrap().version,
+        "2.0.0"
+    );
+    install(&fx, &service, "acme.hello", "2.0.0");
+    let listed = entry(&service, "acme.hello");
+    assert!(listed.replaced.is_none());
+    assert_eq!(
+        identity(listed.manifest.as_deref().unwrap()).unwrap().1,
+        "2.0.0"
+    );
+}
+
+/// Every field the inventory persists, pinned to its version: a new one fails this test until
+/// `INVENTORY_VERSION` is raised (and a migration written) -- so an older Yavin refuses the
+/// inventory rather than drop the new field on its next write.
+#[test]
+fn ext17_the_persisted_schema_is_pinned_to_its_version() {
+    let fx = fixture("ext17-schema");
+    let service = installed(&fx);
+    service.create_profile("Work").unwrap();
+    drop(service);
+    let mut inv = inventory(&fx);
+    let record = inv.extensions.get_mut("acme.hello").unwrap();
+    record.broken = Some("x".into());
+    record.replaced = Some(Replaced {
+        version: "0.1.0".into(),
+        reason: "x".into(),
+        at: 1,
+    });
+    record.active.unchecked = Some(Unchecked::Legacy);
+    record.active.signature = Some(SignatureRecord {
+        status: SignatureStatus::RegistrySigned,
+        registry: "https://open-vsx.org".into(),
+        key_id: Some("k".into()),
+        namespace: "acme".into(),
+        sha256: "0".repeat(64),
+        store_revision: 1,
+    });
+    record.previous.as_mut().unwrap().unchecked = Some(Unchecked::Adopted);
+    let signature = record.active.signature.clone();
+    let before = record.clone();
+    inv.operations.insert(
+        "0123456789abcdef".into(),
+        Operation {
+            id: "acme.hello".into(),
+            version: "3.0.0".into(),
+            source: "file".into(),
+            state: OpState::Staged,
+            sha256: None,
+            before: Some(before),
+            signature,
+        },
+    );
+    inv.recoveries.push(Recovery {
+        at: 1,
+        id: None,
+        reason: "x".into(),
+    });
+    let value = serde_json::to_value(&inv).unwrap();
+    // Every persisted field by its path; keys that are data (ids, profile ids, operation
+    // keys, setting names) are `*`.
+    fn walk(value: &serde_json::Value, path: &str, keys: &mut std::collections::BTreeSet<String>) {
+        const DATA: [&str; 5] = [
+            "extensions",
+            "grants",
+            "operations",
+            "profiles.list",
+            "profiles.list.*.settings",
+        ];
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    let name = if DATA.contains(&path) {
+                        "*"
+                    } else {
+                        key.as_str()
+                    };
+                    let next = if path.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{path}.{name}")
+                    };
+                    if !path.ends_with("settings.*") {
+                        keys.insert(next.clone());
+                        walk(child, &next, keys);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items
+                .iter()
+                .for_each(|item| walk(item, &format!("{path}[]"), keys)),
+            _ => {}
+        }
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    walk(&value, "", &mut keys);
+    assert_eq!(
+        INVENTORY_VERSION, 2,
+        "a new version: pin its fields with it"
+    );
+    let text = keys.into_iter().collect::<Vec<_>>().join(
+        "
+",
+    );
+    let pinned = include_str!("extension_inventory_v2.fields.txt").replace(
+        "
+", "
+",
+    );
+    assert_eq!(
+        text.trim(),
+        pinned.trim(),
+        "the persisted fields changed:
+{text}"
+    );
 }

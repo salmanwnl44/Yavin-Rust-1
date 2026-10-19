@@ -119,6 +119,10 @@ interface Commands {
         permissions: NativePermissions | null;
         /** What its package's signature was found to be when installed (EXT-09). */
         signature: NativeSignature | null;
+        /** Whether its files are the package's (EXT-17). */
+        integrity: NativeIntegrity | null;
+        /** The copy its intact previous one replaced (EXT-17). */
+        replaced: NativeReplaced | null;
       }[];
       skipped: number;
       disabled: string[];
@@ -782,6 +786,21 @@ export interface NativeSignature {
   namespace: string;
   sha256: string;
   storeRevision: number;
+}
+
+/** What is known of a copy's files (EXT-17, `Integrity` in `extension_service.rs`). */
+export interface NativeIntegrity {
+  state: "verified" | "unchecked" | "changed" | "development";
+  reason: "legacy" | "adopted" | "rebuilt" | null;
+  /** Whether its code may run. */
+  runs: boolean;
+}
+
+/** A copy that could not be used, replaced by its intact previous one (EXT-17). */
+export interface NativeReplaced {
+  version: string;
+  reason: string;
+  at: number;
 }
 
 /** The extension host's resources (EXT-10, `HostResources` in `extension_host.rs`). */

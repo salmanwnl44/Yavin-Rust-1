@@ -5,7 +5,7 @@
  * A checksum that matches is never called "verified": it shows the package arrived intact, not
  * who made it.
  */
-import type { NativeSignature } from "../native.ts";
+import type { NativeIntegrity, NativeSignature } from "../native.ts";
 
 export interface SignatureDescription {
   /** Short: for the row's first words. */
@@ -26,7 +26,16 @@ const hostOf = (origin: string) => {
 
 export function describeSignature(
   signature: NativeSignature | null | undefined,
+  /** What is known of the copy's files (EXT-17): a record is shown only for checked files. */
+  integrity?: NativeIntegrity | null,
 ): SignatureDescription {
+  if (!signature && integrity?.state === "unchecked")
+    return {
+      label: "Not shown",
+      detail:
+        "Its installed files have not been checked against its package, so no signature is shown for it, whatever was found when it was installed. Reinstall it to check them.",
+      signed: false,
+    };
   if (!signature)
     return {
       label: "Not recorded",

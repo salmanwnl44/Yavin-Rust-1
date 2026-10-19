@@ -166,9 +166,13 @@ export async function palette(page: Page, command: string) {
   await page.getByRole("option").filter({ hasText: command }).first().click();
 }
 
+/** The Extensions view, opened if it is not the one showing (its icon on an open view hides it). */
 export async function extensionsView(page: Page) {
-  await page.getByTitle("Extensions & Plugins (Ctrl+Shift+X)", { exact: true }).click();
-  return page.getByRole("complementary", { name: "Extensions" });
+  const view = page.getByRole("complementary", { name: "Extensions" });
+  if (!(await view.isVisible()))
+    await page.getByTitle("Extensions & Plugins (Ctrl+Shift+X)", { exact: true }).click();
+  await expect(view).toBeVisible();
+  return view;
 }
 
 /** The Extensions view's runtime diagnostics (the host line, Restart, Reload). */
@@ -182,3 +186,32 @@ export const message = (page: Page) => page.getByRole("status", { name: "Extensi
 /** The window's error bar (not an alert inside a view, like the Extensions view's). */
 export const alert = (page: Page) =>
   page.locator("[role=alert]:not(.monaco-alert):not(aside [role=alert])");
+
+/**
+ * A local registry that publishes nothing, for tests that are not about the marketplace: what
+ * they see must not depend on the network or on what Yavin's registry publishes (a newer
+ * version there would show an extension as "Update Available" instead of its running state).
+ */
+export async function emptyRegistry(): Promise<{ url: string; close(): Promise<void> }> {
+  const { createServer } = await import("node:http");
+  const index = JSON.stringify({
+    schema: 1,
+    name: "Empty test registry",
+    categories: [],
+    recommended: [],
+    extensions: [],
+  });
+  const server = createServer((request, response) => {
+    if ((request.url ?? "").split("?")[0] === "/index.json") {
+      response.writeHead(200, {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(index),
+      });
+      response.end(index);
+    } else response.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const url = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}/`;
+  return { url, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+}

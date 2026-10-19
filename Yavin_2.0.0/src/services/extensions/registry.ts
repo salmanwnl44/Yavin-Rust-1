@@ -16,7 +16,7 @@ import {
   type SettingDefinition,
   type SettingsRegistry,
 } from "../settings/settings.ts";
-import type { NativeSignature } from "../native.ts";
+import type { NativeIntegrity, NativeReplaced, NativeSignature } from "../native.ts";
 import { ExtensionError } from "./errors.ts";
 import {
   readManifest,
@@ -73,6 +73,10 @@ export interface RegisteredExtension {
    * inventory said: null when it has not said (not recorded, or not listed yet).
    */
   signature: NativeSignature | null;
+  /** What is known of its files (EXT-17), as the native inventory said: null until it has. */
+  integrity: NativeIntegrity | null;
+  /** The copy its intact previous one replaced (EXT-17), while that is so. */
+  replaced: NativeReplaced | null;
 }
 
 export interface RejectedExtension {
@@ -217,6 +221,10 @@ export function createExtensionRegistry(options: {
   /** Grant states by id, as last confirmed (kept across a re-registration of the same copy). */
   const grantStates = new Map<string, GrantState>();
   const signatureStates = new Map<string, NativeSignature | null>();
+  const integrityStates = new Map<
+    string,
+    { integrity: NativeIntegrity | null; replaced: NativeReplaced | null }
+  >();
   let rejected: RejectedExtension[] = [];
   /** Settings registered for each enabled extension, to remove with it. */
   const settingRemovals = new Map<string, (() => void)[]>();
@@ -363,6 +371,21 @@ export function createExtensionRegistry(options: {
     publish();
   };
 
+  const setIntegrity = (
+    id: string,
+    integrity: NativeIntegrity | null,
+    replaced: NativeReplaced | null,
+  ) => {
+    integrityStates.set(id, { integrity, replaced });
+    const entry = extensions.get(id);
+    if (!entry) return;
+    if (JSON.stringify([entry.integrity, entry.replaced]) === JSON.stringify([integrity, replaced]))
+      return;
+    entry.integrity = integrity;
+    entry.replaced = replaced;
+    publish();
+  };
+
   const setGrants = (id: string, state: GrantState) => {
     grantStates.set(id, state);
     const entry = extensions.get(id);
@@ -417,6 +440,8 @@ export function createExtensionRegistry(options: {
         shadowed,
         grants: grantStates.get(manifest.id) ?? NO_GRANTS,
         signature: signatureStates.get(manifest.id) ?? null,
+        integrity: integrityStates.get(manifest.id)?.integrity ?? null,
+        replaced: integrityStates.get(manifest.id)?.replaced ?? null,
       };
       extensions.set(manifest.id, entry);
       if (entry.enabled) applySettings(entry);
@@ -462,8 +487,11 @@ export function createExtensionRegistry(options: {
         },
         // The new copy's is not the old one's: unknown until the inventory lists it.
         signature: null,
+        integrity: null,
+        replaced: null,
       };
       signatureStates.delete(id);
+      integrityStates.delete(id);
       grantStates.set(id, entry.grants);
       extensions.set(id, entry);
       if (entry.enabled) applySettings(entry);
@@ -479,6 +507,7 @@ export function createExtensionRegistry(options: {
       const entry = extensions.get(id);
       if (forget) grantStates.delete(id);
       if (forget) signatureStates.delete(id);
+      if (forget) integrityStates.delete(id);
       if (forget && disabled.delete(id) && !options.persistEnabled) saveDisabled(id, true);
       if (!entry) return;
       if (entry.enabled) removeSettings(entry);
@@ -489,6 +518,8 @@ export function createExtensionRegistry(options: {
     setGrants,
     /** What an extension copy's signature was found to be, as the native inventory said. */
     setSignature,
+    /** What is known of an extension copy's files, as the native inventory said (EXT-17). */
+    setIntegrity,
     /**
      * Allows exactly `capabilities` (each one its manifest requests) and returns the state the
      * native side then holds -- shown only once it said so.

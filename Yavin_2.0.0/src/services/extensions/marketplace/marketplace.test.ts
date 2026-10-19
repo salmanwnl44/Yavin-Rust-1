@@ -918,3 +918,114 @@ test("an extension whose dependency is not installed is refused before it is put
   assert.equal(m.getSnapshot().statuses["acme.quiet"]?.state, "active");
   await m.dispose();
 });
+
+test("EXT-16 statuses: a running extension is Active; a blocked permission and an update are said beside it", async () => {
+  const { displayStatus } = await import("./status.ts");
+  const t = setup();
+  await t.installer.install("acme.python-tools");
+  const entry = t.registry.get("acme.python-tools")!;
+  assert.ok(entry.manifest.main, "an extension with code");
+  const active = { state: "active", reason: null, activationMs: 3 } as const;
+  const denied = { method: "documents.getText", capability: "documents.read" };
+  const update = { id: entry.id, installed: "1.2.0", available: "1.3.0" };
+  const base = { entry, trusted: true };
+  // Running: Active, whatever else holds -- each said as its own notice.
+  const running = displayStatus({ ...base, runtime: active, denied, update });
+  assert.equal(running.label, "Active");
+  assert.equal(running.tone, "good");
+  assert.deepEqual(
+    running.notices?.map((n) => [n.kind, n.label]),
+    [
+      ["permission", "Permission Needed"],
+      ["update", "Update Available"],
+    ],
+  );
+  assert.match(
+    running.notices?.[0].detail ?? "",
+    /blocked its request to read your open documents/,
+  );
+  assert.equal(running.notices?.[1].detail, "Version 1.3.0 is available.");
+  assert.deepEqual(displayStatus({ ...base, runtime: active }).notices, []);
+  // Not running: the blocked permission is the status, the update beside it.
+  const blocked = displayStatus({ ...base, denied, update });
+  assert.equal(blocked.label, "Permission Needed");
+  assert.deepEqual(
+    blocked.notices?.map((n) => n.kind),
+    ["update"],
+  );
+  // Neither failed nor stopped looks like a security block, nor the other way round.
+  const failed = displayStatus({
+    ...base,
+    runtime: { state: "failed", reason: "Activation failed: kaboom", activationMs: null },
+    denied,
+  });
+  assert.equal(failed.label, "Failed");
+  assert.equal(
+    displayStatus({ ...base, entry: { ...entry, enabled: false }, denied }).label,
+    "Disabled",
+  );
+  assert.equal(displayStatus({ ...base, update }).label, "Update Available");
+});
+
+test("EXT-17 statuses: unchecked files are said, never verified; a recovered copy's code is Not Verified; a fallback names what it replaced", async () => {
+  const { displayStatus } = await import("./status.ts");
+  const { describeSignature } = await import("../signature.ts");
+  const t = setup();
+  await t.installer.install("acme.python-tools");
+  const installed = t.registry.get("acme.python-tools")!;
+  const active = { state: "active", reason: null, activationMs: 3 } as const;
+  const show = (entry: typeof installed, more: object = {}) =>
+    displayStatus({ entry, trusted: true, ...more });
+  // Installed before files were checked: it runs; said beside its status.
+  const legacy = {
+    ...installed,
+    integrity: { state: "unchecked", reason: "legacy", runs: true } as const,
+  };
+  const running = show(legacy, { runtime: active });
+  assert.equal(running.label, "Active");
+  const notice = running.notices?.find((n) => n.kind === "integrity");
+  assert.equal(notice?.label, "Not Checked");
+  assert.match(
+    notice?.detail ?? "",
+    /installed before Yavin checked installed files.*It runs\. Reinstall/,
+  );
+  // Recovered: its code does not run -- the status says so, not "Enabled".
+  const rebuilt = {
+    ...installed,
+    integrity: { state: "unchecked", reason: "rebuilt", runs: false } as const,
+  };
+  const refused = show(rebuilt);
+  assert.equal(refused.label, "Not Verified");
+  assert.equal(refused.tone, "error");
+  assert.match(refused.detail ?? "", /code does not run\. Reinstall/);
+  // Disabled, it is Disabled -- and the reason is still said.
+  const off = show({ ...rebuilt, enabled: false });
+  assert.equal(off.label, "Disabled");
+  assert.equal(off.notices?.[0]?.label, "Not Verified");
+  // Verified files: nothing more is said.
+  const verified = show(
+    { ...installed, integrity: { state: "verified", reason: null, runs: true } },
+    { runtime: active },
+  );
+  assert.deepEqual(verified.notices, []);
+  // A fallback: the intact copy used, the one it replaced and why.
+  const fallback = show(
+    {
+      ...installed,
+      integrity: { state: "verified", reason: null, runs: true },
+      replaced: { version: "9.9.9", reason: "its files changed since it was installed", at: 1 },
+    },
+    { runtime: active },
+  );
+  assert.equal(fallback.label, "Active");
+  const said = fallback.notices?.find((n) => n.kind === "fallback");
+  assert.equal(said?.label, "Using Previous Version");
+  assert.match(
+    said?.detail ?? "",
+    /Version 9\.9\.9 could not be used \(its files changed.*version .* -- intact -- is used instead/,
+  );
+  // Signatures: an unchecked copy's is never shown as signed.
+  const unchecked = describeSignature(null, legacy.integrity);
+  assert.equal(unchecked.signed, false);
+  assert.equal(unchecked.label, "Not shown");
+});

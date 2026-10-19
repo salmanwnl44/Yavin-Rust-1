@@ -3,15 +3,33 @@
  * Installed, Enabled, Disabled, Activating, Active, Failed, Incompatible, Update Available,
  * Untrusted, Host Unavailable, Permission Needed -- and why. Runtime internals (host generations, request ids,
  * process state) are not part of it; they are in the view's diagnostics.
+ *
+ * A running extension's status is Active (EXT-16): what else holds -- a request Yavin refused for
+ * a permission it does not have, an update -- is said beside it, as a notice, never in its place.
+ * An extension that is not running shows Permission Needed as its status, the update as a notice.
  */
 import type { RegisteredExtension } from "../registry.ts";
 import type { ExtensionStatus } from "../host.ts";
 import type { HoldKind } from "../manager.ts";
 import { describeCapability } from "../permissions.ts";
+import { describeIntegrity, describeReplaced } from "../integrity.ts";
 import type { Operation } from "./installer.ts";
 import type { ExtensionUpdate } from "./types.ts";
 
 export type StatusTone = "neutral" | "good" | "busy" | "warning" | "error";
+
+/** Said beside the status (EXT-16): it does not replace what the extension is doing. */
+export interface StatusNotice {
+  kind: "permission" | "update" | "integrity" | "fallback";
+  label:
+    | "Permission Needed"
+    | "Update Available"
+    | "Not Checked"
+    | "Not Verified"
+    | "Using Previous Version";
+  tone: StatusTone;
+  detail: string;
+}
 
 export interface DisplayStatus {
   label:
@@ -30,10 +48,13 @@ export interface DisplayStatus {
     | "Unavailable"
     | "Installing"
     | "Updating"
-    | "Uninstalling";
+    | "Uninstalling"
+    | "Not Verified";
   tone: StatusTone;
   /** Why, when there is something to say. */
   detail: string | null;
+  /** What else holds, beside the status (EXT-16). */
+  notices?: readonly StatusNotice[];
 }
 
 const PHASE: Record<Operation["phase"], string> = {
@@ -43,7 +64,7 @@ const PHASE: Record<Operation["phase"], string> = {
   removing: "Removing…",
 };
 
-export function displayStatus(input: {
+type StatusInput = {
   entry: RegisteredExtension | undefined;
   runtime?: ExtensionStatus;
   /** A dependency problem (`RegistrySnapshot.unavailable`). */
@@ -58,7 +79,43 @@ export function displayStatus(input: {
   update?: ExtensionUpdate;
   operation?: Operation;
   incompatible?: string | null;
-}): DisplayStatus {
+};
+
+/**
+ * EXT-17: what is known of an installed copy's files is said too. A copy whose code may not
+ * run (recovered, its files unverifiable) is **Not Verified** -- its status, unless it is busy,
+ * disabled or has no code -- with what to do; one never checked (installed before Yavin checked
+ * files, or adopted) runs and says so beside its status; an intact previous version used in
+ * place of a copy that could not be used says which, and why. Nothing here is ever "verified"
+ * or "signed" for files that were not checked.
+ */
+export function displayStatus(input: StatusInput): DisplayStatus {
+  const status = coreStatus(input);
+  const { entry, operation } = input;
+  if (!entry || operation) return status;
+  const notices: StatusNotice[] = [...(status.notices ?? [])];
+  const integrity = describeIntegrity(entry.integrity);
+  const runs = !!entry.manifest.main;
+  if (integrity && !integrity.runs && runs && entry.enabled)
+    return { label: "Not Verified", tone: "error", detail: integrity.detail, notices };
+  if (integrity && (integrity.label === "Not Checked" || integrity.label === "Not Verified"))
+    notices.push({
+      kind: "integrity",
+      label: integrity.label,
+      tone: integrity.runs ? "warning" : "error",
+      detail: integrity.detail,
+    });
+  if (entry.replaced)
+    notices.push({
+      kind: "fallback",
+      label: "Using Previous Version",
+      tone: "warning",
+      detail: describeReplaced(entry.replaced, entry.manifest.version),
+    });
+  return notices.length ? { ...status, notices } : status;
+}
+
+function coreStatus(input: StatusInput): DisplayStatus {
   const { entry, runtime, operation } = input;
   if (operation)
     return {
@@ -109,22 +166,41 @@ export function displayStatus(input: {
       tone: "warning",
       detail: input.held,
     };
-  if (runs && input.denied)
+  const permission: StatusNotice | null =
+    runs && input.denied
+      ? {
+          kind: "permission",
+          label: "Permission Needed",
+          tone: "warning",
+          detail: input.denied.capability
+            ? `Yavin blocked its request to ${describeCapability(input.denied.capability).title.toLowerCase()} (${input.denied.method}): that permission is not allowed for it. Allow it under Permissions on its page.`
+            : `Yavin refused its request ${input.denied.method}.`,
+        }
+      : null;
+  const update: StatusNotice | null = input.update
+    ? {
+        kind: "update",
+        label: "Update Available",
+        tone: "warning",
+        detail: `Version ${input.update.available} is available.`,
+      }
+    : null;
+  if (runtime?.state === "active")
+    return {
+      label: "Active",
+      tone: "good",
+      detail: null,
+      notices: [permission, update].filter((one): one is StatusNotice => one !== null),
+    };
+  if (permission)
     return {
       label: "Permission Needed",
-      tone: "warning",
-      detail: input.denied.capability
-        ? `It asked to ${describeCapability(input.denied.capability).title.toLowerCase()} (${input.denied.method}), which you have not allowed.`
-        : `Yavin refused its request ${input.denied.method}.`,
+      tone: permission.tone,
+      detail: permission.detail,
+      notices: update ? [update] : [],
     };
-  if (input.update)
-    return {
-      label: "Update Available",
-      tone: "warning",
-      detail: `Version ${input.update.available} is available.`,
-    };
+  if (update) return { label: "Update Available", tone: update.tone, detail: update.detail };
   if (runtime?.state === "activating") return { label: "Activating", tone: "busy", detail: null };
-  if (runtime?.state === "active") return { label: "Active", tone: "good", detail: null };
   return {
     label: runs ? "Enabled" : "Installed",
     tone: "neutral",

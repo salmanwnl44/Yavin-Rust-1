@@ -180,6 +180,11 @@ async function desktop(
       const market = { down: setup.marketplace?.down ?? false, failCommit: false };
       /** Installed through the marketplace: id → manifest text and code. */
       const installedExtensions: Record<string, { manifest: string; code: string | null }> = {};
+      /** EXT-17: what the inventory says of installed copies' files (`__copyStates`, set by a test). */
+      const copyStates = (): Record<
+        string,
+        { integrity?: { state: string; reason: string | null; runs: boolean }; replaced?: unknown }
+      > => ((window as unknown as { __copyStates?: Record<string, never> }).__copyStates ??= {});
       // The native extension profiles (EXT-13), as the mock holds them.
       const profiles = {
         active: "default",
@@ -855,6 +860,13 @@ async function desktop(
                     manifest: one.manifest,
                     error: null,
                     permissions: permissionsOf(id),
+                    // EXT-17: what is known of its files; a test may say otherwise beforehand.
+                    integrity: copyStates()[id]?.integrity ?? {
+                      state: "verified",
+                      reason: null,
+                      runs: true,
+                    },
+                    replaced: copyStates()[id]?.replaced ?? null,
                   })),
                   ...(setup.extensions ?? []).map((one) => {
                     const id = one.error ? null : idOf(one.manifest);
@@ -963,6 +975,8 @@ async function desktop(
                 throw "InstallFailed: the installed version could not be moved aside (it is in use).";
               const one = staged[args.token as string];
               delete staged[args.token as string];
+              // A reinstall over an installed copy binds its files (EXT-17), as natively.
+              if (installedExtensions[one.id]) delete copyStates()[one.id];
               // A new copy has no grant; the old one's is shown as such (EXT-07).
               if (grants[one.id]?.length && installedExtensions[one.id])
                 previousGrants[one.id] = {
@@ -3557,6 +3571,9 @@ async function extensionsView(page: Page) {
 
 const sampleState = (view: Locator) =>
   view.getByRole("group", { name: "Hello World (sample)" }).getByTestId("extension-state");
+/** What holds beside the sample's status (EXT-16: a running extension's status is Active). */
+const sampleNotice = (view: Locator) =>
+  view.getByRole("group", { name: "Hello World (sample)" }).getByTestId("extension-notice");
 
 /** The Extensions view's runtime diagnostics (the host, its generation, Restart, Reload). */
 async function showDiagnostics(page: Page, view: Locator) {
@@ -3828,8 +3845,10 @@ test("permissions: a refused request says why; the page allows and revokes it th
   await page.getByText("file.ts", { exact: true }).click();
   await (await palette(page, "Hello World: Describe Active File")).click();
   const view = await extensionsView(page);
-  await expect(sampleState(view)).toHaveText(/^Permission Needed/);
-  await expect(sampleState(view)).toContainText("read your open documents");
+  // It runs (its command did), so it is Active; the blocked request is said beside it.
+  await expect(sampleState(view)).toHaveText("Active");
+  await expect(sampleNotice(view)).toHaveText(/^Permission Needed/);
+  await expect(sampleNotice(view)).toContainText("read your open documents");
   await view.getByRole("group", { name: "Hello World (sample)" }).click();
   const details = page.getByRole("region", { name: "Extension: Hello World (sample)" });
   const permissions = details.getByRole("region", { name: "Permissions" });
@@ -3862,7 +3881,190 @@ test("permissions: a refused request says why; the page allows and revokes it th
   await details.getByRole("button", { name: "Back to Extensions" }).click();
   await page.getByRole("tab", { name: /file\.ts/ }).click();
   await (await palette(page, "Hello World: Describe Active File")).click();
-  await expect(sampleState(view)).toHaveText(/^Permission Needed/);
+  await expect(sampleState(view)).toHaveText("Active");
+  await expect(sampleNotice(view)).toHaveText(/^Permission Needed/);
+});
+
+test("EXT-16 permissions: granted capabilities and status shown; a revocation is confirmed, enforced natively, and a blocked request is marked", async ({
+  page,
+}) => {
+  await desktop(page);
+  await page.getByText("file.ts", { exact: true }).click();
+  const view = await extensionsView(page);
+  await view.getByRole("group", { name: "Hello World (sample)" }).click();
+  const details = page.getByRole("region", { name: "Extension: Hello World (sample)" });
+  const permissions = details.getByRole("region", { name: "Permissions" });
+  const documents = permissions.locator('[data-capability="documents.read"]');
+  await expect(permissions.getByTestId("permission-summary")).toContainText(
+    "None of what it requests is allowed.",
+  );
+  await permissions.getByRole("button", { name: "Allow: Read your open documents" }).click();
+  await expect(permissions.getByRole("status")).toHaveText("Allowed: Read your open documents.");
+  await expect(permissions.getByTestId("permission-summary")).toContainText("1 of 1 allowed.");
+  await details.getByRole("button", { name: "Back to Extensions" }).click();
+  await page.getByRole("tab", { name: /file\.ts/ }).click();
+  await (await palette(page, "Hello World: Describe Active File")).click();
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText("lines");
+  await expect(sampleState(view)).toHaveText("Active");
+  await expect(sampleNotice(view)).toHaveCount(0);
+
+  // Revoked from its page: confirmed only once the native side has made it.
+  await view.getByRole("group", { name: "Hello World (sample)" }).click();
+  const revoke = permissions.getByRole("button", { name: "Revoke: Read your open documents" });
+  await expect(revoke).toBeEnabled();
+  await revoke.focus();
+  await page.keyboard.press("Enter");
+  await expect(permissions.getByRole("status")).toHaveText(
+    "Revoked: Read your open documents. Yavin refuses it from Hello World (sample)'s next request.",
+  );
+  await expect(documents.getByTestId("permission-state")).toHaveText("Not allowed");
+  expect((await calls(page, "extensions_set_grants")).at(-1)?.args).toEqual({
+    id: "yavin-samples.hello-world",
+    version: "2.0.1",
+    capabilities: [],
+  });
+  // The running extension's next request is blocked: said on its card and marked on its page.
+  await details.getByRole("button", { name: "Back to Extensions" }).click();
+  await page.getByRole("tab", { name: /file\.ts/ }).click();
+  await (await palette(page, "Hello World: Describe Active File")).click();
+  await expect(sampleState(view)).toHaveText("Active");
+  await expect(sampleNotice(view)).toContainText(
+    "Permission Needed — Yavin blocked its request to read your open documents",
+  );
+  await view.getByRole("group", { name: "Hello World (sample)" }).click();
+  await expect(details.getByTestId("extension-notice")).toContainText("Permission Needed");
+  await expect(documents.getByTestId("permission-blocked")).toContainText(
+    "Blocked: Yavin refused its request",
+  );
+  // Allowed again: the block is no longer shown.
+  await permissions.getByRole("button", { name: "Allow: Read your open documents" }).click();
+  await expect(documents.getByTestId("permission-blocked")).toHaveCount(0);
+  await expect(details.getByTestId("extension-notice")).toHaveCount(0);
+});
+
+// --- EXT-17: installed files that were not checked, a recovered copy, a fallback ---------------
+
+/** Says what the inventory will list for `id`'s files from the next listing on (EXT-17). */
+async function copyState(page: Page, id: string, state: unknown) {
+  await page.evaluate(
+    ([id, state]) => {
+      const states = ((
+        window as unknown as { __copyStates?: Record<string, unknown> }
+      ).__copyStates ??= {});
+      states[id as string] = state;
+    },
+    [id, state],
+  );
+}
+
+test("EXT-17 an installed copy whose files were not checked says so, runs, and a reinstall checks them", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await copyState(page, "acme.docker-tools", {
+    integrity: { state: "unchecked", reason: "legacy", runs: true },
+  });
+  const recommended = view.getByRole("region", { name: "Recommended extensions" });
+  await card(recommended, "Docker Tools")
+    .getByRole("button", { name: "Install Docker Tools" })
+    .click();
+  const installed = card(
+    view.getByRole("region", { name: "Installed extensions" }),
+    "Docker Tools",
+  );
+  await expect(installed.getByTestId("extension-state")).toHaveText("Enabled");
+  await expect(installed.getByTestId("extension-notice")).toContainText(
+    "Not Checked — It was installed before Yavin checked installed files",
+  );
+  await installed.click();
+  const details = page.getByRole("region", { name: "Extension: Docker Tools" });
+  const banner = details.getByTestId("extension-integrity");
+  await expect(banner).toContainText("Not Checked");
+  await expect(details.getByTestId("extension-integrity-runs")).toHaveText("Its code may run.");
+  await details.getByRole("tab", { name: "Requirements" }).click();
+  await expect(details.getByTestId("extension-files")).toContainText("Not Checked");
+  await expect(details.getByTestId("extension-signature")).toHaveAttribute("data-signed", "false");
+  await expect(details.getByTestId("extension-signature")).toContainText("Not shown");
+  // Reinstalled: the same version again, and its files are checked.
+  await banner.getByRole("button", { name: /^Reinstall Docker Tools/ }).click();
+  await expect(details.getByTestId("extension-integrity")).toHaveCount(0);
+  await expect(details.getByTestId("extension-files")).toContainText("Verified Files");
+  expect((await calls(page, "extensions_stage")).at(-1)?.args).toMatchObject({
+    expectedId: "acme.docker-tools",
+  });
+});
+
+test("EXT-17 a recovered copy whose code cannot run is Not Verified; a fallback says which copy it replaced", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await copyState(page, "acme.docker-tools", {
+    integrity: { state: "unchecked", reason: "rebuilt", runs: false },
+  });
+  const recommended = view.getByRole("region", { name: "Recommended extensions" });
+  await card(recommended, "Docker Tools")
+    .getByRole("button", { name: "Install Docker Tools" })
+    .click();
+  const installed = card(
+    view.getByRole("region", { name: "Installed extensions" }),
+    "Docker Tools",
+  );
+  await expect(installed.getByTestId("extension-state")).toHaveText(
+    /^Not Verified — It was recovered from its folder .* its code does not run\. Reinstall it/,
+  );
+  await installed.click();
+  const details = page.getByRole("region", { name: "Extension: Docker Tools" });
+  await expect(details.getByTestId("extension-integrity-runs")).toHaveText(
+    "Its code does not run.",
+  );
+  await expect(details.getByTestId("extension-details-state")).toContainText("Not Verified");
+
+  // Reinstalled: its files checked, it runs again.
+  await details
+    .getByTestId("extension-integrity")
+    .getByRole("button", { name: /^Reinstall/ })
+    .click();
+  await expect(details.getByTestId("extension-integrity")).toHaveCount(0);
+  await expect(details.getByTestId("extension-details-state")).not.toContainText("Not Verified");
+});
+
+test("EXT-17 a fallback: the intact previous version is used, the one it replaced and why are said, and it can be reinstalled", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await copyState(page, "acme.updater", {
+    integrity: { state: "verified", reason: null, runs: true },
+    replaced: { version: "1.1.0", reason: "its files changed since it was installed", at: 1 },
+  });
+  await searchBox(view).fill("updater");
+  await card(view.getByRole("region", { name: "Marketplace results" }), "Updater Demo").click();
+  const details = page.getByRole("region", { name: "Extension: Updater Demo" });
+  await details.getByRole("tab", { name: "Information" }).click();
+  await details.getByRole("button", { name: "Install version 1.0.0" }).click();
+  const replaced = details.getByTestId("extension-replaced");
+  await expect(replaced).toContainText(
+    "Version 1.1.0 could not be used (its files changed since it was installed), so version 1.0.0 -- intact -- is used instead.",
+  );
+  await expect(
+    card(view.getByRole("region", { name: "Installed extensions" }), "Updater Demo").getByTestId(
+      "extension-notice",
+    ),
+  ).toContainText("Using Previous Version");
+  // The intact copy is the one in use: its own files are verified.
+  await details.getByRole("tab", { name: "Requirements" }).click();
+  await expect(details.getByTestId("extension-files")).toContainText("Verified Files");
+  await details
+    .getByTestId("extension-integrity")
+    .getByRole("button", { name: "Reinstall Updater Demo 1.1.0" })
+    .click();
+  await expect(details.getByTestId("extension-replaced")).toHaveCount(0);
+  await (await palette(page, "Updater: Which Version")).click();
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
+    "Updater 1.1.0",
+  );
 });
 
 test("permissions: a change the native side refuses is never shown as made", async ({ page }) => {
@@ -4308,7 +4510,9 @@ test("update: an older version installed, the update found and badged, installed
   ).toContainText("1");
   const updates = view.getByRole("region", { name: "Updates" });
   const updater = card(updates, "Updater Demo");
-  await expect(updater.getByTestId("extension-state")).toHaveText(
+  // It runs (its command did): Active, the update said beside it (EXT-16).
+  await expect(updater.getByTestId("extension-state")).toHaveText("Active");
+  await expect(updater.getByTestId("extension-notice")).toHaveText(
     "Update Available — Version 1.1.0 is available.",
   );
   await updater.getByRole("button", { name: "Update Updater Demo" }).click();

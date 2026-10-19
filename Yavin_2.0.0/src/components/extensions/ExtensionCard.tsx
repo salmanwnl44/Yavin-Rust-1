@@ -1,6 +1,6 @@
 import { memo, type ReactNode } from "react";
 import type { ExtensionMarketplaceService } from "../../services/extensions/marketplace/service";
-import type { DisplayStatus } from "../../services/extensions/marketplace/status";
+import type { DisplayStatus, StatusNotice } from "../../services/extensions/marketplace/status";
 import { ExtensionIcon } from "./ExtensionIcon";
 
 const TONE: Record<DisplayStatus["tone"], string> = {
@@ -10,6 +10,35 @@ const TONE: Record<DisplayStatus["tone"], string> = {
   warning: "text-amber-300/90",
   error: "text-red-400/90",
 };
+
+/**
+ * What holds beside an extension's status (EXT-16): a permission Yavin blocked, an update. Each
+ * is its own line, so a running extension still reads as Active.
+ */
+export function StatusNotices({
+  notices,
+  className = "truncate text-[10.5px]",
+}: {
+  notices: readonly StatusNotice[] | undefined;
+  className?: string;
+}) {
+  if (!notices?.length) return null;
+  return (
+    <ul aria-label="Notices" className="flex flex-col">
+      {notices.map((notice) => (
+        <li
+          key={notice.kind}
+          data-testid="extension-notice"
+          data-kind={notice.kind}
+          className={`${className} ${TONE[notice.tone]}`}
+          title={notice.detail}
+        >
+          {notice.label} — {notice.detail}
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 export interface CardModel {
   id: string;
@@ -89,6 +118,7 @@ export const ExtensionCard = memo(function ExtensionCard({
             {model.status.detail ? ` — ${model.status.detail}` : ""}
           </div>
         )}
+        {showState && <StatusNotices notices={model.status.notices} />}
         {model.failure && (
           <div
             role="alert"

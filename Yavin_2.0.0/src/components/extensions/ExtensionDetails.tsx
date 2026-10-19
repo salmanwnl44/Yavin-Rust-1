@@ -11,8 +11,9 @@ import {
 import { compareVersions } from "../../services/extensions/marketplace/versions";
 import { EXTENSION_API } from "../../services/extensions/manifest";
 import { describeSignature } from "../../services/extensions/signature";
+import { describeIntegrity, describeReplaced } from "../../services/extensions/integrity";
 import { openExternalUrl } from "../../services/git/remoteUrl";
-import { CardButton } from "./ExtensionCard";
+import { CardButton, StatusNotices } from "./ExtensionCard";
 import { ExtensionIcon } from "./ExtensionIcon";
 import { ExtensionMarkdown } from "./ExtensionMarkdown";
 import { ExtensionPermissions } from "./ExtensionPermissions";
@@ -128,7 +129,8 @@ export function ExtensionDetails({
 
   const extension = listing.extension;
   const manifest = entry?.manifest;
-  const signature = describeSignature(entry?.signature);
+  const signature = describeSignature(entry?.signature, entry?.integrity);
+  const integrity = describeIntegrity(entry?.integrity);
   const name = manifest?.displayName ?? extension?.displayName ?? id;
   const status = statusOf(id, state, trusted, marketplace, extension);
   const operation = state.operations.operations[id];
@@ -248,6 +250,13 @@ export function ExtensionDetails({
                 {status.detail ? ` — ${status.detail}` : ""}
               </span>
             </div>
+            {/* What the integrity note below says (with its action) is not said twice. */}
+            <StatusNotices
+              notices={status.notices?.filter(
+                (n) => n.kind !== "integrity" && n.kind !== "fallback",
+              )}
+              className="mt-1 text-[12px]"
+            />
             {failure && (
               <div
                 role="alert"
@@ -257,6 +266,48 @@ export function ExtensionDetails({
                 {failure.detail && (
                   <div className="mt-0.5 text-[11px] text-red-400/70">{failure.detail}</div>
                 )}
+              </div>
+            )}
+            {entry && integrity && (integrity.reinstall || entry.replaced) && (
+              <div
+                role="note"
+                data-testid="extension-integrity"
+                data-state={entry.integrity?.state}
+                className={`mt-2 rounded border px-2 py-1.5 text-[12px] ${
+                  integrity.runs
+                    ? "border-amber-900/60 bg-amber-950/30 text-amber-200/90"
+                    : "border-red-900/60 bg-red-950/30 text-red-300"
+                }`}
+              >
+                {integrity.reinstall && (
+                  <p>
+                    <span className="font-medium">{integrity.label}</span> — {integrity.detail}{" "}
+                    <span data-testid="extension-integrity-runs">
+                      {integrity.runs ? "Its code may run." : "Its code does not run."}
+                    </span>
+                  </p>
+                )}
+                {entry.replaced && (
+                  <p data-testid="extension-replaced" className={integrity.reinstall ? "mt-1" : ""}>
+                    <span className="font-medium">Using previous version</span> —{" "}
+                    {describeReplaced(entry.replaced, entry.manifest.version)}
+                  </p>
+                )}
+                <div className="mt-1.5">
+                  <CardButton
+                    label={`Reinstall ${name} ${entry.replaced?.version ?? entry.manifest.version}`}
+                    disabled={!!operation}
+                    onClick={() =>
+                      report(
+                        installer.install(id, entry.replaced?.version ?? entry.manifest.version),
+                      )
+                    }
+                  >
+                    {operation
+                      ? "Reinstalling…"
+                      : `Reinstall ${entry.replaced?.version ?? entry.manifest.version}`}
+                  </CardButton>
+                </div>
               </div>
             )}
             {!entry && compatibility && !compatibility.compatible && !latest && (
@@ -280,7 +331,13 @@ export function ExtensionDetails({
           </p>
         )}
 
-        {entry && <ExtensionPermissions entry={entry} registry={registry} />}
+        {entry && (
+          <ExtensionPermissions
+            entry={entry}
+            registry={registry}
+            denied={state.runtime.denied[id] ?? null}
+          />
+        )}
 
         <nav
           role="tablist"
@@ -396,6 +453,21 @@ export function ExtensionDetails({
                   {compatibility.compatible
                     ? ["Compatible", ...(compatibility.notes ?? [])].join(" — ")
                     : `Incompatible — ${compatibility.reasons.join(" ")}`}
+                </Row>
+              )}
+              {integrity && (
+                <Row label="Installed files">
+                  <span data-testid="extension-files" data-state={entry?.integrity?.state}>
+                    <span
+                      className={
+                        integrity.label === "Verified Files" ? "text-emerald-300" : "text-amber-300"
+                      }
+                    >
+                      {integrity.label}
+                    </span>
+                    {" — "}
+                    {integrity.detail}
+                  </span>
                 </Row>
               )}
               {entry?.source.kind === "folder" && (

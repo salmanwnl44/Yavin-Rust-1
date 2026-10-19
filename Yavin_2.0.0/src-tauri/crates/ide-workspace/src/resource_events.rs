@@ -1329,6 +1329,10 @@ mod tests {
         fs::write(source.join("deep/deeper/b.ts"), "b").unwrap();
         let expected = Arc::new(ExpectedWrites::default());
         let (recorder, watch) = Recorder::start(&dir, Arc::clone(&expected));
+        // Windows may deliver the setup's own changes (its folders' "modified") after the
+        // watch has started: they are not the operation's. Let them arrive and drop them.
+        recorder.settled();
+        recorder.clear();
 
         // A file two new folders down, the way `create_file` registers it.
         let file = dir.join("x/y/new.ts");

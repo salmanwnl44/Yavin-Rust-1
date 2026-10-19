@@ -166,7 +166,9 @@ fn search_pages_versions_and_failures_follow_the_api_contract() {
         .unwrap_err()
         .starts_with("MarketplaceUnavailable"));
     assert!(ext("nobody").unwrap_err().starts_with("NotFound"));
-    assert!(ext("huge").unwrap_err().starts_with("TooLarge"));
+    // Said in full if it fails (it has failed under load, with no message to tell why).
+    let huge = ext("huge").unwrap_err();
+    assert!(huge.starts_with("TooLarge"), "{huge}");
     assert!(ext("html").unwrap_err().starts_with("UnexpectedContent"));
     let versions = answer(
         &r,
@@ -713,4 +715,107 @@ fn only_the_pinned_store_can_make_a_package_trusted() {
     let staged = attempt(pinned(&base)).unwrap();
     service.commit(&staged.token, "acme.hello").unwrap();
     let _ = fs::remove_dir_all(&dir);
+}
+
+// --- EXT-15: the bytes a trust decision covers --------------------------------------------------
+
+/// The bytes the signature is checked over are the bytes whose checksum was verified: read once,
+/// their SHA-256 compared -- a package file that changed in between is refused.
+#[test]
+fn the_bytes_checked_are_the_bytes_hashed() {
+    let dir = temp("openvsx-same-bytes");
+    std::fs::create_dir_all(&dir).unwrap();
+    let archive = dir.join("package.vsix");
+    std::fs::write(&archive, b"PK the package as downloaded").unwrap();
+    let sha = crate::extension_package::sha256_file(&archive).unwrap();
+    assert_eq!(
+        verified_bytes(&archive, &sha).unwrap(),
+        b"PK the package as downloaded"
+    );
+    std::fs::write(&archive, b"PK something else, written in between").unwrap();
+    let refused = verified_bytes(&archive, &sha).unwrap_err();
+    assert!(refused.starts_with("IntegrityFailed"), "{refused}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A signed, installed copy whose files change afterwards is no longer the package that was
+/// verified: it is not used (no previous version: reported broken), not listed as signed, and
+/// its code does not load -- until its files are as installed again.
+#[test]
+fn an_installed_copy_whose_files_change_is_not_listed_signed_or_used() {
+    let dir = temp("openvsx-files-changed");
+    let published = Arc::new(Mutex::new(BTreeMap::new()));
+    published.lock().unwrap().insert(
+        "1.0.0".to_string(),
+        Published {
+            package: yavin_package(&dir, "1.0.0"),
+            metadata_id: ("acme", "hello"),
+            checksum: None,
+            download_url: None,
+            signature: Sig::Valid,
+        },
+    );
+    let base = registry_of(published);
+    let root = dir.join("extensions");
+    let service = ExtensionService::new(root.clone(), Vec::new());
+    crate::package_trust::with_store(pinned(&base), || {
+        let source = PackageSource::OpenVsx {
+            registry_url: base.clone(),
+            namespace: "acme".into(),
+            name: "hello".into(),
+        };
+        let staged = stage(&service, source, "acme.hello", "1.0.0").unwrap();
+        service.commit(&staged.token, "acme.hello").unwrap();
+        service.finish(&staged.token, "acme.hello", true).unwrap();
+    });
+    let entry = |service: &ExtensionService| {
+        service
+            .list(None)
+            .unwrap()
+            .extensions
+            .into_iter()
+            .find(|e| e.id.as_deref() == Some("acme.hello"))
+            .unwrap()
+    };
+    let signed = entry(&service);
+    assert_eq!(
+        signed.signature.as_ref().unwrap().status,
+        crate::package_trust::SignatureStatus::RegistrySigned
+    );
+    let record = inventory(&root).extensions["acme.hello"].clone();
+    assert!(
+        record.active.files_sha256.is_some(),
+        "the files are bound at install"
+    );
+    // One file of the installed copy changes.
+    let folder = root.join(record.active.folder.replace('/', "\\"));
+    let theme = folder.join("extension").join("theme.json");
+    let original = std::fs::read(&theme).unwrap();
+    std::fs::write(
+        &theme,
+        b"{\"colors\": {\"editor.background\": \"#ff0000\"}}",
+    )
+    .unwrap();
+    let changed = entry(&service);
+    assert!(changed.signature.is_none(), "not listed as signed");
+    assert!(
+        changed
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("files changed"),
+        "{:?}",
+        changed.error
+    );
+    // A file added is a change too.
+    std::fs::write(&theme, &original).unwrap();
+    assert!(
+        entry(&service).signature.is_some(),
+        "as installed again: signed again"
+    );
+    std::fs::write(folder.join("extra.js"), b"module.exports = {};").unwrap();
+    assert!(entry(&service).signature.is_none());
+    std::fs::remove_file(folder.join("extra.js")).unwrap();
+    assert!(entry(&service).signature.is_some());
+    let _ = std::fs::remove_dir_all(&dir);
 }

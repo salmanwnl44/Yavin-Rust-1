@@ -1040,7 +1040,11 @@ pub(crate) mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                // The request is read through the one socket: `try_clone` would make a second,
+                // inheritable handle (Windows), which a process another test starts meanwhile
+                // inherits -- and when that process is killed, Windows resets this connection
+                // mid-answer (the client sees it cut short: EXT-17).
+                let mut reader = std::io::BufReader::new(&stream);
                 let mut line = String::new();
                 if reader.read_line(&mut line).is_err() {
                     continue;
@@ -1052,6 +1056,7 @@ pub(crate) mod tests {
                         break;
                     }
                 }
+                drop(reader);
                 let (status, headers, body) = respond(&path);
                 let mut head = format!(
                     "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n",

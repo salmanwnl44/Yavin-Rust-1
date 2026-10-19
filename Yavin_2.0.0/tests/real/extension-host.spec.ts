@@ -19,6 +19,7 @@ import {
   close,
   CONFIG,
   DATA,
+  emptyRegistry,
   extensionsView,
   host,
   hostProcesses,
@@ -76,8 +77,15 @@ async function prepareProfile() {
   );
 }
 
+// Not a marketplace test: a registry of its own that publishes nothing, so no update is ever
+// found for the installed sample and nothing here reaches the network.
+let registry: Awaited<ReturnType<typeof emptyRegistry>>;
+test.beforeAll(async () => {
+  registry = await emptyRegistry();
+});
 test.beforeEach(async () => prepareProfile());
 test.afterAll(async () => {
+  await registry?.close();
   await profileReleased();
   // WebView2 lets go of the profile a moment after Yavin exits.
   for (const folder of [ROOT, CONFIG, DATA])
@@ -93,7 +101,7 @@ test("the installed host is packaged where Yavin looks for it", () => {
 });
 
 test("installed Yavin runs Hello World in the real host, end to end, and ends the host on exit", async () => {
-  const running = await launch();
+  const running = await launch({ YAVIN_TEST_REGISTRY: registry.url });
   const { app, page } = running;
   try {
     await trust(page, true);
@@ -130,7 +138,7 @@ test("installed Yavin runs Hello World in the real host, end to end, and ends th
 });
 
 test("a crashed host is reported; Restart starts a new real host and the extension works again", async () => {
-  const running = await launch();
+  const running = await launch({ YAVIN_TEST_REGISTRY: registry.url });
   const { app, page } = running;
   try {
     await trust(page, true);
@@ -161,7 +169,7 @@ test("a crashed host is reported; Restart starts a new real host and the extensi
 });
 
 test("switching workspace ends A's host; B starts from nothing; A's state comes back with A", async () => {
-  const running = await launch();
+  const running = await launch({ YAVIN_TEST_REGISTRY: registry.url });
   const { app, page } = running;
   try {
     await trust(page, true);
@@ -184,7 +192,12 @@ test("switching workspace ends A's host; B starts from nothing; A's state comes 
 
     await palette(page, "Welcome");
     await page.getByTitle(A, { exact: true }).click();
-    await trust(page, false);
+    // A is open again, already trusted (not asked). The sidebar keeps the view chosen last --
+    // Extensions, opened in B -- so the Files tree is not what shows it.
+    await expect(page.getByRole("region", { name: "Welcome" })).toContainText("Working in alpha", {
+      timeout: 30_000,
+    });
+    await expect(page.getByRole("button", { name: "Yes, I trust the authors" })).toHaveCount(0);
     const again = await extensionsView(page);
     await expect(again.getByRole("region", { name: "Greetings" })).toContainText("Hello, world!");
     await close(running);
@@ -197,7 +210,7 @@ test("without its host, installed Yavin says so and everything else works", asyn
   const packaged = host()!;
   const aside = `${packaged}.aside`;
   renameSync(packaged, aside);
-  const running = await launch();
+  const running = await launch({ YAVIN_TEST_REGISTRY: registry.url });
   const { app, page } = running;
   try {
     await trust(page, true);

@@ -377,7 +377,10 @@ pub fn download(
     // Its signature (EXT-09): over these very bytes, under a key Yavin pins for this registry --
     // or it is not installed. The metadata's key id only chooses among the pinned keys.
     let publisher = expected_id.split('.').next().unwrap_or_default();
-    let status = signature_status(registry, &meta, publisher, archive, &label);
+    // The bytes checked are the bytes hashed, and the bytes unpacked (EXT-15): read once, their
+    // SHA-256 the one just verified -- a file that changed in between is refused.
+    let package = verified_bytes(archive, &actual)?;
+    let status = signature_status(registry, &meta, publisher, &package, &label);
     if !status.trusted() {
         return Err(package_trust::refusal(status, &label, &registry.origin));
     }
@@ -405,12 +408,24 @@ fn key_id(meta: &Value, registry: &Registry) -> Option<String> {
     ok.then(|| id.to_string())
 }
 
-/// What the signature of the downloaded `archive` is found to be.
+/// The contents of `archive`, if they are the bytes whose SHA-256 is `sha256`.
+fn verified_bytes(archive: &Path, sha256: &str) -> Result<Vec<u8>, String> {
+    let package = fs::read(archive).map_err(|e| format!("InstallFailed: {e}"))?;
+    let hash = extension_package::hex(&Sha256::digest(&package));
+    if !hash.eq_ignore_ascii_case(sha256) {
+        return Err(format!(
+            "IntegrityFailed: the downloaded package changed before it was checked (its SHA-256 is now {hash}, not {sha256})."
+        ));
+    }
+    Ok(package)
+}
+
+/// What the signature of the downloaded `package` (its bytes) is found to be.
 fn signature_status(
     registry: &Registry,
     meta: &Value,
     publisher: &str,
-    archive: &Path,
+    package: &[u8],
     label: &str,
 ) -> SignatureStatus {
     if meta["files"]["signature"].is_null() {
@@ -434,15 +449,12 @@ fn signature_status(
     if fetched.is_err() {
         return SignatureStatus::Unavailable;
     }
-    let Ok(package) = fs::read(archive) else {
-        return SignatureStatus::Unavailable;
-    };
     package_trust::verify(
         &package_trust::store(),
         &registry.origin,
         publisher,
         key_id(meta, registry).as_deref(),
-        &package,
+        package,
         Some(&sigzip),
         package_trust::today(),
     )

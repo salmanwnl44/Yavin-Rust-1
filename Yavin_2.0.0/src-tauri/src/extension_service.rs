@@ -82,7 +82,12 @@ pub const LAST_GOOD: &str = "inventory.last-good.json";
 const UNRECOVERED: &str = ".unrecovered";
 /// IDE-09's folder for a version moved aside during an update.
 const LEGACY_PREVIOUS: &str = ".previous";
-const INVENTORY_VERSION: u32 = 1;
+/// The inventory's schema (EXT-17). 2 adds `filesSha256` and `unchecked` on copies and
+/// `replaced` on records. **Every change of what is persisted bumps it** (and is migrated in
+/// `read_inventory`): a Yavin that reads an inventory written by a newer one refuses it --
+/// it never reads it and drops what it does not know (grants, profiles, signature records,
+/// files digests) on its next write. A test pins the persisted fields to this version.
+const INVENTORY_VERSION: u32 = 2;
 const MAX_RECOVERIES: usize = 20;
 /// How long a staged or committed operation of this process may wait for its window before
 /// another operation of its id may end it. The window takes milliseconds between the steps; an
@@ -107,6 +112,31 @@ pub struct Copy {
     /// by a recovery -- never taken for verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<SignatureRecord>,
+    /// The digest of its files as they were put in place (EXT-15, `tree_digest`): what binds
+    /// the unpacked copy to the verified package. Checked whenever the copy is used; none for a
+    /// copy installed before EXT-15, adopted or rebuilt (its files cannot be checked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_sha256: Option<String>,
+    /// Why it has no files digest (EXT-17), when it has none: never a claim that its files
+    /// are the package's. A copy with neither is taken for `Rebuilt` (the most restricted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unchecked: Option<Unchecked>,
+}
+
+/// Why a copy's files cannot be checked (EXT-17), and so what it may do.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Unchecked {
+    /// Installed by Yavin before files were bound (EXT-15): its package was verified then;
+    /// its files were never compared. It runs; a reinstall checks and binds them.
+    Legacy,
+    /// One of IDE-09's root folders, adopted where it was: no package is on record. It runs;
+    /// a reinstall from a registry binds it.
+    Adopted,
+    /// Recovered from the folders after the inventory and its last good copy were lost --
+    /// what an attacker who stripped the digests would cause. Its code does not run until it
+    /// is reinstalled; what is declarative (themes, snippets) still applies.
+    Rebuilt,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -116,6 +146,20 @@ pub struct Record {
     pub previous: Option<Copy>,
     /// Why the active copy cannot be used and there was nothing to fall back to.
     pub broken: Option<String>,
+    /// The copy that could not be used when its previous one took its place (EXT-17): said
+    /// beside the copy now used, until the next install, update or uninstall.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<Replaced>,
+}
+
+/// A copy that was replaced by its intact previous one (EXT-17).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Replaced {
+    pub version: String,
+    pub reason: String,
+    /// Seconds since the Unix epoch.
+    pub at: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -231,8 +275,68 @@ pub struct Listed {
     /// Which copy it is, for the host and for grants (not sent to the window).
     #[serde(skip)]
     pub copy: Option<CopyFacts>,
-    /// What its package's signature was found to be when installed (EXT-09).
+    /// What its package's signature was found to be when installed (EXT-09) -- reported only
+    /// while its files are bound to that package (EXT-17).
     pub signature: Option<SignatureRecord>,
+    /// Whether its files are the package's (EXT-17); none for an entry with no copy.
+    pub integrity: Option<Integrity>,
+    /// The copy that could not be used, when this one -- its intact previous one -- took its
+    /// place (EXT-17).
+    pub replaced: Option<Replaced>,
+}
+
+/// What is known of a copy's files (EXT-17), as the window shows it.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Integrity {
+    /// `verified` (bound and as installed), `unchecked` (no digest), `changed` (not as
+    /// installed: not used), or `development` (a repository sample: mutable by design).
+    pub state: &'static str,
+    /// For `unchecked`: `legacy`, `adopted` or `rebuilt`.
+    pub reason: Option<&'static str>,
+    /// Whether its code may run.
+    pub runs: bool,
+}
+
+impl Integrity {
+    fn of(copy: &Copy) -> Integrity {
+        match (&copy.files_sha256, copy.unchecked) {
+            (Some(_), _) => Integrity {
+                state: "verified",
+                reason: None,
+                runs: true,
+            },
+            (None, Some(Unchecked::Legacy)) => Integrity {
+                state: "unchecked",
+                reason: Some("legacy"),
+                runs: true,
+            },
+            (None, Some(Unchecked::Adopted)) => Integrity {
+                state: "unchecked",
+                reason: Some("adopted"),
+                runs: true,
+            },
+            (None, Some(Unchecked::Rebuilt) | None) => Integrity {
+                state: "unchecked",
+                reason: Some("rebuilt"),
+                runs: false,
+            },
+        }
+    }
+    fn changed() -> Integrity {
+        Integrity {
+            state: "changed",
+            reason: None,
+            runs: false,
+        }
+    }
+    fn development() -> Integrity {
+        Integrity {
+            state: "development",
+            reason: None,
+            runs: true,
+        }
+    }
 }
 
 /// The copy an entry is (EXT-07): what a grant is bound to.
@@ -354,6 +458,12 @@ pub struct ExtensionService {
     diagnostics: OnceLock<Diagnostics>,
     /// Safe mode (EXT-14): no extension code loads, whatever is enabled. It only refuses.
     safe_mode: std::sync::atomic::AtomicBool,
+    /// Copies' files digests, by folder, with the fingerprint they were computed for (EXT-15):
+    /// computed again only when a file changed.
+    digests: Mutex<HashMap<PathBuf, (String, String)>>,
+    /// Counts grant changes in this process (EXT-16): a refusal already told to a window is
+    /// told again once a grant changed since (it forgot it when the permission was allowed).
+    grants_revision: std::sync::atomic::AtomicU64,
     /// Test only: the step at which to stop as if Yavin crashed there.
     #[cfg(test)]
     pub crash_at: Mutex<Option<&'static str>>,
@@ -440,6 +550,102 @@ fn read_copy(folder: &Path, id: &str, version: Option<&str>) -> Result<String, S
         }
     }
     Ok(text)
+}
+
+/// `ExtensionService::authorize` against `inv` (the inventory, its lock held by the caller).
+fn authorize_in(inv: &Inventory, copy: &HostCopy, capability: Option<&str>) -> Result<(), Denial> {
+    let id = &copy.id;
+    if inv.disabled.contains(id) {
+        return Err(Denial::new(
+            "ExtensionDisabled",
+            format!("{id} is disabled."),
+        ));
+    }
+    let current = match (&copy.stored, inv.extensions.get(id)) {
+        (Some(stored), Some(record)) => {
+            record.active.folder == *stored && record.active.version == copy.version
+        }
+        // A development copy: still the one used while nothing is installed over it.
+        (None, None) => true,
+        _ => false,
+    };
+    if !current {
+        return Err(Denial::new(
+            "ExtensionChanged",
+            format!(
+                "The running code of {id} is no longer the installed copy; it must be reloaded."
+            ),
+        ));
+    }
+    // Its required dependencies still there, enabled and in range (EXT-12).
+    for need in &copy.requires {
+        let gone = || {
+            Denial::new(
+                "DependencyUnavailable",
+                format!(
+                    "{id} needs {} {}, which is no longer available.",
+                    need.id, need.range.text
+                ),
+            )
+        };
+        if inv.disabled.contains(&need.id) {
+            return Err(Denial::new(
+                "DependencyUnavailable",
+                format!("{id} needs {}, which is disabled.", need.id),
+            ));
+        }
+        match inv.extensions.get(&need.id) {
+            Some(record) => {
+                let fits = semver::Version::parse(&record.active.version)
+                    .is_ok_and(|v| need.range.matches(&v));
+                if !fits {
+                    return Err(gone());
+                }
+            }
+            None if need.installed => return Err(gone()),
+            None => {}
+        }
+    }
+    let Some(capability) = capability else {
+        return Ok(());
+    };
+    if !copy.requested.contains(capability) {
+        return Err(Denial::new(
+            "PermissionDenied",
+            format!("{id} does not request \"{capability}\" in its manifest."),
+        ));
+    }
+    let granted = inv.grants.get(id).is_some_and(|grant| {
+        grant.binds(&copy.folder, &copy.version, copy.sha256.as_deref())
+            && grant.capabilities.contains(capability)
+    });
+    if !granted {
+        return Err(Denial::new(
+            "PermissionDenied",
+            format!("\"{capability}\" is not allowed for {id} {}.", copy.version),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether signature record `s` can be the record of a copy installed from `source`
+/// (EXT-15): a signed one only from that very registry (`openvsx <url>` whose origin it
+/// names); an unsigned one from a file only if it says `file`. A record that names another
+/// source is not this copy's.
+fn record_matches_source(s: &SignatureRecord, source: &str) -> bool {
+    let origin_of = |url: &str| {
+        url::Url::parse(url)
+            .ok()
+            .map(|u| u.origin().ascii_serialization())
+    };
+    match source.split_once(' ') {
+        Some(("openvsx", url)) => origin_of(url).is_some_and(|o| o == s.registry),
+        Some(("registry", url)) => {
+            !s.status.trusted() && origin_of(url).is_some_and(|o| o == s.registry)
+        }
+        None if source == "file" => !s.status.trusted() && s.registry == "file",
+        _ => false,
+    }
 }
 
 /// Every usable listed copy but `except`, as the resolver's candidates (EXT-12): its version,
@@ -629,10 +835,37 @@ impl ExtensionService {
         let file = paths.root.join(INVENTORY);
         match read_inventory(&file) {
             // Nothing installed: a new folder, or IDE-09's (adopted as it is by listing).
+            // A newer Yavin's inventory was kept aside: nothing is restored or rebuilt over it,
+            // however often this Yavin starts (EXT-17).
+            Loaded::Missing if newer_kept_aside(&paths.root).is_some() => Err(format!(
+                "InventoryUnsupported: the extension inventory was written by a newer Yavin (version {}); it was kept aside, untouched. Update Yavin.",
+                newer_kept_aside(&paths.root).unwrap_or_default()
+            )),
             Loaded::Missing if !installed_data(&paths.root) => Ok((Inventory::default(), false)),
             Loaded::Missing => self.restore(paths, "was missing").map(|inv| (inv, true)),
-            Loaded::Current(inventory) | Loaded::Migrated { value: inventory, .. } => {
-                Ok((inventory, false))
+            Loaded::Current(inventory) => Ok((inventory, false)),
+            // Migrated (EXT-17): the file as it was is kept beside it, then the new version is
+            // written at once -- an older Yavin then refuses it rather than drop what is new.
+            Loaded::Migrated { value: mut inventory, from } => {
+                let original = paths.root.join(format!(
+                    "{INVENTORY}.v{from}-migrated-{}.bak",
+                    ide_workspace::durable::now_millis()
+                ));
+                let text = fs::read(&file).map_err(|e| {
+                    format!("InventoryUnavailable: the extension inventory cannot be read right now ({e}); nothing was changed.")
+                })?;
+                write_durably(&original, &text).map_err(|e| {
+                    format!("InventoryUnavailable: the extension inventory could not be kept before it was upgraded ({e}); nothing was changed.")
+                })?;
+                note(
+                    &mut inventory,
+                    None,
+                    format!(
+                        "The extension inventory was upgraded from version {from} (the original was kept as {}). Copies installed before Yavin checked installed files are marked as not checked.",
+                        display(&original)
+                    ),
+                );
+                Ok((inventory, true))
             }
             Loaded::Corrupt { backup: Some(backup) } => self
                 .restore(
@@ -731,6 +964,8 @@ impl ExtensionService {
                 installed_at: now(),
                 // Rebuilt from the folder alone: what its signature was is not known (EXT-09).
                 signature: None,
+                files_sha256: None,
+                unchecked: Some(Unchecked::Rebuilt),
             };
             inventory.extensions.insert(
                 id.clone(),
@@ -738,6 +973,7 @@ impl ExtensionService {
                     active: copy(&found[0]),
                     previous: found.get(1).map(copy),
                     broken: None,
+                    replaced: None,
                 },
             );
             inventory.disabled.insert(id);
@@ -1169,13 +1405,68 @@ impl ExtensionService {
         if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(format!("InstallFailed: {op} has no verified package hash."));
         }
-        let folder = format!("{STORE}/{id}/{}-{}", operation.version, &sha256[..8]);
-        let target = join(root, &folder);
         let before = inner
             .inventory
             .as_ref()
             .and_then(|inv| inv.extensions.get(&id).cloned());
-        let in_use = folders_of(before.as_ref()).contains(&folder);
+        // A copy already in place is reused only if it is these very bytes: a different package
+        // whose hash merely starts the same (32 bits) gets a folder of its own (EXT-15).
+        let short = format!("{STORE}/{id}/{}-{}", operation.version, &sha256[..8]);
+        let taken_by_other = before.as_ref().is_some_and(|record| {
+            std::iter::once(&record.active)
+                .chain(record.previous.as_ref())
+                .any(|copy| {
+                    copy.folder == short
+                        && !copy
+                            .sha256
+                            .as_deref()
+                            .is_some_and(|s| s.eq_ignore_ascii_case(&sha256))
+                })
+        });
+        let mut folder = if taken_by_other {
+            format!(
+                "{STORE}/{id}/{}-{}",
+                operation.version,
+                sha256.to_ascii_lowercase()
+            )
+        } else {
+            short
+        };
+        let mut target = join(root, &folder);
+        // What binds the files to the verified package (EXT-15): their digest, as staged.
+        let files_sha256 = Some(
+            crate::extension_package::tree_digest(&staged).map_err(|why| {
+                format!("InstallFailed: the staged package cannot be read: {why}.")
+            })?,
+        );
+        let mut in_use = folders_of(before.as_ref()).contains(&folder);
+        // The same package again (a reinstall) into a copy already in place (EXT-17): its files
+        // are compared with the verified package's. The same: they are bound to it (and its
+        // fresh signature record kept). Not the same: that copy is not reused, nor kept to
+        // fall back on -- the package gets a folder of its own.
+        let mut mismatched: Option<String> = None;
+        if in_use {
+            let actual = crate::extension_package::tree_digest(&target).ok();
+            if actual.as_deref() != files_sha256.as_deref() {
+                mismatched = Some(folder.clone());
+                let short = format!("{STORE}/{id}/{}-{}", operation.version, &sha256[..8]);
+                let long = format!(
+                    "{STORE}/{id}/{}-{}",
+                    operation.version,
+                    sha256.to_ascii_lowercase()
+                );
+                let other = if folder == short { long } else { short };
+                if folders_of(before.as_ref()).contains(&other) {
+                    return Err(format!(
+                        "InstallFailed: both of {id} {}'s folders are in use; uninstall it, then install it again.",
+                        operation.version
+                    ));
+                }
+                folder = other;
+                target = join(root, &folder);
+                in_use = false;
+            }
+        }
         let mut published = false;
         if !in_use {
             // An unreferenced folder of that name is a publish a crash interrupted.
@@ -1195,24 +1486,54 @@ impl ExtensionService {
             source: operation.source.clone(),
             installed_at: now(),
             signature: operation.signature.clone(),
+            files_sha256,
+            unchecked: None,
+        };
+        // A copy in place that is this package, checked just now: bound to it (EXT-17).
+        let fresh = copy.clone();
+        let bound = |old: &Copy| Copy {
+            files_sha256: fresh.files_sha256.clone(),
+            unchecked: None,
+            signature: fresh.signature.clone(),
+            source: fresh.source.clone(),
+            ..old.clone()
         };
         let switched = Self::write(&mut inner, paths, |inv| {
             let record = match &before {
-                Some(old) if old.active.folder == folder => old.clone(),
+                Some(old) if old.active.folder == folder => Record {
+                    active: bound(&old.active),
+                    previous: old.previous.clone(),
+                    broken: None,
+                    replaced: None,
+                },
                 Some(old) if old.previous.as_ref().is_some_and(|p| p.folder == folder) => Record {
-                    active: old.previous.clone().ok_or("InstallFailed")?,
+                    active: bound(old.previous.as_ref().ok_or("InstallFailed")?),
                     previous: Some(old.active.clone()),
                     broken: None,
+                    replaced: None,
+                },
+                // The copy in place was not this package: never kept to fall back on.
+                Some(old) if mismatched.is_some() => Record {
+                    previous: [Some(&old.active), old.previous.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .find(|c| Some(&c.folder) != mismatched.as_ref())
+                        .cloned(),
+                    active: copy,
+                    broken: None,
+                    replaced: None,
                 },
                 Some(old) => Record {
                     active: copy,
                     previous: Some(old.active.clone()),
                     broken: None,
+                    replaced: None,
                 },
                 None => Record {
                     active: copy,
                     previous: None,
                     broken: None,
+                    replaced: None,
                 },
             };
             inv.extensions.insert(id.clone(), record);
@@ -1502,6 +1823,32 @@ impl ExtensionService {
         })
     }
 
+    /// The files digest of the copy in `folder` (`tree_digest`), computed again only when a
+    /// file of it changed (`tree_fingerprint`).
+    fn files_digest(&self, folder: &Path) -> Result<String, String> {
+        let fingerprint = crate::extension_package::tree_fingerprint(folder)?;
+        if let Some((seen, digest)) = self
+            .digests
+            .lock()
+            .ok()
+            .and_then(|m| m.get(folder).cloned())
+        {
+            if seen == fingerprint {
+                return Ok(digest);
+            }
+        }
+        let digest = crate::extension_package::tree_digest(folder)?;
+        if let Ok(mut memo) = self.digests.lock() {
+            memo.insert(folder.to_path_buf(), (fingerprint, digest.clone()));
+        }
+        Ok(digest)
+    }
+
+    /// How many times grants changed in this process (EXT-16; never decides anything).
+    pub fn grants_revision(&self) -> u64 {
+        self.grants_revision.load(Ordering::SeqCst)
+    }
+
     pub fn safe_mode(&self) -> bool {
         self.safe_mode.load(Ordering::SeqCst)
     }
@@ -1601,6 +1948,12 @@ impl ExtensionService {
     /// `secrets` grant, enabled, still installed, its dependencies there), then done in the OS
     /// store for its owner (its id and origin), the active profile and the scope asked. The
     /// answer is the value for a read; nothing else carries one.
+    ///
+    /// The check and the operation are one step (EXT-16): the inventory's lock is held across
+    /// both, so a revocation, a disable or an update -- each a change of the inventory, under
+    /// the same lock -- either comes before the check (the operation is refused) or waits until
+    /// the operation is done (it completes, allowed). Once `set_grants` answers, nothing it
+    /// revoked is still running.
     pub fn secret(
         &self,
         copy: &HostCopy,
@@ -1608,16 +1961,16 @@ impl ExtensionService {
         method: &str,
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, Denial> {
-        self.authorize(copy, Some(crate::extension_permissions::SECRETS))?;
         let (inner, paths) = self
             .lock()
             .map_err(|why| Denial::new("InventoryUnavailable", why))?;
-        let profile = inner
+        let inv = inner
             .inventory
             .as_ref()
-            .map(|inv| inv.profiles.active.clone())
-            .unwrap_or_else(|| profiles::DEFAULT.into());
-        drop(inner);
+            .ok_or_else(|| Denial::new("InventoryUnavailable", "The inventory is not read."))?;
+        authorize_in(inv, copy, Some(crate::extension_permissions::SECRETS))?;
+        let profile = inv.profiles.active.clone();
+        // `inner` stays held until the operation is done (see above).
         let refused = |text: String| {
             let (code, message) = text
                 .split_once(": ")
@@ -1781,6 +2134,7 @@ impl ExtensionService {
             }
             Ok(())
         })?;
+        self.grants_revision.fetch_add(1, Ordering::SeqCst);
         let grants = &inner.inventory.as_ref().ok_or("InstallFailed")?.grants;
         let requested: BTreeSet<String> = state.requested.iter().cloned().collect();
         Ok(permission_state(
@@ -1822,6 +2176,12 @@ impl ExtensionService {
             .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
             .and_then(|value| value.get("main")?.as_str().map(str::to_string))
             .ok_or_else(|| format!("UnsupportedRuntime: {id} has no code (no \"main\")."))?;
+        // A copy whose files cannot be checked and whose origin is not known (EXT-17).
+        if chosen.integrity.as_ref().is_some_and(|i| !i.runs) {
+            return Err(format!(
+                "IntegrityUnverified: {id} was recovered from its folder after Yavin's extension inventory was lost; its files cannot be checked, so its code does not run. Reinstall it."
+            ));
+        }
         let (Some(copy), Some(state)) = (chosen.copy.clone(), chosen.permissions.clone()) else {
             return Err(format!("UnknownExtension: {id} is not installed."));
         };
@@ -1863,76 +2223,7 @@ impl ExtensionService {
             .inventory
             .as_ref()
             .ok_or_else(|| Denial::new("InventoryUnavailable", "The inventory is not read."))?;
-        let id = &copy.id;
-        if inv.disabled.contains(id) {
-            return Err(Denial::new(
-                "ExtensionDisabled",
-                format!("{id} is disabled."),
-            ));
-        }
-        let current = match (&copy.stored, inv.extensions.get(id)) {
-            (Some(stored), Some(record)) => {
-                record.active.folder == *stored && record.active.version == copy.version
-            }
-            // A development copy: still the one used while nothing is installed over it.
-            (None, None) => true,
-            _ => false,
-        };
-        if !current {
-            return Err(Denial::new(
-                "ExtensionChanged",
-                format!("The running code of {id} is no longer the installed copy; it must be reloaded."),
-            ));
-        }
-        // Its required dependencies still there, enabled and in range (EXT-12).
-        for need in &copy.requires {
-            let gone = || {
-                Denial::new(
-                    "DependencyUnavailable",
-                    format!(
-                        "{id} needs {} {}, which is no longer available.",
-                        need.id, need.range.text
-                    ),
-                )
-            };
-            if inv.disabled.contains(&need.id) {
-                return Err(Denial::new(
-                    "DependencyUnavailable",
-                    format!("{id} needs {}, which is disabled.", need.id),
-                ));
-            }
-            match inv.extensions.get(&need.id) {
-                Some(record) => {
-                    let fits = semver::Version::parse(&record.active.version)
-                        .is_ok_and(|v| need.range.matches(&v));
-                    if !fits {
-                        return Err(gone());
-                    }
-                }
-                None if need.installed => return Err(gone()),
-                None => {}
-            }
-        }
-        let Some(capability) = capability else {
-            return Ok(());
-        };
-        if !copy.requested.contains(capability) {
-            return Err(Denial::new(
-                "PermissionDenied",
-                format!("{id} does not request \"{capability}\" in its manifest."),
-            ));
-        }
-        let granted = inv.grants.get(id).is_some_and(|grant| {
-            grant.binds(&copy.folder, &copy.version, copy.sha256.as_deref())
-                && grant.capabilities.contains(capability)
-        });
-        if !granted {
-            return Err(Denial::new(
-                "PermissionDenied",
-                format!("\"{capability}\" is not allowed for {id} {}.", copy.version),
-            ));
-        }
-        Ok(())
+        authorize_in(inv, copy, capability)
     }
 
     /// The disk and the inventory, made to agree; what to list. Root folders the inventory
@@ -1970,6 +2261,8 @@ impl ExtensionService {
                     permissions: None,
                     copy: None,
                     signature: None,
+                    integrity: None,
+                    replaced: None,
                 }),
             }
         }
@@ -2012,9 +2305,12 @@ impl ExtensionService {
                             source: "unknown".into(),
                             installed_at: now(),
                             signature: None,
+                            files_sha256: None,
+                            unchecked: Some(Unchecked::Adopted),
                         },
                         previous: None,
                         broken: None,
+                        replaced: None,
                     },
                 );
             }
@@ -2034,7 +2330,16 @@ impl ExtensionService {
                         "its recorded folder is not inside Yavin's extensions folder".to_string(),
                     );
                 }
-                read_copy(&join(root, &copy.folder), &id, Some(&copy.version))
+                let text = read_copy(&join(root, &copy.folder), &id, Some(&copy.version))?;
+                // Its files are still the ones put in place (EXT-15): else it is not the copy
+                // that was verified -- not used, not listed as signed, its grants not applied.
+                if let Some(expected) = &copy.files_sha256 {
+                    let actual = self.files_digest(&join(root, &copy.folder))?;
+                    if !actual.eq_ignore_ascii_case(expected) {
+                        return Err("its files changed since it was installed (they are not the package that was verified)".to_string());
+                    }
+                }
+                Ok(text)
             };
             let facts = |copy: &Copy| CopyFacts {
                 version: copy.version.clone(),
@@ -2043,11 +2348,16 @@ impl ExtensionService {
             };
             // A signature record holds only for the bytes it was checked against (EXT-09): one
             // whose SHA-256 is not this copy's is not reported at all.
+            // ... and only while its files are bound to those bytes (EXT-17): a copy whose
+            // files were never checked keeps its record, unshown, until a reinstall binds them.
             let signature_of = |copy: &Copy| {
                 copy.signature.clone().filter(|s| {
-                    copy.sha256
-                        .as_deref()
-                        .is_some_and(|sha| s.sha256.eq_ignore_ascii_case(sha))
+                    copy.files_sha256.is_some()
+                        && copy
+                            .sha256
+                            .as_deref()
+                            .is_some_and(|sha| s.sha256.eq_ignore_ascii_case(sha))
+                        && record_matches_source(s, &copy.source)
                 })
             };
             let mut entry = Listed {
@@ -2060,6 +2370,8 @@ impl ExtensionService {
                 permissions: None,
                 copy: Some(facts(&record.active)),
                 signature: signature_of(&record.active),
+                integrity: Some(Integrity::of(&record.active)),
+                replaced: record.replaced.clone(),
             };
             match usable(&record.active) {
                 Ok(text) => {
@@ -2079,11 +2391,17 @@ impl ExtensionService {
                     });
                     match fallback {
                         Some((previous, text)) => {
+                            let replaced = Replaced {
+                                version: record.active.version.clone(),
+                                reason: why.clone(),
+                                at: now(),
+                            };
                             Self::write(inner, paths, |inv| {
                                 if let Some(r) = inv.extensions.get_mut(&id) {
                                     r.active = previous.clone();
                                     r.previous = None;
                                     r.broken = None;
+                                    r.replaced = Some(replaced.clone());
                                 }
                                 note(inv, Some(&id), format!(
                                     "{id} {} could not be used ({why}); the previous version, {}, is used instead.",
@@ -2095,6 +2413,8 @@ impl ExtensionService {
                             entry.manifest = Some(text);
                             entry.copy = Some(facts(&previous));
                             entry.signature = signature_of(&previous);
+                            entry.integrity = Some(Integrity::of(&previous));
+                            entry.replaced = Some(replaced);
                         }
                         None => {
                             let reason = format!("The installed {id} {} cannot be used: {why}. Reinstall or uninstall it.", record.active.version);
@@ -2110,6 +2430,9 @@ impl ExtensionService {
                             entry.error = Some(reason);
                             entry.copy = None;
                             entry.signature = None;
+                            entry.integrity = why
+                                .starts_with("its files changed")
+                                .then(Integrity::changed);
                         }
                     }
                 }
@@ -2139,6 +2462,8 @@ impl ExtensionService {
                         permissions: None,
                         copy: None,
                         signature: None,
+                        integrity: None,
+                        replaced: None,
                     });
                     continue;
                 };
@@ -2172,6 +2497,8 @@ impl ExtensionService {
                         stored: None,
                     }),
                     signature: None,
+                    integrity: Some(Integrity::development()),
+                    replaced: None,
                 });
             }
         }
@@ -2289,9 +2616,59 @@ fn save(paths: &Paths, inventory: &Inventory) -> Result<(), String> {
 
 fn read_inventory(file: &Path) -> Loaded<Inventory> {
     read_versioned(file, INVENTORY_VERSION, json_version, |text, version| {
-        (version == INVENTORY_VERSION)
-            .then(|| serde_json::from_str::<Inventory>(text).ok())
-            .flatten()
+        let inventory = serde_json::from_str::<Inventory>(text).ok()?;
+        match version {
+            INVENTORY_VERSION => Some(inventory),
+            1 => Some(migrate_v1(inventory)),
+            _ => None,
+        }
+    })
+}
+
+/// A version-1 inventory as version 2 (EXT-17). Nothing is raised: a copy without a files
+/// digest is marked unchecked -- `Adopted` (an IDE-09 root folder), `Rebuilt` (a store
+/// copy with no recorded source: a rebuild), else `Legacy` (installed before EXT-15). Its
+/// signature record, grants, profiles and the rest are kept as they were.
+fn migrate_v1(mut inventory: Inventory) -> Inventory {
+    inventory.version = INVENTORY_VERSION;
+    let mark = |copy: &mut Copy| {
+        if copy.files_sha256.is_none() && copy.unchecked.is_none() {
+            copy.unchecked = Some(if !copy.folder.starts_with(&format!("{STORE}/")) {
+                Unchecked::Adopted
+            } else if copy.source == "unknown" {
+                Unchecked::Rebuilt
+            } else {
+                Unchecked::Legacy
+            });
+        }
+    };
+    for record in inventory.extensions.values_mut() {
+        mark(&mut record.active);
+        if let Some(previous) = record.previous.as_mut() {
+            mark(previous);
+        }
+    }
+    for operation in inventory.operations.values_mut() {
+        if let Some(before) = operation.before.as_mut() {
+            mark(&mut before.active);
+            if let Some(previous) = before.previous.as_mut() {
+                mark(previous);
+            }
+        }
+    }
+    inventory
+}
+
+/// Whether a newer Yavin's inventory was kept aside here (`inventory.json.v<N>-<ms>.bak`, N
+/// past this one's): then a missing inventory is not restored or rebuilt over it (EXT-17).
+fn newer_kept_aside(root: &Path) -> Option<u32> {
+    fs::read_dir(root).ok()?.flatten().find_map(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        [INVENTORY, LAST_GOOD].iter().find_map(|file| {
+            let rest = name.strip_prefix(&format!("{file}.v"))?;
+            let version: u32 = rest.split('-').next()?.parse().ok()?;
+            (version > INVENTORY_VERSION && name.ends_with(".bak")).then_some(version)
+        })
     })
 }
 
@@ -2304,7 +2681,8 @@ fn installed_data(root: &Path) -> bool {
 }
 
 /// The version of store copy `folder` of `id` if it is one: a plain folder inside the root
-/// named `<version>-<sha8>`, whose manifest is `id` at that version.
+/// named `<version>-<sha8>` (or `<version>-<sha256>`, when the short name was another package's:
+/// EXT-15), whose manifest is `id` at that version.
 fn validated(root: &Path, id: &str, folder: &str) -> Option<String> {
     if !folder_ok(folder) {
         return None;
@@ -2314,8 +2692,9 @@ fn validated(root: &Path, id: &str, folder: &str) -> Option<String> {
         return None;
     }
     let name = folder.rsplit('/').next()?;
-    let (version, sha8) = name.rsplit_once('-')?;
-    let hex = sha8.len() == 8 && sha8.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let (version, sha) = name.rsplit_once('-')?;
+    let hex =
+        matches!(sha.len(), 8 | 64) && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     if !hex || crate::extension_package::version_ok(version).is_err() {
         return None;
     }

@@ -1928,3 +1928,50 @@ test("EXT-14 an activation that fails or times out is reported by its code -- ne
   assert.deepEqual(reported, [["ActivationFailed", "acme.hello"]]);
   assert.ok(!JSON.stringify(reported).includes("supersecret123"));
 });
+
+// --- EXT-16: revocation while a request is in flight -------------------------------------------
+
+test("EXT-16 a request in flight when its capability is revoked: its answer is withheld and said; the next is refused", async () => {
+  const t = setup();
+  t.add(
+    { permissions: { version: 1, request: ["workspace.fs.read", "documents.read"] } },
+    `
+module.exports.activate = function (c, yavin) {
+  c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", async function (what) {
+    try {
+      return what === "doc"
+        ? await yavin.documents.getText("file:///C:/work/readme.md")
+        : await yavin.workspace.fs.readFile("notes.txt");
+    } catch (e) { return e.code || String(e); }
+  }));
+};`,
+  );
+  await t.registry.grant("acme.hello", ["workspace.fs.read", "documents.read"]);
+  const m = t.manager();
+  assert.equal(await m.executeCommand("acme.hello.greet"), "a note");
+  let release!: () => void;
+  let entered!: () => void;
+  const inside = new Promise<void>((resolve) => (entered = resolve));
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const win = t.win.window as { readFile: (path: string) => Promise<string> };
+  const read = win.readFile;
+  win.readFile = async (path) => {
+    entered();
+    await gate;
+    return read(path);
+  };
+  const running = m.executeCommand("acme.hello.greet");
+  await inside;
+  // Only the one capability is revoked.
+  await t.registry.grant("acme.hello", ["documents.read"]);
+  release();
+  assert.equal(await running, "PermissionDenied");
+  assert.equal(m.getSnapshot().denied["acme.hello"]?.capability, "workspace.fs.read");
+  assert.match(
+    m.getSnapshot().denied["acme.hello"]?.message ?? "",
+    /revoked .* while fs\.readFile ran/,
+  );
+  win.readFile = read;
+  assert.equal(await m.executeCommand("acme.hello.greet"), "PermissionDenied");
+  assert.equal(await m.executeCommand("acme.hello.greet", "doc"), "# Readme\nhello");
+});

@@ -970,6 +970,19 @@ export function createExtensionHost(options: ExtensionHostOptions) {
     }
     try {
       const value = await method(one, params);
+      // Revoked while it ran (EXT-16): what it found is not delivered -- the native side
+      // withholds such an answer too; this host applies the same rule.
+      if (need.kind === "capability" && !allowed(one, need.capability)) {
+        const text = `"${need.capability}" was revoked for ${one.entry.id} while ${message.method} ran; its answer is withheld.`;
+        refuse(one.entry.id, {
+          method: message.method,
+          capability: need.capability,
+          code: "PermissionDenied",
+          message: text,
+        });
+        await respond(message, { ok: false, code: "PermissionDenied", text });
+        return;
+      }
       await respond(message, { ok: true, value });
     } catch (error) {
       const code = (error as { code?: string }).code ?? "Failed";
