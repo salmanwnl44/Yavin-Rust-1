@@ -184,7 +184,7 @@ export function createLanguageClient(init: {
 
   const initializeParams = () => ({
     processId: null,
-    clientInfo: { name: "Yavin", version: "2.0.0" },
+    clientInfo: { name: "Yavin", version: "2.1.0" },
     locale: "en",
     rootPath: root.path,
     rootUri: root.uri,

@@ -88,7 +88,7 @@ export function TitleBar({
             YAVIN
           </span>
           <span className="rounded bg-[#121212] border border-[#222] px-1.5 py-0.2 text-[9.5px] font-mono text-zinc-500 pointer-events-none">
-            v2.0.0
+            v2.1.0
           </span>
         </div>
 
