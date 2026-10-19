@@ -3891,6 +3891,8 @@ export default function App() {
                 onClose={() => setExtensionPage(null)}
                 onUninstall={confirmUninstall}
                 declarative={declarativeContributions}
+                settingsRegistry={settings}
+                workspace={settingsWorkspace}
               />
             ) : settingsOpen ? (
               <SettingsView

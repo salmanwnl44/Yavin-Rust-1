@@ -169,6 +169,15 @@ interface Commands {
     args: { id: string; key: string; value: unknown };
     result: import("./extensions/profiles.ts").ProfilesView;
   };
+  /** All of an extension's setting changes in a profile, or none (EXT-18). */
+  extensions_profile_settings: {
+    args: {
+      id: string;
+      profile: string;
+      changes: { key: string; value: unknown; expected: unknown }[];
+    };
+    result: import("./extensions/profiles.ts").ProfilesView;
+  };
   extensions_set_enabled: { args: { id: string; enabled: boolean }; result: void };
   /** Allows exactly `capabilities` for the installed copy (EXT-07); the state it then holds. */
   extensions_set_grants: {

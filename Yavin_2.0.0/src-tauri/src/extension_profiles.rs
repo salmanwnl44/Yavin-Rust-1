@@ -323,6 +323,179 @@ pub fn set_setting(
     Ok(())
 }
 
+// --- EXT-18: settings as their extension declares them -----------------------------------------
+
+/// What an extension declares one of its settings to be (its manifest's
+/// `contributes.configuration.properties`), as the window reads it (`manifest.ts`,
+/// `registry.ts`): a value is valid natively exactly when it is valid there.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingKind {
+    Boolean,
+    /// Finite, within its bounds (absent: the safe-integer range).
+    Number {
+        min: f64,
+        max: f64,
+    },
+    /// One line, not blank, at most `MAX_STRING` UTF-16 units.
+    String,
+    /// One of these.
+    Enum(Vec<String>),
+}
+
+/// The longest string setting value, in UTF-16 units (as the window counts).
+pub const MAX_STRING: usize = 1000;
+const SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// The settings extension `id`'s manifest declares, by key (`<id>.<name>`). A declaration
+/// the window would refuse is not one: none of its values is accepted.
+pub fn declared_settings(manifest: &Value, id: &str) -> BTreeMap<String, SettingKind> {
+    let mut found = BTreeMap::new();
+    let Some(properties) = manifest
+        .pointer("/contributes/configuration/properties")
+        .and_then(Value::as_object)
+    else {
+        return found;
+    };
+    for (key, entry) in properties {
+        let owned = key
+            .strip_prefix(id)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some_and(|rest| !rest.is_empty());
+        let Some(entry) = entry.as_object().filter(|_| owned) else {
+            continue;
+        };
+        let default = entry.get("default");
+        let kind = if let Some(values) = entry.get("enum") {
+            let Some(values) = values.as_array().filter(|v| !v.is_empty()) else {
+                continue;
+            };
+            let values: Option<Vec<String>> = values
+                .iter()
+                .map(|v| v.as_str().map(str::to_string))
+                .collect();
+            match values {
+                Some(values)
+                    if default
+                        .and_then(Value::as_str)
+                        .is_some_and(|d| values.iter().any(|v| v == d)) =>
+                {
+                    SettingKind::Enum(values)
+                }
+                _ => continue,
+            }
+        } else {
+            match entry.get("type").and_then(Value::as_str) {
+                Some("boolean") if default.is_some_and(Value::is_boolean) => SettingKind::Boolean,
+                Some("string") if default.is_some_and(Value::is_string) => SettingKind::String,
+                Some("number") if default.is_some_and(Value::is_number) => {
+                    let bound = |name: &str, fallback: f64| {
+                        entry.get(name).and_then(Value::as_f64).unwrap_or(fallback)
+                    };
+                    let (min, max) = (
+                        bound("minimum", -SAFE_INTEGER),
+                        bound("maximum", SAFE_INTEGER),
+                    );
+                    if min > max {
+                        continue;
+                    }
+                    SettingKind::Number { min, max }
+                }
+                _ => continue,
+            }
+        };
+        found.insert(key.clone(), kind);
+    }
+    found
+}
+
+/// Whether `value` is a valid value of a setting declared `kind` -- or what is wrong with it.
+pub fn check_value(kind: &SettingKind, value: &Value) -> Result<(), String> {
+    match kind {
+        SettingKind::Boolean if value.is_boolean() => Ok(()),
+        SettingKind::Boolean => Err("must be true or false".into()),
+        SettingKind::Number { min, max } => match value.as_f64() {
+            Some(n) if n.is_finite() && n >= *min && n <= *max => Ok(()),
+            _ => Err(format!("must be a number from {min} to {max}")),
+        },
+        SettingKind::String => match value.as_str() {
+            Some(text)
+                if !text.trim().is_empty()
+                    && text.encode_utf16().count() <= MAX_STRING
+                    && !text.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7f) =>
+            {
+                Ok(())
+            }
+            _ => Err(format!(
+                "must be one line of text, not blank, of at most {MAX_STRING} characters"
+            )),
+        },
+        SettingKind::Enum(values) => match value.as_str() {
+            Some(text) if values.iter().any(|v| v == text) => Ok(()),
+            _ => Err(format!("must be one of: {}", values.join(", "))),
+        },
+    }
+}
+
+/// One change of a profile's setting value (EXT-18): `value` none removes the override; the
+/// value it replaces must still be `expected` (none: not set) -- else it changed meanwhile.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct SettingChange {
+    pub key: String,
+    pub value: Option<Value>,
+    pub expected: Option<Value>,
+}
+
+/// Applies `changes` to extension `id`'s settings in profile `profile` -- all of them or
+/// none (EXT-18). Refused: `profile` is no longer the active one (`ProfileChanged`: it was
+/// switched meanwhile, by this window or another); a key the extension does not declare
+/// (`UnknownSetting`); a value invalid for its declaration (`InvalidSetting`); a value that
+/// is no longer the one the change was made against (`SettingChanged`).
+pub fn apply_settings(
+    profiles: &mut Profiles,
+    profile: &str,
+    id: &str,
+    declared: &BTreeMap<String, SettingKind>,
+    changes: &[SettingChange],
+) -> Result<(), String> {
+    if profiles.active != profile {
+        let name = profiles
+            .list
+            .get(&profiles.active)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| profiles.active.clone());
+        return Err(format!(
+            "ProfileChanged: the active extension profile is now \"{name}\", not the one these settings were edited in; nothing was saved. Review them again."
+        ));
+    }
+    let mut next = profiles.clone();
+    for change in changes {
+        let kind = declared.get(&change.key).ok_or_else(|| {
+            format!(
+                "UnknownSetting: {id} declares no setting \"{}\".",
+                change.key
+            )
+        })?;
+        if let Some(value) = &change.value {
+            check_value(kind, value)
+                .map_err(|why| format!("InvalidSetting: {} {why}.", change.key))?;
+        }
+        let current = next
+            .list
+            .get(profile)
+            .and_then(|p| p.settings.get(id))
+            .and_then(|values| values.get(&change.key));
+        if current != change.expected.as_ref() {
+            return Err(format!(
+                "SettingChanged: {} was changed elsewhere since it was read; nothing was saved. Review it again.",
+                change.key
+            ));
+        }
+        set_setting(&mut next, id, &change.key, change.value.clone())?;
+    }
+    *profiles = next;
+    Ok(())
+}
+
 /// Forgets extension `id` in every profile (it was uninstalled).
 pub fn forget_extension(profiles: &mut Profiles, id: &str) {
     for profile in profiles.list.values_mut() {

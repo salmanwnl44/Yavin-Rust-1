@@ -565,3 +565,87 @@ test("EXT-17 an older inventory: upgraded, its copy not checked but running; rei
     if (running.app.exitCode === null) running.app.kill();
   }
 });
+
+test("EXT-18 profile settings in the installed app: saved natively, used by the running extension, kept per profile across restarts", async () => {
+  let running = await start();
+  const count = async (words: number) => {
+    // The Explorer's icon toggles it: open it only if it is not (a restart reopens it).
+    const files = running.page.getByRole("tree", { name: "Files" });
+    if (!(await files.isVisible()))
+      await running.page.getByTitle("Explorer (Ctrl+Shift+E)", { exact: true }).click();
+    await files.getByText("notes.md", { exact: true }).click();
+    await palette(running.page, "Word Count: Count Words in Active File");
+    await expect(message(running.page)).toContainText(`notes.md: ${words} words`);
+  };
+  const settingsPage = async () => {
+    const view = await extensionsView(running.page);
+    await card(view.getByRole("region", { name: "Installed extensions" }), "Word Count").click();
+    const details = running.page.getByRole("region", { name: "Extension: Word Count" });
+    await details.getByRole("tab", { name: "Settings" }).click();
+    return { view, details, markup: details.getByRole("checkbox", { name: "ignore-markup" }) };
+  };
+  const stored = () =>
+    JSON.parse(readFileSync(join(EXTENSIONS, "inventory.json"), "utf8")).profiles as {
+      active: string;
+      list: Record<string, { settings: Record<string, Record<string, unknown>> }>;
+    };
+  try {
+    const view = await extensionsView(running.page);
+    await card(view.getByRole("region", { name: "Recommended extensions" }), "Word Count")
+      .getByRole("button", { name: "Install Word Count" })
+      .click();
+    await review(running.page, "Install and allow");
+    // Its default: markup left out.
+    await count(6);
+
+    // Off in this profile: saved natively, and the running extension counts the markup at once.
+    let page = await settingsPage();
+    await expect(page.markup).toBeChecked();
+    await page.markup.uncheck();
+    await page.details.getByRole("button", { name: "Save settings of Word Count" }).click();
+    await expect(page.details.getByTestId("settings-saved")).toHaveText(
+      'Saved in the profile "Default".',
+    );
+    expect(stored().list.default.settings["yavin.word-count"]).toEqual({
+      "yavin.word-count.ignore-markup": false,
+    });
+    const hosts = hostProcesses(running.app.pid!).map((one) => one.id);
+    await count(7);
+    expect(hostProcesses(running.app.pid!).map((one) => one.id)).toEqual(hosts);
+
+    // A profile of its own, on again there.
+    page = await settingsPage();
+    await page.details.getByRole("button", { name: "Manage profiles" }).click();
+    const profiles = page.view.getByRole("region", { name: "Extension profiles" });
+    await profiles.getByRole("textbox", { name: "New profile name" }).fill("Work");
+    await profiles.getByRole("button", { name: "Create", exact: true }).click();
+    await page.details.getByRole("combobox", { name: "Extension profile" }).selectOption("work");
+    await expect(page.markup).not.toBeChecked();
+    await page.markup.check();
+    await page.details.getByRole("button", { name: "Save settings of Word Count" }).click();
+    await expect(page.details.getByTestId("settings-saved")).toHaveText(
+      'Saved in the profile "Work".',
+    );
+    await count(6);
+    await close(running);
+
+    // Restarted: the active profile, and each profile's own value.
+    running = await restart();
+    expect(stored().active).toBe("work");
+    await count(6);
+    await (
+      await extensionsView(running.page)
+    )
+      .getByRole("combobox", { name: "Active extension profile" })
+      .selectOption("default");
+    await count(7);
+    page = await settingsPage();
+    await expect(page.markup).not.toBeChecked();
+    await expect(
+      page.details.getByRole("group", { name: "ignore-markup" }).getByTestId("setting-source"),
+    ).toHaveText("Now off, from this profile.");
+    await close(running);
+  } finally {
+    if (running.app.exitCode === null) running.app.kill();
+  }
+});

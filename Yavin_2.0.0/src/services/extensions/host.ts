@@ -126,6 +126,8 @@ export interface ExtensionHostOptions {
   report?: (code: string, extensionId: string) => void;
   /** The active extension profile's setting values (EXT-13), per extension. */
   profileSettings?: () => Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+  /** Hears that the active profile's setting values changed (EXT-18); returns the unsubscribe. */
+  onProfileSettings?: (listener: () => void) => () => void;
   registry: ExtensionRegistry;
   settings: SettingsRegistry;
   storage: ExtensionStorage;
@@ -683,7 +685,11 @@ export function createExtensionHost(options: ExtensionHostOptions) {
   const emit = (event: string, payload: unknown, only?: string) => {
     const need = needOfEvent(event);
     for (const one of running.values()) {
-      if (one.status.state !== "active" || !one.events.has(event)) continue;
+      // Its own settings' changes reach it whether or not it follows them (EXT-18): they also
+      // refresh what its getConfiguration answers, which would otherwise stay as it was at
+      // activation. Listeners are called only if it has any (the bootstrap).
+      const delivered = one.events.has(event) || event === "configuration.changed";
+      if (one.status.state !== "active" || !delivered) continue;
       if (only && one.entry.id !== only) continue;
       // Allowed when it subscribed is not enough: allowed now (EXT-07).
       if (need.kind === "capability" && !allowed(one, need.capability)) continue;
@@ -703,10 +709,33 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         ),
       );
     }
+    // EXT-18: a change of the active profile's values reaches the extensions it is theirs, as a
+    // user or workspace change does -- for each of their keys whose profile value changed.
+    if (options.onProfileSettings) {
+      let before = options.profileSettings?.() ?? {};
+      windowStops.push(
+        options.onProfileSettings(() => {
+          const after = options.profileSettings?.() ?? {};
+          const was = before;
+          before = after;
+          for (const one of running.values()) {
+            const old = was[one.entry.id] ?? {};
+            const now = after[one.entry.id] ?? {};
+            for (const key of new Set([...Object.keys(old), ...Object.keys(now)]))
+              if (JSON.stringify(old[key]) !== JSON.stringify(now[key]))
+                emit(
+                  "configuration.changed",
+                  { key: key.slice(one.entry.id.length + 1), values: configurationOf(one) },
+                  one.entry.id,
+                );
+          }
+        }),
+      );
+    }
     windowStops.push(
       options.settings.subscribe(options.workspace, (change) => {
         for (const one of running.values())
-          if (owned(one, change.id) && one.events.has("configuration.changed"))
+          if (owned(one, change.id))
             emit(
               "configuration.changed",
               { key: change.id.slice(one.entry.id.length + 1), values: configurationOf(one) },
@@ -1138,6 +1167,8 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         `Activated in ${one.status.activationMs} ms (host generation ${options.generation}).`,
       );
       one.activation = null;
+      // Its settings' changes reach it from now on, followed or not (EXT-18).
+      startWindowListeners();
       publish();
       // A view it contributes that is already shown is filled now.
       for (const view of one.entry.manifest.contributes.views)

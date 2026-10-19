@@ -1804,14 +1804,74 @@ impl ExtensionService {
         })
     }
 
-    /// Sets (`None`: removes) extension `id`'s setting `key` in the active profile.
+    /// Sets (`None`: removes) extension `id`'s setting `key` in the active profile -- a
+    /// setting it declares, a value valid for it (EXT-18), whatever it replaces.
     pub fn set_profile_setting(
         &self,
         id: &str,
         key: &str,
         value: Option<serde_json::Value>,
     ) -> Result<ProfilesView, String> {
-        self.change_profiles(|inv| profiles::set_setting(&mut inv.profiles, id, key, value))
+        let (mut inner, paths) = self.lock()?;
+        let declared = self.declared_settings(&mut inner, paths, id)?;
+        let kind = declared
+            .get(key)
+            .ok_or_else(|| format!("UnknownSetting: {id} declares no setting \"{key}\"."))?;
+        if let Some(value) = &value {
+            profiles::check_value(kind, value)
+                .map_err(|why| format!("InvalidSetting: {key} {why}."))?;
+        }
+        Self::write(&mut inner, paths, |inv| {
+            profiles::set_setting(&mut inv.profiles, id, key, value)
+        })?;
+        Ok(inner
+            .inventory
+            .as_ref()
+            .ok_or("InstallFailed")?
+            .profiles
+            .view())
+    }
+
+    /// Changes extension `id`'s settings in profile `profile`, all or none, each checked
+    /// against what the extension declares and against the value it was made from (EXT-18:
+    /// `profiles::apply_settings`). One durable write; the view after it.
+    pub fn set_profile_settings(
+        &self,
+        id: &str,
+        profile: &str,
+        changes: &[profiles::SettingChange],
+    ) -> Result<ProfilesView, String> {
+        let (mut inner, paths) = self.lock()?;
+        let declared = self.declared_settings(&mut inner, paths, id)?;
+        Self::write(&mut inner, paths, |inv| {
+            profiles::apply_settings(&mut inv.profiles, profile, id, &declared, changes)
+        })?;
+        Ok(inner
+            .inventory
+            .as_ref()
+            .ok_or("InstallFailed")?
+            .profiles
+            .view())
+    }
+
+    /// The settings the copy of `id` that `list` reports declares (EXT-18) -- installed or
+    /// development, enabled or not; refused for one that is not listed usable.
+    fn declared_settings(
+        &self,
+        inner: &mut Inner,
+        paths: &Paths,
+        requested: &str,
+    ) -> Result<BTreeMap<String, profiles::SettingKind>, String> {
+        let id = canonical_id(requested)
+            .ok_or_else(|| format!("InvalidRequest: \"{requested}\" is not an extension id."))?;
+        let (listed, _) = self.reconcile(inner, paths)?;
+        let manifest = listed
+            .iter()
+            .find(|one| one.id.as_deref() == Some(id.as_str()) && one.error.is_none())
+            .and_then(|one| one.manifest.as_deref())
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .ok_or_else(|| format!("UnknownExtension: {id} is not installed."))?;
+        Ok(profiles::declared_settings(&manifest, &id))
     }
 
     // --- Diagnostics and safe mode (EXT-14) ------------------------------------------------
@@ -2889,6 +2949,17 @@ pub fn extensions_profile_select(
     id: String,
 ) -> Result<ProfileSwitch, String> {
     service.select_profile(&id)
+}
+
+/// Changes an extension's settings in a profile, all or none (EXT-18).
+#[tauri::command(async)]
+pub fn extensions_profile_settings(
+    service: State<'_, ExtensionService>,
+    id: String,
+    profile: String,
+    changes: Vec<profiles::SettingChange>,
+) -> Result<ProfilesView, String> {
+    service.set_profile_settings(&id, &profile, &changes)
 }
 
 #[tauri::command(async)]

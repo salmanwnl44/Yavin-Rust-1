@@ -153,3 +153,78 @@ export function ExtensionProfiles({
     </section>
   );
 }
+
+/**
+ * The active extension profile, always in view at the top of the Extensions view (EXT-18), and
+ * switching to another -- as in the profiles section, which Manage shows (create, rename, delete).
+ */
+export function ProfileSwitcher({
+  store,
+  onSwitched,
+  managing,
+  onManage,
+}: {
+  store: ProfileStore;
+  onSwitched: () => Promise<unknown>;
+  managing: boolean;
+  onManage: () => void;
+}) {
+  const view = useSyncExternalStore(store.subscribe, store.getSnapshot);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (!view) return null;
+  return (
+    <div className="shrink-0 px-3 pb-2 text-[11px] text-zinc-500">
+      <div className="flex items-center gap-2">
+        <label className="flex min-w-0 flex-1 items-center gap-1.5">
+          <span className="shrink-0">Profile</span>
+          <select
+            aria-label="Active extension profile"
+            value={view.active}
+            disabled={busy}
+            onChange={(event) => {
+              const id = event.target.value;
+              setBusy(true);
+              setError(null);
+              store
+                .select(id)
+                .then(() => onSwitched())
+                .catch((failure: unknown) =>
+                  setError(
+                    String((failure as Error)?.message ?? failure).replace(/^[A-Za-z]+: /, ""),
+                  ),
+                )
+                .finally(() => setBusy(false));
+            }}
+            className="min-w-0 flex-1 truncate rounded border border-zinc-800 bg-[#0b0b0b] px-1 py-0.5 text-zinc-200"
+          >
+            {view.profiles.map((profile) => (
+              <option key={profile.id} value={profile.id}>
+                {profile.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button
+          type="button"
+          aria-expanded={managing}
+          aria-label="Manage extension profiles"
+          onClick={onManage}
+          className="shrink-0 rounded px-1.5 py-0.5 hover:bg-zinc-900 hover:text-zinc-200"
+        >
+          Manage
+        </button>
+      </div>
+      {busy && (
+        <p role="status" className="mt-0.5">
+          Switching…
+        </p>
+      )}
+      {error && (
+        <p role="alert" className="mt-0.5 text-red-400">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}

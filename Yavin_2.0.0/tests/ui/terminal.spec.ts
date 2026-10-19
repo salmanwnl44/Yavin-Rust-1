@@ -191,7 +191,22 @@ async function desktop(
         profiles: [{ id: "default", name: "Default" }] as { id: string; name: string }[],
         settings: {} as Record<string, Record<string, unknown>>,
       };
-      const profileView = () => ({ ...profiles, profiles: [...profiles.profiles] });
+      // Each profile's setting values (EXT-18); the view shows the active one's.
+      const perProfile: Record<string, Record<string, Record<string, unknown>>> = { default: {} };
+      const profileView = () => ({
+        ...profiles,
+        profiles: [...profiles.profiles],
+        settings: structuredClone(perProfile[profiles.active] ?? {}),
+      });
+      // Another window changing a profile value (a test's way to make a save stale).
+      (window as unknown as Record<string, unknown>).__profileSetting = (
+        id: string,
+        key: string,
+        value: unknown,
+      ) => {
+        const values = ((perProfile[profiles.active] ??= {})[id] ??= {});
+        values[key] = value;
+      };
       // The native extension diagnostics (EXT-14): already classified and redacted, as the
       // native side answers.
       let diagnostics = [
@@ -830,6 +845,8 @@ async function desktop(
                 .toLowerCase()
                 .replace(/[^a-z0-9]+/g, "-");
               profiles.profiles.push({ id, name: String(args.name) });
+              // A new profile starts as the active one is (EXT-13).
+              perProfile[id] = structuredClone(perProfile[profiles.active] ?? {});
               return profileView();
             }
             if (command === "extensions_profile_select") {
@@ -837,6 +854,28 @@ async function desktop(
                 throw `ProfileNotFound: there is no extension profile "${args.id}".`;
               profiles.active = String(args.id);
               return { profiles: profileView(), unavailable: [] };
+            }
+            if (command === "extensions_profiles") return profileView();
+            // EXT-18: all or none, in the profile they were made in, against what they replace.
+            if (command === "extensions_profile_settings") {
+              if (args.profile !== profiles.active)
+                throw `ProfileChanged: the active extension profile is now "${profiles.profiles.find((p) => p.id === profiles.active)?.name}", not the one these settings were edited in; nothing was saved. Review them again.`;
+              const values = structuredClone(
+                (perProfile[profiles.active] ??= {})[String(args.id)] ?? {},
+              );
+              for (const change of args.changes as {
+                key: string;
+                value: unknown;
+                expected: unknown;
+              }[]) {
+                if (JSON.stringify(values[change.key] ?? null) !== JSON.stringify(change.expected))
+                  throw `SettingChanged: ${change.key} was changed elsewhere since it was read; nothing was saved. Review it again.`;
+                if (change.value === null) delete values[change.key];
+                else values[change.key] = change.value;
+              }
+              perProfile[profiles.active][String(args.id)] = values;
+              if (!Object.keys(values).length) delete perProfile[profiles.active][String(args.id)];
+              return profileView();
             }
             if (command === "extensions_profile_rename") {
               const found = profiles.profiles.find((p) => p.id === args.id)!;
@@ -4737,4 +4776,202 @@ test("extension diagnostics: refused and failed told apart, what to do next, the
   );
   await section.getByRole("button", { name: "Clear" }).click();
   await expect(section).toContainText("Nothing to report.");
+});
+
+// --- EXT-18: profile settings ------------------------------------------------------------------
+
+const SETTINGS_DEMO = {
+  publisher: "acme",
+  name: "demo",
+  displayName: "Settings Demo",
+  version: "1.0.0",
+  contributes: {
+    configuration: {
+      properties: {
+        "acme.demo.size": {
+          type: "number",
+          default: 4,
+          minimum: 1,
+          maximum: 10,
+          title: "Size",
+          description: "How big.",
+        },
+        "acme.demo.on": { type: "boolean", default: true, title: "On", description: "Whether on." },
+        "acme.demo.mode": {
+          enum: ["fast", "slow"],
+          default: "fast",
+          title: "Mode",
+          description: "How fast.",
+        },
+        "acme.demo.label": {
+          type: "string",
+          default: "x",
+          title: "Label",
+          description: "A label.",
+        },
+      },
+    },
+  },
+};
+
+/** The Settings Demo's Settings tab. */
+async function demoSettings(page: Page) {
+  await desktop(page, {
+    extensions: [
+      {
+        folder: "/data/extensions/acme.demo",
+        manifest: JSON.stringify(SETTINGS_DEMO),
+        error: null,
+      },
+    ],
+  });
+  const view = await extensionsView(page);
+  await view.getByRole("group", { name: "Settings Demo", exact: true }).click();
+  const details = page.getByRole("region", { name: "Extension: Settings Demo" });
+  await details.getByRole("tab", { name: "Settings" }).click();
+  const field = (title: string) => details.getByRole("group", { name: title, exact: true });
+  return { view, details, field };
+}
+
+test("EXT-18 an extension's settings: where each value comes from, edited with its control, validated, saved, cancelled and reset", async ({
+  page,
+}) => {
+  const { view, details, field } = await demoSettings(page);
+  await expect(view.getByRole("combobox", { name: "Active extension profile" })).toHaveValue(
+    "default",
+  );
+  await expect(details.getByRole("combobox", { name: "Extension profile" })).toHaveValue("default");
+  await expect(field("Size").getByTestId("setting-source")).toHaveText("Now 4, from its default.");
+  await expect(field("Size").getByTestId("setting-layers")).toHaveText(
+    "Default 4 · user not set · profile not set",
+  );
+  const save = details.getByRole("button", { name: "Save settings of Settings Demo" });
+  const cancel = details.getByRole("button", {
+    name: "Cancel changes to Settings Demo's settings",
+  });
+  await expect(save).toBeDisabled();
+
+  // An invalid value is said, kept as entered, and nothing is saved.
+  const size = field("Size").getByRole("spinbutton", { name: "Size" });
+  await size.fill("0");
+  await expect(field("Size").getByTestId("setting-problem")).toHaveText(
+    "Must be a number from 1 to 10.",
+  );
+  await save.click();
+  await expect(details.getByTestId("settings-failed")).toHaveText(
+    "Nothing was saved: correct the values marked below.",
+  );
+  await expect(size).toHaveValue("0");
+  expect(await countCalls(page, "extensions_profile_settings")).toBe(0);
+
+  // Every kind of control; Cancel puts them all back.
+  await size.fill("7");
+  await field("On").getByRole("checkbox", { name: "On" }).uncheck();
+  await field("Mode").getByRole("combobox", { name: "Mode" }).selectOption("slow");
+  await field("Label").getByRole("textbox", { name: "Label" }).fill("hello");
+  await expect(details.getByText("4 unsaved changes")).toBeVisible();
+  // While there are edits, the profile cannot be switched under them.
+  await expect(details.getByRole("combobox", { name: "Extension profile" })).toBeDisabled();
+  await cancel.click();
+  await expect(size).toHaveValue("4");
+  await expect(field("On").getByRole("checkbox", { name: "On" })).toBeChecked();
+  await expect(field("Label").getByRole("textbox", { name: "Label" })).toHaveValue("x");
+  await expect(save).toBeDisabled();
+
+  // Saved in the active profile: all at once, each against what it replaces.
+  await size.fill("7");
+  await field("Mode").getByRole("combobox", { name: "Mode" }).selectOption("slow");
+  await size.press("Enter");
+  await save.click();
+  await expect(details.getByTestId("settings-saved")).toHaveText('Saved in the profile "Default".');
+  await expect(field("Size").getByTestId("setting-source")).toHaveText("Now 7, from this profile.");
+  expect((await calls(page, "extensions_profile_settings")).at(-1)?.args).toEqual({
+    id: "acme.demo",
+    profile: "default",
+    changes: [
+      { key: "acme.demo.size", value: 7, expected: null },
+      { key: "acme.demo.mode", value: "slow", expected: null },
+    ],
+  });
+
+  // Reset: the profile's value goes; what it inherits applies.
+  await field("Size").getByRole("button", { name: "Reset Size" }).click();
+  await expect(field("Size").getByTestId("setting-draft")).toHaveText(
+    "Will be reset: its default (4) applies.",
+  );
+  await save.click();
+  await expect(field("Size").getByTestId("setting-source")).toHaveText("Now 4, from its default.");
+
+  // The user level (every profile) -- and a profile value over it.
+  await details.getByRole("radio", { name: "All profiles (user settings)" }).click();
+  await size.fill("5");
+  await save.click();
+  await expect(details.getByTestId("settings-saved")).toHaveText(
+    "Saved in your user settings (every profile).",
+  );
+  await expect(field("Size").getByTestId("setting-source")).toHaveText(
+    "Now 5, from your user settings.",
+  );
+  await details.getByRole("radio", { name: /^This profile/ }).click();
+  await expect(size).toHaveValue("5");
+  await size.fill("9");
+  await save.click();
+  await expect(field("Size").getByTestId("setting-source")).toHaveText("Now 9, from this profile.");
+  await expect(field("Size").getByTestId("setting-layers")).toHaveText(
+    "Default 4 · user 5 · profile 9",
+  );
+  // Reset of the profile value: the user's applies.
+  await field("Size").getByRole("button", { name: "Reset Size" }).click();
+  await expect(field("Size").getByTestId("setting-draft")).toHaveText(
+    "Will be reset: your user setting (5) applies.",
+  );
+});
+
+test("EXT-18 profiles: switched from the Extensions view or the page, each with its own values; a stale or switched save is refused and the edits kept", async ({
+  page,
+}) => {
+  const { view, details, field } = await demoSettings(page);
+  const size = field("Size").getByRole("spinbutton", { name: "Size" });
+  const save = details.getByRole("button", { name: "Save settings of Settings Demo" });
+  await size.fill("7");
+  await save.click();
+  await expect(field("Size").getByTestId("setting-source")).toHaveText("Now 7, from this profile.");
+
+  // Created from Manage (the page's link opens the profiles section).
+  await details.getByRole("button", { name: "Manage profiles" }).click();
+  const profiles = view.getByRole("region", { name: "Extension profiles" });
+  await profiles.getByRole("textbox", { name: "New profile name" }).fill("Work");
+  await profiles.getByRole("button", { name: "Create", exact: true }).click();
+  await expect(profiles).toContainText("Work");
+
+  // Switched on the page: a new profile starts as the active one was.
+  await details.getByRole("combobox", { name: "Extension profile" }).selectOption("work");
+  await expect(view.getByRole("combobox", { name: "Active extension profile" })).toHaveValue(
+    "work",
+  );
+  await expect(field("Size").getByTestId("setting-source")).toHaveText("Now 7, from this profile.");
+  await size.fill("3");
+  await save.click();
+  await expect(details.getByTestId("settings-saved")).toHaveText('Saved in the profile "Work".');
+  // Switched back from the Extensions view: Default's own value.
+  await view.getByRole("combobox", { name: "Active extension profile" }).selectOption("default");
+  await expect(details.getByRole("combobox", { name: "Extension profile" })).toHaveValue("default");
+  await expect(size).toHaveValue("7");
+
+  // Another window changes the value meanwhile: the save is refused, the edit kept; saved again
+  // against what is there now, it holds.
+  await size.fill("6");
+  await page.evaluate(() =>
+    (
+      window as unknown as { __profileSetting: (id: string, key: string, value: unknown) => void }
+    ).__profileSetting("acme.demo", "acme.demo.size", 2),
+  );
+  await save.click();
+  await expect(details.getByTestId("settings-failed")).toContainText(
+    "acme.demo.size was changed elsewhere since it was read; nothing was saved.",
+  );
+  await expect(size).toHaveValue("6");
+  await expect(field("Size").getByTestId("setting-layers")).toContainText("profile 2");
+  await save.click();
+  await expect(field("Size").getByTestId("setting-source")).toHaveText("Now 6, from this profile.");
 });

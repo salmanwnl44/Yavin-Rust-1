@@ -358,6 +358,8 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
           report: (code, id) => void nativeDiagnostics.note(code, id).catch(() => undefined),
           // The active extension profile's setting values (EXT-13).
           profileSettings: () => profileStore.settings(),
+          // ... and their changes, which reach running extensions (EXT-18).
+          onProfileSettings: (listener) => profileStore.subscribe(listener),
           // Each host starts with the user's resource settings (EXT-10).
           transport: createNativeHostTransport(() => hostResources(settings)),
           window: windowProxy,

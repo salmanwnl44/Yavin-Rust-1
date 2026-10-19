@@ -18,11 +18,20 @@ import { ExtensionIcon } from "./ExtensionIcon";
 import { ExtensionMarkdown } from "./ExtensionMarkdown";
 import { ExtensionPermissions } from "./ExtensionPermissions";
 import { statusOf, useExtensionsState } from "./model";
+import { ExtensionSettings } from "./ExtensionSettings";
+import { profileStore, type ProfileStore } from "../../services/extensions/profiles";
+import type { SettingsRegistry } from "../../services/settings/settings";
+import type { WorkspaceId } from "../../services/terminalProtocol";
 
-type Tab = "overview" | "features" | "requirements" | "changelog" | "information";
+/** Asks the Extensions view to show where profiles are managed (EXT-18). */
+export const MANAGE_PROFILES_EVENT = "yavin:manage-extension-profiles";
+
+type Tab = "overview" | "features" | "settings" | "requirements" | "changelog" | "information";
 const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "features", label: "Features" },
+  // EXT-18: an installed extension's settings, for the active profile or the user.
+  { id: "settings", label: "Settings" },
   { id: "requirements", label: "Requirements" },
   { id: "changelog", label: "Changelog" },
   { id: "information", label: "Information" },
@@ -64,6 +73,9 @@ export function ExtensionDetails({
   onClose,
   onUninstall,
   declarative,
+  settingsRegistry,
+  workspace = null,
+  profiles = profileStore,
 }: {
   id: string;
   registry: ExtensionRegistry;
@@ -75,6 +87,12 @@ export function ExtensionDetails({
   onUninstall: (id: string) => void;
   /** Extensions' themes and snippets as applied (EXT-04): what could not be. */
   declarative?: DeclarativeContributions;
+  /** The settings registry (IDE-03): the user and workspace levels (EXT-18). */
+  settingsRegistry?: SettingsRegistry;
+  /** The open workspace, whose values win. */
+  workspace?: WorkspaceId | null;
+  /** The extension profiles (EXT-13): the profile level. */
+  profiles?: ProfileStore;
 }) {
   const state = useExtensionsState({ registry, manager, marketplace, installer });
   const applied = useSyncExternalStore(
@@ -344,7 +362,7 @@ export function ExtensionDetails({
           aria-label="Extension details"
           className="flex gap-4 border-b border-[#141414] px-8"
         >
-          {TABS.map((one) => (
+          {TABS.filter((one) => one.id !== "settings" || (entry && settingsRegistry)).map((one) => (
             <button
               key={one.id}
               role="tab"
@@ -420,6 +438,18 @@ export function ExtensionDetails({
                   </Section>
                 )}
             </>
+          )}
+
+          {tab === "settings" && entry && settingsRegistry && (
+            <ExtensionSettings
+              entry={entry}
+              registry={registry}
+              settings={settingsRegistry}
+              workspace={workspace}
+              profiles={profiles}
+              onSwitched={() => manager.reload()}
+              onManageProfiles={() => window.dispatchEvent(new Event(MANAGE_PROFILES_EVENT))}
+            />
           )}
 
           {tab === "requirements" && (

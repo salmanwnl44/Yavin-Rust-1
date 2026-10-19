@@ -14,7 +14,8 @@ import type {
   MarketplaceExtension,
 } from "../../services/extensions/marketplace/types";
 import { CardButton, ExtensionCard } from "../extensions/ExtensionCard";
-import { ExtensionProfiles } from "../extensions/ExtensionProfiles";
+import { ExtensionProfiles, ProfileSwitcher } from "../extensions/ExtensionProfiles";
+import { MANAGE_PROFILES_EVENT } from "../extensions/ExtensionDetails";
 import { ExtensionDiagnostics } from "../extensions/ExtensionDiagnostics";
 import { nativeDiagnostics } from "../../services/extensions/diagnostics";
 import { profileStore } from "../../services/extensions/profiles";
@@ -289,6 +290,12 @@ export function ExtensionsPanel({
   } | null>(null);
   const [diagnostics, setDiagnostics] = useState(false);
   const [profilesShown, setProfilesShown] = useState(false);
+  // An extension's Settings page asks for the profiles to be managed (EXT-18).
+  useEffect(() => {
+    const show = () => setProfilesShown(true);
+    window.addEventListener(MANAGE_PROFILES_EVENT, show);
+    return () => window.removeEventListener(MANAGE_PROFILES_EVENT, show);
+  }, []);
   const [diagnosticsShown, setDiagnosticsShown] = useState(false);
   const [categories, setCategories] = useState<{
     status: "idle" | "loading" | "loaded" | "error";
@@ -683,6 +690,12 @@ export function ExtensionsPanel({
           </button>
         </div>
       </div>
+      <ProfileSwitcher
+        store={profileStore}
+        onSwitched={() => manager.reload()}
+        managing={profilesShown}
+        onManage={() => setProfilesShown(!profilesShown)}
+      />
       <div className="shrink-0 px-3 pb-2">
         <div className="flex items-center gap-1 rounded border border-zinc-800 bg-[#0b0b0b] px-2 focus-within:border-indigo-500/70">
           <SearchIcon size={13} className="shrink-0 text-zinc-500" />

@@ -175,6 +175,7 @@ function setup(
     failStart?: string;
     delay?: Parameters<typeof createInProcessTransport>[0]["delay"];
     profileSettings?: () => Record<string, Record<string, unknown>>;
+    onProfileSettings?: (listener: () => void) => () => void;
     report?: (code: string, id: string) => void;
   } = {},
 ) {
@@ -215,6 +216,7 @@ function setup(
       }),
       timeouts: { provider: 200, command: 1000, activate: 1000, ...timeouts },
       profileSettings: options.profileSettings,
+      onProfileSettings: options.onProfileSettings,
       report: options.report,
       rediscover: async () => void rediscovered++,
     });
@@ -1900,6 +1902,8 @@ test("EXT-13 the profile store shows only what the native side answered", async 
       ...view("work", ["Default", "Work"]),
       settings: { "acme.one": { "acme.one.x": 1 } },
     }),
+    list: async () => view("work", ["Default", "Work"]),
+    saveSettings: async () => view("work", ["Default", "Work"]),
   };
   const store = createProfileStore(io);
   assert.equal(store.getSnapshot(), null);
@@ -1974,4 +1978,84 @@ module.exports.activate = function (c, yavin) {
   win.readFile = read;
   assert.equal(await m.executeCommand("acme.hello.greet"), "PermissionDenied");
   assert.equal(await m.executeCommand("acme.hello.greet", "doc"), "# Readme\nhello");
+});
+
+test("EXT-18 a change of the profile's values reaches the running extension it is of, at once", async () => {
+  let profile: Record<string, Record<string, unknown>> = {};
+  const listeners = new Set<() => void>();
+  const t = setup({
+    profileSettings: () => profile,
+    onProfileSettings: (listener) => (
+      listeners.add(listener),
+      () => void listeners.delete(listener)
+    ),
+  });
+  t.add(
+    {},
+    `module.exports.activate = function (c, yavin) {
+      globalThis.__changes = [];
+      c.subscriptions.push(yavin.workspace.onDidChangeConfiguration(function (e) {
+        globalThis.__changes.push([e.key, yavin.workspace.getConfiguration("acme.hello").get("mood")]);
+      }));
+      c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", function () {
+        return globalThis.__changes;
+      }));
+    };`,
+  );
+  const m = t.manager(A, 1);
+  assert.deepEqual(await m.executeCommand("acme.hello.greet"), []);
+  const changed = () => listeners.forEach((listener) => listener());
+  profile = { "acme.hello": { "acme.hello.mood": "bright" } };
+  changed();
+  await settle();
+  assert.deepEqual(await m.executeCommand("acme.hello.greet"), [["mood", "bright"]]);
+  // Another extension's values, or the same again: nothing for this one.
+  profile = { ...profile, "acme.other": { "acme.other.x": 1 } };
+  changed();
+  await settle();
+  assert.equal(((await m.executeCommand("acme.hello.greet")) as unknown[]).length, 1);
+  // Reset: the default again.
+  profile = {};
+  changed();
+  await settle();
+  assert.deepEqual(await m.executeCommand("acme.hello.greet"), [
+    ["mood", "bright"],
+    ["mood", "calm"],
+  ]);
+  await m.dispose();
+  assert.equal(listeners.size, 0, "a stopped host hears nothing more");
+});
+
+test("EXT-18 an extension that does not follow its settings still reads their current values", async () => {
+  let profile: Record<string, Record<string, unknown>> = {};
+  const listeners = new Set<() => void>();
+  const t = setup({
+    profileSettings: () => profile,
+    onProfileSettings: (listener) => (
+      listeners.add(listener),
+      () => void listeners.delete(listener)
+    ),
+  });
+  t.add(
+    {},
+    `module.exports.activate = function (c, yavin) {
+      c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", function () {
+        return yavin.workspace.getConfiguration("acme.hello").get("mood");
+      }));
+    };`,
+  );
+  const m = t.manager(A, 1);
+  assert.equal(await m.executeCommand("acme.hello.greet"), "calm");
+  profile = { "acme.hello": { "acme.hello.mood": "bright" } };
+  listeners.forEach((listener) => listener());
+  await settle();
+  assert.equal(
+    await m.executeCommand("acme.hello.greet"),
+    "bright",
+    "the profile's, in the same host",
+  );
+  t.settings.set(t.registry.settingDefinition("acme.hello.mood")!, "workspace", "calm", A);
+  await settle();
+  assert.equal(await m.executeCommand("acme.hello.greet"), "calm", "this workspace's");
+  await m.dispose();
 });

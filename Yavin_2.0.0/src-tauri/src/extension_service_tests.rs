@@ -2483,11 +2483,19 @@ fn ext13_a_profile_never_grants_and_its_dependencies_are_said() {
     );
 }
 
+/// A manifest addition declaring `<id>.color`, a string, for an extension `acme.one`.
+fn declares_color() -> serde_json::Value {
+    serde_json::json!({"contributes": {"configuration": {"properties": {
+        "acme.one.color": {"type": "string", "default": "black", "description": "Its colour."}
+    }}}})
+}
+
 #[test]
 fn ext13_profile_settings_are_an_extensions_own_and_per_profile() {
     let fx = fixture("ext13-settings");
     let service = fx.service();
-    install(&fx, &service, "acme.one", "1.0.0");
+    // A setting it declares (EXT-18: a profile keeps only those).
+    install_with(&fx, &service, "acme.one", "1.0.0", declares_color()).unwrap();
     service
         .set_profile_setting("acme.one", "acme.one.color", Some(serde_json::json!("red")))
         .unwrap();
@@ -3727,5 +3735,320 @@ fn ext17_the_persisted_schema_is_pinned_to_its_version() {
         pinned.trim(),
         "the persisted fields changed:
 {text}"
+    );
+}
+
+// --- EXT-18: profile settings, checked natively ---------------------------------------------------
+
+/// `acme.one` declaring one setting of each kind.
+fn declares_every_kind() -> serde_json::Value {
+    serde_json::json!({"contributes": {"configuration": {"properties": {
+        "acme.one.enabled": {"type": "boolean", "default": true, "description": "On."},
+        "acme.one.size": {"type": "number", "default": 4, "minimum": 1, "maximum": 10, "description": "Size."},
+        "acme.one.label": {"type": "string", "default": "x", "description": "Label."},
+        "acme.one.mode": {"enum": ["fast", "slow"], "default": "fast", "description": "Mode."}
+    }}}})
+}
+
+fn change(
+    key: &str,
+    value: Option<serde_json::Value>,
+    expected: Option<serde_json::Value>,
+) -> crate::extension_profiles::SettingChange {
+    crate::extension_profiles::SettingChange {
+        key: key.into(),
+        value,
+        expected,
+    }
+}
+
+/// Only settings the extension declares, each with a value valid for its declaration -- the
+/// same rules as the window's; anything else is refused and nothing is written.
+#[test]
+fn ext18_settings_are_checked_against_what_the_extension_declares() {
+    let fx = fixture("ext18-schema");
+    let service = fx.service();
+    install_with(&fx, &service, "acme.one", "1.0.0", declares_every_kind()).unwrap();
+    use serde_json::json;
+    for (key, value) in [
+        ("acme.one.enabled", json!(false)),
+        ("acme.one.size", json!(10)),
+        ("acme.one.size", json!(1.5)),
+        ("acme.one.label", json!("a label")),
+        ("acme.one.mode", json!("slow")),
+    ] {
+        service
+            .set_profile_setting("acme.one", key, Some(value.clone()))
+            .unwrap_or_else(|e| panic!("{key} {value}: {e}"));
+    }
+    let before = inventory(&fx);
+    for (key, value, code) in [
+        ("acme.one.enabled", json!("true"), "InvalidSetting"),
+        ("acme.one.size", json!(11), "InvalidSetting"),
+        ("acme.one.size", json!(0), "InvalidSetting"),
+        ("acme.one.size", json!("5"), "InvalidSetting"),
+        ("acme.one.label", json!("   "), "InvalidSetting"),
+        ("acme.one.label", json!("two\nlines"), "InvalidSetting"),
+        ("acme.one.label", json!("x".repeat(1001)), "InvalidSetting"),
+        ("acme.one.mode", json!("medium"), "InvalidSetting"),
+        ("acme.one.mode", json!(1), "InvalidSetting"),
+        ("acme.one.undeclared", json!(1), "UnknownSetting"),
+        ("acme.two.size", json!(1), "UnknownSetting"),
+    ] {
+        let refused = service
+            .set_profile_setting("acme.one", key, Some(value.clone()))
+            .unwrap_err();
+        assert!(refused.starts_with(code), "{key} {value}: {refused}");
+        let refused = service
+            .set_profile_settings(
+                "acme.one",
+                "default",
+                &[change(key, Some(value.clone()), None)],
+            )
+            .unwrap_err();
+        assert!(
+            refused.starts_with(code) || refused.starts_with("SettingChanged"),
+            "{key} {value}: {refused}"
+        );
+    }
+    assert_eq!(
+        inventory(&fx).profiles,
+        before.profiles,
+        "nothing refused was written"
+    );
+    // An extension that is not installed has no settings to keep.
+    assert!(service
+        .set_profile_setting("acme.none", "acme.none.x", Some(json!(1)))
+        .unwrap_err()
+        .starts_with("UnknownExtension"));
+}
+
+/// A save is all of its changes or none; a change made against a value that changed meanwhile,
+/// or in a profile that is no longer the active one, is refused -- nothing saved.
+#[test]
+fn ext18_a_save_is_all_or_none_and_refuses_stale_values_and_switched_profiles() {
+    let fx = fixture("ext18-stale");
+    let service = fx.service();
+    install_with(&fx, &service, "acme.one", "1.0.0", declares_every_kind()).unwrap();
+    use serde_json::json;
+    service
+        .set_profile_settings(
+            "acme.one",
+            "default",
+            &[
+                change("acme.one.size", Some(json!(5)), None),
+                change("acme.one.mode", Some(json!("slow")), None),
+            ],
+        )
+        .unwrap();
+    let saved = || {
+        service
+            .profiles()
+            .unwrap()
+            .settings
+            .get("acme.one")
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert_eq!(saved()["acme.one.size"], json!(5));
+    // One invalid change: none of them.
+    let refused = service
+        .set_profile_settings(
+            "acme.one",
+            "default",
+            &[
+                change("acme.one.size", Some(json!(6)), Some(json!(5))),
+                change("acme.one.mode", Some(json!("medium")), Some(json!("slow"))),
+            ],
+        )
+        .unwrap_err();
+    assert!(refused.starts_with("InvalidSetting"), "{refused}");
+    assert_eq!(saved()["acme.one.size"], json!(5));
+    // Another window changed it meanwhile: this change was made against 5.
+    service
+        .set_profile_setting("acme.one", "acme.one.size", Some(json!(7)))
+        .unwrap();
+    let stale = service
+        .set_profile_settings(
+            "acme.one",
+            "default",
+            &[change("acme.one.size", Some(json!(6)), Some(json!(5)))],
+        )
+        .unwrap_err();
+    assert!(stale.starts_with("SettingChanged"), "{stale}");
+    assert_eq!(saved()["acme.one.size"], json!(7));
+    // Edited in "default", but "work" is active now.
+    service.create_profile("Work").unwrap();
+    service.select_profile("work").unwrap();
+    let switched = service
+        .set_profile_settings(
+            "acme.one",
+            "default",
+            &[change("acme.one.size", Some(json!(6)), Some(json!(7)))],
+        )
+        .unwrap_err();
+    assert!(
+        switched.starts_with("ProfileChanged") && switched.contains("Work"),
+        "{switched}"
+    );
+    service.select_profile("default").unwrap();
+    assert_eq!(
+        saved()["acme.one.size"],
+        json!(7),
+        "neither profile was changed"
+    );
+    // A reset removes the override: the inherited value applies again.
+    service
+        .set_profile_settings(
+            "acme.one",
+            "default",
+            &[change("acme.one.size", None, Some(json!(7)))],
+        )
+        .unwrap();
+    assert!(!saved().contains_key("acme.one.size"));
+}
+
+/// Values kept per profile survive a restart and switching there and back; one stored before
+/// the extension changed what it declares (now invalid) is kept as it is -- never applied by
+/// the window -- and can be reset.
+#[test]
+fn ext18_settings_persist_per_profile_and_a_stale_value_can_be_reset() {
+    let fx = fixture("ext18-persist");
+    let service = fx.service();
+    install_with(&fx, &service, "acme.one", "1.0.0", declares_every_kind()).unwrap();
+    use serde_json::json;
+    service
+        .set_profile_settings(
+            "acme.one",
+            "default",
+            &[change("acme.one.mode", Some(json!("slow")), None)],
+        )
+        .unwrap();
+    // A new profile starts as the active one is (EXT-13): "work" has "slow" too.
+    service.create_profile("Work").unwrap();
+    service.select_profile("work").unwrap();
+    service
+        .set_profile_settings(
+            "acme.one",
+            "work",
+            &[change(
+                "acme.one.mode",
+                Some(json!("fast")),
+                Some(json!("slow")),
+            )],
+        )
+        .unwrap();
+    drop(service);
+    let service = fx.service();
+    assert_eq!(service.profiles().unwrap().active, "work");
+    assert_eq!(
+        service.profiles().unwrap().settings["acme.one"]["acme.one.mode"],
+        json!("fast")
+    );
+    service.select_profile("default").unwrap();
+    assert_eq!(
+        service.profiles().unwrap().settings["acme.one"]["acme.one.mode"],
+        json!("slow")
+    );
+    // 2.0.0 declares the mode differently: the stored "slow" is no longer one of its values.
+    let mut redeclared = declares_every_kind();
+    redeclared["contributes"]["configuration"]["properties"]["acme.one.mode"] =
+        json!({"enum": ["quick", "careful"], "default": "quick", "description": "Mode."});
+    install_with(&fx, &service, "acme.one", "2.0.0", redeclared).unwrap();
+    assert_eq!(
+        service.profiles().unwrap().settings["acme.one"]["acme.one.mode"],
+        json!("slow"),
+        "kept as it was"
+    );
+    let invalid = service
+        .set_profile_settings(
+            "acme.one",
+            "default",
+            &[change(
+                "acme.one.mode",
+                Some(json!("slow")),
+                Some(json!("slow")),
+            )],
+        )
+        .unwrap_err();
+    assert!(invalid.starts_with("InvalidSetting"), "{invalid}");
+    service
+        .set_profile_settings(
+            "acme.one",
+            "default",
+            &[change("acme.one.mode", None, Some(json!("slow")))],
+        )
+        .unwrap();
+    assert!(!service
+        .profiles()
+        .unwrap()
+        .settings
+        .contains_key("acme.one"));
+}
+
+/// Settings and profile switches never reach what is not theirs: grants, signature records,
+/// copies and the enabled set are as they were; a secret is never in a profile's settings.
+#[test]
+fn ext18_settings_never_reach_grants_trust_or_secrets() {
+    let fx = fixture("ext18-isolation");
+    let service = fx.service();
+    with_memory_secrets(&service);
+    install_with(
+        &fx,
+        &service,
+        "acme.one",
+        "1.0.0",
+        serde_json::json!({
+            "permissions": {"version": 1, "request": ["secrets", "documents.read"]},
+            "contributes": declares_every_kind()["contributes"].clone()
+        }),
+    )
+    .unwrap();
+    service
+        .set_grants("acme.one", None, &strings(&["secrets"]))
+        .unwrap();
+    let copy = service.host_copy("acme.one").unwrap();
+    secret(
+        &service,
+        &copy,
+        None,
+        "secrets.store",
+        serde_json::json!({"key": "token", "value": "the-secret-value"}),
+    )
+    .unwrap();
+    let before = inventory(&fx);
+    service
+        .set_profile_settings(
+            "acme.one",
+            "default",
+            &[change(
+                "acme.one.label",
+                Some(serde_json::json!("shown")),
+                None,
+            )],
+        )
+        .unwrap();
+    service.create_profile("Work").unwrap();
+    service.select_profile("work").unwrap();
+    service.select_profile("default").unwrap();
+    let after = inventory(&fx);
+    assert_eq!(after.grants, before.grants);
+    assert_eq!(
+        after.extensions, before.extensions,
+        "copies and signature records"
+    );
+    assert_eq!(after.disabled, before.disabled);
+    let view = serde_json::to_string(&service.profiles().unwrap()).unwrap();
+    assert!(!view.contains("the-secret-value"));
+    assert!(!fs::read_to_string(fx.root.join(INVENTORY))
+        .unwrap()
+        .contains("the-secret-value"));
+    // Still exactly what was granted: a setting is not a capability.
+    assert_eq!(
+        service
+            .authorize(&copy, Some("documents.read"))
+            .unwrap_err()
+            .code,
+        "PermissionDenied"
     );
 }

@@ -163,3 +163,44 @@ fn invalid_missing_and_corrupted_profiles_are_made_valid_and_said() {
     // A record that is not profiles at all does not parse (the inventory then uses its default).
     assert!(serde_json::from_value::<Profiles>(json!({"active": 3})).is_err());
 }
+
+/// EXT-18: a declaration the window would refuse is not one; what is declared is read as the
+/// window reads it.
+#[test]
+fn declared_settings_are_read_as_the_window_reads_them() {
+    let manifest = json!({"contributes": {"configuration": {"properties": {
+        "acme.one.on": {"type": "boolean", "default": false},
+        "acme.one.n": {"type": "number", "default": 2, "minimum": 1},
+        "acme.one.s": {"type": "string", "default": "x"},
+        "acme.one.e": {"enum": ["a", "b"], "default": "a"},
+        "acme.one.badEnum": {"enum": ["a", 1], "default": "a"},
+        "acme.one.badDefault": {"enum": ["a", "b"], "default": "c"},
+        "acme.one.badType": {"type": "object", "default": {}},
+        "acme.one.wrongDefault": {"type": "boolean", "default": "no"},
+        "acme.one.bounds": {"type": "number", "default": 5, "minimum": 9, "maximum": 1},
+        "acme.two.other": {"type": "boolean", "default": true},
+        "acme.one": {"type": "boolean", "default": true}
+    }}}});
+    let declared = declared_settings(&manifest, "acme.one");
+    assert_eq!(
+        declared.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["acme.one.e", "acme.one.n", "acme.one.on", "acme.one.s"]
+    );
+    assert_eq!(
+        declared["acme.one.n"],
+        SettingKind::Number {
+            min: 1.0,
+            max: 9_007_199_254_740_991.0
+        }
+    );
+    assert!(declared_settings(&json!({}), "acme.one").is_empty());
+    // Values: the window's rules.
+    assert!(check_value(&SettingKind::String, &json!("é".repeat(1000))).is_ok());
+    assert!(
+        check_value(&SettingKind::String, &json!("😀".repeat(501))).is_err(),
+        "UTF-16 units"
+    );
+    assert!(check_value(&SettingKind::String, &json!("tab\there")).is_err());
+    assert!(check_value(&SettingKind::Number { min: 0.0, max: 1.0 }, &json!(0.5)).is_ok());
+    assert!(check_value(&SettingKind::Boolean, &json!(null)).is_err());
+}
