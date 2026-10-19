@@ -286,7 +286,7 @@ export function ExtensionDetails({
                 )}
               </div>
             )}
-            {entry && integrity && (integrity.reinstall || entry.replaced) && (
+            {entry && integrity && (integrity.reinstall || entry.replaced || !integrity.runs) && (
               <div
                 role="note"
                 data-testid="extension-integrity"
@@ -297,7 +297,7 @@ export function ExtensionDetails({
                     : "border-red-900/60 bg-red-950/30 text-red-300"
                 }`}
               >
-                {integrity.reinstall && (
+                {(integrity.reinstall || !integrity.runs) && (
                   <p>
                     <span className="font-medium">{integrity.label}</span> — {integrity.detail}{" "}
                     <span data-testid="extension-integrity-runs">
@@ -311,21 +311,23 @@ export function ExtensionDetails({
                     {describeReplaced(entry.replaced, entry.manifest.version)}
                   </p>
                 )}
-                <div className="mt-1.5">
-                  <CardButton
-                    label={`Reinstall ${name} ${entry.replaced?.version ?? entry.manifest.version}`}
-                    disabled={!!operation}
-                    onClick={() =>
-                      report(
-                        installer.install(id, entry.replaced?.version ?? entry.manifest.version),
-                      )
-                    }
-                  >
-                    {operation
-                      ? "Reinstalling…"
-                      : `Reinstall ${entry.replaced?.version ?? entry.manifest.version}`}
-                  </CardButton>
-                </div>
+                {(integrity.reinstall || entry.replaced) && (
+                  <div className="mt-1.5">
+                    <CardButton
+                      label={`Reinstall ${name} ${entry.replaced?.version ?? entry.manifest.version}`}
+                      disabled={!!operation}
+                      onClick={() =>
+                        report(
+                          installer.install(id, entry.replaced?.version ?? entry.manifest.version),
+                        )
+                      }
+                    >
+                      {operation
+                        ? "Reinstalling…"
+                        : `Reinstall ${entry.replaced?.version ?? entry.manifest.version}`}
+                    </CardButton>
+                  </div>
+                )}
               </div>
             )}
             {!entry && compatibility && !compatibility.compatible && !latest && (

@@ -215,3 +215,191 @@ export async function emptyRegistry(): Promise<{ url: string; close(): Promise<v
   const url = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}/`;
   return { url, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
 }
+
+// --- EXT-19: extensions installed as a user installs them ------------------------------------
+
+/** A stored ZIP of `files` (no compression, no timestamps): an extension package. */
+function storedZip(files: { name: string; data: Buffer }[]): Buffer {
+  const table = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc32 = (bytes: Buffer) => {
+    let c = 0xffffffff;
+    for (const b of bytes) c = table[(c ^ b) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const locals: Buffer[] = [];
+  const central: Buffer[] = [];
+  let offset = 0;
+  for (const { name, data } of files) {
+    const nameBytes = Buffer.from(name, "utf8");
+    const crc = crc32(data);
+    const header = (signature: number, entry: boolean) => {
+      const b = Buffer.alloc(entry ? 46 : 30);
+      let i = 0;
+      const u32 = (v: number) => void (i = b.writeUInt32LE(v >>> 0, i));
+      const u16 = (v: number) => void (i = b.writeUInt16LE(v, i));
+      u32(signature);
+      if (entry) u16(20);
+      u16(20);
+      u16(0x0800);
+      u16(0);
+      u16(0);
+      u16(0x21);
+      u32(crc);
+      u32(data.length);
+      u32(data.length);
+      u16(nameBytes.length);
+      u16(0);
+      if (entry) {
+        u16(0);
+        u16(0);
+        u16(0);
+        u32(0);
+        u32(offset);
+      }
+      return b;
+    };
+    const local = Buffer.concat([header(0x04034b50, false), nameBytes, data]);
+    central.push(Buffer.concat([header(0x02014b50, true), nameBytes]));
+    locals.push(local);
+    offset += local.length;
+  }
+  const directory = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(directory.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, directory, end]);
+}
+
+/**
+ * A loopback registry publishing exactly what `extension-host.spec.ts` needs, so that it can
+ * install it as a user does (EXT-19: a folder put in Yavin's extensions folder by hand is
+ * adopted, never checked, and does not run): the Hello World sample at the version in the
+ * repository (its published package -- so no update is ever found), and an extension that
+ * fails when it activates, packaged here.
+ */
+export async function sampleRegistry(): Promise<{ url: string; close(): Promise<void> }> {
+  const { createServer } = await import("node:http");
+  const { readFileSync, existsSync } = await import("node:fs");
+  const { createHash } = await import("node:crypto");
+  const { fileURLToPath } = await import("node:url");
+  const root = fileURLToPath(new URL("../../registry/", import.meta.url));
+  const index = JSON.parse(readFileSync(join(root, "index.json"), "utf8"));
+  const sampleVersion = JSON.parse(
+    readFileSync(
+      fileURLToPath(
+        new URL("../../extensions/samples/hello-world/yavin-extension.json", import.meta.url),
+      ),
+      "utf8",
+    ),
+  ).version;
+  const hello = index.extensions.find(
+    (one: { id: string }) => one.id === "yavin-samples.hello-world",
+  );
+  hello.versions = hello.versions.filter(
+    (one: { version: string }) => one.version === sampleVersion,
+  );
+  const manifest = {
+    publisher: "acme",
+    name: "broken",
+    displayName: "Broken",
+    description: "Throws when it activates.",
+    version: "1.0.0",
+    engines: { yavin: "^2.0.0" },
+    main: "extension.js",
+    activationEvents: ["onCommand:acme.broken.go"],
+    contributes: { commands: [{ command: "acme.broken.go", title: "Go", category: "Broken" }] },
+  };
+  const brokenPackage = storedZip([
+    { name: "yavin-extension.json", data: Buffer.from(JSON.stringify(manifest)) },
+    {
+      name: "extension.js",
+      data: Buffer.from('module.exports.activate = function () { throw new Error("kaboom"); };'),
+    },
+  ]);
+  const broken = {
+    id: "acme.broken",
+    publisher: "acme",
+    name: "broken",
+    displayName: "Broken",
+    publisherDisplayName: "Acme",
+    description: "Throws when it activates.",
+    categories: ["samples"],
+    tags: [],
+    contributes: { commands: [{ command: "acme.broken.go", title: "Broken: Go" }], settings: [] },
+    extensionKind: "code",
+    activationEvents: ["onCommand:acme.broken.go"],
+    versions: [
+      {
+        version: "1.0.0",
+        publishedAt: "2026-10-19",
+        engines: { yavin: "^2.0.0" },
+        package: "packages/acme.broken-1.0.0.yvx",
+        sha256: createHash("sha256").update(brokenPackage).digest("hex"),
+        size: brokenPackage.length,
+      },
+    ],
+  };
+  const served = JSON.stringify({
+    schema: 1,
+    name: "Sample test registry",
+    categories: index.categories,
+    recommended: [hello.id, broken.id],
+    extensions: [hello, broken],
+  });
+  const types: Record<string, string> = {
+    ".json": "text/plain; charset=utf-8",
+    ".md": "text/plain; charset=utf-8",
+    ".png": "image/png",
+    ".yvx": "application/octet-stream",
+  };
+  const server = createServer((request, response) => {
+    const path = decodeURIComponent((request.url ?? "/").split("?")[0]).replace(/^\//, "");
+    const send = (type: string, body: Buffer | string) => {
+      response.writeHead(200, { "Content-Type": type, "Content-Length": Buffer.byteLength(body) });
+      response.end(body);
+    };
+    if (path === "index.json") return send("application/json", served);
+    if (path === "packages/acme.broken-1.0.0.yvx") return send(types[".yvx"], brokenPackage);
+    const file = join(root, path);
+    if (!path.includes("..") && file.startsWith(root) && existsSync(file))
+      return send(
+        types[path.slice(path.lastIndexOf("."))] ?? "application/octet-stream",
+        readFileSync(file),
+      );
+    response.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const url = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}/`;
+  return { url, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+}
+
+/** Installs the sample registry's extensions from the Extensions view, as a user does. */
+export async function installSamples(page: Page) {
+  const view = await extensionsView(page);
+  const recommended = view.getByRole("region", { name: "Recommended extensions" });
+  const installed = view.getByRole("region", { name: "Installed extensions" });
+  for (const name of ["Hello World (sample)", "Broken"]) {
+    await recommended
+      .getByRole("group", { name, exact: true })
+      .getByRole("button", { name: `Install ${name}` })
+      .click();
+    // The sample asks to read documents (EXT-07): installed without allowing it.
+    if (name.startsWith("Hello")) {
+      const dialog = page.getByRole("dialog");
+      await dialog.getByRole("option", { name: /^Install without allowing/ }).click();
+      await expect(dialog).toHaveCount(0);
+    }
+    await expect(installed.getByRole("group", { name, exact: true })).toBeVisible();
+  }
+  // Back to the Explorer, as the window was.
+  await page.getByTitle("Explorer (Ctrl+Shift+E)", { exact: true }).click();
+  await expect(page.getByRole("tree", { name: "Files" })).toBeVisible();
+}

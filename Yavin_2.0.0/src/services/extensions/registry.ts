@@ -578,8 +578,9 @@ export function createExtensionRegistry(options: {
     commandOwner: (id: string) =>
       snapshot.commands.find((command) => command.command === id)?.extensionId,
     /** Records an extension that could not even be read (its manifest unreadable or not JSON). */
-    reject(origin: string, problem: string) {
-      rejected = [...rejected, { id: null, origin, problems: [problem] }];
+    /** A copy that is not loaded, and why -- named by its id when that is known (EXT-19). */
+    reject(origin: string, problem: string, id: string | null = null) {
+      rejected = [...rejected, { id, origin, problems: [problem] }];
       publish();
     },
     /**

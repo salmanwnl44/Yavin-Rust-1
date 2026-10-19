@@ -15,6 +15,10 @@ extensions.*.active.signature.sha256
 extensions.*.active.signature.status
 extensions.*.active.signature.storeRevision
 extensions.*.active.source
+extensions.*.active.trust
+extensions.*.active.trust.keyId
+extensions.*.active.trust.mac
+extensions.*.active.trust.schema
 extensions.*.active.unchecked
 extensions.*.active.version
 extensions.*.broken
@@ -31,6 +35,10 @@ extensions.*.previous.signature.sha256
 extensions.*.previous.signature.status
 extensions.*.previous.signature.storeRevision
 extensions.*.previous.source
+extensions.*.previous.trust
+extensions.*.previous.trust.keyId
+extensions.*.previous.trust.mac
+extensions.*.previous.trust.schema
 extensions.*.previous.unchecked
 extensions.*.previous.version
 extensions.*.replaced
@@ -60,6 +68,10 @@ operations.*.before.active.signature.sha256
 operations.*.before.active.signature.status
 operations.*.before.active.signature.storeRevision
 operations.*.before.active.source
+operations.*.before.active.trust
+operations.*.before.active.trust.keyId
+operations.*.before.active.trust.mac
+operations.*.before.active.trust.schema
 operations.*.before.active.unchecked
 operations.*.before.active.version
 operations.*.before.broken
@@ -76,6 +88,10 @@ operations.*.before.previous.signature.sha256
 operations.*.before.previous.signature.status
 operations.*.before.previous.signature.storeRevision
 operations.*.before.previous.source
+operations.*.before.previous.trust
+operations.*.before.previous.trust.keyId
+operations.*.before.previous.trust.mac
+operations.*.before.previous.trust.schema
 operations.*.before.previous.unchecked
 operations.*.before.previous.version
 operations.*.before.replaced

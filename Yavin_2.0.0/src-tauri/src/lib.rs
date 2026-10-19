@@ -23,6 +23,7 @@ mod extension_permissions;
 mod extension_profiles;
 mod extension_secrets;
 mod extension_service;
+mod extension_trust;
 mod extensions;
 mod external;
 mod git;

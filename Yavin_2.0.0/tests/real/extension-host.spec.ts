@@ -6,9 +6,10 @@
  * user's), extracts it the way an installation lays it out, and runs this against the
  * extracted application: the real window (driven through WebView2's DevTools protocol), the
  * real native layer, the `yavin-extension-host` process shipped as a bundle resource, and the
- * Hello World sample installed in the profile's extensions folder.
+ * Hello World sample, installed through the window from a loopback registry (EXT-19: as a user
+ * installs it -- a folder copied in by hand is adopted, never checked, and does not run).
  */
-import { cpSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "@playwright/test";
@@ -19,15 +20,16 @@ import {
   close,
   CONFIG,
   DATA,
-  emptyRegistry,
   extensionsView,
   host,
   hostProcesses,
   INSTALL,
+  installSamples,
   launch,
   message,
   palette,
   profileReleased,
+  sampleRegistry,
   showDiagnostics,
   trust,
 } from "./harness";
@@ -35,7 +37,6 @@ import {
 const ROOT = join(tmpdir(), `yavin-e2e-workspaces-${process.pid}`);
 const A = join(ROOT, "alpha");
 const B = join(ROOT, "beta");
-const SAMPLE = new URL("../../extensions/samples/hello-world/", import.meta.url);
 
 test.describe.configure({ mode: "serial" });
 test.skip(
@@ -55,33 +56,15 @@ async function prepareProfile() {
     join(CONFIG, "session.json"),
     JSON.stringify({ version: 1, folders: [A, B], workspaces: [] }),
   );
-  const extensions = join(DATA, "extensions");
-  cpSync(SAMPLE, join(extensions, "hello-world"), { recursive: true });
-  mkdirSync(join(extensions, "acme.broken"), { recursive: true });
-  writeFileSync(
-    join(extensions, "acme.broken", "yavin-extension.json"),
-    JSON.stringify({
-      publisher: "acme",
-      name: "broken",
-      displayName: "Broken",
-      version: "1.0.0",
-      engines: { yavin: "^2.0.0" },
-      main: "extension.js",
-      activationEvents: ["onCommand:acme.broken.go"],
-      contributes: { commands: [{ command: "acme.broken.go", title: "Go", category: "Broken" }] },
-    }),
-  );
-  writeFileSync(
-    join(extensions, "acme.broken", "extension.js"),
-    'module.exports.activate = function () { throw new Error("kaboom"); };',
-  );
+  // The sample and the broken extension are installed from the sample registry, as a user
+  // installs them (`installSamples`): EXT-19 runs no code that was not checked and vouched for.
 }
 
 // Not a marketplace test: a registry of its own that publishes nothing, so no update is ever
 // found for the installed sample and nothing here reaches the network.
-let registry: Awaited<ReturnType<typeof emptyRegistry>>;
+let registry: Awaited<ReturnType<typeof sampleRegistry>>;
 test.beforeAll(async () => {
-  registry = await emptyRegistry();
+  registry = await sampleRegistry();
 });
 test.beforeEach(async () => prepareProfile());
 test.afterAll(async () => {
@@ -101,10 +84,29 @@ test("the installed host is packaged where Yavin looks for it", () => {
 });
 
 test("installed Yavin runs Hello World in the real host, end to end, and ends the host on exit", async () => {
+  // Installed first (its Greetings view, shown while installing, starts a host), then Yavin
+  // started again -- from there on nothing runs until it is used.
+  const installing = await launch({ YAVIN_TEST_REGISTRY: registry.url });
+  try {
+    await trust(installing.page, true);
+    await installSamples(installing.page);
+    // The window remembers its sidebar: left on the Explorer (saved a moment after it changes),
+    // so the next start shows no extension view.
+    await installing.page.waitForTimeout(1500);
+    await close(installing);
+  } finally {
+    if (installing.app.exitCode === null) installing.app.kill();
+  }
   const running = await launch({ YAVIN_TEST_REGISTRY: registry.url });
   const { app, page } = running;
   try {
-    await trust(page, true);
+    // Already trusted (not asked again); it reopens what it had open.
+    await expect(
+      page.getByTitle("Extensions & Plugins (Ctrl+Shift+X)", { exact: true }),
+    ).toBeVisible({
+      timeout: 30_000,
+    });
+    await expect(page.getByRole("button", { name: "Yes, I trust the authors" })).toHaveCount(0);
     expect(hostProcesses(app.pid!)).toEqual([]); // lazy: nothing runs yet
     await palette(page, "Hello World: Say Hello");
     await expect(message(page)).toContainText("Hello, world!");
@@ -142,6 +144,7 @@ test("a crashed host is reported; Restart starts a new real host and the extensi
   const { app, page } = running;
   try {
     await trust(page, true);
+    await installSamples(page);
     await palette(page, "Hello World: Say Hello");
     await expect(message(page)).toContainText("Hello, world!");
     await expect.poll(() => hostProcesses(app.pid!).length).toBe(1);
@@ -173,6 +176,7 @@ test("switching workspace ends A's host; B starts from nothing; A's state comes 
   const { app, page } = running;
   try {
     await trust(page, true);
+    await installSamples(page);
     await palette(page, "Hello World: Say Hello");
     await expect(message(page)).toContainText("Hello, world!");
     await expect.poll(() => hostProcesses(app.pid!).length).toBe(1);
@@ -214,6 +218,7 @@ test("without its host, installed Yavin says so and everything else works", asyn
   const { app, page } = running;
   try {
     await trust(page, true);
+    await installSamples(page);
     await palette(page, "Hello World: Say Hello");
     await expect(alert(page)).toContainText("extension host");
     await expect(alert(page)).toContainText("missing");

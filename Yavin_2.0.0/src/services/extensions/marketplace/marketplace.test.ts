@@ -967,7 +967,7 @@ test("EXT-16 statuses: a running extension is Active; a blocked permission and a
   assert.equal(displayStatus({ ...base, update }).label, "Update Available");
 });
 
-test("EXT-17 statuses: unchecked files are said, never verified; a recovered copy's code is Not Verified; a fallback names what it replaced", async () => {
+test("EXT-17/EXT-19 statuses: a copy not checked or not vouched for is Reinstall Required, never verified; a fallback names what it replaced", async () => {
   const { displayStatus } = await import("./status.ts");
   const { describeSignature } = await import("../signature.ts");
   const t = setup();
@@ -976,32 +976,51 @@ test("EXT-17 statuses: unchecked files are said, never verified; a recovered cop
   const active = { state: "active", reason: null, activationMs: 3 } as const;
   const show = (entry: typeof installed, more: object = {}) =>
     displayStatus({ entry, trusted: true, ...more });
-  // Installed before files were checked: it runs; said beside its status.
+  // Installed before files were checked (EXT-19): its code does not run -- its status says so,
+  // with the way out.
   const legacy = {
     ...installed,
-    integrity: { state: "unchecked", reason: "legacy", runs: true } as const,
+    integrity: { state: "unchecked", reason: "legacy", runs: false } as const,
   };
-  const running = show(legacy, { runtime: active });
-  assert.equal(running.label, "Active");
-  const notice = running.notices?.find((n) => n.kind === "integrity");
-  assert.equal(notice?.label, "Not Checked");
+  const required = show(legacy);
+  assert.equal(required.label, "Reinstall Required");
+  assert.equal(required.tone, "error");
   assert.match(
-    notice?.detail ?? "",
-    /installed before Yavin checked installed files.*It runs\. Reinstall/,
+    required.detail ?? "",
+    /installed before Yavin checked installed files.*code does not run. Reinstall it/,
   );
-  // Recovered: its code does not run -- the status says so, not "Enabled".
+  // Recovered: the same.
   const rebuilt = {
     ...installed,
     integrity: { state: "unchecked", reason: "rebuilt", runs: false } as const,
   };
   const refused = show(rebuilt);
-  assert.equal(refused.label, "Not Verified");
-  assert.equal(refused.tone, "error");
-  assert.match(refused.detail ?? "", /code does not run\. Reinstall/);
+  assert.equal(refused.label, "Reinstall Required");
+  assert.match(refused.detail ?? "", /code does not run. Reinstall/);
   // Disabled, it is Disabled -- and the reason is still said.
   const off = show({ ...rebuilt, enabled: false });
   assert.equal(off.label, "Disabled");
-  assert.equal(off.notices?.[0]?.label, "Not Verified");
+  assert.equal(off.notices?.[0]?.label, "Not Checked");
+  // EXT-19: a record that does not verify -- Reinstall Required, saying why; no key to be had --
+  // Not Verified, and no reinstall offered (it would not help).
+  for (const [reason, said] of [
+    ["missing", /no authenticated record/],
+    ["mismatch", /does not match it/],
+    ["key", /trust key this Yavin does not have/],
+  ] as const) {
+    const shown = show({
+      ...installed,
+      integrity: { state: "untrusted", reason, runs: false },
+    });
+    assert.equal(shown.label, "Reinstall Required", reason);
+    assert.match(shown.detail ?? "", said);
+  }
+  const keyless = show({
+    ...installed,
+    integrity: { state: "untrusted", reason: "unavailable", runs: false },
+  });
+  assert.equal(keyless.label, "Not Verified");
+  assert.match(keyless.detail ?? "", /trust key cannot be used.*Restart Yavin/);
   // Verified files: nothing more is said.
   const verified = show(
     { ...installed, integrity: { state: "verified", reason: null, runs: true } },

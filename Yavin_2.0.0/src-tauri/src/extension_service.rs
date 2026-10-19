@@ -87,7 +87,8 @@ const LEGACY_PREVIOUS: &str = ".previous";
 /// `read_inventory`): a Yavin that reads an inventory written by a newer one refuses it --
 /// it never reads it and drops what it does not know (grants, profiles, signature records,
 /// files digests) on its next write. A test pins the persisted fields to this version.
-const INVENTORY_VERSION: u32 = 2;
+/// 3 (EXT-19) adds `trust` on copies.
+const INVENTORY_VERSION: u32 = 3;
 const MAX_RECOVERIES: usize = 20;
 /// How long a staged or committed operation of this process may wait for its window before
 /// another operation of its id may end it. The window takes milliseconds between the steps; an
@@ -121,6 +122,11 @@ pub struct Copy {
     /// are the package's. A copy with neither is taken for `Rebuilt` (the most restricted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unchecked: Option<Unchecked>,
+    /// Its trust facts, authenticated (EXT-19: `extension_trust`): made when Yavin verified
+    /// its package and files -- at install, or a reinstall that bound them -- and checked
+    /// whenever it is listed or loaded. None: never vouched for; its code does not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<crate::extension_trust::TrustRecord>,
 }
 
 /// Why a copy's files cannot be checked (EXT-17), and so what it may do.
@@ -299,22 +305,42 @@ pub struct Integrity {
 }
 
 impl Integrity {
-    fn of(copy: &Copy) -> Integrity {
+    /// What is known of `copy` of `id`: its files digest, and -- EXT-19 -- its trust record,
+    /// authenticated under `key`. Only a copy with both runs. A copy never checked (legacy,
+    /// adopted, rebuilt) does not run either: it is reinstalled to be checked (EXT-19).
+    fn of(
+        id: &str,
+        copy: &Copy,
+        key: Result<&crate::extension_trust::TrustKey, &String>,
+    ) -> Integrity {
+        use crate::extension_trust::TrustFailure;
+        let untrusted = |why: TrustFailure| Integrity {
+            state: "untrusted",
+            reason: Some(why.code()),
+            runs: false,
+        };
         match (&copy.files_sha256, copy.unchecked) {
-            (Some(_), _) => Integrity {
-                state: "verified",
-                reason: None,
-                runs: true,
+            (Some(_), _) => match (&copy.trust, key) {
+                (None, _) => untrusted(TrustFailure::Missing),
+                (Some(_), Err(_)) => untrusted(TrustFailure::Unavailable),
+                (Some(record), Ok(key)) => match key.verify(&trust_facts(id, copy), record) {
+                    Ok(()) => Integrity {
+                        state: "verified",
+                        reason: None,
+                        runs: true,
+                    },
+                    Err(why) => untrusted(why),
+                },
             },
             (None, Some(Unchecked::Legacy)) => Integrity {
                 state: "unchecked",
                 reason: Some("legacy"),
-                runs: true,
+                runs: false,
             },
             (None, Some(Unchecked::Adopted)) => Integrity {
                 state: "unchecked",
                 reason: Some("adopted"),
-                runs: true,
+                runs: false,
             },
             (None, Some(Unchecked::Rebuilt) | None) => Integrity {
                 state: "unchecked",
@@ -336,6 +362,19 @@ impl Integrity {
             reason: None,
             runs: true,
         }
+    }
+}
+
+/// The facts a trust record of `copy` of `id` binds (EXT-19).
+fn trust_facts<'a>(id: &'a str, copy: &'a Copy) -> crate::extension_trust::TrustFacts<'a> {
+    crate::extension_trust::TrustFacts {
+        id,
+        version: &copy.version,
+        folder: &copy.folder,
+        sha256: copy.sha256.as_deref(),
+        files_sha256: copy.files_sha256.as_deref(),
+        source: &copy.source,
+        signature: copy.signature.as_ref(),
     }
 }
 
@@ -464,6 +503,12 @@ pub struct ExtensionService {
     /// Counts grant changes in this process (EXT-16): a refusal already told to a window is
     /// told again once a grant changed since (it forgot it when the permission was allowed).
     grants_revision: std::sync::atomic::AtomicU64,
+    /// Where the trust key is kept (EXT-19); the platform's unless a test says otherwise.
+    trust_keys: Mutex<Option<std::sync::Arc<dyn crate::extension_trust::TrustKeyStore>>>,
+    /// The trust key, once had (it does not change while Yavin runs).
+    trust_key: Mutex<Option<std::sync::Arc<crate::extension_trust::TrustKey>>>,
+    /// What getting the key said (an unreadable key kept aside), to be recorded as a recovery.
+    trust_notes: Mutex<Vec<String>>,
     /// Test only: the step at which to stop as if Yavin crashed there.
     #[cfg(test)]
     pub crash_at: Mutex<Option<&'static str>>,
@@ -966,6 +1011,7 @@ impl ExtensionService {
                 signature: None,
                 files_sha256: None,
                 unchecked: Some(Unchecked::Rebuilt),
+                trust: None,
             };
             inventory.extensions.insert(
                 id.clone(),
@@ -1479,7 +1525,7 @@ impl ExtensionService {
             published = true;
         }
         self.crash("published")?;
-        let copy = Copy {
+        let mut copy = Copy {
             version: operation.version.clone(),
             folder: folder.clone(),
             sha256: Some(sha256),
@@ -1488,15 +1534,24 @@ impl ExtensionService {
             signature: operation.signature.clone(),
             files_sha256,
             unchecked: None,
+            trust: None,
         };
+        // Vouched for (EXT-19): its package verified, its files just digested.
+        copy.trust = self.seal(root, &id, &copy);
         // A copy in place that is this package, checked just now: bound to it (EXT-17).
         let fresh = copy.clone();
-        let bound = |old: &Copy| Copy {
-            files_sha256: fresh.files_sha256.clone(),
-            unchecked: None,
-            signature: fresh.signature.clone(),
-            source: fresh.source.clone(),
-            ..old.clone()
+        let bound = |old: &Copy| {
+            let mut bound = Copy {
+                files_sha256: fresh.files_sha256.clone(),
+                unchecked: None,
+                signature: fresh.signature.clone(),
+                source: fresh.source.clone(),
+                trust: None,
+                ..old.clone()
+            };
+            // Its files are the verified package's, checked just now: vouched for (EXT-19).
+            bound.trust = self.seal(root, &id, &bound);
+            bound
         };
         let switched = Self::write(&mut inner, paths, |inv| {
             let record = match &before {
@@ -1987,6 +2042,50 @@ impl ExtensionService {
 
     // --- Secrets (EXT-13) --------------------------------------------------------------------
 
+    /// Test only: keeps the trust key in `keys` (a store that is unavailable or fails).
+    #[cfg(test)]
+    pub fn use_trust_keys(&self, keys: std::sync::Arc<dyn crate::extension_trust::TrustKeyStore>) {
+        *self.trust_keys.lock().unwrap() = Some(keys);
+        *self.trust_key.lock().unwrap() = None;
+    }
+
+    /// The trust key for `root` (EXT-19), had once and kept; an error when none can be had.
+    fn trust_key(
+        &self,
+        root: &Path,
+    ) -> Result<std::sync::Arc<crate::extension_trust::TrustKey>, String> {
+        if let Some(key) = self.trust_key.lock().ok().and_then(|k| k.clone()) {
+            return Ok(key);
+        }
+        let store = self
+            .trust_keys
+            .lock()
+            .ok()
+            .and_then(|s| s.clone())
+            .unwrap_or_else(crate::extension_trust::platform);
+        let (key, note) = store.key(root)?;
+        let key = std::sync::Arc::new(key);
+        if let Ok(mut kept) = self.trust_key.lock() {
+            *kept = Some(key.clone());
+        }
+        if let (Some(note), Ok(mut notes)) = (note, self.trust_notes.lock()) {
+            notes.push(note);
+        }
+        Ok(key)
+    }
+
+    /// A trust record for `copy` of `id`, if a key can be had (else none: it will not run).
+    fn seal(
+        &self,
+        root: &Path,
+        id: &str,
+        copy: &Copy,
+    ) -> Option<crate::extension_trust::TrustRecord> {
+        self.trust_key(root)
+            .ok()
+            .map(|key| key.seal(&trust_facts(id, copy)))
+    }
+
     /// Test only: another credential store.
     #[cfg(test)]
     pub fn use_secret_backend(&self, backend: std::sync::Arc<dyn SecretBackend>) {
@@ -2236,11 +2335,24 @@ impl ExtensionService {
             .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
             .and_then(|value| value.get("main")?.as_str().map(str::to_string))
             .ok_or_else(|| format!("UnsupportedRuntime: {id} has no code (no \"main\")."))?;
-        // A copy whose files cannot be checked and whose origin is not known (EXT-17).
-        if chosen.integrity.as_ref().is_some_and(|i| !i.runs) {
-            return Err(format!(
-                "IntegrityUnverified: {id} was recovered from its folder after Yavin's extension inventory was lost; its files cannot be checked, so its code does not run. Reinstall it."
-            ));
+        // Only a copy whose files are bound and whose trust record verifies runs (EXT-17,
+        // EXT-19); every other is refused, saying why, with the way out.
+        if let Some(integrity) = chosen.integrity.as_ref().filter(|i| !i.runs) {
+            return Err(match (integrity.state, integrity.reason) {
+                ("untrusted", Some("unavailable")) => format!(
+                    "TrustStateUnavailable: Yavin's trust key cannot be used, so {id}'s record of verified files cannot be checked and its code does not run."
+                ),
+                ("untrusted", reason) => format!(
+                    "TrustStateInvalid: Yavin could not authenticate its record of {id}'s verified files ({}); its code does not run. Reinstall it.",
+                    reason.unwrap_or("mismatch")
+                ),
+                (_, Some("rebuilt")) => format!(
+                    "IntegrityUnverified: {id} was recovered from its folder after Yavin's extension inventory was lost; its files cannot be checked, so its code does not run. Reinstall it."
+                ),
+                _ => format!(
+                    "IntegrityUnverified: {id}'s installed files have never been checked against its package, so its code does not run. Reinstall it to have them checked."
+                ),
+            });
         }
         let (Some(copy), Some(state)) = (chosen.copy.clone(), chosen.permissions.clone()) else {
             return Err(format!("UnknownExtension: {id} is not installed."));
@@ -2291,6 +2403,22 @@ impl ExtensionService {
     /// active copy falls back to the previous one, or the install is reported broken.
     fn reconcile(&self, inner: &mut Inner, paths: &Paths) -> Result<(Vec<Listed>, usize), String> {
         let root = &paths.root;
+        // The trust key (EXT-19): each copy's record is checked under it. None to be had: no
+        // record verifies, and no extension code runs.
+        let key = self.trust_key(root);
+        let notes: Vec<String> = self
+            .trust_notes
+            .lock()
+            .map(|mut n| std::mem::take(&mut *n))
+            .unwrap_or_default();
+        if !notes.is_empty() {
+            Self::write(inner, paths, |inv| {
+                for text in &notes {
+                    note(inv, None, text.clone());
+                }
+                Ok(())
+            })?;
+        }
         let scan = discover(root);
         let mut skipped = scan.skipped;
         let mut invalid = Vec::new();
@@ -2367,6 +2495,7 @@ impl ExtensionService {
                             signature: None,
                             files_sha256: None,
                             unchecked: Some(Unchecked::Adopted),
+                            trust: None,
                         },
                         previous: None,
                         broken: None,
@@ -2430,7 +2559,7 @@ impl ExtensionService {
                 permissions: None,
                 copy: Some(facts(&record.active)),
                 signature: signature_of(&record.active),
-                integrity: Some(Integrity::of(&record.active)),
+                integrity: Some(Integrity::of(&id, &record.active, key.as_deref())),
                 replaced: record.replaced.clone(),
             };
             match usable(&record.active) {
@@ -2473,7 +2602,8 @@ impl ExtensionService {
                             entry.manifest = Some(text);
                             entry.copy = Some(facts(&previous));
                             entry.signature = signature_of(&previous);
-                            entry.integrity = Some(Integrity::of(&previous));
+                            // The fallback is checked on its own (its own record, files).
+                            entry.integrity = Some(Integrity::of(&id, &previous, key.as_deref()));
                             entry.replaced = Some(replaced);
                         }
                         None => {
@@ -2679,6 +2809,13 @@ fn read_inventory(file: &Path) -> Loaded<Inventory> {
         let inventory = serde_json::from_str::<Inventory>(text).ok()?;
         match version {
             INVENTORY_VERSION => Some(inventory),
+            // Version 3 (EXT-19) adds only `trust`, which no older copy has: such a copy is
+            // unauthenticated and its code does not run until it is reinstalled. No record is
+            // made for it here -- a migration never vouches for files it did not check.
+            2 => Some(Inventory {
+                version: INVENTORY_VERSION,
+                ..inventory
+            }),
             1 => Some(migrate_v1(inventory)),
             _ => None,
         }

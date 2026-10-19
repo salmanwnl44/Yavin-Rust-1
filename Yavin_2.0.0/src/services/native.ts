@@ -799,8 +799,18 @@ export interface NativeSignature {
 
 /** What is known of a copy's files (EXT-17, `Integrity` in `extension_service.rs`). */
 export interface NativeIntegrity {
-  state: "verified" | "unchecked" | "changed" | "development";
-  reason: "legacy" | "adopted" | "rebuilt" | null;
+  state: "verified" | "unchecked" | "untrusted" | "changed" | "development";
+  /** unchecked: legacy, adopted, rebuilt; untrusted (EXT-19): why its record does not verify. */
+  reason:
+    | "legacy"
+    | "adopted"
+    | "rebuilt"
+    | "missing"
+    | "mismatch"
+    | "key"
+    | "schema"
+    | "unavailable"
+    | null;
   /** Whether its code may run. */
   runs: boolean;
 }

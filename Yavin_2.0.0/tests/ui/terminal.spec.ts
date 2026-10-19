@@ -4002,7 +4002,7 @@ test("EXT-17 an installed copy whose files were not checked says so, runs, and a
   await desktop(page);
   const view = await extensionsView(page);
   await copyState(page, "acme.docker-tools", {
-    integrity: { state: "unchecked", reason: "legacy", runs: true },
+    integrity: { state: "unchecked", reason: "legacy", runs: false },
   });
   const recommended = view.getByRole("region", { name: "Recommended extensions" });
   await card(recommended, "Docker Tools")
@@ -4012,15 +4012,17 @@ test("EXT-17 an installed copy whose files were not checked says so, runs, and a
     view.getByRole("region", { name: "Installed extensions" }),
     "Docker Tools",
   );
-  await expect(installed.getByTestId("extension-state")).toHaveText("Enabled");
-  await expect(installed.getByTestId("extension-notice")).toContainText(
-    "Not Checked — It was installed before Yavin checked installed files",
+  // EXT-19: never checked, so its code does not run -- its status says so, and how to fix it.
+  await expect(installed.getByTestId("extension-state")).toHaveText(
+    /^Reinstall Required — It was installed before Yavin checked installed files.*its code does not run/,
   );
   await installed.click();
   const details = page.getByRole("region", { name: "Extension: Docker Tools" });
   const banner = details.getByTestId("extension-integrity");
   await expect(banner).toContainText("Not Checked");
-  await expect(details.getByTestId("extension-integrity-runs")).toHaveText("Its code may run.");
+  await expect(details.getByTestId("extension-integrity-runs")).toHaveText(
+    "Its code does not run.",
+  );
   await details.getByRole("tab", { name: "Requirements" }).click();
   await expect(details.getByTestId("extension-files")).toContainText("Not Checked");
   await expect(details.getByTestId("extension-signature")).toHaveAttribute("data-signed", "false");
@@ -4034,7 +4036,7 @@ test("EXT-17 an installed copy whose files were not checked says so, runs, and a
   });
 });
 
-test("EXT-17 a recovered copy whose code cannot run is Not Verified; a fallback says which copy it replaced", async ({
+test("EXT-17 a recovered copy whose code cannot run is Reinstall Required; reinstalled, it runs", async ({
   page,
 }) => {
   await desktop(page);
@@ -4051,14 +4053,14 @@ test("EXT-17 a recovered copy whose code cannot run is Not Verified; a fallback 
     "Docker Tools",
   );
   await expect(installed.getByTestId("extension-state")).toHaveText(
-    /^Not Verified — It was recovered from its folder .* its code does not run\. Reinstall it/,
+    /^Reinstall Required — It was recovered from its folder .* its code does not run\. Reinstall it/,
   );
   await installed.click();
   const details = page.getByRole("region", { name: "Extension: Docker Tools" });
   await expect(details.getByTestId("extension-integrity-runs")).toHaveText(
     "Its code does not run.",
   );
-  await expect(details.getByTestId("extension-details-state")).toContainText("Not Verified");
+  await expect(details.getByTestId("extension-details-state")).toContainText("Reinstall Required");
 
   // Reinstalled: its files checked, it runs again.
   await details
@@ -4066,7 +4068,61 @@ test("EXT-17 a recovered copy whose code cannot run is Not Verified; a fallback 
     .getByRole("button", { name: /^Reinstall/ })
     .click();
   await expect(details.getByTestId("extension-integrity")).toHaveCount(0);
-  await expect(details.getByTestId("extension-details-state")).not.toContainText("Not Verified");
+  await expect(details.getByTestId("extension-details-state")).not.toContainText(
+    "Reinstall Required",
+  );
+});
+
+test("EXT-19 a copy whose trust record does not verify: Reinstall Required, saying why -- or, with no trust key, Not Verified with no reinstall offered", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await copyState(page, "acme.docker-tools", {
+    integrity: { state: "untrusted", reason: "mismatch", runs: false },
+  });
+  const recommended = view.getByRole("region", { name: "Recommended extensions" });
+  await card(recommended, "Docker Tools")
+    .getByRole("button", { name: "Install Docker Tools" })
+    .click();
+  const installed = card(
+    view.getByRole("region", { name: "Installed extensions" }),
+    "Docker Tools",
+  );
+  await expect(installed.getByTestId("extension-state")).toHaveText(
+    /^Reinstall Required — Yavin's record of its verified files does not match it/,
+  );
+  await installed.click();
+  const details = page.getByRole("region", { name: "Extension: Docker Tools" });
+  const banner = details.getByTestId("extension-integrity");
+  await expect(banner).toHaveAttribute("data-state", "untrusted");
+  await expect(details.getByTestId("extension-integrity-runs")).toHaveText(
+    "Its code does not run.",
+  );
+  // Never shown as verified or signed meanwhile.
+  await details.getByRole("tab", { name: "Requirements" }).click();
+  await expect(details.getByTestId("extension-files")).toContainText("Not Verified");
+  await expect(details.getByTestId("extension-signature")).toHaveAttribute("data-signed", "false");
+  // Reinstalled: checked and vouched for again.
+  await banner.getByRole("button", { name: /^Reinstall/ }).click();
+  await expect(details.getByTestId("extension-integrity")).toHaveCount(0);
+  // No trust key can be used (listed after the next install): said, and no reinstall is
+  // offered -- it would not help.
+  await copyState(page, "acme.docker-tools", {
+    integrity: { state: "untrusted", reason: "unavailable", runs: false },
+  });
+  await details.getByRole("button", { name: "Back to Extensions" }).click();
+  await card(recommended, "Python Tools")
+    .getByRole("button", { name: "Install Python Tools" })
+    .click();
+  await expect(installed.getByTestId("extension-state")).toHaveText(
+    /^Not Verified — Yavin's trust key cannot be used on this computer/,
+  );
+  await installed.click();
+  await expect(details.getByTestId("extension-integrity")).toBeVisible();
+  await expect(
+    details.getByTestId("extension-integrity").getByRole("button", { name: /^Reinstall/ }),
+  ).toHaveCount(0);
 });
 
 test("EXT-17 a fallback: the intact previous version is used, the one it replaced and why are said, and it can be reinstalled", async ({

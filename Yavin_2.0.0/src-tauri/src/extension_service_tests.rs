@@ -476,15 +476,19 @@ fn s08_the_host_loads_the_inventorys_folder() {
         &manifest("acme.hello", "0.1.0"),
     );
     let service = fx.service();
-    let (folder, main) = service.folder_of("acme.hello").unwrap();
-    assert_eq!(folder, fx.root.join("acme.hello"));
-    assert_eq!(main, "extension.js");
+    // The IDE-09 folder is the one chosen -- and, adopted (never checked), its code is not
+    // given to the host (EXT-19).
+    let folder = fx.root.join("acme.hello");
     let listed = entry(&service, "acme.hello");
     assert_eq!(
         PathBuf::from(&listed.folder),
         folder,
-        "the listing and the host agree"
+        "the listing chooses it"
     );
+    assert!(service
+        .folder_of("acme.hello")
+        .unwrap_err()
+        .starts_with("IntegrityUnverified"));
     assert_eq!(listed.shadowed.len(), 2, "{:?}", listed.shadowed);
     // The invalid one is reported as such, with no id: it can never be loaded.
     let listing = service.list(None).unwrap();
@@ -562,7 +566,11 @@ fn s10_one_identity_rule_everywhere() {
     fx.folder(&fx.root, "too-long", &manifest(&too_long, "1.0.0"));
     fx.folder(&fx.root, "upper", &manifest("Acme.Upper", "1.0.0"));
     let service = fx.service();
-    assert!(service.folder_of(&long).is_ok());
+    // Found (EXT-19: adopted, so refused its code -- by name, which is the point here).
+    assert!(service
+        .folder_of(&long)
+        .unwrap_err()
+        .starts_with("IntegrityUnverified"));
     assert!(service.folder_of(&too_long).is_err());
     let listing = service.list(None).unwrap();
     for refused in ["too-long", "upper"] {
@@ -582,10 +590,10 @@ fn s10_one_identity_rule_everywhere() {
         );
     }
     // A request is folded: the same extension whatever its case.
-    assert_eq!(
-        service.folder_of(&long.to_uppercase()).unwrap().0,
-        fx.root.join("long")
-    );
+    assert!(service
+        .folder_of(&long.to_uppercase())
+        .unwrap_err()
+        .contains(&long));
     service.set_enabled(&long.to_uppercase(), false).unwrap();
     assert_eq!(service.list(None).unwrap().disabled, vec![long.clone()]);
     // An install names its id canonically.
@@ -861,6 +869,7 @@ fn a_recorded_folder_outside_the_root_is_never_used_or_deleted() {
                 signature: None,
                 files_sha256: None,
                 unchecked: Some(Unchecked::Adopted),
+                trust: None,
             },
             previous: None,
             broken: None,
@@ -953,6 +962,7 @@ fn a_tampered_operation_cannot_name_a_path() {
                 signature: None,
                 files_sha256: None,
                 unchecked: Some(Unchecked::Adopted),
+                trust: None,
             },
             previous: None,
             broken: None,
@@ -2807,8 +2817,15 @@ fn ext13_an_update_keeps_its_secrets_but_another_origin_or_a_rebuild_cannot_read
         fs::write(fx.root.join(LAST_GOOD), &text).unwrap();
         let restarted = fx.service();
         restarted.use_secret_backend(backend.clone());
-        let copy = restarted.host_copy("acme.one").unwrap();
-        assert_eq!(copy.origin, origin);
+        // EXT-19: a source changed in the inventory does not match the copy's trust record --
+        // the copy does not load at all.
+        assert!(restarted
+            .host_copy("acme.one")
+            .unwrap_err()
+            .starts_with("TrustStateInvalid"));
+        // And the secrets' own check, should code of another origin ever be loaded: refused.
+        let mut copy = back.clone();
+        copy.origin = origin.into();
         let error = secret(
             &restarted,
             &copy,
@@ -3108,9 +3125,11 @@ fn ext15_copies_installed_before_files_were_bound_still_load_and_recovery_binds_
         entry(&service, "acme.hello").integrity.unwrap().reason,
         Some("legacy")
     );
-    service
+    // EXT-19: never checked, so its code does not run until it is reinstalled.
+    assert!(service
         .host_copy("acme.hello")
-        .expect("a legacy copy loads");
+        .unwrap_err()
+        .starts_with("IntegrityUnverified"));
     // A rebuild from the folders alone: no signature, no files digest -- nothing it cannot know.
     drop(service);
     damage_beyond_the_last_good_copy(&fx);
@@ -3334,6 +3353,7 @@ fn as_version_1(fx: &Fixture) -> String {
             if let Some(copy) = record.get_mut(key).and_then(|c| c.as_object_mut()) {
                 copy.remove("filesSha256");
                 copy.remove("unchecked");
+                copy.remove("trust");
             }
         }
         record.as_object_mut().unwrap().remove("replaced");
@@ -3370,17 +3390,19 @@ fn ext17_a_version_1_inventory_is_upgraded_once_marked_unchecked_and_kept() {
     let integrity = listed.integrity.clone().unwrap();
     assert_eq!(
         (integrity.state, integrity.reason, integrity.runs),
-        ("unchecked", Some("legacy"), true)
+        ("unchecked", Some("legacy"), false)
     );
     assert!(
         listed.signature.is_none(),
         "never shown for files that were not checked"
     );
-    service
+    // EXT-19: a legacy copy's code does not run until it is reinstalled.
+    assert!(service
         .host_copy("acme.hello")
-        .expect("a legacy copy still runs");
+        .unwrap_err()
+        .starts_with("IntegrityUnverified"));
     let after = inventory(&fx);
-    assert_eq!(after.version, 2);
+    assert_eq!(after.version, INVENTORY_VERSION);
     let active = &after.extensions["acme.hello"].active;
     assert_eq!(active.unchecked, Some(Unchecked::Legacy));
     assert!(active.files_sha256.is_none(), "no digest is made up");
@@ -3529,7 +3551,7 @@ fn ext17_an_adopted_folder_is_unchecked_and_never_signed() {
     let integrity = listed.integrity.unwrap();
     assert_eq!(
         (integrity.state, integrity.reason, integrity.runs),
-        ("unchecked", Some("adopted"), true)
+        ("unchecked", Some("adopted"), false)
     );
     assert!(listed.signature.is_none());
     assert_eq!(
@@ -3546,7 +3568,7 @@ fn ext17_a_newer_inventory_is_refused_on_every_start_and_nothing_is_rebuilt() {
     drop(installed(&fx));
     let mut value: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(fx.root.join(INVENTORY)).unwrap()).unwrap();
-    value["version"] = serde_json::json!(3);
+    value["version"] = serde_json::json!(INVENTORY_VERSION + 1);
     value["somethingNew"] = serde_json::json!({"kept": true});
     let text = value.to_string();
     fs::write(fx.root.join(INVENTORY), &text).unwrap();
@@ -3572,7 +3594,7 @@ fn ext17_a_newer_inventory_is_refused_on_every_start_and_nothing_is_rebuilt() {
     assert_eq!(after, store);
     let kept: Vec<_> = backups(&fx, "inventory.")
         .into_iter()
-        .filter(|n| n.contains(".v3-"))
+        .filter(|n| n.contains(&format!(".v{}-", INVENTORY_VERSION + 1)))
         .collect();
     assert!(!kept.is_empty());
     for name in kept {
@@ -3660,6 +3682,13 @@ fn ext17_the_persisted_schema_is_pinned_to_its_version() {
         store_revision: 1,
     });
     record.previous.as_mut().unwrap().unchecked = Some(Unchecked::Adopted);
+    let sealed = crate::extension_trust::TrustRecord {
+        schema: 1,
+        key_id: "k".into(),
+        mac: "00".into(),
+    };
+    record.active.trust = Some(sealed.clone());
+    record.previous.as_mut().unwrap().trust = Some(sealed);
     let signature = record.active.signature.clone();
     let before = record.clone();
     inv.operations.insert(
@@ -3718,14 +3747,14 @@ fn ext17_the_persisted_schema_is_pinned_to_its_version() {
     let mut keys = std::collections::BTreeSet::new();
     walk(&value, "", &mut keys);
     assert_eq!(
-        INVENTORY_VERSION, 2,
+        INVENTORY_VERSION, 3,
         "a new version: pin its fields with it"
     );
     let text = keys.into_iter().collect::<Vec<_>>().join(
         "
 ",
     );
-    let pinned = include_str!("extension_inventory_v2.fields.txt").replace(
+    let pinned = include_str!("extension_inventory_v3.fields.txt").replace(
         "
 ", "
 ",
@@ -4051,4 +4080,428 @@ fn ext18_settings_never_reach_grants_trust_or_secrets() {
             .code,
         "PermissionDenied"
     );
+}
+
+// --- EXT-19: strict integrity and authenticated trust records ------------------------------------
+
+/// Rewrites the inventory and its last good copy (so no restore undoes it) with `change`.
+fn tamper(fx: &Fixture, change: impl FnOnce(&mut Inventory)) {
+    let mut inv = inventory(fx);
+    change(&mut inv);
+    let text = serde_json::to_string(&inv).unwrap();
+    fs::write(fx.root.join(INVENTORY), &text).unwrap();
+    fs::write(fx.root.join(LAST_GOOD), &text).unwrap();
+}
+
+fn refusal(service: &ExtensionService, id: &str) -> String {
+    service
+        .host_copy(id)
+        .map(|_| "it runs".to_string())
+        .unwrap_or_else(|e| e)
+}
+
+/// An installed copy is vouched for when it is installed -- a record bound to its facts under
+/// the user's protected key -- runs, and still verifies after a restart (the key is kept).
+#[test]
+fn ext19_an_installed_copy_is_vouched_for_and_runs_across_restarts() {
+    let fx = fixture("ext19-sealed");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    let trust = inventory(&fx).extensions["acme.hello"]
+        .active
+        .trust
+        .clone()
+        .unwrap();
+    assert_eq!(trust.schema, crate::extension_trust::RECORD_SCHEMA);
+    assert_eq!(trust.mac.len(), 64);
+    service.host_copy("acme.hello").unwrap();
+    assert!(fx.root.join(crate::extension_trust::KEY_FILE).exists());
+    drop(service);
+    let service = fx.service();
+    service
+        .host_copy("acme.hello")
+        .expect("the same key after a restart");
+    assert_eq!(
+        entry(&service, "acme.hello").integrity.unwrap().state,
+        "verified"
+    );
+}
+
+/// Changed files with a digest made to match, a record removed, one taken from another copy, a
+/// fact changed (source, package, signature), another format or key: none verifies; the code
+/// does not run, and the listing says why. Settings and grants change nothing of that.
+#[test]
+fn ext19_a_forged_or_changed_trust_record_fails_closed() {
+    type Forge = Box<dyn Fn(&Fixture, &mut Inventory)>;
+    let cases: Vec<(&str, &str, Forge)> = vec![
+        (
+            "files and their digest changed together",
+            "mismatch",
+            Box::new(|fx, inv| {
+                let copy = &mut inv.extensions.get_mut("acme.hello").unwrap().active;
+                let folder = join(&fx.root, &copy.folder);
+                fs::write(
+                    folder.join("extension.js"),
+                    "module.exports = 'not the package';",
+                )
+                .unwrap();
+                copy.files_sha256 = Some(crate::extension_package::tree_digest(&folder).unwrap());
+            }),
+        ),
+        (
+            "record removed",
+            "missing",
+            Box::new(|_, inv| {
+                inv.extensions.get_mut("acme.hello").unwrap().active.trust = None;
+            }),
+        ),
+        (
+            "another copy's record",
+            "mismatch",
+            Box::new(|_, inv| {
+                let other = inv.extensions["acme.other"].active.trust.clone();
+                inv.extensions.get_mut("acme.hello").unwrap().active.trust = other;
+            }),
+        ),
+        (
+            "source",
+            "mismatch",
+            Box::new(|_, inv| {
+                inv.extensions.get_mut("acme.hello").unwrap().active.source =
+                    "openvsx https://open-vsx.org".into();
+            }),
+        ),
+        (
+            "package digest and its signature record",
+            "mismatch",
+            Box::new(|_, inv| {
+                let copy = &mut inv.extensions.get_mut("acme.hello").unwrap().active;
+                let forged = "f".repeat(64);
+                copy.sha256 = Some(forged.clone());
+                if let Some(sig) = copy.signature.as_mut() {
+                    sig.sha256 = forged;
+                }
+            }),
+        ),
+        (
+            "signature status raised",
+            "mismatch",
+            Box::new(|_, inv| {
+                let copy = &mut inv.extensions.get_mut("acme.hello").unwrap().active;
+                copy.signature.as_mut().unwrap().status = SignatureStatus::RegistrySigned;
+            }),
+        ),
+        (
+            "another record format",
+            "schema",
+            Box::new(|_, inv| {
+                inv.extensions
+                    .get_mut("acme.hello")
+                    .unwrap()
+                    .active
+                    .trust
+                    .as_mut()
+                    .unwrap()
+                    .schema = 2;
+            }),
+        ),
+        (
+            "another key named",
+            "key",
+            Box::new(|_, inv| {
+                inv.extensions
+                    .get_mut("acme.hello")
+                    .unwrap()
+                    .active
+                    .trust
+                    .as_mut()
+                    .unwrap()
+                    .key_id = "0123456789abcdef".into();
+            }),
+        ),
+    ];
+    for (what, reason, change) in cases {
+        let fx = fixture(&format!("ext19-forged-{}", reason));
+        let service = fx.service();
+        install(&fx, &service, "acme.hello", "1.0.0");
+        install(&fx, &service, "acme.other", "1.0.0");
+        service.host_copy("acme.hello").unwrap();
+        drop(service);
+        tamper(&fx, |inv| change(&fx, inv));
+        let service = fx.service();
+        let refused = refusal(&service, "acme.hello");
+        assert!(
+            refused.starts_with("TrustStateInvalid") && refused.contains(reason),
+            "{what}: {refused}"
+        );
+        let integrity = entry(&service, "acme.hello").integrity.unwrap();
+        assert_eq!(
+            (integrity.state, integrity.reason, integrity.runs),
+            ("untrusted", Some(reason), false),
+            "{what}"
+        );
+        assert!(
+            entry(&service, "acme.hello").signature.is_none()
+                || reason != "mismatch"
+                || what != "signature status raised"
+        );
+        // Nothing the user sets grants it: a grant, a setting, enabling it.
+        service.set_enabled("acme.hello", true).unwrap();
+        assert!(
+            refusal(&service, "acme.hello").starts_with("TrustStateInvalid"),
+            "{what}"
+        );
+        // The other, untouched, runs.
+        if what != "another copy's record" {
+            service
+                .host_copy("acme.other")
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+        }
+        // A reinstall vouches for it again.
+        install(&fx, &service, "acme.hello", "1.0.0");
+        service
+            .host_copy("acme.hello")
+            .unwrap_or_else(|e| panic!("{what}, reinstalled: {e}"));
+    }
+}
+
+/// The key lost (deleted) or unusable (damaged): every record made under it fails closed; a
+/// damaged key file is kept aside and said; a reinstall vouches under the new key.
+#[test]
+fn ext19_a_lost_or_damaged_key_fails_closed_and_a_reinstall_recovers() {
+    for damage in ["deleted", "damaged"] {
+        let fx = fixture(&format!("ext19-key-{damage}"));
+        let service = fx.service();
+        install(&fx, &service, "acme.hello", "1.0.0");
+        drop(service);
+        let key = fx.root.join(crate::extension_trust::KEY_FILE);
+        if damage == "deleted" {
+            fs::remove_file(&key).unwrap();
+        } else {
+            fs::write(&key, b"damaged").unwrap();
+        }
+        let service = fx.service();
+        let refused = refusal(&service, "acme.hello");
+        assert!(
+            refused.starts_with("TrustStateInvalid") && refused.contains("(key)"),
+            "{damage}: {refused}"
+        );
+        if damage == "damaged" {
+            assert!(recovered(&fx, "trust key could not be used"));
+            assert!(fs::read_dir(&fx.root)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains(".unreadable-")));
+        }
+        install(&fx, &service, "acme.hello", "1.0.0");
+        service.host_copy("acme.hello").unwrap();
+    }
+}
+
+/// With no protected store for the key, installs still work -- declarative contributions
+/// included -- but no extension code runs, and the reason is said.
+#[test]
+fn ext19_without_a_key_store_no_code_runs() {
+    let fx = fixture("ext19-no-store");
+    let service = fx.service();
+    service.use_trust_keys(std::sync::Arc::new(crate::extension_trust::Unavailable));
+    install(&fx, &service, "acme.hello", "1.0.0");
+    assert!(
+        inventory(&fx).extensions["acme.hello"]
+            .active
+            .trust
+            .is_none(),
+        "nothing vouched for"
+    );
+    assert!(refusal(&service, "acme.hello").starts_with("TrustStateInvalid"));
+    // Installed with a key, then the store fails: unavailable, said so.
+    let fx = fixture("ext19-store-fails");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    drop(service);
+    let service = fx.service();
+    service.use_trust_keys(std::sync::Arc::new(crate::extension_trust::Unavailable));
+    let refused = refusal(&service, "acme.hello");
+    assert!(refused.starts_with("TrustStateUnavailable"), "{refused}");
+    assert_eq!(
+        entry(&service, "acme.hello").integrity.unwrap().reason,
+        Some("unavailable")
+    );
+}
+
+/// Every path that makes a copy no one vouched for -- a version-1 (legacy) inventory, a
+/// version-2 one (files bound, no record), an adopted folder, a rebuild -- leaves it unable to
+/// run until a reinstall, which checks its files and vouches for them.
+#[test]
+fn ext19_every_unvouched_copy_needs_a_reinstall() {
+    // Legacy (version 1).
+    let fx = fixture("ext19-legacy");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    drop(service);
+    as_version_1(&fx);
+    let service = fx.service();
+    assert!(refusal(&service, "acme.hello").starts_with("IntegrityUnverified"));
+    install(&fx, &service, "acme.hello", "1.0.0");
+    service
+        .host_copy("acme.hello")
+        .expect("reinstalled: checked and vouched for");
+    // Version 2: files bound, no record -- not vouched for by a migration.
+    let fx = fixture("ext19-v2");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    drop(service);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(fx.root.join(INVENTORY)).unwrap()).unwrap();
+    value["version"] = serde_json::json!(2);
+    value["extensions"]["acme.hello"]["active"]
+        .as_object_mut()
+        .unwrap()
+        .remove("trust");
+    let text = value.to_string();
+    fs::write(fx.root.join(INVENTORY), &text).unwrap();
+    fs::write(fx.root.join(LAST_GOOD), &text).unwrap();
+    let service = fx.service();
+    let refused = refusal(&service, "acme.hello");
+    assert!(
+        refused.starts_with("TrustStateInvalid") && refused.contains("missing"),
+        "{refused}"
+    );
+    assert!(
+        inventory(&fx).extensions["acme.hello"]
+            .active
+            .trust
+            .is_none(),
+        "the migration made none"
+    );
+    install(&fx, &service, "acme.hello", "1.0.0");
+    service.host_copy("acme.hello").unwrap();
+    // Adopted: refused; a package installed over it runs, and the adopted folder is not kept to
+    // fall back on as a vouched copy.
+    let fx = fixture("ext19-adopted");
+    fx.folder(&fx.root, "acme.hello", &manifest("acme.hello", "1.0.0"));
+    let service = fx.service();
+    assert!(refusal(&service, "acme.hello").starts_with("IntegrityUnverified"));
+    install(&fx, &service, "acme.hello", "1.0.0");
+    service.host_copy("acme.hello").unwrap();
+    // Rebuilt: refused; reinstalled: runs.
+    let fx = fixture("ext19-rebuilt");
+    drop(installed(&fx));
+    damage_beyond_the_last_good_copy(&fx);
+    let service = fx.service();
+    service.set_enabled("acme.hello", true).unwrap();
+    assert!(refusal(&service, "acme.hello").starts_with("IntegrityUnverified"));
+    for copy in inventory(&fx).extensions.values() {
+        assert!(copy.active.trust.is_none(), "a rebuild vouches for nothing");
+    }
+    install(&fx, &service, "acme.hello", "2.0.0");
+    service.host_copy("acme.hello").unwrap();
+}
+
+/// A fallback is checked on its own: an intact previous copy with a valid record runs; one
+/// whose record does not verify is used (its files intact) but its code does not run.
+#[test]
+fn ext19_a_fallback_is_checked_on_its_own() {
+    for previous_ok in [true, false] {
+        let fx = fixture(&format!("ext19-fallback-{previous_ok}"));
+        let service = fx.service();
+        install(&fx, &service, "acme.hello", "1.0.0");
+        install(&fx, &service, "acme.hello", "2.0.0");
+        drop(service);
+        let active = inventory(&fx).extensions["acme.hello"]
+            .active
+            .folder
+            .clone();
+        fs::write(
+            join(&fx.root, &active).join("extension.js"),
+            "module.exports = 'changed';",
+        )
+        .unwrap();
+        if !previous_ok {
+            tamper(&fx, |inv| {
+                inv.extensions
+                    .get_mut("acme.hello")
+                    .unwrap()
+                    .previous
+                    .as_mut()
+                    .unwrap()
+                    .source = "file elsewhere".into();
+            });
+        }
+        let service = fx.service();
+        let listed = entry(&service, "acme.hello");
+        assert_eq!(listed.replaced.unwrap().version, "2.0.0");
+        if previous_ok {
+            service.host_copy("acme.hello").unwrap();
+        } else {
+            assert_eq!(listed.integrity.unwrap().state, "untrusted");
+            assert!(refusal(&service, "acme.hello").starts_with("TrustStateInvalid"));
+        }
+    }
+}
+
+/// An update rolled back, and an update stopped after publishing: the copy in use keeps its
+/// own record and runs; the inventory never names a copy whose record was not made with it.
+#[test]
+fn ext19_rollback_and_an_interrupted_update_keep_a_vouched_copy() {
+    let fx = fixture("ext19-rollback");
+    let service = fx.service();
+    install(&fx, &service, "acme.hello", "1.0.0");
+    let op = stage_file(
+        &service,
+        &fx.package("acme.hello", "2.0.0"),
+        "acme.hello",
+        "2.0.0",
+    )
+    .unwrap();
+    service.commit(&op, "acme.hello").unwrap();
+    service
+        .host_copy("acme.hello")
+        .expect("the new copy, vouched for at commit");
+    service.finish(&op, "acme.hello", false).unwrap();
+    assert_eq!(version_listed(&service, "acme.hello"), "1.0.0");
+    service
+        .host_copy("acme.hello")
+        .expect("the old copy's own record");
+    // Stopped after publishing, before the switch: the next start uses the old copy, vouched.
+    let op = stage_file(
+        &service,
+        &fx.package("acme.hello", "2.0.0"),
+        "acme.hello",
+        "2.0.0",
+    )
+    .unwrap();
+    *service.crash_at.lock().unwrap() = Some("published");
+    assert!(service.commit(&op, "acme.hello").is_err());
+    drop(service);
+    let service = fx.service();
+    assert_eq!(version_listed(&service, "acme.hello"), "1.0.0");
+    service.host_copy("acme.hello").unwrap();
+}
+
+/// Two Yavins starting at once over one extensions folder make one key between them: what
+/// either vouches for, the other -- and any later start -- verifies.
+#[test]
+fn ext19_two_yavins_share_one_key() {
+    let fx = fixture("ext19-two");
+    let (a, b) = (fx.service(), fx.service());
+    // Both list at once: each gets the key, made by whichever came first.
+    std::thread::scope(|scope| {
+        scope.spawn(|| a.list(None).unwrap());
+        scope.spawn(|| b.list(None).unwrap());
+    });
+    install(&fx, &a, "acme.one", "1.0.0");
+    drop((a, b));
+    let c = fx.service();
+    install(&fx, &c, "acme.two", "1.0.0");
+    let inv = inventory(&fx);
+    let ids: Vec<_> = ["acme.one", "acme.two"]
+        .iter()
+        .map(|id| inv.extensions[*id].active.trust.clone().unwrap().key_id)
+        .collect();
+    assert_eq!(ids[0], ids[1], "one key");
+    drop(c);
+    let d = fx.service();
+    d.host_copy("acme.one").unwrap();
+    d.host_copy("acme.two").unwrap();
 }

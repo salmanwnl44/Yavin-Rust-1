@@ -142,7 +142,7 @@ export async function discoverExtensions(
         one.error = `Its manifest is not JSON: ${(error as Error).message}`;
       }
     if (parsed === undefined) {
-      registry.reject(one.folder, one.error ?? "Its manifest could not be read.");
+      registry.reject(one.folder, one.error ?? "Its manifest could not be read.", one.id ?? null);
       rejected++;
       continue;
     }

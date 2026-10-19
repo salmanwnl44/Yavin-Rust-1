@@ -101,28 +101,53 @@ impl Yavin {
     }
 
     /// Test extensions with more in their manifests (`extra`: its permissions, EXT-07).
-    fn with(test: &str, extensions: &[(&str, Value, &str)]) -> Yavin {
+    fn with(test: &str, wanted: &[(&str, Value, &str)]) -> Yavin {
         let scratch =
             std::env::temp_dir().join(format!("yavin-ext-e2e-{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
-        for (id, extra, code) in extensions {
-            let (publisher, name) = id.split_once('.').unwrap();
-            let folder = scratch.join(id);
-            std::fs::create_dir_all(&folder).unwrap();
-            let mut manifest = json!({"publisher": publisher, "name": name, "version": "1.0.0", "engines": {"yavin": "^2.0.0"}, "main": "extension.js"});
-            for (key, value) in extra.as_object().unwrap() {
-                manifest[key] = value.clone();
-            }
-            std::fs::write(folder.join("yavin-extension.json"), manifest.to_string()).unwrap();
-            std::fs::write(folder.join("extension.js"), code).unwrap();
-        }
         std::fs::create_dir_all(&scratch).unwrap();
         let samples = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("extensions")
             .join("samples");
+        let extensions = Arc::new(ExtensionService::new(
+            scratch.join("extensions"),
+            vec![samples],
+        ));
+        // Each installed as a user installs one (EXT-19): a package, staged, verified and
+        // committed -- so its files are bound and its trust record made. (A folder put in
+        // Yavin's extensions folder by hand is adopted, never checked, and does not run.)
+        for (id, extra, code) in wanted {
+            let (publisher, name) = id.split_once('.').unwrap();
+            let mut manifest = json!({"publisher": publisher, "name": name, "version": "1.0.0", "engines": {"yavin": "^2.0.0"}, "main": "extension.js"});
+            for (key, value) in extra.as_object().unwrap() {
+                manifest[key] = value.clone();
+            }
+            let at = scratch.join("packages").join(id);
+            std::fs::create_dir_all(&at).unwrap();
+            let package = crate::extension_package::tests::package(
+                &at,
+                &[
+                    (
+                        crate::extensions::MANIFEST_FILE,
+                        manifest.to_string().as_bytes(),
+                    ),
+                    ("extension.js", code.as_bytes()),
+                ],
+            );
+            let staged = crate::marketplace::stage(
+                &extensions,
+                crate::marketplace::PackageSource::File {
+                    path: package.to_string_lossy().into(),
+                },
+                id,
+                "1.0.0",
+            )
+            .unwrap_or_else(|e| panic!("{id} stages: {e}"));
+            extensions.commit(&staged.token, id).unwrap();
+            extensions.finish(&staged.token, id, true).unwrap();
+        }
         let (sender, events) = channel();
-        let extensions = Arc::new(ExtensionService::new(scratch.clone(), vec![samples]));
         Yavin {
             sessions: ExtHostSessions::default(),
             events,
@@ -2353,7 +2378,7 @@ fn a_secret_store_failure_is_recorded_without_the_secret() {
     );
     let report = crate::extension_diagnostics::render_report(&seen, "test");
     assert!(!report.contains(value));
-    let files = std::fs::read_dir(yavin._scratch.0.join(".diagnostics"))
+    let files = std::fs::read_dir(yavin._scratch.0.join("extensions").join(".diagnostics"))
         .into_iter()
         .flatten()
         .flatten()

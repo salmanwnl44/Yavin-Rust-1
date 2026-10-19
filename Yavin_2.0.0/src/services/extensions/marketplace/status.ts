@@ -49,7 +49,8 @@ export interface DisplayStatus {
     | "Installing"
     | "Updating"
     | "Uninstalling"
-    | "Not Verified";
+    | "Not Verified"
+    | "Reinstall Required";
   tone: StatusTone;
   /** Why, when there is something to say. */
   detail: string | null;
@@ -96,8 +97,15 @@ export function displayStatus(input: StatusInput): DisplayStatus {
   const notices: StatusNotice[] = [...(status.notices ?? [])];
   const integrity = describeIntegrity(entry.integrity);
   const runs = !!entry.manifest.main;
+  // EXT-19: a copy whose code may not run says so as its status -- Reinstall Required where a
+  // reinstall is the way out, Not Verified where it is not (no trust key can be used).
   if (integrity && !integrity.runs && runs && entry.enabled)
-    return { label: "Not Verified", tone: "error", detail: integrity.detail, notices };
+    return {
+      label: integrity.reinstall ? "Reinstall Required" : "Not Verified",
+      tone: "error",
+      detail: integrity.detail,
+      notices,
+    };
   if (integrity && (integrity.label === "Not Checked" || integrity.label === "Not Verified"))
     notices.push({
       kind: "integrity",

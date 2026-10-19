@@ -39,6 +39,8 @@ ide-terminal-protocol = { path = "crates/ide-terminal-protocol" }
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
+# HMAC-SHA256 for authenticated trust records (EXT-19): RustCrypto, beside sha2.
+hmac = "0.12"
 # Resolving redirects and building request URLs (EXT-08): already in the build, through Tauri.
 url = "2.5"
 # Verifying Open VSX package signatures (EXT-09): Ed25519 (RFC 8032), verification only.
@@ -55,4 +57,4 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # A Local Git restore recreates Windows junctions (FSCTL_SET_REPARSE_POINT), never by a process.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Threading"] }

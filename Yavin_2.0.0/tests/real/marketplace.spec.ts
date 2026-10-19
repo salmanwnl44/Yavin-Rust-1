@@ -10,7 +10,7 @@
  * HTTPS and Yavin's own registry.
  */
 import { createServer, type Server } from "node:http";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { extname, join, normalize } from "node:path";
 import { expect, test } from "@playwright/test";
@@ -452,6 +452,7 @@ function asVersion1() {
         if (copy) {
           delete copy.filesSha256;
           delete copy.unchecked;
+          delete copy.trust;
         }
       }
       delete record.replaced;
@@ -473,7 +474,7 @@ async function restart() {
   return running;
 }
 
-test("EXT-17 an older inventory: upgraded, its copy not checked but running; reinstalled, checked; recovered, its code refused until reinstalled", async () => {
+test("EXT-17/EXT-19 an older inventory: upgraded, its copy not checked and its code refused; reinstalled, checked and run; recovered, refused until reinstalled", async () => {
   let running = await start();
   try {
     const { page } = running;
@@ -485,22 +486,25 @@ test("EXT-17 an older inventory: upgraded, its copy not checked but running; rei
     await close(running);
     asVersion1();
 
-    // Upgraded at start: the copy is not checked -- it runs, and says so; no signature shown.
+    // Upgraded at start: the copy is not checked -- EXT-19: its code does not run, and it says
+    // so with the way out; no signature shown.
     running = await restart();
     let installed = card(
       (await extensionsView(running.page)).getByRole("region", { name: "Installed extensions" }),
       "Word Count",
     );
-    await expect(installed.getByTestId("extension-notice")).toContainText("Not Checked");
+    await expect(installed.getByTestId("extension-state")).toHaveText(/^Reinstall Required/);
     const inventory = JSON.parse(readFileSync(join(EXTENSIONS, "inventory.json"), "utf8"));
-    expect(inventory.version).toBe(2);
+    expect(inventory.version).toBe(3);
     expect(inventory.extensions["yavin.word-count"].active.unchecked).toBe("legacy");
     expect(readdirSync(EXTENSIONS).some((n) => n.startsWith("inventory.json.v1-migrated-"))).toBe(
       true,
     );
     await installed.click();
     const details = running.page.getByRole("region", { name: "Extension: Word Count" });
-    await expect(details.getByTestId("extension-integrity-runs")).toHaveText("Its code may run.");
+    await expect(details.getByTestId("extension-integrity-runs")).toHaveText(
+      "Its code does not run.",
+    );
     await details.getByRole("tab", { name: "Requirements" }).click();
     await expect(details.getByTestId("extension-signature")).toContainText("Not shown");
     await running.page.getByRole("button", { name: "Back to Extensions" }).click();
@@ -509,8 +513,11 @@ test("EXT-17 an older inventory: upgraded, its copy not checked but running; rei
       .getByRole("tree", { name: "Files" })
       .getByText("notes.md", { exact: true })
       .click();
+    // Run before it is checked: refused natively, saying why.
     await palette(running.page, "Word Count: Count Words in Active File");
-    await expect(message(running.page)).toContainText("notes.md:");
+    await expect(alert(running.page)).toContainText(
+      "IntegrityUnverified: yavin.word-count's installed files have never been checked",
+    );
 
     // Reinstalled from its registry: its files are checked and bound.
     await extensionsView(running.page);
@@ -526,6 +533,11 @@ test("EXT-17 an older inventory: upgraded, its copy not checked but running; rei
     await expect(details.getByTestId("extension-signature")).toContainText("Unsigned");
     const bound = JSON.parse(readFileSync(join(EXTENSIONS, "inventory.json"), "utf8"));
     expect(bound.extensions["yavin.word-count"].active.filesSha256).toMatch(/^[0-9a-f]{64}$/);
+    // EXT-19: vouched for -- an authenticated record -- and now it runs.
+    expect(bound.extensions["yavin.word-count"].active.trust.mac).toMatch(/^[0-9a-f]{64}$/);
+    await running.page.getByRole("button", { name: "Back to Extensions" }).click();
+    await palette(running.page, "Word Count: Count Words in Active File");
+    await expect(message(running.page)).toContainText("notes.md:");
     await close(running);
 
     // The inventory and its last good copy lost: rebuilt from the folders -- disabled, and its
@@ -538,9 +550,9 @@ test("EXT-17 an older inventory: upgraded, its copy not checked but running; rei
       "Word Count",
     );
     await expect(installed.getByTestId("extension-state")).toHaveText("Disabled");
-    await expect(installed.getByTestId("extension-notice")).toContainText("Not Verified");
+    await expect(installed.getByTestId("extension-notice")).toContainText("Not Checked");
     await installed.getByRole("button", { name: "Enable Word Count" }).click();
-    await expect(installed.getByTestId("extension-state")).toHaveText(/^Not Verified/);
+    await expect(installed.getByTestId("extension-state")).toHaveText(/^Reinstall Required/);
     await running.page.getByTitle("Explorer (Ctrl+Shift+E)", { exact: true }).click();
     await running.page
       .getByRole("tree", { name: "Files" })
@@ -644,6 +656,105 @@ test("EXT-18 profile settings in the installed app: saved natively, used by the 
     await expect(
       page.details.getByRole("group", { name: "ignore-markup" }).getByTestId("setting-source"),
     ).toHaveText("Now off, from this profile.");
+    await close(running);
+  } finally {
+    if (running.app.exitCode === null) running.app.kill();
+  }
+});
+
+test("EXT-19 a forged trust record, a lost trust key and changed files: each refused natively, said, and fixed by a reinstall", async () => {
+  let running = await start();
+  const files = () => running.page.getByRole("tree", { name: "Files" });
+  const count = async () => {
+    if (!(await files().isVisible()))
+      await running.page.getByTitle("Explorer (Ctrl+Shift+E)", { exact: true }).click();
+    await files().getByText("notes.md", { exact: true }).click();
+    await palette(running.page, "Word Count: Count Words in Active File");
+  };
+  const edit = (change: (inventory: Record<string, any>) => void) => {
+    for (const name of ["inventory.json", "inventory.last-good.json"]) {
+      const file = join(EXTENSIONS, name);
+      const inventory = JSON.parse(readFileSync(file, "utf8"));
+      change(inventory);
+      writeFileSync(file, JSON.stringify(inventory, null, 2));
+    }
+  };
+  const reinstall = async () => {
+    const view = await extensionsView(running.page);
+    await card(view.getByRole("region", { name: "Installed extensions" }), "Word Count").click();
+    await running.page
+      .getByRole("region", { name: "Extension: Word Count" })
+      .getByTestId("extension-integrity")
+      .getByRole("button", { name: "Reinstall Word Count 1.0.1" })
+      .click();
+    await review(running.page, "Install and allow");
+    await running.page.getByRole("button", { name: "Back to Extensions" }).click();
+  };
+  try {
+    const view = await extensionsView(running.page);
+    await card(view.getByRole("region", { name: "Recommended extensions" }), "Word Count")
+      .getByRole("button", { name: "Install Word Count" })
+      .click();
+    await review(running.page, "Install and allow");
+    await count();
+    await expect(message(running.page)).toContainText("notes.md:");
+    await close(running);
+
+    // A trust fact rewritten in the inventory (and its last good copy) without the key.
+    edit((inventory) => {
+      inventory.extensions["yavin.word-count"].active.source = "openvsx https://open-vsx.org";
+    });
+    running = await restart();
+    let installed = card(
+      (await extensionsView(running.page)).getByRole("region", { name: "Installed extensions" }),
+      "Word Count",
+    );
+    await expect(installed.getByTestId("extension-state")).toHaveText(
+      /^Reinstall Required — Yavin's record of its verified files does not match it/,
+    );
+    await count();
+    await expect(alert(running.page)).toContainText("TrustStateInvalid");
+    await reinstall();
+    await count();
+    await expect(message(running.page)).toContainText("notes.md:");
+    await close(running);
+
+    // The trust key lost: every record made with it fails, closed; a reinstall vouches anew.
+    rmSync(join(EXTENSIONS, "trust-key.dpapi"));
+    running = await restart();
+    installed = card(
+      (await extensionsView(running.page)).getByRole("region", { name: "Installed extensions" }),
+      "Word Count",
+    );
+    await expect(installed.getByTestId("extension-state")).toHaveText(
+      /^Reinstall Required — Yavin's record of its verified files was made with a trust key/,
+    );
+    await reinstall();
+    await count();
+    await expect(message(running.page)).toContainText("notes.md:");
+    await close(running);
+
+    // Its files changed: not loaded -- said, with the reason -- and installed again from its card.
+    const folder = join(
+      EXTENSIONS,
+      ...JSON.parse(readFileSync(join(EXTENSIONS, "inventory.json"), "utf8")).extensions[
+        "yavin.word-count"
+      ].active.folder.split("/"),
+    );
+    writeFileSync(join(folder, "extension.js"), "module.exports.activate = function () {};");
+    running = await restart();
+    const changed = await extensionsView(running.page);
+    await expect(
+      changed
+        .getByRole("region", { name: "Not loaded" })
+        .getByRole("group", { name: "Not loaded: yavin.word-count" }),
+    ).toContainText("its files changed since it was installed");
+    await card(changed.getByRole("region", { name: "Recommended extensions" }), "Word Count")
+      .getByRole("button", { name: "Install Word Count" })
+      .click();
+    await review(running.page, "Install and allow");
+    await count();
+    await expect(message(running.page)).toContainText("notes.md:");
     await close(running);
   } finally {
     if (running.app.exitCode === null) running.app.kill();
