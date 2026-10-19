@@ -174,6 +174,8 @@ function setup(
     codes?: Record<string, string>;
     failStart?: string;
     delay?: Parameters<typeof createInProcessTransport>[0]["delay"];
+    profileSettings?: () => Record<string, Record<string, unknown>>;
+    report?: (code: string, id: string) => void;
   } = {},
 ) {
   const storage = memoryStorage();
@@ -212,6 +214,8 @@ function setup(
         appendLine: (text: string) => logs.set(id, [...(logs.get(id) ?? []), text]),
       }),
       timeouts: { provider: 200, command: 1000, activate: 1000, ...timeouts },
+      profileSettings: options.profileSettings,
+      report: options.report,
       rediscover: async () => void rediscovered++,
     });
   const add = (overrides: Record<string, unknown>, code: string | null) => {
@@ -1837,4 +1841,90 @@ test("EXT-12 dependencies: required and optional declared, the API stated by cod
     { incompatibilities: { "acme.hello": "*" } },
   ])
     assert.equal(readManifest(manifest(bad)).ok, false, JSON.stringify(bad));
+});
+
+test("EXT-13 an extension's settings: this workspace's, else the profile's, else the user's, else the default", async () => {
+  let profile: Record<string, Record<string, unknown>> = {};
+  const t = setup({ profileSettings: () => profile });
+  t.add(
+    {},
+    `module.exports.activate = function (c, yavin) {
+      c.subscriptions.push(yavin.commands.registerCommand("acme.hello.greet", function () {
+        return yavin.workspace.getConfiguration("acme.hello").get("mood");
+      }));
+    };`,
+  );
+  const mood = t.registry.settingDefinition("acme.hello.mood")!;
+  const read = async () => {
+    const m = t.manager(A, 1);
+    const value = await m.executeCommand("acme.hello.greet");
+    await m.dispose();
+    return value;
+  };
+  assert.equal(await read(), "calm", "the default");
+  profile = { "acme.hello": { "acme.hello.mood": "bright" } };
+  assert.equal(await read(), "bright", "the profile's");
+  t.settings.set(mood, "user", "calm");
+  assert.equal(await read(), "bright", "the profile's over the user's");
+  t.settings.set(mood, "workspace", "calm", A);
+  assert.equal(await read(), "calm", "this workspace's over the profile's");
+  t.settings.reset(mood, "workspace", A);
+  // A profile value the setting does not accept is not used: the user's is.
+  profile = { "acme.hello": { "acme.hello.mood": "loud" } };
+  assert.equal(await read(), "calm");
+  // Another extension's profile values are not this one's.
+  profile = { "acme.other": { "acme.hello.mood": "bright" } };
+  assert.equal(await read(), "calm");
+});
+
+test("EXT-13 the profile store shows only what the native side answered", async () => {
+  const { createProfileStore } = await import("./profiles.ts");
+  const view = (active: string, names: string[]) => ({
+    active,
+    profiles: names.map((name) => ({ id: name.toLowerCase(), name })),
+    settings: {},
+  });
+  let failing = false;
+  const io = {
+    create: async (name: string) => view("default", ["Default", name]),
+    rename: async () => view("default", ["Default", "Renamed"]),
+    remove: async () => view("default", ["Default"]),
+    select: async (id: string) => {
+      if (failing) throw new Error("ProfileNotFound: there is no extension profile.");
+      return {
+        profiles: view(id, ["Default", "Work"]),
+        unavailable: [{ id: "acme.app", reason: "DependencyUnavailable: x" }],
+      };
+    },
+    setSetting: async () => ({
+      ...view("work", ["Default", "Work"]),
+      settings: { "acme.one": { "acme.one.x": 1 } },
+    }),
+  };
+  const store = createProfileStore(io);
+  assert.equal(store.getSnapshot(), null);
+  assert.deepEqual(store.settings(), {});
+  await store.create("Work");
+  assert.equal(store.getSnapshot()!.profiles.length, 2);
+  const switched = await store.select("work");
+  assert.equal(store.getSnapshot()!.active, "work");
+  assert.equal(switched.unavailable[0].id, "acme.app");
+  failing = true;
+  await assert.rejects(store.select("gone"), /ProfileNotFound/);
+  assert.equal(store.getSnapshot()!.active, "work", "a refused switch shows nothing new");
+  await store.setSetting("acme.one", "acme.one.x", 1);
+  assert.deepEqual(store.settings(), { "acme.one": { "acme.one.x": 1 } });
+});
+
+test("EXT-14 an activation that fails or times out is reported by its code -- never with the extension's own text", async () => {
+  const reported: [string, string][] = [];
+  const t = setup({ report: (code, id) => reported.push([code, id]) });
+  t.add(
+    {},
+    `module.exports.activate = function () { throw new Error("token=supersecret123 at C:/Users/me"); };`,
+  );
+  const m = t.manager();
+  await assert.rejects(m.executeCommand("acme.hello.greet"));
+  assert.deepEqual(reported, [["ActivationFailed", "acme.hello"]]);
+  assert.ok(!JSON.stringify(reported).includes("supersecret123"));
 });

@@ -527,6 +527,31 @@ fn installs_and_refuses(
         "SignatureInvalid",
     );
     assert!(inventory(&root).operations.is_empty());
+    // EXT-14: each refusal is a trust diagnostic of the application's -- refused, with what to
+    // do, its detail redacted (no path of this machine).
+    let seen = service.diagnostics().visible("main", Some("acme.hello"));
+    for code in [
+        "SignatureMissing",
+        "SignatureInvalid",
+        "UntrustedKey",
+        "SignatureMalformed",
+        "VerificationUnavailable",
+        "IntegrityFailed",
+        "ManifestMismatch",
+    ] {
+        let found = seen
+            .iter()
+            .find(|d| d.code == code)
+            .unwrap_or_else(|| panic!("{code}: {seen:?}"));
+        assert!(found.refusal, "{code}");
+        assert!(found.window.is_none(), "an install is the application's");
+        assert!(found.remedy.is_some() || code == "UnsupportedPackage");
+    }
+    assert!(seen.iter().all(|d| !d
+        .detail
+        .as_deref()
+        .unwrap_or("")
+        .contains(&dir.display().to_string())));
     let _ = fs::remove_dir_all(&dir);
 }
 

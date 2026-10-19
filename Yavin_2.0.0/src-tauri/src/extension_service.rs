@@ -55,8 +55,11 @@
 //! privileged request, from the inventory in memory: a revocation holds for the next request.
 
 use crate::extension_dependencies as deps;
+use crate::extension_diagnostics::{self as diag, Diagnostic, Diagnostics, Event};
 use crate::extension_package::identity;
 use crate::extension_permissions::{declared, grantable, Denial};
+use crate::extension_profiles::{self as profiles, Profiles, ProfilesView};
+use crate::extension_secrets::{SecretBackend, SecretOwner, SecretScope, SecretStore};
 use crate::extensions::{discover, read_manifest, read_resource};
 use crate::package_trust::SignatureRecord;
 use ide_workspace::durable::{json_version, read_versioned, remove_durably, write_durably, Loaded};
@@ -181,6 +184,10 @@ pub struct Inventory {
     /// What the user allowed, per extension id (EXT-07). Absent in an older inventory: none.
     #[serde(default)]
     pub grants: BTreeMap<String, Grant>,
+    /// The extension profiles (EXT-13); the active one's enabled set is `disabled`. Absent
+    /// in an older inventory: the default profile alone, with what was disabled.
+    #[serde(default)]
+    pub profiles: Profiles,
 }
 
 impl Default for Inventory {
@@ -193,6 +200,7 @@ impl Default for Inventory {
             operations: BTreeMap::new(),
             recoveries: Vec::new(),
             grants: BTreeMap::new(),
+            profiles: Profiles::default(),
         }
     }
 }
@@ -267,10 +275,28 @@ pub struct HostCopy {
     pub sha256: Option<String>,
     pub stored: Option<String>,
     pub requested: BTreeSet<String>,
+    /// Where its copy came from (`Copy::source`; `development` for a sample): who its
+    /// secrets belong to (EXT-13).
+    pub origin: String,
     /// Its required dependencies (EXT-12): each must stay enabled, installed and in range for
     /// its code to act. `installed`: it was an installed copy (not a development one) when
     /// loaded.
     pub requires: Vec<HostRequirement>,
+}
+
+/// A profile switch (EXT-13): the profiles now, and which enabled extensions it leaves unable
+/// to load, and why.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSwitch {
+    pub profiles: ProfilesView,
+    pub unavailable: Vec<Unavailable>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct Unavailable {
+    pub id: String,
+    pub reason: String,
 }
 
 /// A required dependency of a loaded copy (EXT-12).
@@ -291,6 +317,8 @@ pub struct Listing {
     pub skipped: usize,
     pub disabled: Vec<String>,
     pub recoveries: Vec<Recovery>,
+    /// The extension profiles, and the active one's settings (EXT-13).
+    pub profiles: ProfilesView,
 }
 
 #[derive(Serialize, Debug)]
@@ -319,6 +347,13 @@ struct Inner {
 pub struct ExtensionService {
     paths: OnceLock<Paths>,
     inner: Mutex<Inner>,
+    /// Where extensions' secrets are kept (EXT-13): the platform's credential store unless a
+    /// test says otherwise.
+    secret_backend: Mutex<Option<std::sync::Arc<dyn SecretBackend>>>,
+    /// What happened to extensions (EXT-14), beside them.
+    diagnostics: OnceLock<Diagnostics>,
+    /// Safe mode (EXT-14): no extension code loads, whatever is enabled. It only refuses.
+    safe_mode: std::sync::atomic::AtomicBool,
     /// Test only: the step at which to stop as if Yavin crashed there.
     #[cfg(test)]
     pub crash_at: Mutex<Option<&'static str>>,
@@ -1204,6 +1239,13 @@ impl ExtensionService {
     /// After `commit`: keep the new copy, or roll back to the record as it was.
     pub fn finish(&self, op: &str, requested: &str, keep: bool) -> Result<(), String> {
         operation_id_ok(op)?;
+        if !keep {
+            self.diagnostics().record(
+                Event::new("InstallRolledBack", "update")
+                    .extension(canonical_id(requested).unwrap_or_default())
+                    .correlation(format!("install-{op}")),
+            );
+        }
         let (mut inner, paths) = self.lock()?;
         let id = inner
             .inventory
@@ -1282,6 +1324,7 @@ impl ExtensionService {
         let record = Self::write(&mut inner, paths, |inv| {
             inv.disabled.remove(&id);
             inv.grants.remove(&id);
+            profiles::forget_extension(&mut inv.profiles, &id);
             inv.extensions.remove(&id).ok_or_else(|| {
                 format!("UnknownExtension: {id} is not installed in Yavin's extensions folder.")
             })
@@ -1290,6 +1333,23 @@ impl ExtensionService {
             remove_copy(&paths.root, &folder);
         }
         let _ = fs::remove_dir(paths.root.join(STORE).join(&id));
+        // Its secrets go with it (EXT-13). If the store cannot delete them now, that is said;
+        // a later install from another origin still cannot read them (`SecretOwnerChanged`).
+        let store = self.secret_store(paths);
+        if let Err(why) = store.forget_extension(&id) {
+            if store.available() {
+                let _ = Self::write(&mut inner, paths, |inv| {
+                    note(
+                        inv,
+                        Some(&id),
+                        format!(
+                            "{id} was uninstalled, but its secrets could not be deleted: {why}"
+                        ),
+                    );
+                    Ok(())
+                });
+            }
+        }
         Ok(display(&join(&paths.root, &record.active.folder)))
     }
 
@@ -1305,6 +1365,315 @@ impl ExtensionService {
             }
             Ok(())
         })
+    }
+
+    // --- Profiles (EXT-13) -----------------------------------------------------------------------
+
+    pub fn profiles(&self) -> Result<ProfilesView, String> {
+        let (inner, _) = self.lock()?;
+        Ok(inner
+            .inventory
+            .as_ref()
+            .ok_or("InstallFailed")?
+            .profiles
+            .view())
+    }
+
+    /// One change to the profiles, written with the inventory or not at all.
+    fn change_profiles(
+        &self,
+        change: impl FnOnce(&mut Inventory) -> Result<(), String>,
+    ) -> Result<ProfilesView, String> {
+        let (mut inner, paths) = self.lock()?;
+        Self::write(&mut inner, paths, change)?;
+        Ok(inner
+            .inventory
+            .as_ref()
+            .ok_or("InstallFailed")?
+            .profiles
+            .view())
+    }
+
+    pub fn create_profile(&self, name: &str) -> Result<ProfilesView, String> {
+        self.change_profiles(|inv| {
+            let live = inv.disabled.clone();
+            profiles::create(&mut inv.profiles, &live, name).map(|_| ())
+        })
+    }
+
+    pub fn rename_profile(&self, id: &str, name: &str) -> Result<ProfilesView, String> {
+        self.change_profiles(|inv| profiles::rename(&mut inv.profiles, id, name))
+    }
+
+    /// Deletes profile `id` and its secrets -- the secrets first: if they cannot be deleted,
+    /// the profile is kept (nothing is left that no profile owns).
+    pub fn delete_profile(&self, id: &str) -> Result<ProfilesView, String> {
+        let (mut inner, paths) = self.lock()?;
+        let view = inner
+            .inventory
+            .as_ref()
+            .ok_or("InstallFailed")?
+            .profiles
+            .clone();
+        if id == view.active || id == profiles::DEFAULT || !view.list.contains_key(id) {
+            let mut probe = view;
+            profiles::delete(&mut probe, id)?;
+        }
+        let store = self.secret_store(paths);
+        if store.available() {
+            store.forget_profile(id)?;
+        }
+        Self::write(&mut inner, paths, |inv| {
+            profiles::delete(&mut inv.profiles, id)
+        })?;
+        Ok(inner
+            .inventory
+            .as_ref()
+            .ok_or("InstallFailed")?
+            .profiles
+            .view())
+    }
+
+    /// Makes `id` the active profile, in one write: from now on every load and request sees its
+    /// enabled set. Its enabled extensions whose required dependency it disables are said
+    /// (they do not load: EXT-12) -- the switch is not refused for them.
+    pub fn select_profile(&self, id: &str) -> Result<ProfileSwitch, String> {
+        let view = self.change_profiles(|inv| {
+            let mut live = std::mem::take(&mut inv.disabled);
+            let result = profiles::select(&mut inv.profiles, &mut live, id);
+            inv.disabled = live;
+            result
+        })?;
+        let (mut inner, paths) = self.lock()?;
+        let listed = self.reconcile(&mut inner, paths)?.0;
+        let mut unavailable = Vec::new();
+        for one in listed.iter().filter(|one| one.error.is_none()) {
+            let Some(own) = one.id.as_deref() else {
+                continue;
+            };
+            if inner
+                .inventory
+                .as_ref()
+                .is_some_and(|inv| inv.disabled.contains(own))
+            {
+                continue;
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(one.manifest.as_deref().unwrap_or("{}")).unwrap_or_default();
+            if let Err(why) = load_requirements(&inner, &listed, one, own) {
+                if value.get("main").is_some() || why.starts_with("DependencyUnavailable") {
+                    unavailable.push(Unavailable {
+                        id: own.to_string(),
+                        reason: why,
+                    });
+                }
+            }
+        }
+        for one in &unavailable {
+            self.diagnostics().record(
+                Event::new("ProfileDependency", "profile")
+                    .extension(one.id.clone())
+                    .detail(one.reason.clone())
+                    .correlation(format!("profile-{id}")),
+            );
+        }
+        Ok(ProfileSwitch {
+            profiles: view,
+            unavailable,
+        })
+    }
+
+    /// Sets (`None`: removes) extension `id`'s setting `key` in the active profile.
+    pub fn set_profile_setting(
+        &self,
+        id: &str,
+        key: &str,
+        value: Option<serde_json::Value>,
+    ) -> Result<ProfilesView, String> {
+        self.change_profiles(|inv| profiles::set_setting(&mut inv.profiles, id, key, value))
+    }
+
+    // --- Diagnostics and safe mode (EXT-14) ------------------------------------------------
+
+    /// The diagnostic log, beside the extensions (in memory only until the folder is known).
+    pub fn diagnostics(&self) -> &Diagnostics {
+        self.diagnostics.get_or_init(|| {
+            Diagnostics::in_folder(self.paths().ok().map(|paths| diag::folder_of(&paths.root)))
+        })
+    }
+
+    pub fn safe_mode(&self) -> bool {
+        self.safe_mode.load(Ordering::SeqCst)
+    }
+
+    /// Turns safe mode on or off (for this run of Yavin). On, no extension code loads; what is
+    /// enabled, installed, granted or signed is untouched.
+    pub fn set_safe_mode(&self, on: bool) {
+        if self.safe_mode.swap(on, Ordering::SeqCst) != on && on {
+            self.diagnostics().record(Event::new("SafeMode", "host"));
+        }
+    }
+
+    /// What `window` may see -- its own records, the application's, and the inventory's
+    /// recoveries (EXT-02) -- newest first; for one extension if `extension`.
+    pub fn diagnostics_for(&self, window: &str, extension: Option<&str>) -> Vec<Diagnostic> {
+        let mut records = self.diagnostics().visible(window, extension);
+        if let Ok((inner, _)) = self.lock() {
+            if let Some(inv) = inner.inventory.as_ref() {
+                for recovery in &inv.recoveries {
+                    if extension.is_some_and(|id| recovery.id.as_deref() != Some(id)) {
+                        continue;
+                    }
+                    let meaning = diag::classify("InventoryRecovered");
+                    records.push(Diagnostic {
+                        at: recovery.at,
+                        code: "InventoryRecovered".into(),
+                        category: meaning.category,
+                        severity: meaning.severity,
+                        refusal: meaning.refusal,
+                        extension: recovery.id.clone(),
+                        version: None,
+                        window: None,
+                        session: None,
+                        phase: "recovery".into(),
+                        summary: meaning.summary.into(),
+                        remedy: meaning.remedy.map(str::to_string),
+                        detail: Some(diag::redact(&recovery.reason)),
+                        correlation: None,
+                        count: 1,
+                        source: "native".into(),
+                    });
+                }
+            }
+        }
+        records.sort_by_key(|r| std::cmp::Reverse(r.at));
+        records.truncate(diag::MAX_RECORDS);
+        records
+    }
+
+    /// Clears what `window` may see (for one extension if `extension`): its diagnostic
+    /// records and the inventory's recovery notes. Nothing else -- no extension, grant, trust
+    /// record or secret -- is touched. How many.
+    pub fn clear_diagnostics(
+        &self,
+        window: &str,
+        extension: Option<&str>,
+    ) -> Result<usize, String> {
+        let mut cleared = self.diagnostics().clear(window, extension);
+        let (mut inner, paths) = self.lock()?;
+        let notes = inner.inventory.as_ref().map_or(0, |inv| {
+            inv.recoveries
+                .iter()
+                .filter(|r| extension.is_none_or(|id| r.id.as_deref() == Some(id)))
+                .count()
+        });
+        if notes > 0 {
+            Self::write(&mut inner, paths, |inv| {
+                inv.recoveries
+                    .retain(|r| extension.is_some_and(|id| r.id.as_deref() != Some(id)));
+                Ok(())
+            })?;
+            cleared += notes;
+        }
+        Ok(cleared)
+    }
+
+    // --- Secrets (EXT-13) --------------------------------------------------------------------
+
+    /// Test only: another credential store.
+    #[cfg(test)]
+    pub fn use_secret_backend(&self, backend: std::sync::Arc<dyn SecretBackend>) {
+        *self.secret_backend.lock().unwrap() = Some(backend);
+    }
+
+    fn secret_store(&self, paths: &Paths) -> SecretStore {
+        let backend = self
+            .secret_backend
+            .lock()
+            .ok()
+            .and_then(|b| b.clone())
+            .unwrap_or_else(crate::extension_secrets::platform);
+        SecretStore::new(backend, &paths.root)
+    }
+
+    /// A secret request of the code of `copy` (`secrets.get|store|delete`), in `workspace`
+    /// (the one its host was started in): allowed for that very copy now (EXT-07: the
+    /// `secrets` grant, enabled, still installed, its dependencies there), then done in the OS
+    /// store for its owner (its id and origin), the active profile and the scope asked. The
+    /// answer is the value for a read; nothing else carries one.
+    pub fn secret(
+        &self,
+        copy: &HostCopy,
+        workspace: Option<&str>,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, Denial> {
+        self.authorize(copy, Some(crate::extension_permissions::SECRETS))?;
+        let (inner, paths) = self
+            .lock()
+            .map_err(|why| Denial::new("InventoryUnavailable", why))?;
+        let profile = inner
+            .inventory
+            .as_ref()
+            .map(|inv| inv.profiles.active.clone())
+            .unwrap_or_else(|| profiles::DEFAULT.into());
+        drop(inner);
+        let refused = |text: String| {
+            let (code, message) = text
+                .split_once(": ")
+                .unwrap_or(("SecretFailed", text.as_str()));
+            let code: &'static str = match code {
+                "SecretInvalid" => "SecretInvalid",
+                "SecretTooLarge" => "SecretTooLarge",
+                "SecretCorrupted" => "SecretCorrupted",
+                "SecretOwnerChanged" => "SecretOwnerChanged",
+                "SecretStorageUnavailable" => "SecretStorageUnavailable",
+                _ => "SecretFailed",
+            };
+            Denial::new(code, message.to_string())
+        };
+        let scope = SecretScope {
+            profile,
+            workspace: match params.get("scope").and_then(serde_json::Value::as_str) {
+                Some("workspace") => Some(workspace.map(str::to_string).ok_or_else(|| {
+                    Denial::new("NoWorkspace", "There is no workspace to keep a secret in.")
+                })?),
+                _ => None,
+            },
+        };
+        let owner = SecretOwner {
+            id: copy.id.clone(),
+            origin: copy.origin.clone(),
+        };
+        let key = params
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let store = self.secret_store(paths);
+        match method {
+            "secrets.get" => store
+                .get(&owner, &scope, key)
+                .map(|value| value.map_or(serde_json::Value::Null, serde_json::Value::String))
+                .map_err(refused),
+            "secrets.store" => {
+                let value = params
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                store
+                    .store(&owner, &scope, key, value)
+                    .map(|()| serde_json::Value::Null)
+                    .map_err(refused)
+            }
+            "secrets.delete" => store
+                .delete(&owner, &scope, key)
+                .map(serde_json::Value::Bool)
+                .map_err(refused),
+            _ => Err(Denial::new(
+                "UnknownMethod",
+                format!("\"{method}\" is not a secrets method."),
+            )),
+        }
     }
 
     // --- Listing and the host's choice ---------------------------------------------------------
@@ -1331,6 +1700,7 @@ impl ExtensionService {
             skipped,
             disabled: inventory.disabled.iter().cloned().collect(),
             recoveries: inventory.recoveries.clone(),
+            profiles: inventory.profiles.view(),
         })
     }
 
@@ -1427,6 +1797,11 @@ impl ExtensionService {
     pub fn host_copy(&self, requested: &str) -> Result<HostCopy, String> {
         let id = canonical_id(requested)
             .ok_or_else(|| format!("UnknownExtension: \"{requested}\" is not an extension id."))?;
+        if self.safe_mode() {
+            return Err(format!(
+                "SafeMode: safe mode is on: {id}'s code does not run until it is turned off."
+            ));
+        }
         let (mut inner, paths) = self.lock()?;
         let (listed, _) = self.reconcile(&mut inner, paths)?;
         let disabled = inner
@@ -1452,6 +1827,17 @@ impl ExtensionService {
         };
         // Its API and its dependencies (EXT-12), natively, whatever the window believes.
         let requires = load_requirements(&inner, &listed, &chosen, &id)?;
+        let origin = match (
+            chosen.source,
+            inner
+                .inventory
+                .as_ref()
+                .and_then(|inv| inv.extensions.get(&id)),
+        ) {
+            ("installed", Some(record)) => record.active.source.clone(),
+            ("installed", None) => "unknown".into(),
+            _ => "development".into(),
+        };
         Ok(HostCopy {
             id,
             folder: chosen.folder,
@@ -1460,6 +1846,7 @@ impl ExtensionService {
             sha256: copy.sha256,
             stored: copy.stored,
             requested: state.requested.into_iter().collect(),
+            origin,
             requires,
         })
     }
@@ -1865,6 +2252,10 @@ fn sanitized(mut inventory: Inventory) -> Inventory {
             "Extension permissions that are not valid were dropped; those extensions are allowed nothing until they are allowed again.".into(),
         );
     }
+    // Profiles that are not valid are made so, and said (EXT-13).
+    for why in profiles::normalize(&mut inventory.profiles) {
+        note(&mut inventory, None, why);
+    }
     if before != (inventory.extensions.len(), inventory.operations.len()) {
         note(
             &mut inventory,
@@ -2019,6 +2410,116 @@ pub fn extensions_set_enabled(
     enabled: bool,
 ) -> Result<(), String> {
     service.set_enabled(&id, enabled)
+}
+
+/// What the calling window may see of extensions' diagnostics (EXT-14): newest first.
+#[tauri::command(async)]
+pub fn extensions_diagnostics(
+    webview: tauri::Webview,
+    service: State<'_, ExtensionService>,
+    id: Option<String>,
+) -> Result<Vec<Diagnostic>, String> {
+    Ok(service.diagnostics_for(webview.label(), id.as_deref()))
+}
+
+/// The redacted report of those, for the user to copy.
+#[tauri::command(async)]
+pub fn extensions_diagnostics_report(
+    webview: tauri::Webview,
+    service: State<'_, ExtensionService>,
+    id: Option<String>,
+) -> Result<String, String> {
+    let records = service.diagnostics_for(webview.label(), id.as_deref());
+    Ok(diag::render_report(&records, env!("CARGO_PKG_VERSION")))
+}
+
+/// Clears what the calling window may see.
+#[tauri::command(async)]
+pub fn extensions_diagnostics_clear(
+    webview: tauri::Webview,
+    service: State<'_, ExtensionService>,
+    id: Option<String>,
+) -> Result<usize, String> {
+    service.clear_diagnostics(webview.label(), id.as_deref())
+}
+
+/// What the window observed (an activation that timed out, say): one of a few codes,
+/// classified and redacted here, marked as the window's -- it decides nothing.
+#[tauri::command(async)]
+pub fn extensions_diagnostics_note(
+    webview: tauri::Webview,
+    service: State<'_, ExtensionService>,
+    code: String,
+    id: Option<String>,
+    detail: Option<String>,
+) -> Result<Diagnostic, String> {
+    let mut event = Event::new(&code, "activation");
+    event.extension = id;
+    event.detail = detail;
+    service
+        .diagnostics()
+        .record_from_window(webview.label(), event)
+}
+
+/// Safe mode (EXT-14): on, no extension code loads (for this run of Yavin).
+#[tauri::command(async)]
+pub fn extensions_safe_mode(
+    service: State<'_, ExtensionService>,
+    enabled: Option<bool>,
+) -> Result<bool, String> {
+    if let Some(on) = enabled {
+        service.set_safe_mode(on);
+    }
+    Ok(service.safe_mode())
+}
+
+/// The extension profiles (EXT-13).
+#[tauri::command(async)]
+pub fn extensions_profiles(service: State<'_, ExtensionService>) -> Result<ProfilesView, String> {
+    service.profiles()
+}
+
+#[tauri::command(async)]
+pub fn extensions_profile_create(
+    service: State<'_, ExtensionService>,
+    name: String,
+) -> Result<ProfilesView, String> {
+    service.create_profile(&name)
+}
+
+#[tauri::command(async)]
+pub fn extensions_profile_rename(
+    service: State<'_, ExtensionService>,
+    id: String,
+    name: String,
+) -> Result<ProfilesView, String> {
+    service.rename_profile(&id, &name)
+}
+
+#[tauri::command(async)]
+pub fn extensions_profile_delete(
+    service: State<'_, ExtensionService>,
+    id: String,
+) -> Result<ProfilesView, String> {
+    service.delete_profile(&id)
+}
+
+#[tauri::command(async)]
+pub fn extensions_profile_select(
+    service: State<'_, ExtensionService>,
+    id: String,
+) -> Result<ProfileSwitch, String> {
+    service.select_profile(&id)
+}
+
+#[tauri::command(async)]
+pub fn extensions_profile_setting(
+    service: State<'_, ExtensionService>,
+    id: String,
+    key: String,
+    value: Option<serde_json::Value>,
+) -> Result<ProfilesView, String> {
+    service.set_profile_setting(&id, &key, value)
 }
 
 /// Allows exactly `capabilities` for an extension's installed copy, the `version` the user

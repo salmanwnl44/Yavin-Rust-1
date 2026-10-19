@@ -6,6 +6,7 @@
  */
 import { native, type NativePermissions, type NativeSignature } from "../native.ts";
 import { DISABLED_KEY, readStoredDisabled, type ExtensionRegistry } from "./registry.ts";
+import { profileStore, type ProfilesView } from "./profiles.ts";
 
 export interface DiscoveryReport {
   root: string | null;
@@ -32,6 +33,8 @@ export interface Listing {
   skipped: number;
   /** The inventory's disabled ids (absent: this window's storage keeps them). */
   disabled?: string[];
+  /** The extension profiles (EXT-13). */
+  profiles?: ProfilesView;
 }
 
 /**
@@ -114,6 +117,7 @@ export async function discoverExtensions(
   const found = await list();
   userRoot = found.root;
   if (found.disabled) registry.setDisabled(found.disabled);
+  if (found.profiles) profileStore.set(found.profiles);
   let registered = 0;
   let rejected = 0;
   for (const one of found.extensions) {

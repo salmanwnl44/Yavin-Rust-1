@@ -588,6 +588,29 @@ pub fn stage(
     expected_id: &str,
     expected_version: &str,
 ) -> Result<Staged, String> {
+    // What went wrong is recorded (EXT-14) -- the code and the redacted message, never the
+    // package or what the registry sent.
+    let staged = stage_package(service, source, expected_id, expected_version);
+    if let Err(error) = &staged {
+        service.diagnostics().record(
+            crate::extension_diagnostics::Event::new(
+                crate::extension_diagnostics::code_of(error),
+                "install",
+            )
+            .extension(expected_id.to_string())
+            .version(expected_version.to_string())
+            .detail(error.clone()),
+        );
+    }
+    staged
+}
+
+fn stage_package(
+    service: &ExtensionService,
+    source: PackageSource,
+    expected_id: &str,
+    expected_version: &str,
+) -> Result<Staged, String> {
     let label = match &source {
         PackageSource::Registry { registry_url, .. } => format!("registry {registry_url}"),
         PackageSource::File { .. } => "file".to_string(),

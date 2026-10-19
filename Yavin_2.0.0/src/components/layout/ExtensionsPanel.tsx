@@ -14,6 +14,10 @@ import type {
   MarketplaceExtension,
 } from "../../services/extensions/marketplace/types";
 import { CardButton, ExtensionCard } from "../extensions/ExtensionCard";
+import { ExtensionProfiles } from "../extensions/ExtensionProfiles";
+import { ExtensionDiagnostics } from "../extensions/ExtensionDiagnostics";
+import { nativeDiagnostics } from "../../services/extensions/diagnostics";
+import { profileStore } from "../../services/extensions/profiles";
 import { statusOf, useExtensionsState, useStore } from "../extensions/model";
 import { ContextMenu, type MenuItem } from "../ui/ContextMenu";
 import { CloseIcon, FilterIcon, MoreIcon, RefreshIcon, SearchIcon } from "../ui/Icons";
@@ -284,6 +288,8 @@ export function ExtensionsPanel({
     label: string;
   } | null>(null);
   const [diagnostics, setDiagnostics] = useState(false);
+  const [profilesShown, setProfilesShown] = useState(false);
+  const [diagnosticsShown, setDiagnosticsShown] = useState(false);
   const [categories, setCategories] = useState<{
     status: "idle" | "loading" | "loaded" | "error";
     items: ExtensionCategory[];
@@ -432,6 +438,16 @@ export function ExtensionsPanel({
           ] as MenuItem[])
         : []),
       { divider: true },
+      {
+        label: "Show Extension Diagnostics",
+        checked: diagnosticsShown,
+        onClick: () => setDiagnosticsShown(!diagnosticsShown),
+      },
+      {
+        label: "Show Extension Profiles",
+        checked: profilesShown,
+        onClick: () => setProfilesShown(!profilesShown),
+      },
       {
         label: "Show Runtime Diagnostics",
         checked: diagnostics,
@@ -874,6 +890,19 @@ export function ExtensionsPanel({
               </div>
             ))}
           </section>
+        )}
+
+        {diagnosticsShown && (
+          <ExtensionDiagnostics
+            io={nativeDiagnostics}
+            isEnabled={(id) => registry.get(id)?.enabled ?? false}
+            onDisable={(id) => registry.setEnabled(id, false)}
+            onSafeModeChanged={() => manager.reload()}
+          />
+        )}
+
+        {profilesShown && (
+          <ExtensionProfiles store={profileStore} onSwitched={() => manager.reload()} />
         )}
 
         {diagnostics && (

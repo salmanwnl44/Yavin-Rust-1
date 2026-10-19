@@ -122,6 +122,10 @@ export const DEFAULT_TIMEOUTS: HostTimeouts = {
 };
 
 export interface ExtensionHostOptions {
+  /** Tells the native diagnostics what only the window saw (EXT-14); best effort. */
+  report?: (code: string, extensionId: string) => void;
+  /** The active extension profile's setting values (EXT-13), per extension. */
+  profileSettings?: () => Readonly<Record<string, Readonly<Record<string, unknown>>>>;
   registry: ExtensionRegistry;
   settings: SettingsRegistry;
   storage: ExtensionStorage;
@@ -650,11 +654,21 @@ export function createExtensionHost(options: ExtensionHostOptions) {
   };
   const windowOf = () =>
     options.window ?? fail("Unavailable", "This window offers no documents or editor.");
+  /**
+   * An extension's own settings, as it sees them (EXT-13): a value set for this workspace, else
+   * the active profile's (if valid for the setting), else the user's, else the default.
+   */
   const configurationOf = (one: Running) => {
     const values: Record<string, unknown> = {};
+    const profiled = options.profileSettings?.()[one.entry.id] ?? {};
     for (const setting of one.entry.manifest.contributes.settings) {
       const definition = options.registry.settingDefinition(setting.id);
-      if (definition) values[setting.id] = options.settings.get(definition, options.workspace);
+      if (!definition) continue;
+      const seen = options.settings.inspect(definition, options.workspace);
+      const fromProfile =
+        setting.id in profiled ? definition.parse(profiled[setting.id]) : undefined;
+      values[setting.id] =
+        seen.source === "workspace" || fromProfile === undefined ? seen.value : fromProfile;
     }
     return values;
   };
@@ -1070,6 +1084,11 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       } catch (error) {
         const reason = `Activation failed: ${(error as Error)?.message ?? String(error)}`;
         log(one, "error", reason);
+        // Recorded natively (EXT-14) -- the code only: the message is the extension's own text.
+        options.report?.(
+          (error as ExtensionError)?.code === "Timeout" ? "ActivationTimeout" : "ActivationFailed",
+          id,
+        );
         // Failed first: from now on nothing it asks is served (not a late registration).
         if (one.status.state === "activating") move(one, "failed", reason);
         clearContributions(id);

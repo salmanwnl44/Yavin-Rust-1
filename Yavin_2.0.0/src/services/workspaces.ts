@@ -28,6 +28,8 @@ import { createExtensionStorage } from "./extensions/storage.ts";
 import { createExtensionHostManager, type ExtensionHostManager } from "./extensions/manager.ts";
 import { createNativeHostTransport } from "./extensions/transport.ts";
 import { HOST_RESOURCE_SETTING_LIST, hostResources } from "./extensions/hostResources.ts";
+import { profileStore } from "./extensions/profiles.ts";
+import { nativeDiagnostics } from "./extensions/diagnostics.ts";
 import { installedRoot, rediscoverExtensions, refreshGrants } from "./extensions/discovery.ts";
 import {
   createExtensionInstaller,
@@ -352,6 +354,10 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
           workspace: folders.length ? id : null,
           folder: folders[0] ?? null,
           workspaceGeneration: lifecycle.generation,
+          // What only the window sees of an extension's failures, recorded natively (EXT-14).
+          report: (code, id) => void nativeDiagnostics.note(code, id).catch(() => undefined),
+          // The active extension profile's setting values (EXT-13).
+          profileSettings: () => profileStore.settings(),
           // Each host starts with the user's resource settings (EXT-10).
           transport: createNativeHostTransport(() => hostResources(settings)),
           window: windowProxy,

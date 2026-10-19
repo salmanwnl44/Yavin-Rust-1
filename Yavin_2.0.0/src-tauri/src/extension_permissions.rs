@@ -16,6 +16,7 @@
 //! | `documents.read` | `documents.all/get/getText`, `editor.active`; receiving the `documents.*` and `editor.active` events |
 //! | `editor.control` | `editor.openLocation`, `editor.setSelection`, `editor.revealRange` |
 //! | `commands.execute:<id>` | `commands.execute` of a command `<id>` contributes (another extension's) |
+//! | `secrets` | `secrets.get`, `secrets.store`, `secrets.delete` -- its own, kept by Yavin in the OS credential store (EXT-13) |
 //!
 //! Nothing else exists: no network, process, file-write or settings-of-others capability, and
 //! a request for a method not listed here needs a capability no extension can have (`Unknown`).
@@ -37,6 +38,8 @@ pub const DOCUMENTS_READ: &str = "documents.read";
 pub const EDITOR_CONTROL: &str = "editor.control";
 /// `commands.execute:<extension id>`: the other extension's commands.
 pub const COMMANDS_EXECUTE: &str = "commands.execute:";
+/// Keeping its own secrets in the OS credential store (EXT-13).
+pub const SECRETS: &str = "secrets";
 /// What a manifest without `permissions` is taken to request.
 pub const LEGACY: [&str; 3] = [DOCUMENTS_READ, EDITOR_CONTROL, FS_READ];
 
@@ -44,7 +47,7 @@ pub const LEGACY: [&str; 3] = [DOCUMENTS_READ, EDITOR_CONTROL, FS_READ];
 /// asking: its own commands need no capability, so naming them is not one.
 pub fn capability(raw: &str, owner: &str) -> Option<String> {
     match raw {
-        FS_READ | DOCUMENTS_READ | EDITOR_CONTROL => Some(raw.to_string()),
+        FS_READ | DOCUMENTS_READ | EDITOR_CONTROL | SECRETS => Some(raw.to_string()),
         _ => {
             let target = canonical_id(raw.strip_prefix(COMMANDS_EXECUTE)?)?;
             (target != owner).then(|| format!("{COMMANDS_EXECUTE}{target}"))
@@ -221,6 +224,22 @@ pub fn need_of_request(caller: &str, method: &str, params: &Value) -> Need {
             need(EDITOR_CONTROL)
         }
         "fs.readFile" | "fs.exists" => need(FS_READ),
+        // Its own secrets (EXT-13): handled natively, never passed to the window.
+        "secrets.get" | "secrets.store" | "secrets.delete" => {
+            let scope_ok = params.get("scope").is_none_or(|s| {
+                s.as_str()
+                    .is_some_and(|s| s == "installation" || s == "workspace")
+            });
+            let value_ok = method != "secrets.store" || string(params, "value").is_some();
+            match string(params, "key") {
+                Some(_) if scope_ok && value_ok => need(SECRETS),
+                Some(_) if !scope_ok => {
+                    Need::Invalid("\"scope\" must be \"installation\" or \"workspace\"".into())
+                }
+                Some(_) => Need::Invalid("\"value\" must be a string".into()),
+                None => Need::Invalid("\"key\" must be a string".into()),
+            }
+        }
         _ => Need::Unknown,
     }
 }

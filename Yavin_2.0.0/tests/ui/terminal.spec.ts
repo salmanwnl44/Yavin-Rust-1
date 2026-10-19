@@ -180,6 +180,55 @@ async function desktop(
       const market = { down: setup.marketplace?.down ?? false, failCommit: false };
       /** Installed through the marketplace: id → manifest text and code. */
       const installedExtensions: Record<string, { manifest: string; code: string | null }> = {};
+      // The native extension profiles (EXT-13), as the mock holds them.
+      const profiles = {
+        active: "default",
+        profiles: [{ id: "default", name: "Default" }] as { id: string; name: string }[],
+        settings: {} as Record<string, Record<string, unknown>>,
+      };
+      const profileView = () => ({ ...profiles, profiles: [...profiles.profiles] });
+      // The native extension diagnostics (EXT-14): already classified and redacted, as the
+      // native side answers.
+      let diagnostics = [
+        {
+          at: 1_790_000_000,
+          code: "SignatureInvalid",
+          category: "trust",
+          severity: "error",
+          refusal: true,
+          extension: "acme.untrusted",
+          version: "1.0.0",
+          window: null,
+          session: null,
+          phase: "install",
+          summary:
+            "The package's signature did not verify under a key Yavin trusts, so it was not installed.",
+          remedy: "Do not install it from this source.",
+          detail: "SignatureInvalid: acme.untrusted 1.0.0's signature does not match",
+          correlation: null,
+          count: 1,
+          source: "native",
+        },
+        {
+          at: 1_790_000_100,
+          code: "HostCrashed",
+          category: "crash",
+          severity: "error",
+          refusal: false,
+          extension: "yavin-samples.hello-world",
+          version: "2.0.0",
+          window: "main",
+          session: 3,
+          phase: "host",
+          summary: "The extension host ended unexpectedly.",
+          remedy: "If it repeats, disable the extension that was running.",
+          detail: "exit code 1",
+          correlation: "session-3",
+          count: 4,
+          source: "native",
+        },
+      ];
+      let safeMode = false;
       const staged: Record<string, { id: string; manifest: string; code: string | null }> = {};
       const aside: Record<string, { manifest: string; code: string | null } | undefined> = {};
       let nextToken = 1;
@@ -758,8 +807,46 @@ async function desktop(
             }
             // The installed extensions (the user's folder first) and the sample (as a development
             // build finds it).
+            if (command === "extensions_diagnostics") return diagnostics;
+            if (command === "extensions_diagnostics_report")
+              return "Yavin extension diagnostics\n[native report: redacted]";
+            if (command === "extensions_diagnostics_clear") {
+              const n = diagnostics.length;
+              diagnostics = [];
+              return n;
+            }
+            if (command === "extensions_diagnostics_note") return null;
+            if (command === "extensions_safe_mode") {
+              if (typeof args.enabled === "boolean") safeMode = args.enabled;
+              return safeMode;
+            }
+            if (command === "extensions_profile_create") {
+              const id = String(args.name)
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, "-");
+              profiles.profiles.push({ id, name: String(args.name) });
+              return profileView();
+            }
+            if (command === "extensions_profile_select") {
+              if (!profiles.profiles.some((p) => p.id === args.id))
+                throw `ProfileNotFound: there is no extension profile "${args.id}".`;
+              profiles.active = String(args.id);
+              return { profiles: profileView(), unavailable: [] };
+            }
+            if (command === "extensions_profile_rename") {
+              const found = profiles.profiles.find((p) => p.id === args.id)!;
+              found.name = String(args.name);
+              return profileView();
+            }
+            if (command === "extensions_profile_delete") {
+              if (args.id === profiles.active)
+                throw "ProfileActive: switch to another profile before deleting this one.";
+              profiles.profiles = profiles.profiles.filter((p) => p.id !== args.id);
+              return profileView();
+            }
             if (command === "extensions_list")
               return {
+                profiles: profileView(),
                 root: "/data/extensions",
                 extensions: [
                   ...Object.entries(installedExtensions).map(([id, one]) => ({
@@ -4366,4 +4453,84 @@ test("the command palette drives the Extensions view", async ({ page }) => {
     .click();
   await (await palette(page, "Extensions: Installed Extensions")).click();
   await expect(sampleState(view)).toHaveText("Disabled");
+});
+
+test("extension profiles: created, switched to (extensions reload), renamed, deleted -- each as the native side answers", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await view.getByRole("button", { name: "More actions" }).click();
+  await page.getByRole("menuitemcheckbox", { name: "Show Extension Profiles" }).click();
+  const section = view.getByRole("region", { name: "Extension profiles" });
+  await expect(section).toContainText("Default (active)");
+  await section.getByRole("textbox", { name: "New profile name" }).fill("Work");
+  await section.getByRole("button", { name: "Create" }).click();
+  await expect(section.getByRole("button", { name: "Switch to Work" })).toBeVisible();
+  const listed = await countCalls(page, "extensions_list");
+  await section.getByRole("button", { name: "Switch to Work" }).click();
+  await expect(section).toContainText("Work (active)");
+  // The switch reloaded the extensions (the inventory listed again).
+  await expect.poll(() => countCalls(page, "extensions_list")).toBeGreaterThan(listed);
+  expect((await calls(page, "extensions_profile_select")).at(-1)?.args).toEqual({ id: "work" });
+  // The active one cannot be deleted (and is not offered); the default never.
+  await expect(section.getByRole("button", { name: "Delete Work" })).toHaveCount(0);
+  await expect(section.getByRole("button", { name: "Delete Default" })).toHaveCount(0);
+  await section.getByRole("button", { name: "Rename Work" }).click();
+  const rename = section.getByRole("textbox", { name: "New name for Work" });
+  await rename.fill("Office");
+  await rename.press("Enter");
+  await expect(section).toContainText("Office (active)");
+  await section.getByRole("button", { name: "Switch to Default" }).click();
+  await expect(section).toContainText("Default (active)");
+  await section.getByRole("button", { name: "Delete Office" }).click();
+  await expect(section).not.toContainText("Office");
+});
+
+test("extension diagnostics: refused and failed told apart, what to do next, the native report copied, cleared; disable and safe mode", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async (text: string) =>
+          void ((window as unknown as { __copied: string }).__copied = text),
+      },
+    });
+  });
+  await view.getByRole("button", { name: "More actions" }).click();
+  await page.getByRole("menuitemcheckbox", { name: "Show Extension Diagnostics" }).click();
+  const section = view.getByRole("region", { name: "Extension diagnostics" });
+  const trust = section.locator('li[data-code="SignatureInvalid"]');
+  await expect(trust).toContainText("Refused");
+  await expect(trust).toContainText("Package trust");
+  await expect(trust).toContainText("Next: Do not install it from this source.");
+  const crash = section.locator('li[data-code="HostCrashed"]');
+  await expect(crash).toContainText("Failed");
+  await expect(crash).toContainText("×4");
+  // A refusal offers no way around it; a failure of an enabled extension offers to disable it.
+  await expect(trust.getByRole("button")).toHaveCount(0);
+  await crash.getByRole("button", { name: "Disable yavin-samples.hello-world" }).click();
+  await expect(section.getByTestId("diagnostics-notice")).toContainText("was disabled");
+  expect((await calls(page, "extensions_set_enabled")).at(-1)?.args).toMatchObject({
+    id: "yavin-samples.hello-world",
+    enabled: false,
+  });
+  // The report copied is the native side's, as it is.
+  await section.getByRole("button", { name: "Copy report" }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { __copied?: string }).__copied))
+    .toBe("Yavin extension diagnostics\n[native report: redacted]");
+  // Safe mode: asked of the native side, and extensions reloaded.
+  const listed = await countCalls(page, "extensions_list");
+  await section.getByRole("checkbox").check();
+  await expect.poll(() => countCalls(page, "extensions_list")).toBeGreaterThan(listed);
+  expect((await calls(page, "extensions_safe_mode")).some((c) => c.args.enabled === true)).toBe(
+    true,
+  );
+  await section.getByRole("button", { name: "Clear" }).click();
+  await expect(section).toContainText("Nothing to report.");
 });

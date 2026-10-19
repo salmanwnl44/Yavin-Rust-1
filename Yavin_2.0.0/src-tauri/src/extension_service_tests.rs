@@ -2346,3 +2346,637 @@ fn ext12_loading_and_every_request_check_the_api_and_dependencies_natively() {
         "1.0.0"
     );
 }
+
+// --- EXT-13: profiles and secrets through the inventory ----------------------------------------
+
+use crate::extension_secrets::tests::{Failing, MemoryBackend};
+
+fn with_memory_secrets(service: &ExtensionService) -> std::sync::Arc<MemoryBackend> {
+    let backend = std::sync::Arc::new(MemoryBackend::default());
+    service.use_secret_backend(backend.clone());
+    backend
+}
+
+/// An installed extension that asks for `secrets`, and the grant of it.
+fn secret_keeper(fx: &Fixture, service: &ExtensionService, id: &str) -> HostCopy {
+    install_with(
+        fx,
+        service,
+        id,
+        "1.0.0",
+        serde_json::json!({"permissions": {"version": 1, "request": ["secrets"]}}),
+    )
+    .unwrap();
+    service
+        .set_grants(id, None, &strings(&["secrets"]))
+        .unwrap();
+    service.host_copy(id).unwrap()
+}
+
+fn secret(
+    service: &ExtensionService,
+    copy: &HostCopy,
+    workspace: Option<&str>,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, Denial> {
+    service.secret(copy, workspace, method, &params)
+}
+
+#[test]
+fn ext13_profiles_switch_the_enabled_set_in_one_write_and_survive_a_restart() {
+    let fx = fixture("ext13-profiles");
+    let service = fx.service();
+    install(&fx, &service, "acme.one", "1.0.0");
+    install(&fx, &service, "acme.two", "1.0.0");
+    service.set_enabled("acme.two", false).unwrap();
+    let work = service.create_profile("Work").unwrap();
+    assert_eq!(work.profiles.len(), 2);
+    // The new profile starts as the active one is; switching to it changes nothing yet.
+    let switched = service.select_profile("work").unwrap();
+    assert_eq!(switched.profiles.active, "work");
+    assert!(inventory(&fx).disabled.contains("acme.two"));
+    // In "work", one is disabled and two enabled; "default" keeps what it had.
+    service.set_enabled("acme.one", false).unwrap();
+    service.set_enabled("acme.two", true).unwrap();
+    service.select_profile("default").unwrap();
+    assert_eq!(
+        inventory(&fx).disabled.iter().cloned().collect::<Vec<_>>(),
+        ["acme.two"]
+    );
+    assert!(service.host_copy("acme.one").is_ok());
+    assert!(service
+        .host_copy("acme.two")
+        .unwrap_err()
+        .starts_with("ExtensionDisabled"));
+    drop(service);
+    // A restart reads the same.
+    let service = fx.service();
+    assert_eq!(service.profiles().unwrap().active, "default");
+    service.select_profile("work").unwrap();
+    assert!(service
+        .host_copy("acme.one")
+        .unwrap_err()
+        .starts_with("ExtensionDisabled"));
+    assert!(service.host_copy("acme.two").is_ok());
+    // Renamed, then deleted (not while active, never the default).
+    service.rename_profile("work", "Office").unwrap();
+    assert!(service
+        .delete_profile("work")
+        .unwrap_err()
+        .starts_with("ProfileActive"));
+    assert!(service.delete_profile("default").is_err());
+    service.select_profile("default").unwrap();
+    service.delete_profile("work").unwrap();
+    assert_eq!(service.profiles().unwrap().profiles.len(), 1);
+    assert!(service
+        .select_profile("work")
+        .unwrap_err()
+        .starts_with("ProfileNotFound"));
+    // Uninstall forgets it in every profile.
+    service.create_profile("Other").unwrap();
+    service.uninstall("acme.two").unwrap();
+    assert!(inventory(&fx)
+        .profiles
+        .list
+        .values()
+        .all(|p| !p.disabled.contains("acme.two")));
+    assert!(!inventory(&fx).disabled.contains("acme.two"));
+}
+
+#[test]
+fn ext13_a_profile_never_grants_and_its_dependencies_are_said() {
+    let fx = fixture("ext13-profile-deps");
+    let service = fx.service();
+    install_with(&fx, &service, "acme.base", "1.0.0", serde_json::json!({})).unwrap();
+    install_with(&fx, &service, "acme.app", "1.0.0", serde_json::json!({"dependencies": {"acme.base": "^1.0.0"}, "permissions": {"version": 1, "request": ["documents.read"]}})).unwrap();
+    service.create_profile("Lean").unwrap();
+    service.select_profile("lean").unwrap();
+    service.set_enabled("acme.base", false).unwrap();
+    service.select_profile("default").unwrap();
+    // Switching to a profile that disables a required dependency: done, and said.
+    let switched = service.select_profile("lean").unwrap();
+    assert_eq!(switched.unavailable.len(), 1, "{:?}", switched.unavailable);
+    assert_eq!(switched.unavailable[0].id, "acme.app");
+    assert!(switched.unavailable[0]
+        .reason
+        .starts_with("DependencyUnavailable"));
+    assert!(service
+        .host_copy("acme.app")
+        .unwrap_err()
+        .starts_with("DependencyUnavailable"));
+    // Back: it loads -- and a profile never granted it anything.
+    service.select_profile("default").unwrap();
+    let app = service.host_copy("acme.app").unwrap();
+    assert_eq!(
+        service
+            .authorize(&app, Some("documents.read"))
+            .unwrap_err()
+            .code,
+        "PermissionDenied"
+    );
+}
+
+#[test]
+fn ext13_profile_settings_are_an_extensions_own_and_per_profile() {
+    let fx = fixture("ext13-settings");
+    let service = fx.service();
+    install(&fx, &service, "acme.one", "1.0.0");
+    service
+        .set_profile_setting("acme.one", "acme.one.color", Some(serde_json::json!("red")))
+        .unwrap();
+    assert!(service
+        .set_profile_setting("acme.one", "acme.two.color", Some(serde_json::json!("x")))
+        .is_err());
+    service.create_profile("Work").unwrap();
+    service.select_profile("work").unwrap();
+    service
+        .set_profile_setting(
+            "acme.one",
+            "acme.one.color",
+            Some(serde_json::json!("blue")),
+        )
+        .unwrap();
+    assert_eq!(
+        service.list(None).unwrap().profiles.settings["acme.one"]["acme.one.color"],
+        serde_json::json!("blue")
+    );
+    service.select_profile("default").unwrap();
+    assert_eq!(
+        service.list(None).unwrap().profiles.settings["acme.one"]["acme.one.color"],
+        serde_json::json!("red")
+    );
+}
+
+#[test]
+fn ext13_corrupted_profiles_fall_back_to_the_default_and_are_said() {
+    let fx = fixture("ext13-corrupt");
+    drop(installed(&fx));
+    let mut inv = inventory(&fx);
+    inv.profiles.active = "vanished".into();
+    inv.profiles.list.insert(
+        "Bad Id".into(),
+        crate::extension_profiles::Profile {
+            name: "x".into(),
+            disabled: Default::default(),
+            settings: Default::default(),
+        },
+    );
+    let text = serde_json::to_string(&inv).unwrap();
+    fs::write(fx.root.join(INVENTORY), &text).unwrap();
+    fs::write(fx.root.join(LAST_GOOD), &text).unwrap();
+    let service = fx.service();
+    let profiles = service.profiles().unwrap();
+    assert_eq!(profiles.active, "default");
+    assert_eq!(profiles.profiles.len(), 1);
+    assert!(recovered(&fx, "the default profile is used"));
+    // An inventory from before EXT-13 (no profiles): the default, with what was disabled.
+    let mut old: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(fx.root.join(INVENTORY)).unwrap()).unwrap();
+    old.as_object_mut().unwrap().remove("profiles");
+    let text = old.to_string();
+    fs::write(fx.root.join(INVENTORY), &text).unwrap();
+    fs::write(fx.root.join(LAST_GOOD), &text).unwrap();
+    let service = fx.service();
+    assert_eq!(service.profiles().unwrap().active, "default");
+    assert!(inventory(&fx).disabled.contains("acme.other"));
+}
+
+#[test]
+fn ext13_concurrent_profile_switches_leave_a_whole_state() {
+    let fx = fixture("ext13-concurrent");
+    let service = std::sync::Arc::new(fx.service());
+    install(&fx, &service, "acme.one", "1.0.0");
+    install(&fx, &service, "acme.two", "1.0.0");
+    service.create_profile("A").unwrap();
+    service.create_profile("B").unwrap();
+    service.select_profile("a").unwrap();
+    service.set_enabled("acme.one", false).unwrap();
+    service.select_profile("b").unwrap();
+    service.set_enabled("acme.two", false).unwrap();
+    std::thread::scope(|scope| {
+        for n in 0..8 {
+            let service = service.clone();
+            scope.spawn(move || {
+                for _ in 0..10 {
+                    service
+                        .select_profile(if n % 2 == 0 { "a" } else { "b" })
+                        .unwrap();
+                }
+            });
+        }
+    });
+    let inv = inventory(&fx);
+    let expected = if inv.profiles.active == "a" {
+        "acme.one"
+    } else {
+        "acme.two"
+    };
+    assert_eq!(inv.disabled.iter().cloned().collect::<Vec<_>>(), [expected]);
+    let other = if inv.profiles.active == "a" { "b" } else { "a" };
+    let kept = if other == "a" { "acme.one" } else { "acme.two" };
+    assert_eq!(
+        inv.profiles.list[other]
+            .disabled
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        [kept]
+    );
+}
+
+#[test]
+fn ext13_secrets_need_the_grant_and_stay_with_their_extension_profile_and_workspace() {
+    let fx = fixture("ext13-secrets");
+    let service = fx.service();
+    let backend = with_memory_secrets(&service);
+    let one = secret_keeper(&fx, &service, "acme.one");
+    let two = secret_keeper(&fx, &service, "acme.two");
+    let store = |copy: &HostCopy, value: &str| {
+        secret(
+            &service,
+            copy,
+            None,
+            "secrets.store",
+            serde_json::json!({"key": "token", "value": value}),
+        )
+    };
+    let get = |copy: &HostCopy, workspace: Option<&str>, scope: &str| {
+        secret(
+            &service,
+            copy,
+            workspace,
+            "secrets.get",
+            serde_json::json!({"key": "token", "scope": scope}),
+        )
+    };
+    store(&one, "one-token").unwrap();
+    store(&two, "two-token").unwrap();
+    assert_eq!(get(&one, None, "installation").unwrap(), "one-token");
+    assert_eq!(get(&two, None, "installation").unwrap(), "two-token");
+    // A workspace secret: per workspace, none without one.
+    assert_eq!(
+        get(&one, Some("C:/w1"), "workspace").unwrap(),
+        serde_json::Value::Null
+    );
+    secret(
+        &service,
+        &one,
+        Some("C:/w1"),
+        "secrets.store",
+        serde_json::json!({"key": "token", "value": "w1", "scope": "workspace"}),
+    )
+    .unwrap();
+    assert_eq!(get(&one, Some("C:/w1"), "workspace").unwrap(), "w1");
+    assert_eq!(
+        get(&one, Some("C:/w2"), "workspace").unwrap(),
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        get(&one, None, "workspace").unwrap_err().code,
+        "NoWorkspace"
+    );
+    // Another profile has its own.
+    service.create_profile("Work").unwrap();
+    service.select_profile("work").unwrap();
+    assert_eq!(
+        get(&one, None, "installation").unwrap(),
+        serde_json::Value::Null
+    );
+    service.select_profile("default").unwrap();
+    assert_eq!(get(&one, None, "installation").unwrap(), "one-token");
+    // Revoked: refused at once; allowed again: there.
+    service.set_grants("acme.one", None, &[]).unwrap();
+    assert_eq!(
+        get(&one, None, "installation").unwrap_err().code,
+        "PermissionDenied"
+    );
+    service
+        .set_grants("acme.one", None, &strings(&["secrets"]))
+        .unwrap();
+    assert_eq!(get(&one, None, "installation").unwrap(), "one-token");
+    // Disabled: refused.
+    service.set_enabled("acme.one", false).unwrap();
+    assert_eq!(
+        get(&one, None, "installation").unwrap_err().code,
+        "ExtensionDisabled"
+    );
+    service.set_enabled("acme.one", true).unwrap();
+    // Without asking for it in its manifest, no grant can give it.
+    install(&fx, &service, "acme.plain", "1.0.0");
+    let plain = service.host_copy("acme.plain").unwrap();
+    assert_eq!(
+        get(&plain, None, "installation").unwrap_err().code,
+        "PermissionDenied"
+    );
+    // Nothing of a value is in the inventory, its last-good copy or any file of Yavin's.
+    let files: Vec<String> = [INVENTORY, LAST_GOOD]
+        .iter()
+        .map(|f| fs::read_to_string(fx.root.join(f)).unwrap())
+        .collect();
+    assert!(files
+        .iter()
+        .all(|text| !text.contains("one-token") && !text.contains("two-token")));
+    // Uninstalled: its secrets go, in every profile and scope; the other's stay.
+    service.select_profile("work").unwrap();
+    secret(
+        &service,
+        &one,
+        None,
+        "secrets.store",
+        serde_json::json!({"key": "k", "value": "work-one"}),
+    )
+    .unwrap();
+    service.select_profile("default").unwrap();
+    service.uninstall("acme.one").unwrap();
+    let left: Vec<String> = backend.0.lock().unwrap().keys().cloned().collect();
+    assert!(left.iter().all(|t| !t.contains("/acme.one/")), "{left:?}");
+    assert_eq!(get(&two, None, "installation").unwrap(), "two-token");
+    // Deleting a profile deletes its secrets.
+    service.select_profile("work").unwrap();
+    secret(
+        &service,
+        &two,
+        None,
+        "secrets.store",
+        serde_json::json!({"key": "k", "value": "work-two"}),
+    )
+    .unwrap();
+    service.select_profile("default").unwrap();
+    service.delete_profile("work").unwrap();
+    assert!(backend
+        .0
+        .lock()
+        .unwrap()
+        .keys()
+        .all(|t| !t.contains("/work/")));
+}
+
+#[test]
+fn ext13_an_update_keeps_its_secrets_but_another_origin_or_a_rebuild_cannot_read_them() {
+    let fx = fixture("ext13-owner");
+    let service = fx.service();
+    let backend = with_memory_secrets(&service);
+    let first = secret_keeper(&fx, &service, "acme.one");
+    let value = "the-value-v8x2q";
+    secret(
+        &service,
+        &first,
+        None,
+        "secrets.store",
+        serde_json::json!({"key": "token", "value": value}),
+    )
+    .unwrap();
+    // Updated through the same pipeline (the same origin): still its own.
+    install_with(
+        &fx,
+        &service,
+        "acme.one",
+        "1.1.0",
+        serde_json::json!({"permissions": {"version": 1, "request": ["secrets"]}}),
+    )
+    .unwrap();
+    service
+        .set_grants("acme.one", None, &strings(&["secrets"]))
+        .unwrap();
+    let updated = service.host_copy("acme.one").unwrap();
+    assert_eq!(
+        secret(
+            &service,
+            &updated,
+            None,
+            "secrets.get",
+            serde_json::json!({"key": "token"})
+        )
+        .unwrap(),
+        value
+    );
+    // Rolled back (a failed update): the previous copy, same origin, still reads it.
+    let op = stage_file(
+        &service,
+        &package_with(
+            &fx,
+            "acme.one",
+            "1.2.0",
+            serde_json::json!({"permissions": {"version": 1, "request": ["secrets"]}}),
+        ),
+        "acme.one",
+        "1.2.0",
+    )
+    .unwrap();
+    service.commit(&op, "acme.one").unwrap();
+    service.finish(&op, "acme.one", false).unwrap();
+    service
+        .set_grants("acme.one", None, &strings(&["secrets"]))
+        .unwrap();
+    let back = service.host_copy("acme.one").unwrap();
+    assert_eq!(back.version, "1.1.0");
+    assert_eq!(
+        secret(
+            &service,
+            &back,
+            None,
+            "secrets.get",
+            serde_json::json!({"key": "token"})
+        )
+        .unwrap(),
+        value
+    );
+    drop(service);
+    // The inventory says another origin -- installed from elsewhere, or rebuilt by recovery:
+    // that copy cannot read it (after a restart, from the same store).
+    for origin in ["registry https://elsewhere.example/", "unknown"] {
+        let mut inv = inventory(&fx);
+        inv.extensions.get_mut("acme.one").unwrap().active.source = origin.into();
+        let text = serde_json::to_string(&inv).unwrap();
+        fs::write(fx.root.join(INVENTORY), &text).unwrap();
+        fs::write(fx.root.join(LAST_GOOD), &text).unwrap();
+        let restarted = fx.service();
+        restarted.use_secret_backend(backend.clone());
+        let copy = restarted.host_copy("acme.one").unwrap();
+        assert_eq!(copy.origin, origin);
+        let error = secret(
+            &restarted,
+            &copy,
+            None,
+            "secrets.get",
+            serde_json::json!({"key": "token"}),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "SecretOwnerChanged", "{origin}");
+        assert!(!error.message.contains(value));
+    }
+}
+
+#[test]
+fn ext13_without_a_store_secrets_fail_closed_and_nothing_is_kept_in_plaintext() {
+    let fx = fixture("ext13-unavailable");
+    let service = fx.service();
+    service.use_secret_backend(std::sync::Arc::new(Failing));
+    let one = secret_keeper(&fx, &service, "acme.one");
+    let error = secret(
+        &service,
+        &one,
+        None,
+        "secrets.store",
+        serde_json::json!({"key": "token", "value": "plaintext-would-be-here"}),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "SecretStorageUnavailable");
+    assert!(!error.message.contains("plaintext-would-be-here"));
+    assert_eq!(
+        secret(
+            &service,
+            &one,
+            None,
+            "secrets.get",
+            serde_json::json!({"key": "token"})
+        )
+        .unwrap_err()
+        .code,
+        "SecretStorageUnavailable"
+    );
+    let anywhere = walk_files(&fx.dir);
+    assert!(anywhere
+        .iter()
+        .all(|text| !text.contains("plaintext-would-be-here")));
+    // A profile whose secrets cannot be deleted is kept.
+    service.create_profile("Work").unwrap();
+    assert!(service
+        .delete_profile("work")
+        .unwrap_err()
+        .starts_with("SecretStorageUnavailable"));
+    assert_eq!(service.profiles().unwrap().profiles.len(), 2);
+}
+
+fn walk_files(dir: &Path) -> Vec<String> {
+    let mut all = Vec::new();
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            all.extend(walk_files(&path));
+        } else if let Ok(bytes) = fs::read(&path) {
+            all.push(String::from_utf8_lossy(&bytes).into_owned());
+        }
+    }
+    all
+}
+
+// --- EXT-14: install, rollback, recovery and safe mode, recorded ---------------------------
+
+#[test]
+fn ext14_install_refusals_rollbacks_and_recoveries_are_recorded_and_cleared() {
+    let fx = fixture("ext14-install");
+    let service = fx.service();
+    let codes = |service: &ExtensionService, id: &str| -> Vec<String> {
+        service
+            .diagnostics_for("main", Some(id))
+            .into_iter()
+            .map(|d| d.code)
+            .collect()
+    };
+    // An incompatible API, a missing dependency: refusals, said with what to do.
+    assert!(install_with(
+        &fx,
+        &service,
+        "acme.future",
+        "1.0.0",
+        serde_json::json!({"engines": {"yavin": "^3.0.0"}})
+    )
+    .is_err());
+    assert!(install_with(
+        &fx,
+        &service,
+        "acme.app",
+        "1.0.0",
+        serde_json::json!({"dependencies": {"acme.base": "^1.0.0"}})
+    )
+    .is_err());
+    let future = service.diagnostics_for("main", Some("acme.future"));
+    assert_eq!(future[0].code, "IncompatibleApi");
+    assert_eq!(
+        future[0].category,
+        crate::extension_diagnostics::Category::Api
+    );
+    assert!(future[0].refusal && future[0].remedy.is_some());
+    assert_eq!(future[0].version.as_deref(), Some("1.0.0"));
+    assert_eq!(future[0].phase, "install");
+    assert_eq!(codes(&service, "acme.app"), ["DependencyMissing"]);
+    // An update whose registration fails: rolled back, recorded with its install's correlation.
+    install(&fx, &service, "acme.base", "1.0.0");
+    let op = stage_file(
+        &service,
+        &fx.package("acme.base", "1.1.0"),
+        "acme.base",
+        "1.1.0",
+    )
+    .unwrap();
+    service.commit(&op, "acme.base").unwrap();
+    service.finish(&op, "acme.base", false).unwrap();
+    let rolled = service.diagnostics_for("main", Some("acme.base"));
+    assert_eq!(rolled[0].code, "InstallRolledBack");
+    assert!(!rolled[0].refusal);
+    assert_eq!(
+        rolled[0].correlation.as_deref(),
+        Some(format!("install-{op}").as_str())
+    );
+    drop(service);
+    // A damaged inventory, restored: the recovery is shown, its paths redacted.
+    fs::write(fx.root.join(INVENTORY), "{ not json").unwrap();
+    let service = fx.service();
+    service.list(None).unwrap();
+    let recovered = service
+        .diagnostics_for("main", None)
+        .into_iter()
+        .find(|d| d.code == "InventoryRecovered")
+        .expect("the recovery is a diagnostic");
+    let detail = recovered.detail.unwrap();
+    assert!(detail.contains("<path>"), "{detail}");
+    assert!(!detail.contains(&fx.root.display().to_string()), "{detail}");
+    // Kept on disk: a restart still shows the install refusals.
+    assert!(codes(&service, "acme.future").contains(&"IncompatibleApi".to_string()));
+    // Cleared: the records and the recovery notes go; nothing installed, allowed or trusted does.
+    let before = inventory(&fx);
+    assert!(service.clear_diagnostics("main", None).unwrap() >= 4);
+    assert!(service.diagnostics_for("main", None).is_empty());
+    let after = inventory(&fx);
+    assert_eq!(after.extensions, before.extensions);
+    assert_eq!(after.grants, before.grants);
+    assert_eq!(after.disabled, before.disabled);
+    assert!(after.recoveries.is_empty());
+}
+
+#[test]
+fn ext14_safe_mode_refuses_code_and_changes_nothing_else() {
+    let fx = fixture("ext14-safe");
+    let service = fx.service();
+    install_with(
+        &fx,
+        &service,
+        "acme.one",
+        "1.0.0",
+        serde_json::json!({"permissions": {"version": 1, "request": ["documents.read"]}}),
+    )
+    .unwrap();
+    service
+        .set_grants("acme.one", None, &strings(&["documents.read"]))
+        .unwrap();
+    let copy = service.host_copy("acme.one").unwrap();
+    let before = inventory(&fx);
+    service.set_safe_mode(true);
+    let refused = service.host_copy("acme.one").unwrap_err();
+    assert!(refused.starts_with("SafeMode"), "{refused}");
+    assert!(service
+        .diagnostics_for("main", None)
+        .iter()
+        .any(|d| d.code == "SafeMode"));
+    // Nothing installed, enabled, granted or signed changed.
+    let during = inventory(&fx);
+    assert_eq!(during.extensions, before.extensions);
+    assert_eq!(during.grants, before.grants);
+    assert_eq!(during.disabled, before.disabled);
+    // It only refuses: what was allowed stays allowed once it is off.
+    service.set_safe_mode(false);
+    assert_eq!(service.host_copy("acme.one").unwrap(), copy);
+    assert!(service.authorize(&copy, Some("documents.read")).is_ok());
+}

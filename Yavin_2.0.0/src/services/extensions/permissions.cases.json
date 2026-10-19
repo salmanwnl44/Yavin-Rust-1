@@ -243,6 +243,19 @@
         }
       },
       "ok": false
+    },
+    {
+      "about": "EXT-13: the secrets capability can be requested",
+      "manifest": {
+        "main": "extension.js",
+        "permissions": {
+          "version": 1,
+          "request": ["secrets"]
+        }
+      },
+      "ok": true,
+      "legacy": false,
+      "requested": ["secrets"]
     }
   ],
   "requests": [
@@ -513,6 +526,59 @@
       "method": "",
       "params": {},
       "need": "unknown"
+    },
+    {
+      "method": "secrets.get",
+      "params": {
+        "key": "token"
+      },
+      "need": "secrets"
+    },
+    {
+      "method": "secrets.get",
+      "params": {
+        "key": "token",
+        "scope": "workspace"
+      },
+      "need": "secrets"
+    },
+    {
+      "method": "secrets.store",
+      "params": {
+        "key": "token",
+        "value": "v"
+      },
+      "need": "secrets"
+    },
+    {
+      "method": "secrets.store",
+      "params": {
+        "key": "token"
+      },
+      "need": "invalid"
+    },
+    {
+      "method": "secrets.delete",
+      "params": {
+        "key": "token",
+        "scope": "installation"
+      },
+      "need": "secrets"
+    },
+    {
+      "method": "secrets.delete",
+      "params": {
+        "key": 7
+      },
+      "need": "invalid"
+    },
+    {
+      "method": "secrets.get",
+      "params": {
+        "key": "token",
+        "scope": "everywhere"
+      },
+      "need": "invalid"
     }
   ],
   "events": [

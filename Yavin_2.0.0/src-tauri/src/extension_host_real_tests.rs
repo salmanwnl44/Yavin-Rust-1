@@ -2136,3 +2136,229 @@ fn a_dependency_in_another_windows_host_does_not_count() {
     );
     a.quiet();
 }
+
+// --- EXT-13: secrets through the real host -----------------------------------------------------
+
+const KEEPER: &str = r#"module.exports.activate = function (c, yavin) {
+    c.subscriptions.push(yavin.commands.registerCommand(EXT + ".keep", function (value) {
+        return c.secrets.store("token", value).then(function () { return "kept"; });
+    }));
+    c.subscriptions.push(yavin.commands.registerCommand(EXT + ".length", function () {
+        return c.secrets.get("token").then(function (value) { return value === null ? -1 : value.length; });
+    }));
+    c.subscriptions.push(yavin.commands.registerCommand(EXT + ".forget", function () {
+        return c.secrets.delete("token");
+    }));
+};"#;
+
+/// An extension keeps a secret through `context.secrets`: the native layer stores it in the
+/// OS credential store (Windows: Credential Manager) and answers the host itself -- nothing the
+/// window is sent ever holds the value; another extension, without the grant, is refused and the
+/// window is told only that.
+#[test]
+fn secrets_are_kept_natively_and_never_reach_the_window() {
+    let keeper = format!("var EXT = \"acme.keeper\";\n{KEEPER}");
+    let other = format!("var EXT = \"acme.other\";\n{KEEPER}");
+    let yavin = Yavin::with(
+        "ext13-secrets",
+        &[
+            ("acme.keeper", permissions(&["secrets"]), keeper.as_str()),
+            ("acme.other", permissions(&["secrets"]), other.as_str()),
+        ],
+    );
+    yavin.grant("acme.keeper", &["secrets"]);
+    let session = yavin.start();
+    yavin.handshake(session, 43_001, 2000);
+    for id in ["acme.keeper", "acme.other"] {
+        assert_eq!(yavin.load(session, 43_001, id)["type"], "loaded");
+        assert_eq!(
+            yavin.ask(session, 43_001, id, "a", "activate", json!({})).0["ok"],
+            true
+        );
+    }
+    let value = "token-q7w3-never-in-the-window";
+    let mut seen = Vec::new();
+    let mut run = |id: &str, command: &str, args: Value| {
+        let (answer, asked, denied) = yavin.ask_seeing(
+            session,
+            43_001,
+            id,
+            command,
+            "command.run",
+            json!({"id": format!("{id}.{command}"), "args": args}),
+        );
+        seen.push(answer.to_string());
+        seen.extend(asked.iter().map(Value::to_string));
+        (answer, denied)
+    };
+    let (kept, _) = run("acme.keeper", "keep", json!([value]));
+    assert_eq!(kept["result"], "kept", "{kept}");
+    let (length, _) = run("acme.keeper", "length", json!([]));
+    assert_eq!(length["result"], value.len(), "{length}");
+    // Without the grant: refused natively, and the window told only which method.
+    let (refused, denied) = run("acme.other", "length", json!([]));
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        denied
+            .iter()
+            .any(|d| d.method == "secrets.get" && d.capability.as_deref() == Some("secrets")),
+        "{denied:?}"
+    );
+    // The keeper's own, deleted.
+    let (forgot, _) = run("acme.keeper", "forget", json!([]));
+    assert_eq!(forgot["result"], true);
+    let (gone, _) = run("acme.keeper", "length", json!([]));
+    assert_eq!(gone["result"], -1);
+    // No message the window got held the value, nor a secrets request at all -- the only time
+    // the value crossed to the window was in the command's own arguments, which Yavin sent.
+    for text in &seen {
+        assert!(!text.contains(value) || text.contains("\"args\""), "{text}");
+        assert!(!text.contains("\"method\":\"secrets."), "{text}");
+    }
+    // Clean the real store of this test's namespace.
+    let store = crate::extension_secrets::SecretStore::new(
+        crate::extension_secrets::platform(),
+        &yavin._scratch.0,
+    );
+    let _ = store.forget_extension("acme.keeper");
+    let _ = store.forget_extension("acme.other");
+}
+
+// --- EXT-14: diagnostics from the real host ----------------------------------------------------
+
+/// Refusals and a crash in one window are recorded -- with that window, its session, the
+/// extension and its version -- and another window does not see them; the report the user
+/// copies says what happened and holds no workspace path or payload.
+#[test]
+fn diagnostics_record_refusals_and_crashes_with_their_window() {
+    let yavin = Yavin::with("ext14-diag", &[("acme.probe", permissions(&ALL), PROBE)]);
+    let (a, b) = (Window::new("window-a"), Window::new("window-b"));
+    let in_a = yavin.start_in(&a, None).unwrap();
+    let in_b = yavin.start_in(&b, None).unwrap();
+    yavin.handshake_in(&a, in_a, 44_001);
+    yavin.handshake_in(&b, in_b, 45_001);
+    assert_eq!(
+        yavin.load_in(&a, in_a, 44_001, "acme.probe")["type"],
+        "loaded"
+    );
+    assert_eq!(
+        yavin.ask_in(&a, in_a, 44_001, "acme.probe", "a", "activate", json!({}))["ok"],
+        true
+    );
+    // Nothing granted: its probe is refused, natively, several times.
+    let ran = yavin.ask_in(
+        &a,
+        in_a,
+        44_001,
+        "acme.probe",
+        "p",
+        "command.run",
+        json!({"id": "acme.probe.go", "args": []}),
+    );
+    assert_eq!(ran["ok"], true, "{ran}");
+    let seen = yavin
+        .extensions
+        .diagnostics_for("window-a", Some("acme.probe"));
+    let denied = seen
+        .iter()
+        .find(|d| d.code == "PermissionDenied")
+        .unwrap_or_else(|| panic!("{seen:?}"));
+    assert!(denied.refusal);
+    assert_eq!(
+        denied.category,
+        crate::extension_diagnostics::Category::Permission
+    );
+    assert_eq!(denied.window.as_deref(), Some("window-a"));
+    assert_eq!(denied.session, Some(in_a));
+    assert_eq!(denied.version.as_deref(), Some("1.0.0"));
+    assert!(denied.remedy.is_some());
+    assert!(denied
+        .detail
+        .as_deref()
+        .unwrap_or("")
+        .starts_with("method "));
+    // Window B sees none of window A's.
+    assert!(yavin
+        .extensions
+        .diagnostics_for("window-b", Some("acme.probe"))
+        .is_empty());
+    // A crash of A's host: recorded for A, as a failure, not a refusal.
+    kill(yavin.sessions.process_id(in_a).unwrap());
+    let _ = a.exit_of(in_a);
+    let crashed = yavin
+        .extensions
+        .diagnostics_for("window-a", None)
+        .into_iter()
+        .find(|d| d.code == "HostCrashed")
+        .expect("the crash is recorded");
+    assert!(!crashed.refusal);
+    assert_eq!(
+        crashed.correlation.as_deref(),
+        Some(format!("session-{in_a}").as_str())
+    );
+    assert!(yavin
+        .extensions
+        .diagnostics_for("window-b", None)
+        .iter()
+        .all(|d| d.code != "HostCrashed"));
+    // The report: what happened, what to do -- nothing of the workspace or a payload.
+    let report = crate::extension_diagnostics::render_report(
+        &yavin.extensions.diagnostics_for("window-a", None),
+        "test",
+    );
+    assert!(
+        report.contains("PermissionDenied") && report.contains("HostCrashed"),
+        "{report}"
+    );
+    assert!(report.contains("Next:"));
+    assert!(!report.to_lowercase().contains("c:/work"), "{report}");
+    assert!(!report.contains("a.txt"), "{report}");
+    let _ = b;
+}
+
+/// A credential store that fails: the extension is refused, the failure recorded -- and the
+/// secret it tried to keep is in no record, report or diagnostics file.
+#[test]
+fn a_secret_store_failure_is_recorded_without_the_secret() {
+    let keeper = format!("var EXT = \"acme.keeper\";\n{KEEPER}");
+    let yavin = Yavin::with(
+        "ext14-secret",
+        &[("acme.keeper", permissions(&["secrets"]), keeper.as_str())],
+    );
+    yavin.extensions.use_secret_backend(std::sync::Arc::new(
+        crate::extension_secrets::tests::Failing,
+    ));
+    yavin.grant("acme.keeper", &["secrets"]);
+    let session = yavin.ready(46_001, "acme.keeper");
+    let value = "q9-secret-that-must-not-be-recorded";
+    let (answer, _) = yavin.ask(
+        session,
+        46_001,
+        "acme.keeper",
+        "k",
+        "command.run",
+        json!({"id": "acme.keeper.keep", "args": [value]}),
+    );
+    assert_eq!(answer["ok"], false, "{answer}");
+    let seen = yavin
+        .extensions
+        .diagnostics_for("main", Some("acme.keeper"));
+    let failed = seen
+        .iter()
+        .find(|d| d.code == "SecretStorageUnavailable")
+        .unwrap_or_else(|| panic!("{seen:?}"));
+    assert_eq!(
+        failed.category,
+        crate::extension_diagnostics::Category::Storage
+    );
+    let report = crate::extension_diagnostics::render_report(&seen, "test");
+    assert!(!report.contains(value));
+    let files = std::fs::read_dir(yavin._scratch.0.join(".diagnostics"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert!(!files.is_empty(), "the diagnostics are kept on disk");
+    assert!(files.iter().all(|text| !text.contains(value)));
+}

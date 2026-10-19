@@ -123,7 +123,47 @@ interface Commands {
       skipped: number;
       disabled: string[];
       recoveries: { at: number; id: string | null; reason: string }[];
+      /** The extension profiles and the active one's settings (EXT-13). */
+      profiles: import("./extensions/profiles.ts").ProfilesView;
     };
+  };
+  /** Extension diagnostics (EXT-14): the calling window's records and the application's. */
+  extensions_diagnostics: {
+    args: { id: string | null };
+    result: import("./extensions/diagnostics.ts").ExtensionDiagnostic[];
+  };
+  extensions_diagnostics_report: { args: { id: string | null }; result: string };
+  extensions_diagnostics_clear: { args: { id: string | null }; result: number };
+  extensions_diagnostics_note: {
+    args: { code: string; id: string | null; detail: string | null };
+    result: import("./extensions/diagnostics.ts").ExtensionDiagnostic;
+  };
+  /** Safe mode (EXT-14): on, no extension code loads; returns the state. */
+  extensions_safe_mode: { args: { enabled: boolean | null }; result: boolean };
+  /** Extension profiles (EXT-13): each answers what the native side now holds. */
+  extensions_profiles: {
+    args: Record<string, never>;
+    result: import("./extensions/profiles.ts").ProfilesView;
+  };
+  extensions_profile_create: {
+    args: { name: string };
+    result: import("./extensions/profiles.ts").ProfilesView;
+  };
+  extensions_profile_rename: {
+    args: { id: string; name: string };
+    result: import("./extensions/profiles.ts").ProfilesView;
+  };
+  extensions_profile_delete: {
+    args: { id: string };
+    result: import("./extensions/profiles.ts").ProfilesView;
+  };
+  extensions_profile_select: {
+    args: { id: string };
+    result: import("./extensions/profiles.ts").ProfileSwitch;
+  };
+  extensions_profile_setting: {
+    args: { id: string; key: string; value: unknown };
+    result: import("./extensions/profiles.ts").ProfilesView;
   };
   extensions_set_enabled: { args: { id: string; enabled: boolean }; result: void };
   /** Allows exactly `capabilities` for the installed copy (EXT-07); the state it then holds. */

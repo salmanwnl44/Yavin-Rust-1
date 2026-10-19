@@ -36,6 +36,18 @@ export interface Memento {
   update(key: string, value: unknown): Promise<void>;
 }
 
+export interface SecretOptions {
+  /** "installation" (default): this extension's, in the active profile; "workspace": also this workspace's. */
+  readonly scope?: "installation" | "workspace";
+}
+
+export interface SecretStorage {
+  get(key: string, options?: SecretOptions): Promise<string | null>;
+  store(key: string, value: string, options?: SecretOptions): Promise<void>;
+  /** Whether there was one. */
+  delete(key: string, options?: SecretOptions): Promise<boolean>;
+}
+
 export interface ExtensionContext {
   readonly extensionId: string;
   readonly extensionPath: string | null;
@@ -44,6 +56,12 @@ export interface ExtensionContext {
   readonly environment: { apiVersion: string; hostGeneration: number };
   readonly globalState: Memento;
   readonly workspaceState: Memento | null;
+  /**
+   * Its own secrets (EXT-13), kept by Yavin in the operating system's credential store (Windows
+   * Credential Manager) -- needs the `secrets` permission. Values are strings of at most 1024
+   * bytes; names are 1 to 128 letters, digits, ".", "_" or "-". Never in settings or state.
+   */
+  readonly secrets: SecretStorage;
   /** Disposed, newest first, when the extension is deactivated. */
   readonly subscriptions: Disposable[];
   readonly log: {

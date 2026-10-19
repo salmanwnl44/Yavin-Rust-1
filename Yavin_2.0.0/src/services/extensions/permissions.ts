@@ -23,12 +23,15 @@ export const FS_READ = "workspace.fs.read";
 export const DOCUMENTS_READ = "documents.read";
 export const EDITOR_CONTROL = "editor.control";
 export const COMMANDS_EXECUTE = "commands.execute:";
+/** Keeping its own secrets in the OS credential store (EXT-13). */
+export const SECRETS = "secrets";
 /** What a manifest without `permissions` is taken to request (when it has code). */
 export const LEGACY: readonly string[] = [DOCUMENTS_READ, EDITOR_CONTROL, FS_READ];
 
 /** `raw` as a capability in its canonical spelling, or null. `owner` is the extension asking. */
 export function capabilityOf(raw: string, owner: string): string | null {
-  if (raw === FS_READ || raw === DOCUMENTS_READ || raw === EDITOR_CONTROL) return raw;
+  if (raw === FS_READ || raw === DOCUMENTS_READ || raw === EDITOR_CONTROL || raw === SECRETS)
+    return raw;
   if (!raw.startsWith(COMMANDS_EXECUTE)) return null;
   const target = canonicalId(raw.slice(COMMANDS_EXECUTE.length));
   return target && target !== owner ? `${COMMANDS_EXECUTE}${target}` : null;
@@ -178,6 +181,21 @@ export function needOfRequest(
     case "fs.readFile":
     case "fs.exists":
       return needs(FS_READ);
+    case "secrets.get":
+    case "secrets.store":
+    case "secrets.delete": {
+      if (typeof params.key !== "string")
+        return { kind: "invalid", reason: '"key" must be a string' };
+      if (
+        params.scope !== undefined &&
+        params.scope !== "installation" &&
+        params.scope !== "workspace"
+      )
+        return { kind: "invalid", reason: '"scope" must be "installation" or "workspace"' };
+      if (method === "secrets.store" && typeof params.value !== "string")
+        return { kind: "invalid", reason: '"value" must be a string' };
+      return needs(SECRETS);
+    }
     default:
       return { kind: "unknown" };
   }
@@ -201,6 +219,12 @@ export function describeCapability(capability: string): { title: string; detail:
       return {
         title: "Control the editor",
         detail: "Open files, move the selection and scroll the editor.",
+      };
+    case SECRETS:
+      return {
+        title: "Keep secrets",
+        detail:
+          "Store and read its own secrets, such as tokens, in your system's credential store (Windows Credential Manager).",
       };
     default:
       if (capability.startsWith(COMMANDS_EXECUTE)) {

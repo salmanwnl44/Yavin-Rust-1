@@ -47,6 +47,7 @@
   let module = { exports: {} };
   let context = null;
 
+  const secretScope = (options) => (options && options.scope === "workspace" ? "workspace" : "installation");
   const memento = (scope) => ({
     get: (key) => (state[scope] ? state[scope][key] : undefined),
     keys: () => (state[scope] ? Object.keys(state[scope]) : []),
@@ -201,6 +202,14 @@
         environment: Object.freeze({ apiVersion: init.apiVersion, hostGeneration: init.hostGeneration }),
         globalState: memento("global"),
         workspaceState: state.workspace ? memento("workspace") : null,
+        // Its own secrets (EXT-13): kept by Yavin in the OS credential store, natively -- with
+        // the "secrets" permission granted. "installation" (default) or "workspace".
+        secrets: Object.freeze({
+          get: (key, options) => call("secrets.get", { key, scope: secretScope(options) }),
+          store: (key, value, options) =>
+            call("secrets.store", { key, value, scope: secretScope(options) }).then(() => undefined),
+          delete: (key, options) => call("secrets.delete", { key, scope: secretScope(options) }),
+        }),
         subscriptions,
         log: Object.freeze({ info: log("info"), warn: log("warn"), error: log("error") }),
       });

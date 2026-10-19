@@ -57,6 +57,7 @@
 //! its own resources: no environment variable or setting chooses the executable it runs, and the
 //! host is started with no arguments (EXT-06).
 
+use crate::extension_diagnostics::{code_of, Event};
 use crate::extension_permissions::{need_of_event, need_of_request, Denial, Need};
 use crate::extension_service::{ExtensionService, HostCopy};
 use crate::extensions::read_main;
@@ -295,6 +296,10 @@ pub trait HostAuthority: Send + Sync + 'static {
     /// Whether the code of `copy` may act now: the folder trusted, the extension enabled and
     /// `copy` still its installed copy -- and, with `capability`, that granted for `copy`.
     fn allow(&self, copy: &HostCopy, capability: Option<&str>) -> Result<(), Denial>;
+    /// A secret request of the code of `copy` (EXT-13), done natively: its answer.
+    fn secret(&self, copy: &HostCopy, method: &str, params: &Value) -> Result<Value, Denial>;
+    /// Records what happened (EXT-14). Best effort: never fails, never decides.
+    fn note(&self, _event: Event) {}
 }
 
 /// One host's permission state: its authority, and what each extension it loaded is.
@@ -319,6 +324,8 @@ struct Shared {
     pending: Mutex<std::collections::HashSet<(String, String)>>,
     /// Its messages' budget.
     budget: Mutex<Budget>,
+    /// Its window and session, for what it records (EXT-14).
+    owner: Mutex<Option<(String, u32)>>,
 }
 
 /// The most refusals one host's window is told of (each extension was answered regardless).
@@ -341,6 +348,7 @@ impl Shared {
             resources,
             pending: Mutex::new(std::collections::HashSet::new()),
             budget: Mutex::new(Budget::new()),
+            owner: Mutex::new(None),
             authority,
             retired: std::sync::atomic::AtomicBool::new(false),
             identity: Mutex::new(None),
@@ -353,6 +361,31 @@ impl Shared {
 
     fn loaded(&self, id: &str) -> Option<HostCopy> {
         held(&self.loaded).get(id).cloned()
+    }
+
+    /// Records `code` of this session (EXT-14): its window and session, the extension and
+    /// its loaded version, a detail that is never a payload (a method name, an exit code).
+    fn note(
+        &self,
+        code: &str,
+        phase: &'static str,
+        extension: Option<&str>,
+        detail: Option<String>,
+    ) {
+        let mut event = Event::new(code, phase);
+        if let Some((window, session)) = held(&self.owner).clone() {
+            event = event
+                .window(window, session)
+                .correlation(format!("session-{session}"));
+        }
+        if let Some(id) = extension {
+            event = event.extension(id.to_string());
+            if let Some(copy) = self.loaded(id) {
+                event = event.version(copy.version);
+            }
+        }
+        event.detail = detail;
+        self.authority.note(event);
     }
 
     fn retired(&self) -> bool {
@@ -479,6 +512,54 @@ impl Shared {
         };
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
         let params = value.get("params").cloned().unwrap_or(Value::Null);
+        // Its secrets (EXT-13): allowed like any request, then done here -- the window never
+        // sees the request or its answer.
+        if method.starts_with("secrets.") {
+            let result = self.decide(id, method, &params).and_then(|()| {
+                let copy = self.loaded(id).ok_or_else(|| {
+                    (
+                        Denial::new("NotLoaded", format!("{id} is not loaded in this host.")),
+                        None,
+                    )
+                })?;
+                self.authority
+                    .secret(&copy, method, &params)
+                    .map_err(|denial| (denial, None))
+            });
+            let answer = match &result {
+                Ok(result) => {
+                    json!({"type": "response", "extensionId": id, "workspaceId": value.get("workspaceId"), "hostGeneration": value.get("hostGeneration"), "requestId": value.get("requestId"), "ok": true, "result": result})
+                }
+                Err((denial, _)) => {
+                    json!({"type": "response", "extensionId": id, "workspaceId": value.get("workspaceId"), "hostGeneration": value.get("hostGeneration"), "requestId": value.get("requestId"), "ok": false, "error": {"code": denial.code, "message": denial.message}})
+                }
+            };
+            if let Err((denial, _)) = &result {
+                self.note(
+                    denial.code,
+                    "secret",
+                    Some(id),
+                    Some(format!("method {method}")),
+                );
+            }
+            // A refused one is told like any refused request (never what it carried).
+            let told = match result {
+                Err((denial, capability))
+                    if capability.is_some() || denial.code == "PermissionDenied" =>
+                {
+                    let denied = Denied {
+                        extension_id: id.to_string(),
+                        method: method.to_string(),
+                        capability: Some(crate::extension_permissions::SECRETS.to_string()),
+                        code: denial.code.to_string(),
+                        message: denial.message,
+                    };
+                    self.tell(&denied).then_some(denied)
+                }
+                _ => None,
+            };
+            return Screened::Refuse(answer.to_string(), told);
+        }
         let decided = self.decide(id, method, &params).and_then(|()| {
             // Allowed: it waits for the window, within the bound (EXT-10).
             let key = (id.to_string(), request_key(&value));
@@ -498,6 +579,12 @@ impl Shared {
         let Err((denial, capability)) = decided else {
             return Screened::Pass;
         };
+        self.note(
+            denial.code,
+            "request",
+            Some(id),
+            Some(format!("method {method}")),
+        );
         let answer = json!({
             "type": "response",
             "extensionId": id,
@@ -638,6 +725,11 @@ struct Session {
 /// When hosts ended on their own, per window (EXT-10, EXT-11).
 type Crashes = Arc<Mutex<HashMap<String, std::collections::VecDeque<std::time::Instant>>>>;
 
+/// The exit code of a host its watchdog ended (`ide_plugin_host::watchdog::EXIT_CODE`).
+fn ide_plugin_host_watchdog_exit() -> i32 {
+    70
+}
+
 /// The most refusals waiting to be answered; more are dropped (a flood is not answered).
 const MAX_ANSWERS: usize = 1024;
 
@@ -649,6 +741,7 @@ impl ServerEvents for Session {
         // Within its budget, or dropped -- a request answered, so its caller does not wait.
         if let Err(first) = held(&self.shared.budget).take(std::time::Instant::now()) {
             if first {
+                self.shared.note("MessageBudget", "request", None, None);
                 self.events.log(
                     self.session,
                     "(the extension host sends more than Yavin takes; its messages are being dropped)"
@@ -705,8 +798,23 @@ impl ServerEvents for Session {
         if let Ok(mut live) = self.live.lock() {
             live.remove(&self.session);
         }
-        // Not stopped, not replaced: it ended on its own.
+        // Not stopped, not replaced: it ended on its own (EXT-14: recorded, without what it
+        // wrote -- extensions' output is not a diagnostic).
         if !self.shared.retired() {
+            let code_name = if code == Some(ide_plugin_host_watchdog_exit()) {
+                "HostWatchdog"
+            } else {
+                "HostCrashed"
+            };
+            self.shared.note(
+                code_name,
+                "host",
+                None,
+                Some(match code {
+                    Some(code) => format!("exit code {code}"),
+                    None => "no exit code".to_string(),
+                }),
+            );
             held(&self.crashes)
                 .entry(self.window.clone())
                 .or_default()
@@ -842,6 +950,9 @@ impl ExtHostSessions {
             }
             if crashes.len() >= MAX_CRASHES {
                 let wait = CRASH_WINDOW.saturating_sub(now.duration_since(crashes[0]));
+                let mut event = Event::new("HostCrashedRepeatedly", "host");
+                event.window = Some(owner.window.clone());
+                authority.note(event);
                 return Err(format!(
                     "HostCrashedRepeatedly: the extension host ended unexpectedly {MAX_CRASHES} times within a minute; it can start again in {} s.",
                     wait.as_secs().max(1)
@@ -853,7 +964,8 @@ impl ExtHostSessions {
         // not heard, not spoken to, ended -- before this one exists, whether or not the window
         // stopped it. Other windows' hosts are not touched.
         self.retire_where(|host| host.owner.window == owner.window);
-        let shared = Arc::new(Shared::with(authority, resources.clone()));
+        let shared = Arc::new(Shared::with(authority.clone(), resources.clone()));
+        *held(&shared.owner) = Some((owner.window.clone(), session));
         // Refusals are answered on a thread of their own: the thread reading the host's output
         // never waits to write its input (with both pipes full, that would deadlock). It ends
         // with the session (its `Session`, holding the sender, goes with the process).
@@ -887,11 +999,13 @@ impl ExtHostSessions {
             }),
         )
         .map_err(|why| {
-            if why.starts_with("SandboxUnavailable:") {
+            let why = if why.starts_with("SandboxUnavailable:") {
                 why
             } else {
                 format!("HostFailed: {why}")
-            }
+            };
+            shared.note(code_of(&why), "host", None, Some(why.clone()));
+            why
         })?;
         self.live.lock().map_err(|e| e.to_string())?.insert(
             session,
@@ -962,7 +1076,30 @@ impl ExtHostSessions {
                     .into(),
             );
         }
-        let prepared = prepare(&host.shared, message)?;
+        let prepared = prepare(&host.shared, message).inspect_err(|why| {
+            let code = code_of(why);
+            if matches!(
+                code,
+                "DependencyNotLoaded"
+                    | "DependencyUnavailable"
+                    | "IncompatibleApi"
+                    | "InvalidManifest"
+                    | "ExtensionDisabled"
+                    | "TrustRequired"
+                    | "PermissionDenied"
+                    | "SafeMode"
+                    | "WorkspaceChanged"
+            ) {
+                let value: Value = serde_json::from_str(message).unwrap_or_default();
+                let id = value.get("extensionId").and_then(Value::as_str);
+                let phase = match value.get("type").and_then(Value::as_str) {
+                    Some("load") => "load",
+                    Some("event") => "event",
+                    _ => "request",
+                };
+                host.shared.note(code, phase, id, Some(why.clone()));
+            }
+        })?;
         host.process
             .send(&prepared)
             .map_err(|why| format!("HostStopped: {why}"))
@@ -1196,6 +1333,18 @@ impl HostAuthority for AppAuthority {
         self.trusted().map_err(refused)?;
         self.app.state::<ExtensionService>().host_copy(id)
     }
+    fn note(&self, event: Event) {
+        self.app
+            .state::<ExtensionService>()
+            .diagnostics()
+            .record(event);
+    }
+    fn secret(&self, copy: &HostCopy, method: &str, params: &Value) -> Result<Value, Denial> {
+        self.trusted()?;
+        self.app
+            .state::<ExtensionService>()
+            .secret(copy, self.workspace.as_deref(), method, params)
+    }
     fn allow(&self, copy: &HostCopy, capability: Option<&str>) -> Result<(), Denial> {
         self.trusted()?;
         self.app
@@ -1350,6 +1499,8 @@ pub fn ext_host_stop_all(
 pub struct ServiceAuthority {
     pub service: Arc<ExtensionService>,
     pub trusted: std::sync::atomic::AtomicBool,
+    /// The workspace its host was started in (EXT-13: a workspace secret's).
+    pub workspace: Mutex<Option<String>>,
 }
 
 #[cfg(test)]
@@ -1358,6 +1509,7 @@ impl ServiceAuthority {
         Arc::new(ServiceAuthority {
             service,
             trusted: std::sync::atomic::AtomicBool::new(true),
+            workspace: Mutex::new(None),
         })
     }
     fn trusted(&self) -> Result<(), Denial> {
@@ -1374,6 +1526,15 @@ impl HostAuthority for ServiceAuthority {
     fn copy_of(&self, id: &str) -> Result<HostCopy, String> {
         self.trusted().map_err(refused)?;
         self.service.host_copy(id)
+    }
+    fn note(&self, event: Event) {
+        self.service.diagnostics().record(event);
+    }
+    fn secret(&self, copy: &HostCopy, method: &str, params: &Value) -> Result<Value, Denial> {
+        self.trusted()?;
+        let workspace = held(&self.workspace).clone();
+        self.service
+            .secret(copy, workspace.as_deref(), method, params)
     }
     fn allow(&self, copy: &HostCopy, capability: Option<&str>) -> Result<(), Denial> {
         self.trusted()?;
@@ -1771,6 +1932,98 @@ mod tests {
             .start(Path::new("C:/host.exe"), Arc::new(Quiet), authority)
             .unwrap_err();
         assert!(error.starts_with("HostFailed:"), "{error}");
+    }
+
+    /// A sandbox that cannot be set up, a crash loop, a flood of messages: each recorded
+    /// (EXT-14) -- with the window -- and the refusal itself unchanged.
+    #[test]
+    fn a_sandbox_failure_a_crash_loop_and_a_flood_are_recorded() {
+        fn failing(
+            _: &Path,
+            _: &SandboxPolicy,
+            _: Arc<dyn ServerEvents>,
+        ) -> Result<ServerProcess, String> {
+            Err("SandboxUnavailable: no AppContainer here.".into())
+        }
+        struct Quiet;
+        impl HostEvents for Quiet {
+            fn message(&self, _: u32, _: String) {}
+            fn exit(&self, _: u32, _: Option<i32>, _: Option<String>) {}
+        }
+        let service = Arc::new(ExtensionService::default());
+        let authority = ServiceAuthority::new(service.clone());
+        let sessions = ExtHostSessions::with_spawner(failing);
+        let owner = HostOwner {
+            window: "window-a".into(),
+            page: 0,
+        };
+        let error = sessions
+            .start_for(
+                &owner,
+                None,
+                Path::new("C:/host.exe"),
+                HostResources::default(),
+                Arc::new(Quiet),
+                authority.clone(),
+            )
+            .unwrap_err();
+        assert!(error.starts_with("SandboxUnavailable"));
+        let seen = service.diagnostics().visible("window-a", None);
+        assert_eq!(seen[0].code, "SandboxUnavailable");
+        assert_eq!(
+            seen[0].category,
+            crate::extension_diagnostics::Category::Sandbox
+        );
+        assert!(seen[0].refusal);
+        assert_eq!(seen[0].window.as_deref(), Some("window-a"));
+        assert!(service.diagnostics().visible("window-b", None).is_empty());
+        // A crash loop: held off, and said.
+        held(&sessions.crashes)
+            .entry("window-a".into())
+            .or_default()
+            .extend(std::iter::repeat_n(std::time::Instant::now(), MAX_CRASHES));
+        let held_off = sessions
+            .start_for(
+                &owner,
+                None,
+                Path::new("C:/host.exe"),
+                HostResources::default(),
+                Arc::new(Quiet),
+                authority.clone(),
+            )
+            .unwrap_err();
+        assert!(held_off.starts_with("HostCrashedRepeatedly"));
+        assert!(service
+            .diagnostics()
+            .visible("window-a", None)
+            .iter()
+            .any(|d| d.code == "HostCrashedRepeatedly"));
+        // A flood: past the budget, messages dropped -- and recorded once per burst, not per
+        // message.
+        let shared = Arc::new(Shared::new(authority.clone()));
+        *held(&shared.owner) = Some(("window-a".into(), 9));
+        let session = Session {
+            session: 9,
+            live: Live::default(),
+            events: Arc::new(Quiet),
+            logged: AtomicU32::new(0),
+            recent: Mutex::new(std::collections::VecDeque::new()),
+            shared,
+            answers: std::sync::mpsc::sync_channel(4).0,
+            crashes: Crashes::default(),
+            window: "window-a".into(),
+        };
+        for _ in 0..(BUDGET_BURST as usize + 200) {
+            session.message("{\"type\":\"log\"}".into());
+        }
+        let floods: Vec<_> = service
+            .diagnostics()
+            .visible("window-a", None)
+            .into_iter()
+            .filter(|d| d.code == "MessageBudget")
+            .collect();
+        assert_eq!(floods.len(), 1);
+        assert_eq!(floods[0].session, Some(9));
     }
 
     const PROBE_MANIFEST: &str = r#"{"publisher":"acme","name":"probe","version":"1.0.0","engines":{"yavin":"^2.0.0"},"main":"extension.js","permissions":{"version":1,"request":["documents.read"]}}"#;
