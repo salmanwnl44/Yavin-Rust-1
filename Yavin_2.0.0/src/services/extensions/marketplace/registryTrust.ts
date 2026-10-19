@@ -19,7 +19,8 @@ export interface IndexVerification {
     | "expired"
     | "replay"
     | "malformed"
-    | "unavailable";
+    | "unavailable"
+    | "stateInvalid";
   registryId: string | null;
   keyId: string | null;
   sequence: number | null;
@@ -125,6 +126,12 @@ export function describeRegistryTrust(
         "This registry served an older index than one Yavin already accepted from it -- a downgrade.",
         "Try again later; if it persists, the registry or your connection may be tampered with.",
       );
+    case "stateInvalid":
+      return refused(
+        "Registry replay record unreadable",
+        "Yavin's record of the registry indexes it accepted cannot be read, so an older index could not be told from a current one. The record was left as it is.",
+        "Reset it to continue: replay protection then starts again from this index.",
+      );
     case "malformed":
       return refused(
         "Registry index unreadable",
@@ -138,6 +145,20 @@ export function describeRegistryTrust(
         "Reinstall or update Yavin.",
       );
   }
+}
+
+/**
+ * Why installing or updating from the registry the view shows would be refused now (EXT-22),
+ * from the native verification of its index: its title, or null when it would not be. A
+ * failed index refuses everything; one with no trusted key (or not reachable) refuses code.
+ * The native side refuses on its own -- this only keeps the view from offering what it would
+ * refuse, so an index that failed never reads as an update available.
+ */
+export function registryRefusal(trust: RegistryTrust | null, hasCode: boolean): string | null {
+  const said = describeRegistryTrust(trust);
+  if (!said || said.installsCode) return null;
+  if (said.tone === "error" || trust?.kind === "unreachable" || hasCode) return said.title;
+  return null;
 }
 
 /** The last trust state of each registry (by URL) the window loaded an index from. */

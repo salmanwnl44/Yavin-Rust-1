@@ -1,3 +1,7 @@
+= operations.*.state: staging | staged | committed
+= signature.status: registrySigned | publisherSigned | missing | invalid | unknownKey | keyRevoked | keyExpired | wrongNamespace | malformed | unavailable | indexSigned
+= trust.schema: 1
+= unchecked: legacy | adopted | rebuilt
 disabled
 disabledImported
 extensions

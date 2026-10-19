@@ -123,13 +123,37 @@ interface Commands {
         integrity: NativeIntegrity | null;
         /** The copy its intact previous one replaced (EXT-17). */
         replaced: NativeReplaced | null;
+        /** Where the copy in use came from, and its package's SHA-256 (EXT-22). */
+        provenance: NativeProvenance | null;
       }[];
       skipped: number;
       disabled: string[];
       recoveries: { at: number; id: string | null; reason: string }[];
       /** The extension profiles and the active one's settings (EXT-13). */
       profiles: import("./extensions/profiles.ts").ProfilesView;
+      /** An inventory an older Yavin set aside, offered back (EXT-21). */
+      setAside: import("./extensions/inventoryState.ts").SetAside | null;
     };
+  };
+  /** EXT-21: restore what an older Yavin set aside (the inventory in use is kept). */
+  extensions_restore_set_aside: {
+    args: { file: string };
+    result: Commands["extensions_list"]["result"];
+  };
+  /** EXT-21: keep the inventory in use; the set-aside one is no longer offered. */
+  extensions_dismiss_set_aside: {
+    args: { file: string };
+    result: Commands["extensions_list"]["result"];
+  };
+  /** EXT-21: set aside an inventory this Yavin cannot use, and start over. */
+  extensions_start_over: {
+    args: Record<string, never>;
+    result: Commands["extensions_list"]["result"];
+  };
+  /** EXT-21: set aside an unreadable record of accepted registry indexes (kept). */
+  marketplace_reset_registry_state: {
+    args: Record<string, never>;
+    result: null;
   };
   /** Extension diagnostics (EXT-14): the calling window's records and the application's. */
   extensions_diagnostics: {
@@ -823,6 +847,16 @@ export interface NativeIntegrity {
     | null;
   /** Whether its code may run. */
   runs: boolean;
+}
+
+/** Where an installed copy came from (EXT-22, `Provenance` in `extension_service.rs`): what
+ *  the inventory recorded when it was installed, never what the window is browsing now. */
+export interface NativeProvenance {
+  kind: "registry" | "openvsx" | "file" | "unknown";
+  /** The registry's address, for a registry or Open VSX. */
+  location: string | null;
+  /** The verified package's SHA-256, if a package is on record. */
+  sha256: string | null;
 }
 
 /** A copy that could not be used, replaced by its intact previous one (EXT-17). */

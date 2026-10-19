@@ -270,7 +270,72 @@ export function marketplaceErrorOf(error: unknown, fallback: MarketplaceErrorCod
     UninstallFailed: ["UninstallFailed", `Could not uninstall ${what}.`],
     UnknownExtension: ["UninstallFailed", `${what} is not installed in Yavin's extensions folder.`],
   };
-  const [mapped, message] = (code && known[code]) || [fallback, `${what}: something went wrong.`];
+  // EXT-20: the registry's signed index, refused -- not the package's own signature (EXT-09),
+  // which shares the codes. The native message says which.
+  const index = /registry's index|index served here/.test(detail);
+  const indexKnown: Record<string, [MarketplaceErrorCode, string]> = {
+    SignatureMissing: [
+      "SignatureFailed",
+      `The registry's index is not signed; ${what} was not installed.`,
+    ],
+    SignatureInvalid: [
+      "SignatureFailed",
+      `The registry's index was changed after it was signed; ${what} was not installed.`,
+    ],
+    UntrustedKey: [
+      "SignatureFailed",
+      `The registry's index is signed with a key this Yavin does not trust; ${what} was not installed. A Yavin update may be needed.`,
+    ],
+    KeyRevoked: [
+      "SignatureFailed",
+      `The registry's index is signed with a revoked key; ${what} was not installed.`,
+    ],
+    KeyExpired: [
+      "SignatureFailed",
+      `The registry's index is signed with a key whose trust has ended; ${what} was not installed.`,
+    ],
+  };
+  const registry: Record<string, [MarketplaceErrorCode, string]> = {
+    RegistryUnverified: [
+      "SignatureFailed",
+      `${what} runs code, and this registry has no key Yavin trusts, so its index cannot be authenticated; it was not installed.`,
+    ],
+    WrongRegistry: [
+      "SignatureFailed",
+      `The index served here is signed for another registry; ${what} was not installed.`,
+    ],
+    RegistryMetadataExpired: [
+      "SignatureFailed",
+      `The registry's index has expired; ${what} was not installed. Try again later.`,
+    ],
+    RegistryReplay: [
+      "SignatureFailed",
+      `The registry served an older index than one Yavin already accepted from it; ${what} was not installed.`,
+    ],
+    RegistryMetadataMalformed: [
+      "SignatureFailed",
+      `The registry's index could not be read unambiguously; ${what} was not installed.`,
+    ],
+    RegistryStateInvalid: [
+      "SignatureFailed",
+      `Yavin's record of the registry indexes it accepted cannot be read; ${what} was not installed. Reset it from the note above the extensions list.`,
+    ],
+    // EXT-21: nothing is installed while the inventory cannot be used.
+    InventoryUnsupported: [
+      "InstallFailed",
+      `${what} was not installed: this Yavin cannot use the extension inventory (see the note above the extensions list).`,
+    ],
+    InventoryUnavailable: [
+      "InstallFailed",
+      `${what}: Yavin's extension inventory cannot be read right now; nothing was changed.`,
+    ],
+    InventoryUnrecoverable: [
+      "InstallFailed",
+      `${what}: Yavin's extension inventory could not be recovered; nothing was changed.`,
+    ],
+  };
+  const [mapped, message] = (code && index && indexKnown[code]) ||
+    (code && (known[code] ?? registry[code])) || [fallback, `${what}: something went wrong.`];
   // The registry's own wait ("try again in 30 s.") is the useful part.
   if (mapped === "RateLimited")
     return new MarketplaceError(mapped, `${message.replace(/\.$/, "")}; ${detail}`, detail);

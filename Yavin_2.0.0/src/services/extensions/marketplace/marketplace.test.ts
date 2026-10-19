@@ -1048,3 +1048,149 @@ test("EXT-17/EXT-19 statuses: a copy not checked or not vouched for is Reinstall
   assert.equal(unchecked.signed, false);
   assert.equal(unchecked.label, "Not shown");
 });
+
+// --- EXT-22: one coherent status; nothing offered that the native side refuses ---------------
+
+test("EXT-22 an update from a registry whose index failed is blocked -- never Update Available -- and a running extension stays Active", async () => {
+  const { displayStatus } = await import("./status.ts");
+  const { registryRefusal } = await import("./registryTrust.ts");
+  const t = setup();
+  await t.installer.install("acme.python-tools");
+  const entry = t.registry.get("acme.python-tools")!;
+  const update = { id: entry.id, installed: "1.2.0", available: "1.3.0" };
+  const altered = registryRefusal(
+    {
+      kind: "checked",
+      verification: {
+        status: "invalid",
+        registryId: "yavin-official",
+        keyId: "k",
+        sequence: 2,
+        issuedAt: null,
+        expiresAt: null,
+        sha256: "a",
+        anchorsRevision: 1,
+      },
+    },
+    true,
+  );
+  assert.equal(altered, "Registry index altered");
+  const notRunning = displayStatus({ entry, trusted: true, update, updateRefused: altered });
+  assert.equal(notRunning.label, "Enabled", "a blocked update is not the status");
+  assert.deepEqual(
+    notRunning.notices?.map((n) => [n.label, n.tone]),
+    [["Update Blocked", "error"]],
+  );
+  assert.match(
+    notRunning.notices![0].detail,
+    /Version 1\.3\.0 is listed, but it cannot be installed: Registry index altered/,
+  );
+  const running = displayStatus({
+    entry,
+    trusted: true,
+    update,
+    updateRefused: altered,
+    runtime: { state: "active", reason: null, activationMs: 3 },
+  });
+  assert.equal(running.label, "Active");
+  assert.deepEqual(
+    running.notices?.map((n) => n.label),
+    ["Update Blocked"],
+  );
+  // Verified: offered as before.
+  assert.equal(
+    displayStatus({ entry, trusted: true, update, updateRefused: null }).label,
+    "Update Available",
+  );
+});
+
+test("EXT-22 what the shown registry refuses: everything when its index failed or it is unreachable; code when it has no trusted key", async () => {
+  const { registryRefusal } = await import("./registryTrust.ts");
+  const checked = (status: string) => ({
+    kind: "checked" as const,
+    verification: {
+      status: status as "verified",
+      registryId: null,
+      keyId: null,
+      sequence: null,
+      issuedAt: null,
+      expiresAt: null,
+      sha256: "a",
+      anchorsRevision: 1,
+    },
+  });
+  assert.equal(registryRefusal(null, true), null);
+  assert.equal(registryRefusal(checked("verified"), true), null);
+  for (const status of ["invalid", "missing", "replay", "expired", "keyRevoked", "stateInvalid"])
+    assert.ok(registryRefusal(checked(status), false), `${status}: nothing installs`);
+  assert.equal(
+    registryRefusal({ kind: "unreachable", error: "offline" }, false),
+    "Registry unavailable",
+  );
+  assert.equal(registryRefusal(checked("unanchored"), false), null, "themes and snippets may");
+  assert.equal(
+    registryRefusal(checked("unanchored"), true),
+    "Registry not verified",
+    "code may not",
+  );
+});
+
+test("EXT-22 a refusal of the registry's signed index is said as such -- not as the package's signature -- and every EXT-20/21 refusal has words", async () => {
+  const { marketplaceErrorOf } = await import("./types.ts");
+  const said = (native: string) =>
+    marketplaceErrorOf(native, "InstallFailed", "Hello World").message;
+  assert.equal(
+    said(
+      "SignatureInvalid: the registry's index does not match its signature: it was changed after it was signed. Hello World was not installed.",
+    ),
+    "The registry's index was changed after it was signed; Hello World was not installed.",
+  );
+  // The package's own signature (EXT-09, Open VSX) keeps its words.
+  assert.equal(
+    said("SignatureInvalid: the signature of acme.x does not verify."),
+    "Hello World's signature does not match the package; it was not installed.",
+  );
+  for (const [code, words] of [
+    ["SignatureMissing: the registry's index is not signed; x", /index is not signed/],
+    [
+      "UntrustedKey: the registry's index is signed with a key this Yavin does not trust for it.",
+      /A Yavin update may be needed/,
+    ],
+    ["RegistryUnverified: x", /no key Yavin trusts/],
+    [
+      "WrongRegistry: the index served here is signed for another registry.",
+      /signed for another registry/,
+    ],
+    ["RegistryMetadataExpired: x", /has expired/],
+    ["RegistryReplay: x", /older index/],
+    ["RegistryMetadataMalformed: x", /could not be read unambiguously/],
+    ["RegistryStateInvalid: x", /Reset it/],
+    ["InventoryUnsupported: x", /cannot use the extension inventory/],
+    ["InventoryUnavailable: x", /cannot be read right now; nothing was changed/],
+  ] as const) {
+    const message = said(code);
+    assert.doesNotMatch(message, /something went wrong/, code);
+    assert.match(message, words, code);
+  }
+});
+
+test("EXT-22 a view of an extension refused for its files or record says so -- not 'Activation failed', not the code", async () => {
+  const { viewPlaceholder } = await import("./status.ts");
+  assert.equal(viewPlaceholder(null, null), "Loading…");
+  assert.equal(
+    viewPlaceholder(undefined, "This folder is not trusted."),
+    "This folder is not trusted.",
+  );
+  const refused = viewPlaceholder(
+    "Activation failed: IntegrityUnverified: acme.hello's installed files have never been checked against its package, so its code does not run. Reinstall it to have them checked.",
+    null,
+  );
+  assert.match(refused, /^Not running: acme\.hello's installed files have never been checked/);
+  assert.match(refused, /Its page in Extensions says what to do\.$/);
+  assert.doesNotMatch(refused, /Activation failed|IntegrityUnverified/);
+  assert.match(
+    viewPlaceholder("Activation failed: TrustStateInvalid: x.", null),
+    /^Not running: x\./,
+  );
+  assert.equal(viewPlaceholder("Activation failed: kaboom", null), "kaboom");
+});

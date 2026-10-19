@@ -569,11 +569,17 @@ pub fn authenticated_index(
         .ok()
         .and_then(|a| a.for_base(&registry.base))
         .map(|a| a.id.clone());
-    let seen = match (root, &registry_id) {
-        (Some(root), Some(id)) => crate::registry_trust::read_seen(root).remove(id),
-        _ => None,
+    // What was accepted before (EXT-21): unreadable, the index is never taken as verified --
+    // nor is the record overwritten -- until the user resets it.
+    let (seen, state_invalid) = match (root, &registry_id) {
+        (Some(root), Some(id)) => match crate::registry_trust::read_seen(root) {
+            Ok(mut seen) => (seen.remove(id), false),
+            Err(e) if e.starts_with("RegistryStateInvalid") => (None, true),
+            Err(e) => return Err(e),
+        },
+        _ => (None, false),
     };
-    let verification = crate::registry_trust::authenticate(
+    let mut verification = crate::registry_trust::authenticate(
         &anchors,
         &registry.base,
         &index,
@@ -581,10 +587,23 @@ pub fn authenticated_index(
         seen.as_ref(),
         crate::package_trust::today(),
     );
+    if state_invalid && verification.status.verified() {
+        verification.status = crate::registry_trust::IndexStatus::StateInvalid;
+    }
     if let Some(root) = root {
         crate::registry_trust::record_seen(root, &verification)?;
     }
     Ok((index, verification))
+}
+
+/// Resets Yavin's record of accepted registry indexes at the user's request (EXT-21): kept
+/// aside, never deleted.
+#[tauri::command(async)]
+pub fn marketplace_reset_registry_state(
+    service: tauri::State<'_, crate::extension_service::ExtensionService>,
+) -> Result<(), String> {
+    let root = service.root_folder()?;
+    crate::registry_trust::reset_seen(&root).map(|_| ())
 }
 
 /// The registry's index with its verification, as the window shows it (EXT-20).
@@ -1080,21 +1099,19 @@ pub(crate) mod tests {
     #[ignore = "uses the network; needs the registry published"]
     fn live_official_registry_index_and_packages() {
         let official = registry(OFFICIAL_REGISTRY).unwrap();
-        let mut bytes = Vec::new();
-        fetch(
-            &official,
-            "index.json",
-            Kind::Text,
-            MAX_INDEX,
-            &mut |chunk| {
-                bytes.extend_from_slice(chunk);
-                Ok(())
-            },
-        )
-        .unwrap_or_else(|e| panic!("the published index: {e}"));
+        let root = temp("live-registry");
+        // EXT-20: the published index verifies under the key this Yavin pins, as the official
+        // registry's.
+        let (bytes, verification) = authenticated_index(&official, Some(&root))
+            .unwrap_or_else(|e| panic!("the published index: {e}"));
+        assert_eq!(
+            verification.status,
+            crate::registry_trust::IndexStatus::Verified,
+            "{verification:?}"
+        );
+        assert_eq!(verification.registry_id.as_deref(), Some("yavin-official"));
         let index: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(index["schema"], 1);
-        let root = temp("live-registry");
         let service = ExtensionService::new(root.clone(), Vec::new());
         let mut installed = 0;
         for extension in index["extensions"].as_array().unwrap() {
@@ -1113,6 +1130,8 @@ pub(crate) mod tests {
                 )
                 .unwrap_or_else(|e| panic!("{id}: {e}"));
                 assert!(staged.files > 0);
+                // Staged only: discarded, so the next version of the same id can be staged.
+                service.discard(&staged.token).unwrap();
                 installed += 1;
             }
         }

@@ -50,10 +50,11 @@ use extension_host::{
 };
 use extension_service::{
     extensions_diagnostics, extensions_diagnostics_clear, extensions_diagnostics_note,
-    extensions_diagnostics_report, extensions_list, extensions_profile_create,
-    extensions_profile_delete, extensions_profile_rename, extensions_profile_select,
-    extensions_profile_setting, extensions_profile_settings, extensions_profiles,
-    extensions_read_resource, extensions_safe_mode, extensions_set_enabled, extensions_set_grants,
+    extensions_diagnostics_report, extensions_dismiss_set_aside, extensions_list,
+    extensions_profile_create, extensions_profile_delete, extensions_profile_rename,
+    extensions_profile_select, extensions_profile_setting, extensions_profile_settings,
+    extensions_profiles, extensions_read_resource, extensions_restore_set_aside,
+    extensions_safe_mode, extensions_set_enabled, extensions_set_grants, extensions_start_over,
     ExtensionService,
 };
 use external::open_external_url;
@@ -875,6 +876,9 @@ pub fn run() {
             dap_stop,
             dap_stop_all,
             extensions_list,
+            extensions_restore_set_aside,
+            extensions_dismiss_set_aside,
+            extensions_start_over,
             extensions_set_enabled,
             extensions_profiles,
             extensions_diagnostics,
@@ -897,6 +901,7 @@ pub fn run() {
             marketplace::marketplace_default_registry,
             marketplace::marketplace_get_text,
             marketplace::marketplace_index,
+            marketplace::marketplace_reset_registry_state,
             marketplace::marketplace_get_icon,
             marketplace::extensions_stage,
             marketplace::extensions_commit,

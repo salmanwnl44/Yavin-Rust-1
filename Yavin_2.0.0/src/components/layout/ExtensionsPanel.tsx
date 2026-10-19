@@ -17,6 +17,15 @@ import { CardButton, ExtensionCard } from "../extensions/ExtensionCard";
 import { ExtensionProfiles, ProfileSwitcher } from "../extensions/ExtensionProfiles";
 import { MANAGE_PROFILES_EVENT } from "../extensions/ExtensionDetails";
 import { RegistryTrustNotice } from "../extensions/RegistryTrustNotice";
+import { InventoryNotice } from "../extensions/InventoryNotice";
+import { inventoryState } from "../../services/extensions/inventoryState";
+import {
+  registryRefusal,
+  registryTrust,
+} from "../../services/extensions/marketplace/registryTrust";
+import { viewPlaceholder } from "../../services/extensions/marketplace/status";
+import { describeIntegrity } from "../../services/extensions/integrity";
+import { native } from "../../services/native";
 import { ExtensionDiagnostics } from "../extensions/ExtensionDiagnostics";
 import { nativeDiagnostics } from "../../services/extensions/diagnostics";
 import { profileStore } from "../../services/extensions/profiles";
@@ -124,7 +133,7 @@ export function ExtensionViewSection({
       </div>
       {!rows && (
         <p className="px-1 text-[11px] text-zinc-600">
-          {status?.reason ?? snapshot.held ?? "Loading…"}
+          {viewPlaceholder(status?.reason, snapshot.held)}
         </p>
       )}
       <div role="tree" aria-label={`${view.name} items`}>
@@ -275,6 +284,11 @@ export function ExtensionsPanel({
   onChooseMarketplace?: (source: "yavin" | "openvsx") => void;
 }) {
   const state = useExtensionsState({ registry, manager, marketplace, installer });
+  // EXT-22: what the registry's verification and the inventory allow is what is offered.
+  useSyncExternalStore(registryTrust.subscribe, registryTrust.getSnapshot);
+  const trustNow = state.market.providerId !== "openvsx" ? registryTrust.latest() : null;
+  const inventoryNow = useSyncExternalStore(inventoryState.subscribe, inventoryState.getSnapshot);
+  const inventoryBlocked = inventoryNow.kind === "unsupported" || inventoryNow.kind === "failed";
   const { registry: known, runtime: running, market, operations } = state;
   const search = useMemo(
     () => createSearchController((request, signal) => marketplace.search(request, signal)),
@@ -474,10 +488,14 @@ export function ExtensionsPanel({
         disabled: busy,
         onClick: () => registry.setEnabled(id, !entry.enabled),
       });
+      // EXT-22: refused by the shown registry: said, not offered.
+      const refused = update ? registryRefusal(trustNow, !!entry.manifest.main) : null;
       if (update)
         items.push({
-          label: `Update to ${update.available}`,
-          disabled: busy,
+          label: refused
+            ? `Update to ${update.available} (blocked: ${refused})`
+            : `Update to ${update.available}`,
+          disabled: busy || !!refused,
           onClick: () => run(installer.update(id)),
         });
       if (installer.removable(entry))
@@ -504,6 +522,18 @@ export function ExtensionsPanel({
     return failure ? { message: failure.message, detail: failure.detail } : null;
   };
 
+  /** Whether reinstalling is the way out for a copy whose code may not run (EXT-17/19). */
+  const reinstallable = (entry: RegisteredExtension) => {
+    const integrity = describeIntegrity(entry.integrity);
+    return (
+      !!entry.manifest.main &&
+      entry.enabled &&
+      !!integrity &&
+      !integrity.runs &&
+      integrity.reinstall
+    );
+  };
+
   /** An installed extension's card. */
   const installedCard = (entry: RegisteredExtension) => {
     const name = entry.manifest.displayName;
@@ -524,7 +554,7 @@ export function ExtensionsPanel({
             description: entry.manifest.description ?? "",
             publisher: entry.manifest.publisher,
             version: entry.manifest.version,
-            status: statusOf(entry.id, state, trusted, marketplace),
+            status: statusOf(entry.id, state, trusted, marketplace, undefined, trustNow),
             failure: failureOf(entry.id),
           }}
           marketplace={marketplace}
@@ -533,7 +563,24 @@ export function ExtensionsPanel({
           onDismissFailure={() => installer.dismiss(entry.id)}
           actions={
             <>
-              {update && (
+              {/* EXT-22: the way out of Reinstall Required, on the card too. */}
+              {reinstallable(entry) && (
+                <CardButton
+                  label={`Reinstall ${name} ${entry.replaced?.version ?? entry.manifest.version}`}
+                  disabled={busy}
+                  onClick={() =>
+                    run(
+                      installer.install(
+                        entry.id,
+                        entry.replaced?.version ?? entry.manifest.version,
+                      ),
+                    )
+                  }
+                >
+                  Reinstall
+                </CardButton>
+              )}
+              {update && !registryRefusal(trustNow, !!entry.manifest.main) && (
                 <CardButton
                   primary
                   label={`Update ${name}`}
@@ -600,6 +647,7 @@ export function ExtensionsPanel({
         : operation?.phase === "verifying"
           ? "Verifying…"
           : "Installing…";
+    const refusedNow = registryRefusal(trustNow, false);
     return (
       <ExtensionCard
         key={extension.id}
@@ -609,7 +657,7 @@ export function ExtensionsPanel({
           description: extension.description,
           publisher: extension.publisherDisplayName ?? extension.publisher,
           version: extension.version,
-          status: statusOf(extension.id, state, trusted, marketplace, extension),
+          status: statusOf(extension.id, state, trusted, marketplace, extension, trustNow),
           failure: failureOf(extension.id),
         }}
         marketplace={marketplace}
@@ -620,8 +668,8 @@ export function ExtensionsPanel({
           <CardButton
             primary
             label={`Install ${name}`}
-            disabled={!!operation || !latest}
-            title={why ?? fits.notes?.[0] ?? `Install ${name}`}
+            disabled={!!operation || !latest || !!refusedNow}
+            title={refusedNow ?? why ?? fits.notes?.[0] ?? `Install ${name}`}
             onClick={() => run(installer.install(extension.id))}
           >
             {operation ? busyLabel : "Install"}
@@ -779,26 +827,46 @@ export function ExtensionsPanel({
           </div>
         )}
       </div>
+      {/* EXT-21: whether this Yavin can use its extension inventory, and what to do if not. */}
+      <InventoryNotice onChanged={() => manager.reload()} />
       {/* EXT-20: whether Yavin's registry index was authenticated. */}
-      {market.providerId !== "openvsx" && <RegistryTrustNotice />}
+      {market.providerId !== "openvsx" && (
+        <RegistryTrustNotice
+          onReset={async () => {
+            await native("marketplace_reset_registry_state", {});
+            marketplace.refresh();
+            setAttempt((n) => n + 1);
+          }}
+        />
+      )}
 
       <div className="min-h-0 flex-1 overflow-y-auto pb-3">
-        {(view === "all" || view === "installed") && (!searching || installedShown.length > 0) && (
-          <section aria-label="Installed extensions">
-            <SectionHeader title="Installed" count={installedShown.length} />
-            {installedShown.length ? (
-              installedShown.map(installedCard)
-            ) : (
-              <Note>
-                {text
-                  ? "No installed extension matches."
-                  : "No extensions installed yet. Search the marketplace above."}
-              </Note>
-            )}
-          </section>
+        {/* EXT-22: while the inventory cannot be used, nothing here is real: not "nothing
+            installed", and no install the native side would refuse. */}
+        {inventoryBlocked && (
+          <Note>
+            Your installed extensions are not shown, and nothing can be installed, until the
+            extension inventory can be used (see the note above).
+          </Note>
         )}
+        {!inventoryBlocked &&
+          (view === "all" || view === "installed") &&
+          (!searching || installedShown.length > 0) && (
+            <section aria-label="Installed extensions">
+              <SectionHeader title="Installed" count={installedShown.length} />
+              {installedShown.length ? (
+                installedShown.map(installedCard)
+              ) : (
+                <Note>
+                  {text
+                    ? "No installed extension matches."
+                    : "No extensions installed yet. Search the marketplace above."}
+                </Note>
+              )}
+            </section>
+          )}
 
-        {view === "updates" && (
+        {!inventoryBlocked && view === "updates" && (
           <section aria-label="Updates">
             <SectionHeader title="Updates" count={updatesShown.length}>
               <button
@@ -820,7 +888,7 @@ export function ExtensionsPanel({
           </section>
         )}
 
-        {searching && (
+        {!inventoryBlocked && searching && (
           <section aria-label="Marketplace results">
             <SectionHeader
               title={market.providerLabel}
@@ -856,7 +924,7 @@ export function ExtensionsPanel({
           </section>
         )}
 
-        {wantsRecommendations && (
+        {!inventoryBlocked && wantsRecommendations && (
           <section aria-label="Recommended extensions">
             <SectionHeader
               title="Recommended"

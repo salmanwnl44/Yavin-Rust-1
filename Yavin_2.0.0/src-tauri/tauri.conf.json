@@ -29,6 +29,7 @@
   "bundle": {
     "resources": ["resources/search/rg.exe", "resources/search/COPYING", "resources/search/LICENSE-MIT", "resources/search/UNLICENSE", "resources/search/VERSION.txt", "resources/extension-host/*"],
     "active": true,
+    "windows": { "allowDowngrades": false },
     "targets": "all",
     "icon": [
       "icons/32x32.png",

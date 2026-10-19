@@ -16,7 +16,12 @@ import {
   type SettingDefinition,
   type SettingsRegistry,
 } from "../settings/settings.ts";
-import type { NativeIntegrity, NativeReplaced, NativeSignature } from "../native.ts";
+import type {
+  NativeIntegrity,
+  NativeProvenance,
+  NativeReplaced,
+  NativeSignature,
+} from "../native.ts";
 import { ExtensionError } from "./errors.ts";
 import {
   readManifest,
@@ -77,6 +82,8 @@ export interface RegisteredExtension {
   integrity: NativeIntegrity | null;
   /** The copy its intact previous one replaced (EXT-17), while that is so. */
   replaced: NativeReplaced | null;
+  /** Where the copy in use came from and its package's SHA-256 (EXT-22): null until said. */
+  provenance: NativeProvenance | null;
 }
 
 export interface RejectedExtension {
@@ -223,7 +230,11 @@ export function createExtensionRegistry(options: {
   const signatureStates = new Map<string, NativeSignature | null>();
   const integrityStates = new Map<
     string,
-    { integrity: NativeIntegrity | null; replaced: NativeReplaced | null }
+    {
+      integrity: NativeIntegrity | null;
+      replaced: NativeReplaced | null;
+      provenance: NativeProvenance | null;
+    }
   >();
   let rejected: RejectedExtension[] = [];
   /** Settings registered for each enabled extension, to remove with it. */
@@ -375,14 +386,19 @@ export function createExtensionRegistry(options: {
     id: string,
     integrity: NativeIntegrity | null,
     replaced: NativeReplaced | null,
+    provenance: NativeProvenance | null = null,
   ) => {
-    integrityStates.set(id, { integrity, replaced });
+    integrityStates.set(id, { integrity, replaced, provenance });
     const entry = extensions.get(id);
     if (!entry) return;
-    if (JSON.stringify([entry.integrity, entry.replaced]) === JSON.stringify([integrity, replaced]))
+    if (
+      JSON.stringify([entry.integrity, entry.replaced, entry.provenance]) ===
+      JSON.stringify([integrity, replaced, provenance])
+    )
       return;
     entry.integrity = integrity;
     entry.replaced = replaced;
+    entry.provenance = provenance;
     publish();
   };
 
@@ -442,6 +458,7 @@ export function createExtensionRegistry(options: {
         signature: signatureStates.get(manifest.id) ?? null,
         integrity: integrityStates.get(manifest.id)?.integrity ?? null,
         replaced: integrityStates.get(manifest.id)?.replaced ?? null,
+        provenance: integrityStates.get(manifest.id)?.provenance ?? null,
       };
       extensions.set(manifest.id, entry);
       if (entry.enabled) applySettings(entry);
@@ -489,6 +506,7 @@ export function createExtensionRegistry(options: {
         signature: null,
         integrity: null,
         replaced: null,
+        provenance: null,
       };
       signatureStates.delete(id);
       integrityStates.delete(id);

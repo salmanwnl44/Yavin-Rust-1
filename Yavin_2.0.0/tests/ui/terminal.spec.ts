@@ -183,7 +183,11 @@ async function desktop(
       /** EXT-17: what the inventory says of installed copies' files (`__copyStates`, set by a test). */
       const copyStates = (): Record<
         string,
-        { integrity?: { state: string; reason: string | null; runs: boolean }; replaced?: unknown }
+        {
+          integrity?: { state: string; reason: string | null; runs: boolean };
+          replaced?: unknown;
+          provenance?: unknown;
+        }
       > => ((window as unknown as { __copyStates?: Record<string, never> }).__copyStates ??= {});
       // The native extension profiles (EXT-13), as the mock holds them.
       const profiles = {
@@ -888,9 +892,35 @@ async function desktop(
               profiles.profiles = profiles.profiles.filter((p) => p.id !== args.id);
               return profileView();
             }
+            // EXT-21: what a test says of the inventory (refused natively, or an older Yavin's
+            // set aside), and the recovery commands, each recorded.
+            const inventory = (
+              window as unknown as {
+                __inventory?: {
+                  error?: string;
+                  setAside?: unknown;
+                  refuse?: string;
+                  calls?: string[];
+                };
+              }
+            ).__inventory;
+            if (
+              command === "extensions_restore_set_aside" ||
+              command === "extensions_dismiss_set_aside" ||
+              command === "extensions_start_over"
+            ) {
+              const state = inventory ?? {};
+              (state.calls ??= []).push(`${command} ${String(args?.file ?? "")}`.trim());
+              if (state.refuse) throw state.refuse;
+              state.error = undefined;
+              state.setAside = undefined;
+              return null;
+            }
+            if (command === "extensions_list" && inventory?.error) throw inventory.error;
             if (command === "extensions_list")
               return {
                 profiles: profileView(),
+                setAside: inventory?.setAside ?? null,
                 root: "/data/extensions",
                 extensions: [
                   ...Object.entries(installedExtensions).map(([id, one]) => ({
@@ -906,6 +936,8 @@ async function desktop(
                       runs: true,
                     },
                     replaced: copyStates()[id]?.replaced ?? null,
+                    // EXT-22: where the copy came from, as the inventory recorded it.
+                    provenance: copyStates()[id]?.provenance ?? null,
                   })),
                   ...(setup.extensions ?? []).map((one) => {
                     const id = one.error ? null : idOf(one.manifest);
@@ -3627,6 +3659,16 @@ test("with no configuration the Debug view says so and Configure Debugging opens
 // from the mock's discovery; their code runs in the mock's extension host, through the real
 // extension API (`bootstrap.js`) and the native start/send/stop contract.
 
+/** EXT-22: a copy whose code may not run is said once, under its status's own label: the
+ *  header names it, the note below explains it (once) with its action -- not a second label. */
+async function saidOnce(details: Locator) {
+  const note = details.getByTestId("extension-integrity");
+  await expect(note).toContainText(/^Reinstall Required — /);
+  expect(((await note.textContent()) ?? "").match(/does not run/g)?.length).toBe(1);
+  await expect(details.getByTestId("extension-details-state")).toHaveText("Reinstall Required");
+  await expect(details.getByTestId("extension-integrity-runs")).toHaveCount(0);
+}
+
 async function extensionsView(page: Page) {
   await page.getByTitle("Extensions & Plugins (Ctrl+Shift+X)", { exact: true }).click();
   return page.getByRole("complementary", { name: "Extensions" });
@@ -4043,10 +4085,7 @@ test("EXT-17 an installed copy whose files were not checked says so, runs, and a
   await installed.click();
   const details = page.getByRole("region", { name: "Extension: Docker Tools" });
   const banner = details.getByTestId("extension-integrity");
-  await expect(banner).toContainText("Not Checked");
-  await expect(details.getByTestId("extension-integrity-runs")).toHaveText(
-    "Its code does not run.",
-  );
+  await saidOnce(details);
   await details.getByRole("tab", { name: "Requirements" }).click();
   await expect(details.getByTestId("extension-files")).toContainText("Not Checked");
   await expect(details.getByTestId("extension-signature")).toHaveAttribute("data-signed", "false");
@@ -4081,9 +4120,7 @@ test("EXT-17 a recovered copy whose code cannot run is Reinstall Required; reins
   );
   await installed.click();
   const details = page.getByRole("region", { name: "Extension: Docker Tools" });
-  await expect(details.getByTestId("extension-integrity-runs")).toHaveText(
-    "Its code does not run.",
-  );
+  await saidOnce(details);
   await expect(details.getByTestId("extension-details-state")).toContainText("Reinstall Required");
 
   // Reinstalled: its files checked, it runs again.
@@ -4120,9 +4157,7 @@ test("EXT-19 a copy whose trust record does not verify: Reinstall Required, sayi
   const details = page.getByRole("region", { name: "Extension: Docker Tools" });
   const banner = details.getByTestId("extension-integrity");
   await expect(banner).toHaveAttribute("data-state", "untrusted");
-  await expect(details.getByTestId("extension-integrity-runs")).toHaveText(
-    "Its code does not run.",
-  );
+  await saidOnce(details);
   // Never shown as verified or signed meanwhile.
   await details.getByRole("tab", { name: "Requirements" }).click();
   await expect(details.getByTestId("extension-files")).toContainText("Not Verified");
@@ -4184,6 +4219,102 @@ test("EXT-17 a fallback: the intact previous version is used, the one it replace
   await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
     "Updater 1.1.0",
   );
+});
+
+test("EXT-21 the extension inventory: a newer one paused and said, with what to do; starting over only after a warning; an older Yavin's set-aside one offered, restored or kept", async ({
+  page,
+}) => {
+  const NEWER =
+    "InventoryUnsupported: the extension inventory was written by a newer Yavin (inventory version 5; this Yavin reads up to 4). It was left exactly as it is, and no extension runs until that Yavin, or a newer one, is installed again -- then your extensions, permissions, profiles and settings are as they were. Nothing needs to be deleted.";
+  await page.addInitScript((error) => {
+    (window as unknown as { __inventory?: unknown }).__inventory = { error, calls: [] };
+  }, NEWER);
+  await desktop(page);
+  const view = await extensionsView(page);
+  const notice = view.getByTestId("inventory-notice");
+  await expect(notice).toHaveAttribute("data-state", "unsupported");
+  await expect(notice).toContainText("Extensions paused: their inventory is from a newer Yavin");
+  await expect(notice).toContainText("Install the Yavin you used before (or a newer one)");
+  await expect(notice).toContainText("Nothing needs to be deleted.");
+  await expect(view.getByTestId("inventory-reason")).toHaveText(NEWER);
+  // No extension is listed as if nothing were wrong.
+  await expect(view.getByRole("group", { name: "Hello World (sample)" })).toHaveCount(0);
+  const calls = () =>
+    page.evaluate(
+      () => (window as unknown as { __inventory: { calls: string[] } }).__inventory.calls,
+    );
+  // Retry: still refused, still said.
+  await notice.getByRole("button", { name: "Retry loading extensions" }).click();
+  await expect(notice).toHaveAttribute("data-state", "unsupported");
+  // Starting over is never one click: the warning first, and Cancel does nothing.
+  await notice.getByRole("button", { name: "Start over with this Yavin" }).click();
+  await expect(view.getByTestId("inventory-start-over-warning")).toContainText(
+    "Your inventory is kept -- renamed, byte for byte",
+  );
+  await notice.getByRole("button", { name: "Cancel starting over" }).click();
+  await expect(view.getByTestId("inventory-start-over-warning")).toHaveCount(0);
+  expect(await calls()).toEqual([]);
+  // Refused natively: said, nothing else changes.
+  await page.evaluate(() => {
+    (window as unknown as { __inventory: { refuse?: string } }).__inventory.refuse =
+      "InventoryUnrecoverable: inventory.json could not be set aside (denied); nothing was changed.";
+  });
+  await notice.getByRole("button", { name: "Start over with this Yavin" }).click();
+  await notice.getByRole("button", { name: "Set aside and start over" }).click();
+  await expect(view.getByTestId("inventory-failure")).toContainText("InventoryUnrecoverable");
+  await expect(notice).toHaveAttribute("data-state", "unsupported");
+  await page.evaluate(() => {
+    (window as unknown as { __inventory: { refuse?: string } }).__inventory.refuse = undefined;
+  });
+  await notice.getByRole("button", { name: "Set aside and start over" }).click();
+  await expect(view.getByTestId("inventory-recovered")).toHaveText(
+    "Started over: your previous extension inventory was kept.",
+  );
+  await expect(view.getByRole("group", { name: "Hello World (sample)" })).toBeVisible();
+  expect(await calls()).toEqual(["extensions_start_over", "extensions_start_over"]);
+
+  // An older Yavin's set-aside inventory: offered, not applied; restored on request.
+  const setAside = {
+    file: "inventory.json.corrupt-1790000000000.bak",
+    at: Date.UTC(2026, 8, 21),
+    version: 3,
+    extensions: 3,
+    grants: 1,
+    profiles: 2,
+  };
+  for (const [button, call, said] of [
+    [
+      "Restore set-aside extensions",
+      "extensions_restore_set_aside",
+      "Extensions restored from the set-aside inventory.",
+    ],
+    [
+      "Keep current extensions",
+      "extensions_dismiss_set_aside",
+      "Kept the extension inventory in use.",
+    ],
+  ] as const) {
+    await page.evaluate((setAside) => {
+      const inventory = (
+        window as unknown as { __inventory: { setAside?: unknown; calls: string[] } }
+      ).__inventory;
+      inventory.setAside = setAside;
+      inventory.calls = [];
+    }, setAside);
+    await view.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("menuitem", { name: "Reload Extensions" }).click();
+    const offered = view.getByTestId("inventory-notice");
+    await expect(offered).toHaveAttribute("data-state", "ok");
+    await expect(offered).toContainText("An older Yavin set your extensions aside");
+    await expect(offered).toContainText("On 2026-09-21,");
+    await expect(offered).toContainText("3 extensions, 1 permission grant and 2 profiles");
+    await expect(offered).toContainText("none runs that would not have");
+    expect(await calls()).toEqual([]);
+    await offered.getByRole("button", { name: button }).click();
+    await expect(view.getByTestId("inventory-recovered")).toHaveText(said);
+    await expect(view.getByTestId("inventory-notice")).toHaveCount(0);
+    expect(await calls()).toEqual([`${call} ${setAside.file}`]);
+  }
 });
 
 test("EXT-20 the registry's index: verified said quietly; altered, untrusted, unpinned or offline said with why and what to do", async ({
@@ -4684,6 +4815,108 @@ test("update: an older version installed, the update found and badged, installed
   await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
     "Updater 1.1.0",
   );
+});
+
+test("EXT-22 one coherent story: where a copy came from is the inventory's; an update from an altered index is blocked, not offered; a refused copy has Reinstall on its card; a paused inventory offers nothing", async ({
+  page,
+}) => {
+  test.slow();
+  await desktop(page);
+  const view = await extensionsView(page);
+  const badge = page.getByTitle("Extensions & Plugins (Ctrl+Shift+X)", { exact: true });
+  await copyState(page, "acme.updater", {
+    provenance: {
+      kind: "registry",
+      location: "https://example.test/registry/",
+      sha256: "ab".repeat(32),
+    },
+  });
+  await searchBox(view).fill("updater");
+  await card(view.getByRole("region", { name: "Marketplace results" }), "Updater Demo").click();
+  const details = page.getByRole("region", { name: "Extension: Updater Demo" });
+  await details.getByRole("tab", { name: "Information" }).click();
+  await expect(details.getByTestId("extension-source")).toHaveText("Yavin Extensions");
+  await details.getByRole("button", { name: "Install version 1.0.0" }).click();
+  await expect(details.getByRole("region", { name: "Versions" })).toContainText("Installed");
+  // Installed: where this copy came from and its package's digest -- not what is browsed.
+  await expect(details.getByTestId("extension-source")).toHaveText(
+    "A registry: https://example.test/registry/",
+  );
+  await expect(details.getByTestId("extension-package-sha256")).toHaveText("ab".repeat(32));
+  await expect(details).toContainText("its installed files are checked against it.");
+  await (await palette(page, "Updater: Which Version")).click();
+  await details.getByRole("button", { name: "Back to Extensions" }).click();
+
+  // The registry's index altered after signing: its update is listed, but blocked.
+  await page.evaluate(() => {
+    (window as unknown as { __registryVerification?: unknown }).__registryVerification = {
+      status: "invalid",
+    };
+  });
+  await view.getByRole("button", { name: "Refresh marketplace" }).click();
+  await expect(view.getByTestId("registry-trust")).toContainText("Registry index altered");
+  await (await palette(page, "Extensions: Check for Updates")).click();
+  const updater = card(view.getByRole("region", { name: "Updates" }), "Updater Demo");
+  await expect(updater.getByTestId("extension-state")).toHaveText("Active");
+  await expect(updater.getByTestId("extension-notice")).toHaveText(
+    /^Update Blocked — Version 1\.1\.0 is listed, but it cannot be installed: Registry index altered/,
+  );
+  await expect(updater.getByRole("button", { name: "Update Updater Demo" })).toHaveCount(0);
+  await expect(badge).not.toContainText("1");
+  await updater.click();
+  await expect(details.getByRole("button", { name: "Update Updater Demo" })).toHaveCount(0);
+  await details.getByRole("button", { name: "Back to Extensions" }).click();
+  // Verified again: offered again.
+  await page.evaluate(() => {
+    (window as unknown as { __registryVerification?: unknown }).__registryVerification = undefined;
+  });
+  await view.getByRole("button", { name: "Refresh marketplace" }).click();
+  await expect(view.getByTestId("registry-trust")).toHaveText("Registry index verified");
+  await expect(updater.getByRole("button", { name: "Update Updater Demo" })).toBeVisible();
+  await expect(updater.getByTestId("extension-notice")).toHaveText(
+    "Update Available — Version 1.1.0 is available.",
+  );
+  await expect(badge).toContainText("1");
+  await view.getByRole("button", { name: "Remove filter Updates" }).click();
+  await searchBox(view).fill("");
+
+  // A copy whose code may not run: Reinstall is on its card, not only on its page.
+  await copyState(page, "acme.docker-tools", {
+    integrity: { state: "unchecked", reason: "legacy", runs: false },
+  });
+  await card(view.getByRole("region", { name: "Recommended extensions" }), "Docker Tools")
+    .getByRole("button", { name: "Install Docker Tools" })
+    .click();
+  const docker = card(view.getByRole("region", { name: "Installed extensions" }), "Docker Tools");
+  await expect(docker.getByTestId("extension-state")).toHaveText(/^Reinstall Required — /);
+  await copyState(page, "acme.docker-tools", {
+    integrity: { state: "verified", reason: null, runs: true },
+  });
+  await docker.getByRole("button", { name: /^Reinstall Docker Tools/ }).click();
+  await expect(docker.getByTestId("extension-state")).not.toHaveText(/Reinstall Required/);
+  await expect(docker.getByRole("button", { name: /^Reinstall Docker Tools/ })).toHaveCount(0);
+
+  // The inventory cannot be used: no "nothing installed", no install that would be refused.
+  await page.evaluate(() => {
+    (window as unknown as { __inventory?: unknown }).__inventory = {
+      error:
+        "InventoryUnsupported: the extension inventory was written by a newer Yavin (inventory version 5; this Yavin reads up to 4). It was left exactly as it is.",
+      calls: [],
+    };
+  });
+  await view.getByRole("button", { name: "More actions" }).click();
+  await page.getByRole("menuitem", { name: "Reload Extensions" }).click();
+  await expect(view.getByTestId("inventory-notice")).toHaveAttribute("data-state", "unsupported");
+  await expect(view).toContainText(
+    "Your installed extensions are not shown, and nothing can be installed, until the extension inventory can be used",
+  );
+  for (const region of ["Installed extensions", "Recommended extensions"])
+    await expect(view.getByRole("region", { name: region })).toHaveCount(0);
+  await expect(view).not.toContainText("No extensions installed yet");
+  // The native reason is there, under Details -- not said twice in full.
+  await expect(view.getByTestId("inventory-reason")).toBeHidden();
+  await view.getByTestId("inventory-notice").getByText("Details").click();
+  await expect(view.getByTestId("inventory-reason")).toBeVisible();
 });
 
 test("uninstall asks first and whether to remove its data; the extension is gone", async ({

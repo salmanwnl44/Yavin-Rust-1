@@ -87,8 +87,13 @@ const LEGACY_PREVIOUS: &str = ".previous";
 /// `read_inventory`): a Yavin that reads an inventory written by a newer one refuses it --
 /// it never reads it and drops what it does not know (grants, profiles, signature records,
 /// files digests) on its next write. A test pins the persisted fields to this version.
-/// 3 (EXT-19) adds `trust` on copies.
-const INVENTORY_VERSION: u32 = 3;
+/// 3 (EXT-19) adds `trust` on copies. 4 (EXT-21) adds no field: it marks the persisted value
+/// `indexSigned` (EXT-20), which a version-3 Yavin cannot read -- EXT-19 took such an inventory
+/// for damage and rebuilt over it. **Persisted values are pinned with the fields**: a new value
+/// of a persisted enum bumps the version too.
+const INVENTORY_VERSION: u32 = 4;
+/// The oldest inventory version this Yavin reads (and migrates).
+const OLDEST_INVENTORY: u32 = 1;
 const MAX_RECOVERIES: usize = 20;
 /// How long a staged or committed operation of this process may wait for its window before
 /// another operation of its id may end it. The window takes milliseconds between the steps; an
@@ -289,6 +294,38 @@ pub struct Listed {
     /// The copy that could not be used, when this one -- its intact previous one -- took its
     /// place (EXT-17).
     pub replaced: Option<Replaced>,
+    /// Where the copy in use came from and its package's SHA-256, as recorded when it was
+    /// installed (EXT-22) -- never what the window happens to be browsing.
+    pub provenance: Option<Provenance>,
+}
+
+/// Where an installed copy came from (EXT-22), from the inventory's record of it.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Provenance {
+    /// `registry` (Yavin's or a custom one), `openvsx`, `file`, or `unknown` (adopted or
+    /// rebuilt: nothing is known of where it came from).
+    pub kind: &'static str,
+    /// The registry's address, for a registry or Open VSX.
+    pub location: Option<String>,
+    /// The verified package's SHA-256; none when no package is on record.
+    pub sha256: Option<String>,
+}
+
+impl Provenance {
+    fn of(copy: &Copy) -> Provenance {
+        let (kind, location) = match copy.source.split_once(' ') {
+            Some(("registry", url)) => ("registry", Some(url.to_string())),
+            Some(("openvsx", url)) => ("openvsx", Some(url.to_string())),
+            _ if copy.source == "file" => ("file", None),
+            _ => ("unknown", None),
+        };
+        Provenance {
+            kind,
+            location,
+            sha256: copy.sha256.clone(),
+        }
+    }
 }
 
 /// What is known of a copy's files (EXT-17), as the window shows it.
@@ -462,6 +499,24 @@ pub struct Listing {
     pub recoveries: Vec<Recovery>,
     /// The extension profiles, and the active one's settings (EXT-13).
     pub profiles: ProfilesView,
+    /// An inventory an older Yavin set aside that this one reads and that differs from the one
+    /// in use: what restoring would bring back (EXT-21).
+    pub set_aside: Option<SetAside>,
+}
+
+/// An inventory set aside by an older Yavin -- one it could not read, which this Yavin can
+/// (EXT-21). Restoring it is the user's choice: what was done since would be replaced.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAside {
+    /// Its file name, in the extensions folder.
+    pub file: String,
+    /// When it was set aside (ms since the Unix epoch).
+    pub at: u64,
+    pub version: u32,
+    pub extensions: usize,
+    pub grants: usize,
+    pub profiles: usize,
 }
 
 #[derive(Serialize, Debug)]
@@ -893,20 +948,63 @@ impl ExtensionService {
     fn load(&self, paths: &Paths) -> Result<(Inventory, bool), String> {
         fs::create_dir_all(&paths.root).map_err(|e| format!("InstallFailed: {e}"))?;
         let file = paths.root.join(INVENTORY);
-        match read_inventory(&file) {
-            // Nothing installed: a new folder, or IDE-09's (adopted as it is by listing).
-            // A newer Yavin's inventory was kept aside: nothing is restored or rebuilt over it,
-            // however often this Yavin starts (EXT-17).
-            Loaded::Missing if newer_kept_aside(&paths.root).is_some() => Err(format!(
-                "InventoryUnsupported: the extension inventory was written by a newer Yavin (version {}); it was kept aside, untouched. Update Yavin.",
-                newer_kept_aside(&paths.root).unwrap_or_default()
+        let loaded = match read_inventory(&file) {
+            Ok(loaded) => loaded,
+            // A newer Yavin's: left as it is, however often this Yavin starts (EXT-21).
+            Err(why @ Unsupported::Newer(_)) => {
+                return Err(unsupported("the extension inventory", why))
+            }
+            // Readable JSON of a known version that this Yavin cannot read: its last good copy
+            // is used if that reads -- the inventory kept first, byte for byte -- and nothing
+            // is ever rebuilt over it.
+            Err(why @ Unsupported::NotUnderstood(_)) => {
+                let mut inventory = match read_inventory(&paths.root.join(LAST_GOOD)) {
+                    Ok(
+                        Loaded::Current(inventory)
+                        | Loaded::Migrated {
+                            value: inventory, ..
+                        },
+                    ) => inventory,
+                    _ => return Err(unsupported("the extension inventory", why)),
+                };
+                let kept = paths.root.join(format!(
+                    "{INVENTORY}.unreadable-{}.bak",
+                    ide_workspace::durable::now_millis()
+                ));
+                let text = fs::read(&file).map_err(|e| {
+                    format!("InventoryUnavailable: the extension inventory cannot be read right now ({e}); nothing was changed.")
+                })?;
+                write_durably(&kept, &text).map_err(|e| {
+                    format!("InventoryUnavailable: the extension inventory could not be kept before it was restored ({e}); nothing was changed.")
+                })?;
+                note(
+                    &mut inventory,
+                    None,
+                    format!(
+                        "The extension inventory could not be read by this Yavin: it holds data this Yavin does not understand (it was kept as {}); it was restored from its last good copy.",
+                        display(&kept)
+                    ),
+                );
+                return Ok((inventory, true));
+            }
+        };
+        match loaded {
+            // A newer Yavin's inventory an older Yavin moved aside: nothing is restored or
+            // rebuilt over it, however often this Yavin starts (EXT-17).
+            Loaded::Missing if newer_kept_aside(&paths.root).is_some() => Err(unsupported(
+                "the extension inventory (kept aside by an older Yavin)",
+                Unsupported::Newer(newer_kept_aside(&paths.root).unwrap_or_default()),
             )),
+            // Nothing installed: a new folder, or IDE-09's (adopted as it is by listing).
             Loaded::Missing if !installed_data(&paths.root) => Ok((Inventory::default(), false)),
             Loaded::Missing => self.restore(paths, "was missing").map(|inv| (inv, true)),
             Loaded::Current(inventory) => Ok((inventory, false)),
             // Migrated (EXT-17): the file as it was is kept beside it, then the new version is
             // written at once -- an older Yavin then refuses it rather than drop what is new.
-            Loaded::Migrated { value: mut inventory, from } => {
+            Loaded::Migrated {
+                value: mut inventory,
+                from,
+            } => {
                 let original = paths.root.join(format!(
                     "{INVENTORY}.v{from}-migrated-{}.bak",
                     ide_workspace::durable::now_millis()
@@ -921,20 +1019,29 @@ impl ExtensionService {
                     &mut inventory,
                     None,
                     format!(
-                        "The extension inventory was upgraded from version {from} (the original was kept as {}). Copies installed before Yavin checked installed files are marked as not checked.",
-                        display(&original)
+                        "The extension inventory was upgraded from version {from} (the original was kept as {}).{}",
+                        display(&original),
+                        if from < 2 {
+                            " Copies installed before Yavin checked installed files are marked as not checked."
+                        } else {
+                            ""
+                        }
                     ),
                 );
                 Ok((inventory, true))
             }
-            Loaded::Corrupt { backup: Some(backup) } => self
+            Loaded::Corrupt {
+                backup: Some(backup),
+            } => self
                 .restore(
                     paths,
                     &format!("could not be read (it was kept as {})", display(&backup)),
                 )
                 .map(|inv| (inv, true)),
-            Loaded::Future { version, .. } => Err(format!(
-                "InventoryUnsupported: the extension inventory was written by a newer Yavin (version {version}); it was kept aside, untouched. Update Yavin."
+            // Not reached: a newer inventory is refused above, before anything moves it.
+            Loaded::Future { version, .. } => Err(unsupported(
+                "the extension inventory",
+                Unsupported::Newer(version),
             )),
             Loaded::Corrupt { backup: None } | Loaded::Unreadable => Err(
                 "InventoryUnavailable: the extension inventory cannot be read right now; nothing was changed.".into(),
@@ -943,25 +1050,53 @@ impl ExtensionService {
     }
 
     /// `inventory.json` `what` (missing, unreadable) while copies are installed: the last-good
-    /// copy if it reads, else a rebuild. A last-good copy a newer Yavin wrote, or one that cannot
-    /// be read right now, stops here: nothing is rebuilt over it.
+    /// copy if it reads; else the newest inventory an older Yavin set aside that reads now
+    /// (EXT-21); else a rebuild. A last-good copy a newer Yavin
+    /// wrote or this one cannot read, or one that cannot be read right now, stops here: nothing
+    /// is rebuilt over it.
     fn restore(&self, paths: &Paths, what: &str) -> Result<Inventory, String> {
+        let both = format!("the extension inventory {what}, and its last good copy");
         match read_inventory(&paths.root.join(LAST_GOOD)) {
-            Loaded::Current(mut inventory) | Loaded::Migrated { value: mut inventory, .. } => {
+            Ok(
+                Loaded::Current(mut inventory)
+                | Loaded::Migrated {
+                    value: mut inventory,
+                    ..
+                },
+            ) => {
                 note(
                     &mut inventory,
                     None,
-                    format!("The extension inventory {what}; it was restored from its last good copy."),
+                    format!(
+                        "The extension inventory {what}; it was restored from its last good copy."
+                    ),
                 );
                 Ok(inventory)
             }
-            Loaded::Future { version, .. } => Err(format!(
-                "InventoryUnsupported: the extension inventory {what}, and its last good copy was written by a newer Yavin (version {version}); both were kept, untouched. Update Yavin."
+            Err(why) => Err(unsupported(&both, why)),
+            Ok(Loaded::Future { version, .. }) => {
+                Err(unsupported(&both, Unsupported::Newer(version)))
+            }
+            Ok(Loaded::Unreadable | Loaded::Corrupt { backup: None }) => Err(format!(
+                "InventoryUnavailable: {both} cannot be read right now; nothing was changed."
             )),
-            Loaded::Unreadable | Loaded::Corrupt { backup: None } => Err(format!(
-                "InventoryUnavailable: the extension inventory {what}, and its last good copy cannot be read right now; nothing was changed."
-            )),
-            Loaded::Missing | Loaded::Corrupt { backup: Some(_) } => self.rebuild(paths, what),
+            Ok(Loaded::Missing | Loaded::Corrupt { backup: Some(_) }) => {
+                if let Some((found, mut inventory)) = set_aside(&paths.root).into_iter().next() {
+                    note(
+                        &mut inventory,
+                        None,
+                        format!(
+                            "The extension inventory {what}, and so was its last good copy; it was restored from {}, which an older Yavin had set aside{}.",
+                            found.file,
+                            when(found.at)
+                        ),
+                    );
+                    mark_set_aside(&paths.root, &found.file, "restored");
+                    Ok(inventory)
+                } else {
+                    self.rebuild(paths, what)
+                }
+            }
         }
     }
 
@@ -2221,6 +2356,10 @@ impl ExtensionService {
         }
         let (extensions, skipped) = self.reconcile(&mut inner, paths)?;
         let inventory = inner.inventory.as_ref().ok_or("InstallFailed")?;
+        let set_aside = set_aside(&paths.root)
+            .into_iter()
+            .find(|(_, kept)| differs(kept, inventory))
+            .map(|(found, _)| found);
         Ok(Listing {
             root: display(&paths.root),
             extensions,
@@ -2228,7 +2367,119 @@ impl ExtensionService {
             disabled: inventory.disabled.iter().cloned().collect(),
             recoveries: inventory.recoveries.clone(),
             profiles: inventory.profiles.view(),
+            set_aside,
         })
+    }
+
+    /// Restores `file`, an inventory an older Yavin set aside (EXT-21), in place of the one in
+    /// use -- which is kept first, byte for byte. Its records are used as they are: every copy
+    /// is checked against its own files digest and authenticated trust record as always, and
+    /// nothing is vouched for, signed or granted that the inventory did not already hold.
+    pub fn restore_set_aside(&self, file: &str) -> Result<Listing, String> {
+        {
+            let (mut inner, paths) = self.lock()?;
+            if !inner.running.is_empty()
+                || inner
+                    .inventory
+                    .as_ref()
+                    .is_some_and(|inv| !inv.operations.is_empty())
+            {
+                return Err(
+                    "Busy: an extension is being installed; try again when it is done.".into(),
+                );
+            }
+            let (found, mut inventory) = set_aside(&paths.root)
+                .into_iter()
+                .find(|(found, _)| found.file == file)
+                .ok_or_else(|| format!("SetAsideUnavailable: {file} is not an inventory set aside by an older Yavin that this Yavin can read; nothing was changed."))?;
+            let replaced = paths.root.join(format!(
+                "{INVENTORY}.replaced-{}.bak",
+                ide_workspace::durable::now_millis()
+            ));
+            if let Ok(current) = fs::read(paths.root.join(INVENTORY)) {
+                write_durably(&replaced, &current).map_err(|e| {
+                    format!("InventoryUnavailable: the inventory in use could not be kept ({e}); nothing was changed.")
+                })?;
+            }
+            inventory = sanitized(inventory);
+            self.recover(paths, &mut inventory);
+            note(
+                &mut inventory,
+                None,
+                format!(
+                    "The extension inventory was restored from {}, which an older Yavin had set aside{}; the one it replaced was kept as {}.",
+                    found.file,
+                    when(found.at),
+                    display(&replaced)
+                ),
+            );
+            save(paths, &inventory)?;
+            inner.inventory = Some(inventory);
+            mark_set_aside(&paths.root, &found.file, "restored");
+        }
+        self.grants_revision.fetch_add(1, Ordering::SeqCst);
+        self.list(None)
+    }
+
+    /// Keeps the inventory in use: `file`, set aside by an older Yavin, is no longer offered.
+    /// It is renamed, never deleted.
+    pub fn dismiss_set_aside(&self, file: &str) -> Result<Listing, String> {
+        {
+            let (_inner, paths) = self.lock()?;
+            if !set_aside(&paths.root)
+                .iter()
+                .any(|(found, _)| found.file == file)
+            {
+                return Err(format!("SetAsideUnavailable: {file} is not an inventory set aside by an older Yavin; nothing was changed."));
+            }
+            mark_set_aside(&paths.root, file, "dismissed");
+        }
+        self.list(None)
+    }
+
+    /// The user's choice when this Yavin cannot use the inventory (EXT-21): both files are set
+    /// aside -- renamed, byte for byte, where a Yavin that reads them finds them -- and an
+    /// inventory is rebuilt from the installed copies: disabled, without permissions, and with
+    /// no copy's code running until it is reinstalled. Never offered while the inventory is in
+    /// use.
+    pub fn start_over(&self) -> Result<Listing, String> {
+        let paths = self.paths()?;
+        {
+            let mut inner = self.inner.lock().map_err(|_| {
+                "InstallFailed: the extension inventory is unavailable.".to_string()
+            })?;
+            if inner.inventory.is_some() {
+                return Err("InventoryInUse: the extension inventory is in use; there is nothing to set aside.".into());
+            }
+            match self.load(paths) {
+                Err(error) if error.starts_with("InventoryUnsupported") => {}
+                Err(error) => return Err(error),
+                Ok(_) => return Err("InventoryInUse: this Yavin can use the extension inventory; there is nothing to set aside.".into()),
+            }
+            let at = ide_workspace::durable::now_millis();
+            for name in [INVENTORY, LAST_GOOD] {
+                let file = paths.root.join(name);
+                let Ok(text) = fs::read_to_string(&file) else {
+                    continue;
+                };
+                let label = match json_version(&text) {
+                    Ok(Some(version)) => format!("v{version}"),
+                    _ => "corrupt".into(),
+                };
+                fs::rename(&file, paths.root.join(format!("{name}.{label}-{at}.bak"))).map_err(|e| {
+                    format!("InventoryUnrecoverable: {} could not be set aside ({e}); nothing was changed.", display(&file))
+                })?;
+            }
+            let mut inventory = self.rebuild(
+                paths,
+                "could not be used by this Yavin and was set aside at your request",
+            )?;
+            self.recover(paths, &mut inventory);
+            save(paths, &inventory)?;
+            inner.inventory = Some(inventory);
+        }
+        self.grants_revision.fetch_add(1, Ordering::SeqCst);
+        self.list(None)
     }
 
     /// A file of `id`'s copy -- the one `list` reports -- for the window to read: a theme or
@@ -2466,6 +2717,7 @@ impl ExtensionService {
                     signature: None,
                     integrity: None,
                     replaced: None,
+                    provenance: None,
                 }),
             }
         }
@@ -2576,6 +2828,7 @@ impl ExtensionService {
                 signature: signature_of(&record.active),
                 integrity: Some(Integrity::of(&id, &record.active, key.as_deref())),
                 replaced: record.replaced.clone(),
+                provenance: Some(Provenance::of(&record.active)),
             };
             match usable(&record.active) {
                 Ok(text) => {
@@ -2617,6 +2870,7 @@ impl ExtensionService {
                             entry.manifest = Some(text);
                             entry.copy = Some(facts(&previous));
                             entry.signature = signature_of(&previous);
+                            entry.provenance = Some(Provenance::of(&previous));
                             // The fallback is checked on its own (its own record, files).
                             entry.integrity = Some(Integrity::of(&id, &previous, key.as_deref()));
                             entry.replaced = Some(replaced);
@@ -2669,6 +2923,7 @@ impl ExtensionService {
                         signature: None,
                         integrity: None,
                         replaced: None,
+                        provenance: None,
                     });
                     continue;
                 };
@@ -2704,6 +2959,7 @@ impl ExtensionService {
                     signature: None,
                     integrity: Some(Integrity::development()),
                     replaced: None,
+                    provenance: None,
                 });
             }
         }
@@ -2819,22 +3075,68 @@ fn save(paths: &Paths, inventory: &Inventory) -> Result<(), String> {
     Ok(())
 }
 
-fn read_inventory(file: &Path) -> Loaded<Inventory> {
-    read_versioned(file, INVENTORY_VERSION, json_version, |text, version| {
-        let inventory = serde_json::from_str::<Inventory>(text).ok()?;
-        match version {
-            INVENTORY_VERSION => Some(inventory),
-            // Version 3 (EXT-19) adds only `trust`, which no older copy has: such a copy is
-            // unauthenticated and its code does not run until it is reinstalled. No record is
-            // made for it here -- a migration never vouches for files it did not check.
-            2 => Some(Inventory {
-                version: INVENTORY_VERSION,
-                ..inventory
-            }),
-            1 => Some(migrate_v1(inventory)),
-            _ => None,
+/// An inventory file this Yavin must not act on (EXT-21). It is left where it is, byte for
+/// byte: never moved, rewritten, migrated down or rebuilt over.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Unsupported {
+    /// Written by a newer Yavin (this version).
+    Newer(u32),
+    /// A version this Yavin knows, holding what it cannot read -- most likely a newer Yavin's
+    /// that did not change the version (EXT-20's `indexSigned` under version 3).
+    NotUnderstood(u32),
+}
+
+/// `text` (an inventory at `version`) in the current shape: the migration, in one place.
+fn parse_inventory(text: &str, version: u32) -> Option<Inventory> {
+    let inventory = serde_json::from_str::<Inventory>(text).ok()?;
+    match version {
+        INVENTORY_VERSION => Some(inventory),
+        // Version 4 (EXT-21) adds nothing; version 3 (EXT-19) adds only `trust`, which no
+        // older copy has: such a copy is unauthenticated and its code does not run until it
+        // is reinstalled. No record is made for it here -- a migration never vouches for
+        // files it did not check.
+        2 | 3 => Some(Inventory {
+            version: INVENTORY_VERSION,
+            ..inventory
+        }),
+        1 => Some(migrate_v1(inventory)),
+        _ => None,
+    }
+}
+
+/// Reads an inventory file. One a newer Yavin wrote, or one this Yavin cannot read although it
+/// knows its version, is refused where it is (EXT-21): before EXT-21 the first was moved aside
+/// and the second taken for damage -- moved, and rebuilt over. Only what is not an inventory
+/// at all (not JSON, no readable version) is damage: moved aside and recovered as before.
+fn read_inventory(file: &Path) -> Result<Loaded<Inventory>, Unsupported> {
+    if let Ok(text) = fs::read_to_string(file) {
+        if let Ok(Some(version)) = json_version(&text) {
+            if version > INVENTORY_VERSION {
+                return Err(Unsupported::Newer(version));
+            }
+            if version >= OLDEST_INVENTORY && parse_inventory(&text, version).is_none() {
+                return Err(Unsupported::NotUnderstood(version));
+            }
         }
-    })
+    }
+    Ok(read_versioned(
+        file,
+        INVENTORY_VERSION,
+        json_version,
+        parse_inventory,
+    ))
+}
+
+/// Why extensions cannot be used while `what` stays as it is (`InventoryUnsupported`).
+fn unsupported(what: &str, why: Unsupported) -> String {
+    match why {
+        Unsupported::Newer(version) => format!(
+            "InventoryUnsupported: {what} was written by a newer Yavin (inventory version {version}; this Yavin reads up to {INVENTORY_VERSION}). It was left exactly as it is, and no extension runs until that Yavin, or a newer one, is installed again -- then your extensions, permissions, profiles and settings are as they were. Nothing needs to be deleted."
+        ),
+        Unsupported::NotUnderstood(version) => format!(
+            "InventoryUnsupported: {what} (inventory version {version}) holds data this Yavin cannot read -- most likely written by a newer Yavin. It was left exactly as it is, and no extension runs until a Yavin that reads it is installed again. Nothing needs to be deleted."
+        ),
+    }
 }
 
 /// A version-1 inventory as version 2 (EXT-17). Nothing is raised: a copy without a files
@@ -2882,6 +3184,83 @@ fn newer_kept_aside(root: &Path) -> Option<u32> {
             (version > INVENTORY_VERSION && name.ends_with(".bak")).then_some(version)
         })
     })
+}
+
+/// When an inventory was set aside, said (` on <date>`), from its file's milliseconds.
+fn when(at: u64) -> String {
+    let days = at / 86_400_000;
+    let (y, m, d) = crate::package_trust::civil_from_days(days as i64);
+    format!(" on {y:04}-{m:02}-{d:02}")
+}
+
+/// The milliseconds of a set-aside inventory's name: `inventory.json.v<N>-<ms>.bak` or
+/// `inventory.json.corrupt-<ms>.bak` (and the last-good copy's), as an older Yavin names an
+/// inventory it cannot read. A migration's `.v<N>-migrated-` copy, one restored or dismissed,
+/// and anything else is not one.
+fn set_aside_at(name: &str) -> Option<u64> {
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    [INVENTORY, LAST_GOOD].iter().find_map(|base| {
+        let rest = name
+            .strip_prefix(&format!("{base}."))?
+            .strip_suffix(".bak")?;
+        let (label, at) = rest.rsplit_once('-')?;
+        let ours = label == "corrupt" || label.strip_prefix('v').is_some_and(digits);
+        (ours && digits(at)).then(|| at.parse().ok()).flatten()
+    })
+}
+
+/// The inventories older Yavins set aside here that this one reads (in the current shape),
+/// newest first -- an inventory before its last-good copy. Read only: nothing is moved.
+fn set_aside(root: &Path) -> Vec<(SetAside, Inventory)> {
+    let mut found: Vec<(SetAside, Inventory)> = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            let at = set_aside_at(&file)?;
+            let text = fs::read_to_string(entry.path()).ok()?;
+            let version = json_version(&text).ok()??;
+            if !(OLDEST_INVENTORY..=INVENTORY_VERSION).contains(&version) {
+                return None;
+            }
+            let inventory = parse_inventory(&text, version)?;
+            Some((
+                SetAside {
+                    file,
+                    at,
+                    version,
+                    extensions: inventory.extensions.len(),
+                    grants: inventory.grants.len(),
+                    profiles: inventory.profiles.list.len(),
+                },
+                inventory,
+            ))
+        })
+        .collect();
+    found.sort_by(|a, b| {
+        b.0.at.cmp(&a.0.at).then(
+            a.0.file
+                .starts_with(LAST_GOOD)
+                .cmp(&b.0.file.starts_with(LAST_GOOD)),
+        )
+    });
+    found
+}
+
+/// Whether restoring `kept` would change what is installed, enabled, allowed or configured.
+fn differs(kept: &Inventory, current: &Inventory) -> bool {
+    kept.extensions != current.extensions
+        || kept.disabled != current.disabled
+        || kept.grants != current.grants
+        || kept.profiles != current.profiles
+}
+
+/// Renames set-aside `file` to `<…>.<how>.bak`: kept, no longer offered.
+fn mark_set_aside(root: &Path, file: &str, how: &str) {
+    if let Some(stem) = file.strip_suffix(".bak") {
+        let _ = fs::rename(root.join(file), root.join(format!("{stem}.{how}.bak")));
+    }
 }
 
 /// Whether anything was installed here by an inventory (not just IDE-09's root folders).
@@ -3134,6 +3513,31 @@ pub fn extensions_set_grants(
     capabilities: Vec<String>,
 ) -> Result<PermissionState, String> {
     service.set_grants(&id, Some(&version), &capabilities)
+}
+
+/// Restores an inventory an older Yavin set aside (EXT-21); the one in use is kept.
+#[tauri::command(async)]
+pub fn extensions_restore_set_aside(
+    service: State<'_, ExtensionService>,
+    file: String,
+) -> Result<Listing, String> {
+    service.restore_set_aside(&file)
+}
+
+/// Keeps the inventory in use; the set-aside one is no longer offered (EXT-21).
+#[tauri::command(async)]
+pub fn extensions_dismiss_set_aside(
+    service: State<'_, ExtensionService>,
+    file: String,
+) -> Result<Listing, String> {
+    service.dismiss_set_aside(&file)
+}
+
+/// Sets aside an inventory this Yavin cannot use and starts over from the installed copies
+/// (EXT-21) -- only at the user's request.
+#[tauri::command(async)]
+pub fn extensions_start_over(service: State<'_, ExtensionService>) -> Result<Listing, String> {
+    service.start_over()
 }
 
 #[cfg(test)]

@@ -24,6 +24,7 @@ export interface StatusNotice {
   label:
     | "Permission Needed"
     | "Update Available"
+    | "Update Blocked"
     | "Not Checked"
     | "Not Verified"
     | "Using Previous Version";
@@ -78,6 +79,8 @@ type StatusInput = {
   denied?: { method: string; capability: string | null } | null;
   trusted: boolean;
   update?: ExtensionUpdate;
+  /** Why the registry it would come from refuses it now (EXT-22): then it is not offered. */
+  updateRefused?: string | null;
   operation?: Operation;
   incompatible?: string | null;
 };
@@ -185,14 +188,23 @@ function coreStatus(input: StatusInput): DisplayStatus {
             : `Yavin refused its request ${input.denied.method}.`,
         }
       : null;
-  const update: StatusNotice | null = input.update
-    ? {
-        kind: "update",
-        label: "Update Available",
-        tone: "warning",
-        detail: `Version ${input.update.available} is available.`,
-      }
-    : null;
+  const update: StatusNotice | null = !input.update
+    ? null
+    : input.updateRefused
+      ? {
+          kind: "update",
+          label: "Update Blocked",
+          tone: "error",
+          detail: `Version ${input.update.available} is listed, but it cannot be installed: ${input.updateRefused} (see the note above the list).`,
+        }
+      : {
+          kind: "update",
+          label: "Update Available",
+          tone: "warning",
+          detail: `Version ${input.update.available} is available.`,
+        };
+  // A blocked update is only ever said beside the status: never the status itself.
+  const besides = update?.label === "Update Blocked" ? [update] : undefined;
   if (runtime?.state === "active")
     return {
       label: "Active",
@@ -207,11 +219,34 @@ function coreStatus(input: StatusInput): DisplayStatus {
       detail: permission.detail,
       notices: update ? [update] : [],
     };
-  if (update) return { label: "Update Available", tone: update.tone, detail: update.detail };
-  if (runtime?.state === "activating") return { label: "Activating", tone: "busy", detail: null };
+  if (update && !besides)
+    return { label: "Update Available", tone: update.tone, detail: update.detail };
+  if (runtime?.state === "activating")
+    return {
+      label: "Activating",
+      tone: "busy",
+      detail: null,
+      ...(besides && { notices: besides }),
+    };
   return {
     label: runs ? "Enabled" : "Installed",
     tone: "neutral",
     detail: runs ? null : "Declarative: nothing to run.",
+    ...(besides && { notices: besides }),
   };
+}
+
+/**
+ * What a view an extension contributes says while it has nothing to show (EXT-22): a code
+ * refused for its files or its record (EXT-17/19) is said as that -- never as an ordinary
+ * activation failure, nor with the native code -- with what to do.
+ */
+export function viewPlaceholder(reason: string | null | undefined, held: string | null): string {
+  if (!reason) return held ?? "Loading…";
+  const text = reason.replace(/^Activation failed: /, "");
+  const refused =
+    /^(IntegrityUnverified|TrustStateInvalid|TrustStateUnavailable|ExtensionDisabled): /.exec(text);
+  if (refused)
+    return `Not running: ${text.slice(refused[0].length)} Its page in Extensions says what to do.`;
+  return text;
 }

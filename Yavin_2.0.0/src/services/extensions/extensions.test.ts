@@ -2059,3 +2059,36 @@ test("EXT-18 an extension that does not follow its settings still reads their cu
   assert.equal(await m.executeCommand("acme.hello.greet"), "calm", "this workspace's");
   await m.dispose();
 });
+
+test("EXT-22 an installed copy's provenance is the inventory's -- where it came from and its package's digest -- and follows it", async () => {
+  const { discoverExtensions, rediscoverExtensions } = await import("./discovery.ts");
+  const t = setup();
+  const provenance = {
+    kind: "openvsx" as const,
+    location: "https://open-vsx.org",
+    sha256: "ab".repeat(32),
+  };
+  const listing = (p: import("../native.ts").NativeProvenance | null) => ({
+    root: "C:/data/extensions",
+    skipped: 0,
+    extensions: [
+      {
+        id: "acme.hello",
+        folder: "C:/data/extensions/.store/acme.hello/1.0.0-abababab",
+        manifest: JSON.stringify(manifest({ main: undefined })),
+        error: null,
+        integrity: { state: "verified" as const, reason: null, runs: true },
+        provenance: p,
+      },
+    ],
+  });
+  await discoverExtensions(t.registry, async () => listing(provenance));
+  assert.deepEqual(t.registry.get("acme.hello")!.provenance, provenance);
+  // A copy installed again from elsewhere: the record says so.
+  const file = { kind: "file" as const, location: null, sha256: "cd".repeat(32) };
+  await rediscoverExtensions(t.registry, async () => listing(file));
+  assert.deepEqual(t.registry.get("acme.hello")!.provenance, file);
+  // Nothing said: nothing shown, never a guess.
+  await rediscoverExtensions(t.registry, async () => listing(null));
+  assert.equal(t.registry.get("acme.hello")!.provenance, null);
+});

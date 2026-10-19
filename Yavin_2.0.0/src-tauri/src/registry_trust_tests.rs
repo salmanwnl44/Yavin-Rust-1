@@ -396,21 +396,21 @@ fn the_highest_accepted_index_is_kept() {
         TODAY,
     );
     record_seen(&dir, &accepted).unwrap();
-    assert_eq!(read_seen(&dir)["acme"].sequence, 5);
+    assert_eq!(read_seen(&dir).unwrap()["acme"].sequence, 5);
     // An older one is never recorded over it; a refused one never at all.
     let older = IndexVerification {
         sequence: Some(4),
         ..accepted.clone()
     };
     record_seen(&dir, &older).unwrap();
-    assert_eq!(read_seen(&dir)["acme"].sequence, 5);
+    assert_eq!(read_seen(&dir).unwrap()["acme"].sequence, 5);
     let refused = IndexVerification {
         sequence: Some(9),
         status: IndexStatus::Invalid,
         ..accepted
     };
     record_seen(&dir, &refused).unwrap();
-    assert_eq!(read_seen(&dir)["acme"].sequence, 5);
+    assert_eq!(read_seen(&dir).unwrap()["acme"].sequence, 5);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -530,7 +530,7 @@ fn a_package_from_a_signed_index_installs_and_is_recorded_as_such() {
             .into_iter()
             .find(|e| e.id.as_deref() == Some("acme.hello"))
             .unwrap();
-        let record = listed.signature.unwrap();
+        let record = listed.signature.clone().unwrap();
         assert_eq!(
             record.status,
             crate::package_trust::SignatureStatus::IndexSigned
@@ -539,6 +539,13 @@ fn a_package_from_a_signed_index_installs_and_is_recorded_as_such() {
         assert_eq!(record.key_id.as_deref(), Some("t"));
         assert_eq!(record.sha256, crate::marketplace::tests::sha(&v1));
         service.host_copy("acme.hello").unwrap();
+        // EXT-22: and the listing says where it came from: this very registry.
+        let from = listed.provenance.unwrap();
+        assert_eq!(
+            (from.kind, from.location.as_deref()),
+            ("registry", Some(served.base.as_str()))
+        );
+        assert_eq!(from.sha256, Some(crate::marketplace::tests::sha(&v1)));
         drop(service);
         let service = ExtensionService::new(dir.join("extensions"), Vec::new());
         service.host_copy("acme.hello").expect("after a restart");
@@ -867,4 +874,53 @@ fn the_published_registry_verifies_under_the_pinned_key() {
         crate::package_trust::today(),
     );
     assert_ne!(refused.status, IndexStatus::Verified);
+}
+
+/// EXT-21: Yavin's record of accepted indexes, unreadable -- damaged, or rewritten -- is never
+/// taken as "nothing accepted" (an older index could then be accepted, and the next write would
+/// erase the record): code is not installed from a signed registry, the record is left byte for
+/// byte, and only the user's reset sets it aside (kept) so verification starts again.
+#[test]
+fn an_unreadable_replay_record_refuses_installs_until_reset() {
+    let dir = scratch("state");
+    let served = Served::new();
+    let v1 = package_of(&dir, "1.0.0", "module.exports = 1;");
+    served.publish(&[("acme.hello", "1.0.0", &v1)], 3);
+    with_anchors(fixtures::anchors_for(&served.base), || {
+        let root = dir.join("extensions");
+        let state = root.join(STATE_FILE);
+        for damaged in [
+            "{ not json",
+            r#"{"acme-test": {"sequence": 9, "sha256": "x"}, "acme-test": {"sequence": 1, "sha256": "y"}}"#,
+            // JSON, unambiguous, but not the record's shape.
+            r#"{"acme-test": 9}"#,
+        ] {
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(&state, damaged).unwrap();
+            let service = ExtensionService::new(root.clone(), Vec::new());
+            let refused = install(&service, from(&served, "1.0.0", &v1), "1.0.0").unwrap_err();
+            assert!(refused.starts_with("RegistryStateInvalid"), "{refused}");
+            assert_eq!(
+                std::fs::read_to_string(&state).unwrap(),
+                damaged,
+                "left as it is"
+            );
+            assert!(read_seen(&root).is_err());
+            // Said as such: the index verifies, but is not taken as verified.
+            let registry = crate::marketplace::registry(&served.base).unwrap();
+            let (_, shown) =
+                crate::marketplace::authenticated_index(&registry, Some(&root)).unwrap();
+            assert_eq!(shown.status, IndexStatus::StateInvalid, "{damaged}");
+            assert_eq!(std::fs::read_to_string(&state).unwrap(), damaged);
+            let kept = reset_seen(&root).unwrap().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(kept).unwrap(),
+                damaged,
+                "kept on reset"
+            );
+            install(&service, from(&served, "1.0.0", &v1), "1.0.0").unwrap();
+            assert_eq!(read_seen(&root).unwrap()[fixtures::REGISTRY_ID].sequence, 3);
+            service.uninstall("acme.hello").unwrap();
+        }
+    });
 }

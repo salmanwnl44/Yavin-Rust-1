@@ -144,6 +144,7 @@ import {
   MARKETPLACE_RECOMMENDATIONS,
 } from "./services/extensions/marketplace/setup";
 import { ExtensionError } from "./services/extensions/errors";
+import { registryRefusal, registryTrust } from "./services/extensions/marketplace/registryTrust";
 import { discoverInstalledOnce } from "./services/extensions/discovery";
 import { followContributedThemes } from "./editor/themes";
 import { documentInfoOf } from "./services/extensions/documentInfo";
@@ -1475,6 +1476,8 @@ export default function App() {
     marketplace.getSnapshot,
     marketplace.getSnapshot,
   );
+  // EXT-22: the badge follows the registry's verification too.
+  useSyncExternalStore(registryTrust.subscribe, registryTrust.getSnapshot);
   const showRecommendations = useSyncExternalStore(
     (listener) => settings.subscribe(null, listener),
     () => settings.get(MARKETPLACE_RECOMMENDATIONS, null),
@@ -3697,7 +3700,12 @@ export default function App() {
             }))}
             gitBadge={totalGitChanges > 0 ? String(totalGitChanges) : ""}
             extensionsBadge={(() => {
-              const updates = Object.keys(marketplaceSnapshot.updates).length;
+              // EXT-22: an update the shown registry refuses is not one to install.
+              const trust =
+                marketplaceSnapshot.providerId !== "openvsx" ? registryTrust.latest() : null;
+              const updates = Object.keys(marketplaceSnapshot.updates).filter(
+                (id) => !registryRefusal(trust, !!extensionRegistry.get(id)?.manifest.main),
+              ).length;
               return updates ? String(updates) : "";
             })()}
             onSelectTab={(tabId) => {

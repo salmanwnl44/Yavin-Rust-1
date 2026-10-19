@@ -1,3 +1,7 @@
+import {
+  registryRefusal,
+  type RegistryTrust,
+} from "../../services/extensions/marketplace/registryTrust";
 import { useSyncExternalStore } from "react";
 import type { ExtensionHostManager } from "../../services/extensions/manager";
 import type { ExtensionRegistry } from "../../services/extensions/registry";
@@ -37,6 +41,8 @@ export function statusOf(
   trusted: boolean,
   marketplace: ExtensionMarketplaceService,
   listing?: MarketplaceExtension,
+  /** The shown registry's verification (EXT-22): an update it refuses is not offered. */
+  trust: RegistryTrust | null = null,
 ): DisplayStatus {
   const entry = state.registry.extensions.find((one) => one.id === id);
   const incompatible =
@@ -52,6 +58,10 @@ export function statusOf(
     denied: state.runtime.denied[id] ?? null,
     trusted,
     update: state.market.updates[id],
+    updateRefused:
+      state.market.updates[id] && state.market.providerId !== "openvsx"
+        ? registryRefusal(trust, !!entry?.manifest.main)
+        : null,
     operation: state.operations.operations[id],
     incompatible,
   });

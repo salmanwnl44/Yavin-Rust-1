@@ -42,7 +42,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The signature file, beside `index.json`.
 pub const SIGNATURE_FILE: &str = "index.json.sig";
@@ -293,6 +293,9 @@ pub enum IndexStatus {
     Malformed,
     /// The anchors cannot be read: nothing authenticates.
     Unavailable,
+    /// Signed and fresh, but Yavin's record of the indexes it accepted cannot be read, so a
+    /// replay could not be told (EXT-21). The record is left as it is until the user resets it.
+    StateInvalid,
 }
 
 impl IndexStatus {
@@ -497,12 +500,42 @@ pub fn authenticate(
     finish(out, IndexStatus::Verified)
 }
 
-/// The highest index accepted per registry id, from `<extensions>/registry-state.json`.
-pub fn read_seen(root: &Path) -> BTreeMap<String, Seen> {
-    std::fs::read(root.join(STATE_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+/// The highest index accepted per registry id, from `<extensions>/registry-state.json`:
+/// nothing yet if there is none. One that cannot be read is an error, never "nothing accepted"
+/// (EXT-21): that would let an older index in, and the next write would erase the record. Its
+/// format is fixed -- EXT-20 reads and writes it as it is -- so a Yavin rolled back to EXT-20
+/// keeps it; a change of format needs a new file.
+pub fn read_seen(root: &Path) -> Result<BTreeMap<String, Seen>, String> {
+    let bytes = match std::fs::read(root.join(STATE_FILE)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(format!("VerificationUnavailable: Yavin's record of accepted registry indexes cannot be read right now ({e}); nothing was installed.")),
+    };
+    if !unambiguous(&bytes) {
+        return Err(state_invalid());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| state_invalid())
+}
+
+fn state_invalid() -> String {
+    format!("RegistryStateInvalid: Yavin's record of the registry indexes it accepted ({STATE_FILE}) cannot be read, so an older index could not be told from a current one. It was left as it is; until it is reset (in the Extensions view), nothing with code is installed from a signed registry.")
+}
+
+/// Sets the record of accepted indexes aside (`registry-state.json.reset-<ms>.bak`, kept) at
+/// the user's request: replay protection starts again from the next verified index.
+pub fn reset_seen(root: &Path) -> Result<Option<PathBuf>, String> {
+    let file = root.join(STATE_FILE);
+    if !file.exists() {
+        return Ok(None);
+    }
+    let kept = root.join(format!(
+        "{STATE_FILE}.reset-{}.bak",
+        ide_workspace::durable::now_millis()
+    ));
+    std::fs::rename(&file, &kept).map_err(|e| {
+        format!("InstallFailed: {STATE_FILE} could not be set aside ({e}); nothing was changed.")
+    })?;
+    Ok(Some(kept))
 }
 
 /// Records `verification` (verified) as accepted, if it is newer than what was.
@@ -514,7 +547,7 @@ pub fn record_seen(root: &Path, verification: &IndexVerification) -> Result<(), 
     ) else {
         return Ok(());
     };
-    let mut seen = read_seen(root);
+    let mut seen = read_seen(root)?;
     if seen.get(id).is_some_and(|s| s.sequence >= sequence) {
         return Ok(());
     }
@@ -542,6 +575,7 @@ pub fn refusal(status: IndexStatus, label: &str) -> String {
         IndexStatus::KeyExpired => format!("KeyExpired: the registry's index is signed with a key whose trust has ended. {label} was not installed."),
         IndexStatus::WrongRegistry => format!("WrongRegistry: the index served here is signed for another registry. {label} was not installed."),
         IndexStatus::Expired => format!("RegistryMetadataExpired: the registry's index is past its expiry date; {label} was not installed. Try again later."),
+        IndexStatus::StateInvalid => format!("{} {label} was not installed.", state_invalid()),
         IndexStatus::Replay => format!("RegistryReplay: the registry served an older index than one Yavin already accepted from it (a downgrade). {label} was not installed."),
         IndexStatus::Malformed => format!("RegistryMetadataMalformed: the registry's index or its signature cannot be read unambiguously. {label} was not installed."),
         IndexStatus::Unavailable => format!("VerificationUnavailable: the registry's index could not be authenticated (no trust anchors); {label} was not installed."),

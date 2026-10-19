@@ -4,10 +4,12 @@
  * per id -- an installed copy over a development sample -- so each id arrives once, with the
  * copies it shadows; the extension host loads code only from the folder listed here.
  */
+import { inventoryState, inventoryStateOf, type SetAside } from "./inventoryState.ts";
 import {
   native,
   type NativeIntegrity,
   type NativePermissions,
+  type NativeProvenance,
   type NativeReplaced,
   type NativeSignature,
 } from "../native.ts";
@@ -35,6 +37,8 @@ export interface ListedExtension {
   integrity?: NativeIntegrity | null;
   /** The copy its intact previous one replaced (EXT-17). */
   replaced?: NativeReplaced | null;
+  /** Where the copy in use came from (EXT-22). */
+  provenance?: NativeProvenance | null;
 }
 
 export interface Listing {
@@ -45,6 +49,8 @@ export interface Listing {
   disabled?: string[];
   /** The extension profiles (EXT-13). */
   profiles?: ProfilesView;
+  /** An inventory an older Yavin set aside, offered back (EXT-21). */
+  setAside?: SetAside | null;
 }
 
 /**
@@ -89,7 +95,15 @@ const windowStorage = () => {
 async function nativeList(): Promise<Listing> {
   const storage = windowStorage();
   const legacyDisabled = readStoredDisabled(storage);
-  const listing = await native("extensions_list", { legacyDisabled });
+  let listing: Listing;
+  try {
+    listing = await native("extensions_list", { legacyDisabled });
+  } catch (error) {
+    // EXT-21: said in the Extensions view, with what to do -- never just an empty list.
+    inventoryState.set(inventoryStateOf(error));
+    throw error;
+  }
+  inventoryState.set({ kind: "ok", root: listing.root, setAside: listing.setAside ?? null });
   try {
     storage?.removeItem(DISABLED_KEY);
   } catch {
@@ -116,7 +130,12 @@ export async function refreshGrants(
           previous: one.permissions.previous,
         });
       registry.setSignature(one.id, one.signature ?? null);
-      registry.setIntegrity(one.id, one.integrity ?? null, one.replaced ?? null);
+      registry.setIntegrity(
+        one.id,
+        one.integrity ?? null,
+        one.replaced ?? null,
+        one.provenance ?? null,
+      );
     }
 }
 
@@ -155,7 +174,13 @@ export async function discoverExtensions(
     // And what its signature was found to be (EXT-09): only the native side says so.
     if (one.id) registry.setSignature(one.id, one.signature ?? null);
     // And what is known of its files (EXT-17): again only the native side says so.
-    if (one.id) registry.setIntegrity(one.id, one.integrity ?? null, one.replaced ?? null);
+    if (one.id)
+      registry.setIntegrity(
+        one.id,
+        one.integrity ?? null,
+        one.replaced ?? null,
+        one.provenance ?? null,
+      );
     const result = registry.add(
       parsed,
       { kind: "folder", path: one.folder },

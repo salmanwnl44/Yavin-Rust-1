@@ -12,6 +12,25 @@ import { compareVersions } from "../../services/extensions/marketplace/versions"
 import { EXTENSION_API } from "../../services/extensions/manifest";
 import { describeSignature } from "../../services/extensions/signature";
 import { describeIntegrity, describeReplaced } from "../../services/extensions/integrity";
+import {
+  registryRefusal,
+  registryTrust,
+} from "../../services/extensions/marketplace/registryTrust";
+import type { NativeProvenance } from "../../services/native";
+
+/** Where an installed copy came from (EXT-22), as the inventory recorded it. */
+export function describeProvenance(provenance: NativeProvenance): string {
+  switch (provenance.kind) {
+    case "registry":
+      return `A registry: ${provenance.location}`;
+    case "openvsx":
+      return `Open VSX: ${provenance.location}`;
+    case "file":
+      return "A package file (not from a registry, so not signed)";
+    default:
+      return "Not known: it has no package on record (found in the extensions folder)";
+  }
+}
 import { openExternalUrl } from "../../services/git/remoteUrl";
 import { CardButton, StatusNotices } from "./ExtensionCard";
 import { ExtensionIcon } from "./ExtensionIcon";
@@ -150,7 +169,10 @@ export function ExtensionDetails({
   const signature = describeSignature(entry?.signature, entry?.integrity);
   const integrity = describeIntegrity(entry?.integrity);
   const name = manifest?.displayName ?? extension?.displayName ?? id;
-  const status = statusOf(id, state, trusted, marketplace, extension);
+  // EXT-22: an update or install the shown registry refuses is not offered.
+  useSyncExternalStore(registryTrust.subscribe, registryTrust.getSnapshot);
+  const trustNow = state.market.providerId !== "openvsx" ? registryTrust.latest() : null;
+  const status = statusOf(id, state, trusted, marketplace, extension, trustNow);
   const operation = state.operations.operations[id];
   const failure = state.operations.failures[id];
   const update = state.market.updates[id];
@@ -228,14 +250,17 @@ export function ExtensionDetails({
                 <CardButton
                   primary
                   label={`Install ${name}`}
-                  disabled={!!operation || !latest}
-                  title={!latest ? compatibility?.reasons[0] : undefined}
+                  disabled={!!operation || !latest || !!registryRefusal(trustNow, false)}
+                  title={
+                    registryRefusal(trustNow, false) ??
+                    (!latest ? compatibility?.reasons[0] : undefined)
+                  }
                   onClick={() => report(installer.install(id))}
                 >
                   {operation ? "Installing…" : "Install"}
                 </CardButton>
               )}
-              {entry && update && (
+              {entry && update && !registryRefusal(trustNow, !!entry.manifest.main) && (
                 <CardButton
                   primary
                   label={`Update ${name}`}
@@ -265,7 +290,10 @@ export function ExtensionDetails({
               )}
               <span data-testid="extension-details-state" className="text-[12px] text-zinc-400">
                 {status.label}
-                {status.detail ? ` — ${status.detail}` : ""}
+                {/* Said in full in the integrity note below, with its action: not twice. */}
+                {status.detail && !(integrity && !integrity.runs && entry?.manifest.main)
+                  ? ` — ${status.detail}`
+                  : ""}
               </span>
             </div>
             {/* What the integrity note below says (with its action) is not said twice. */}
@@ -299,10 +327,18 @@ export function ExtensionDetails({
               >
                 {(integrity.reinstall || !integrity.runs) && (
                   <p>
-                    <span className="font-medium">{integrity.label}</span> — {integrity.detail}{" "}
-                    <span data-testid="extension-integrity-runs">
-                      {integrity.runs ? "Its code may run." : "Its code does not run."}
-                    </span>
+                    <span className="font-medium">
+                      {integrity.runs
+                        ? integrity.label
+                        : integrity.reinstall
+                          ? "Reinstall Required"
+                          : "Not Verified"}
+                    </span>{" "}
+                    — {integrity.detail}{" "}
+                    {/* Every description of a copy that may not run already says so. */}
+                    {integrity.runs && (
+                      <span data-testid="extension-integrity-runs">Its code may run.</span>
+                    )}
                   </p>
                 )}
                 {entry.replaced && (
@@ -611,12 +647,38 @@ export function ExtensionDetails({
                     </button>
                   </Row>
                 )}
-                {extension && (
-                  <Row label="Source">
-                    <span data-testid="extension-source">
-                      {marketplace.getSnapshot().providerLabel}
-                    </span>
-                  </Row>
+                {entry?.provenance ? (
+                  <>
+                    <Row label="Installed from">
+                      <span data-testid="extension-source">
+                        {describeProvenance(entry.provenance)}
+                      </span>
+                    </Row>
+                    {entry.provenance.sha256 && (
+                      <Row label="Package SHA-256">
+                        <span
+                          data-testid="extension-package-sha256"
+                          className="font-mono text-[11px] break-all"
+                        >
+                          {entry.provenance.sha256}
+                        </span>
+                        <span className="block text-[11px] text-zinc-500">
+                          The package Yavin verified when it was installed
+                          {entry.integrity?.state === "verified"
+                            ? "; its installed files are checked against it."
+                            : "; its installed files have not been verified against it."}
+                        </span>
+                      </Row>
+                    )}
+                  </>
+                ) : (
+                  extension && (
+                    <Row label={entry ? "Source" : "Available from"}>
+                      <span data-testid="extension-source">
+                        {marketplace.getSnapshot().providerLabel}
+                      </span>
+                    </Row>
+                  )
                 )}
                 {extension?.deprecated && (
                   <Row label="Deprecated">Its publisher marked it deprecated.</Row>
@@ -646,7 +708,10 @@ export function ExtensionDetails({
                           ) : fits.compatible ? (
                             <CardButton
                               label={`Install version ${v.version}`}
-                              disabled={!!operation}
+                              disabled={
+                                !!operation || !!registryRefusal(trustNow, !!entry?.manifest.main)
+                              }
+                              title={registryRefusal(trustNow, !!entry?.manifest.main) ?? undefined}
                               onClick={() => report(installer.install(id, v.version))}
                             >
                               Install this version

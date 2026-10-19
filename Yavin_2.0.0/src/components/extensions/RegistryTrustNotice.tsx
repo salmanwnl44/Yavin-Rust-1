@@ -1,4 +1,5 @@
-import { useSyncExternalStore } from "react";
+import { useState, useSyncExternalStore } from "react";
+import { CardButton } from "./ExtensionCard";
 import {
   describeRegistryTrust,
   registryTrust,
@@ -13,12 +14,24 @@ const TONE = {
 /**
  * Whether the registry's index was authenticated (EXT-20), at the top of the Extensions view:
  * one quiet line when it was, a note saying why and what to do when it was not. The native
- * side refuses installs on its own; this only says so.
+ * side refuses installs on its own; this only says so. An unreadable replay record (EXT-21)
+ * is reset only from here, at the user's request: `onReset` (kept aside natively), then the
+ * index is loaded again.
  */
-export function RegistryTrustNotice({ store = registryTrust }: { store?: typeof registryTrust }) {
+export function RegistryTrustNotice({
+  store = registryTrust,
+  onReset,
+}: {
+  store?: typeof registryTrust;
+  onReset?: () => Promise<unknown>;
+}) {
   useSyncExternalStore(store.subscribe, store.getSnapshot);
-  const said = describeRegistryTrust(store.latest());
+  const [failure, setFailure] = useState<string | null>(null);
+  const latest = store.latest();
+  const said = describeRegistryTrust(latest);
   if (!said) return null;
+  const resettable =
+    !!onReset && latest?.kind === "checked" && latest.verification.status === "stateInvalid";
   const quiet = said.tone === "good";
   return (
     <div
@@ -31,6 +44,22 @@ export function RegistryTrustNotice({ store = registryTrust }: { store?: typeof 
     >
       <span className="font-medium">{said.title}</span>
       {quiet ? "" : <span className="block">{said.detail}</span>}
+      {failure && <span className="block font-medium">{failure}</span>}
+      {resettable && (
+        <span className="mt-1 block">
+          <CardButton
+            label="Reset registry replay record"
+            onClick={() =>
+              void onReset().then(
+                () => setFailure(null),
+                (error) => setFailure(String((error as Error)?.message ?? error)),
+              )
+            }
+          >
+            Reset
+          </CardButton>
+        </span>
+      )}
     </div>
   );
 }

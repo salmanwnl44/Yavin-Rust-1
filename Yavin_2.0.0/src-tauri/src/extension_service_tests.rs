@@ -3592,18 +3592,21 @@ fn ext17_a_newer_inventory_is_refused_on_every_start_and_nothing_is_rebuilt() {
         .map(|e| e.file_name())
         .collect();
     assert_eq!(after, store);
-    let kept: Vec<_> = backups(&fx, "inventory.")
-        .into_iter()
-        .filter(|n| n.contains(&format!(".v{}-", INVENTORY_VERSION + 1)))
-        .collect();
-    assert!(!kept.is_empty());
-    for name in kept {
+    // EXT-21: not even moved aside -- both stay where a newer Yavin finds them, byte for byte.
+    for name in [INVENTORY, LAST_GOOD] {
         assert_eq!(
             fs::read_to_string(fx.root.join(name)).unwrap(),
             text,
-            "kept byte for byte"
+            "{name} kept in place byte for byte"
         );
     }
+    assert!(
+        backups(&fx, "inventory.")
+            .iter()
+            .all(|n| n == INVENTORY || n == LAST_GOOD),
+        "nothing set aside: {:?}",
+        backups(&fx, "inventory.")
+    );
 }
 
 /// When the active copy cannot be used and its intact previous one takes its place, the
@@ -3746,15 +3749,73 @@ fn ext17_the_persisted_schema_is_pinned_to_its_version() {
     }
     let mut keys = std::collections::BTreeSet::new();
     walk(&value, "", &mut keys);
+    // The values of every persisted enum (EXT-21): a value an older Yavin does not know makes
+    // the inventory unreadable to it as surely as a field -- EXT-20's `indexSigned` did, under
+    // version 3. Each list is checked complete by a match, so a new value fails to compile here.
+    use crate::package_trust::SignatureStatus as S;
+    let statuses = [
+        S::RegistrySigned,
+        S::PublisherSigned,
+        S::Missing,
+        S::Invalid,
+        S::UnknownKey,
+        S::KeyRevoked,
+        S::KeyExpired,
+        S::WrongNamespace,
+        S::Malformed,
+        S::Unavailable,
+        S::IndexSigned,
+    ];
+    let _complete = |s: S| match s {
+        S::RegistrySigned
+        | S::PublisherSigned
+        | S::Missing
+        | S::Invalid
+        | S::UnknownKey
+        | S::KeyRevoked
+        | S::KeyExpired
+        | S::WrongNamespace
+        | S::Malformed
+        | S::Unavailable
+        | S::IndexSigned => (),
+    };
+    let unchecked = [Unchecked::Legacy, Unchecked::Adopted, Unchecked::Rebuilt];
+    let _complete = |u: Unchecked| match u {
+        Unchecked::Legacy | Unchecked::Adopted | Unchecked::Rebuilt => (),
+    };
+    let states = [OpState::Staging, OpState::Staged, OpState::Committed];
+    let _complete = |o: OpState| match o {
+        OpState::Staging | OpState::Staged | OpState::Committed => (),
+    };
+    fn values<T: serde::Serialize>(name: &str, all: &[T]) -> String {
+        let names: Vec<String> = all
+            .iter()
+            .map(|v| {
+                serde_json::to_value(v)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        format!("= {name}: {}", names.join(" | "))
+    }
+    keys.insert(values("signature.status", &statuses));
+    keys.insert(values("unchecked", &unchecked));
+    keys.insert(values("operations.*.state", &states));
+    keys.insert(format!(
+        "= trust.schema: {}",
+        crate::extension_trust::RECORD_SCHEMA
+    ));
     assert_eq!(
-        INVENTORY_VERSION, 3,
-        "a new version: pin its fields with it"
+        INVENTORY_VERSION, 4,
+        "a new version: pin its fields and values with it"
     );
     let text = keys.into_iter().collect::<Vec<_>>().join(
         "
 ",
     );
-    let pinned = include_str!("extension_inventory_v3.fields.txt").replace(
+    let pinned = include_str!("extension_inventory_v4.fields.txt").replace(
         "
 ", "
 ",
@@ -3762,7 +3823,7 @@ fn ext17_the_persisted_schema_is_pinned_to_its_version() {
     assert_eq!(
         text.trim(),
         pinned.trim(),
-        "the persisted fields changed:
+        "the persisted fields or values changed -- bump the inventory version:
 {text}"
     );
 }
@@ -4505,3 +4566,8 @@ fn ext19_two_yavins_share_one_key() {
     d.host_copy("acme.one").unwrap();
     d.host_copy("acme.two").unwrap();
 }
+
+// --- EXT-21: upgrade, downgrade and recovery -------------------------------------------------
+
+#[path = "extension_upgrade_tests.rs"]
+mod ext21;
