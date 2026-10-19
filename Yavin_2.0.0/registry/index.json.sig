@@ -1,0 +1,1 @@
+{"schema":1,"registryId":"yavin-official","keyId":"yavin-registry-2026-10-19","algorithm":"ed25519","signature":"LRwG1C61C7Hv1/sUMIrhaTWDpElcAa7CEn9WOhIY0h2Tk4wxL5rRCYERX/DAN9UOBu6z6tWRhSWHFWGlNzMDCQ=="}

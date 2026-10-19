@@ -5,6 +5,7 @@
  * the user's.
  */
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { chromium, expect, type Browser, type Locator, type Page } from "@playwright/test";
@@ -346,8 +347,8 @@ export async function sampleRegistry(): Promise<{ url: string; close(): Promise<
       },
     ],
   };
-  const served = JSON.stringify({
-    schema: 1,
+  // Signed (EXT-20): the test build pins this registry under the run's test key.
+  const { text: served, signature: servedSignature } = signedIndex({
     name: "Sample test registry",
     categories: index.categories,
     recommended: [hello.id, broken.id],
@@ -366,6 +367,7 @@ export async function sampleRegistry(): Promise<{ url: string; close(): Promise<
       response.end(body);
     };
     if (path === "index.json") return send("application/json", served);
+    if (path === "index.json.sig") return send("text/plain", servedSignature);
     if (path === "packages/acme.broken-1.0.0.yvx") return send(types[".yvx"], brokenPackage);
     const file = join(root, path);
     if (!path.includes("..") && file.startsWith(root) && existsSync(file))
@@ -402,4 +404,55 @@ export async function installSamples(page: Page) {
   // Back to the Explorer, as the window was.
   await page.getByTitle("Explorer (Ctrl+Shift+E)", { exact: true }).click();
   await expect(page.getByRole("tree", { name: "Files" })).toBeVisible();
+}
+
+// --- EXT-20: a test registry's signed index ---------------------------------------------------
+
+/** This run's test registry key: its public half reaches the test build only through
+ *  `YAVIN_TEST_REGISTRY_KEY`, bound to `YAVIN_TEST_REGISTRY` (no other build reads either). */
+const testKey = (() => {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const raw = publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("base64");
+  return { privateKey, raw };
+})();
+
+/** What Yavin is started with to use the loopback registry at `url`, under the test key. */
+export const registryEnv = (url: string) => ({
+  YAVIN_TEST_REGISTRY: url,
+  YAVIN_TEST_REGISTRY_KEY: testKey.raw,
+});
+
+/** `index` as the test registry publishes it, signed (EXT-20): its text and signature file. */
+export function signedIndex(index: Record<string, unknown>, sequence = 1) {
+  const {
+    schema: _schema,
+    registryId: _id,
+    sequence: _seq,
+    issuedAt: _at,
+    expiresAt: _until,
+    ...rest
+  } = index;
+  const text = JSON.stringify({
+    schema: 1,
+    registryId: "yavin-test",
+    sequence,
+    issuedAt: "2026-01-01",
+    expiresAt: "2099-12-31",
+    ...rest,
+  });
+  const signature = sign(
+    null,
+    Buffer.concat([Buffer.from("Yavin.RegistryIndex.v1\0", "utf8"), Buffer.from(text, "utf8")]),
+    testKey.privateKey,
+  ).toString("base64");
+  return {
+    text,
+    signature: JSON.stringify({
+      schema: 1,
+      registryId: "yavin-test",
+      keyId: "test",
+      algorithm: "ed25519",
+      signature,
+    }),
+  };
 }

@@ -67,6 +67,10 @@ pub enum SignatureStatus {
     Malformed,
     /// It could not be checked: the signature could not be fetched, or no trust store.
     Unavailable,
+    /// Yavin's registry (EXT-20): the package is the one listed -- by SHA-256 -- in a registry
+    /// index signed with a key Yavin pins for that registry. The package itself carries no
+    /// signature, and the publisher's identity is not established by it.
+    IndexSigned,
 }
 
 impl SignatureStatus {
@@ -162,7 +166,7 @@ pub fn ed25519_from_pem(pem: &str) -> Result<[u8; 32], String> {
 }
 
 /// `YYYY-MM-DD` as days since 1970-01-01 (the civil calendar).
-fn days_of(date: &str) -> Option<i64> {
+pub(crate) fn days_of(date: &str) -> Option<i64> {
     let mut parts = date.split('-');
     let (y, m, d) = (parts.next()?, parts.next()?, parts.next()?);
     if parts.next().is_some() || y.len() != 4 || m.len() != 2 || d.len() != 2 {
@@ -414,7 +418,9 @@ pub fn refusal(status: SignatureStatus, label: &str, registry: &str) -> String {
         SignatureStatus::WrongNamespace => format!("UntrustedKey: {label} is signed with another publisher's key."),
         SignatureStatus::Malformed => format!("SignatureMalformed: {label}'s signature cannot be read."),
         SignatureStatus::Unavailable => format!("VerificationUnavailable: {label}'s signature could not be checked; it was not installed."),
-        SignatureStatus::RegistrySigned | SignatureStatus::PublisherSigned => String::new(),
+        SignatureStatus::RegistrySigned
+        | SignatureStatus::PublisherSigned
+        | SignatureStatus::IndexSigned => String::new(),
     }
 }
 

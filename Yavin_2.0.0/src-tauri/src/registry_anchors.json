@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "revision": 1,
+  "registries": [
+    {
+      "id": "yavin-official",
+      "base": "https://raw.githubusercontent.com/salmanwnl44/Yavin-Rust-1/main/Yavin_2.0.0/registry/",
+      "keys": [
+        {
+          "keyId": "yavin-registry-2026-10-19",
+          "algorithm": "ed25519",
+          "publicKey": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA+LL8dUY9RmtM1X3LEaS6I0Ko6IR2Ra8bDOg8cK0WaS8=\n-----END PUBLIC KEY-----\n",
+          "status": "active",
+          "notAfter": "2028-10-19",
+          "added": "2026-10-19",
+          "provenance": "Yavin's registry signing key (EXT-20), generated on 2026-10-19 on the maintainer's machine with Node's crypto (Ed25519); the private key is kept outside the repository (%USERPROFILE%\\.yavin-registry\\signing-key.pem, readable by the maintainer's account only). It signs registry/index.json; it vouches that the index -- and so each package's SHA-256 -- is the one Yavin's maintainers published, not who wrote any extension."
+        }
+      ]
+    }
+  ]
+}

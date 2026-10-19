@@ -5,12 +5,15 @@
  * (`marketplace.rs`: HTTPS, same-host redirects, bounded, content-checked); the window itself
  * has no network access (its content security policy).
  *
- * Trust: transport security (HTTPS) and a SHA-256 per package, published in the index and
- * verified natively before anything is unpacked. Packages are NOT signed: the checksum proves
- * the package is the one the index lists, not who wrote it. See ARCHITECTURE.md.
+ * Trust (EXT-20): the index is signed with a key Yavin pins for the registry, and authenticated
+ * natively whenever it is fetched -- here, for what the view shows (`registryTrust`), and again
+ * before any install -- and each package's SHA-256, listed in that index, is verified natively
+ * before anything is unpacked. That proves a package is the one the registry published, not who
+ * wrote it. See ARCHITECTURE.md.
  */
 import { native } from "../../native.ts";
 import { createIndexProvider } from "./indexProvider.ts";
+import { registryTrust } from "./registryTrust.ts";
 
 export const YAVIN_REGISTRY_PROVIDER = "yavin";
 
@@ -23,7 +26,19 @@ export function createYavinRegistryProvider(
       id: YAVIN_REGISTRY_PROVIDER,
       label: "Yavin Extensions",
       location: registryUrl,
-      loadIndex: () => native("marketplace_get_text", { registryUrl, path: "index.json" }),
+      loadIndex: async () => {
+        try {
+          const index = await native("marketplace_index", { registryUrl });
+          registryTrust.set(registryUrl, { kind: "checked", verification: index.verification });
+          return index.text;
+        } catch (error) {
+          registryTrust.set(registryUrl, {
+            kind: "unreachable",
+            error: String((error as Error)?.message ?? error),
+          });
+          throw error;
+        }
+      },
       loadDocument: (path) => native("marketplace_get_text", { registryUrl, path }),
       loadIcon: (path) => native("marketplace_get_icon", { registryUrl, path }),
       packageSource: (version) => ({

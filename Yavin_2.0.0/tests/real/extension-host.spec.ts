@@ -29,6 +29,7 @@ import {
   message,
   palette,
   profileReleased,
+  registryEnv,
   sampleRegistry,
   showDiagnostics,
   trust,
@@ -86,7 +87,7 @@ test("the installed host is packaged where Yavin looks for it", () => {
 test("installed Yavin runs Hello World in the real host, end to end, and ends the host on exit", async () => {
   // Installed first (its Greetings view, shown while installing, starts a host), then Yavin
   // started again -- from there on nothing runs until it is used.
-  const installing = await launch({ YAVIN_TEST_REGISTRY: registry.url });
+  const installing = await launch(registryEnv(registry.url));
   try {
     await trust(installing.page, true);
     await installSamples(installing.page);
@@ -97,7 +98,7 @@ test("installed Yavin runs Hello World in the real host, end to end, and ends th
   } finally {
     if (installing.app.exitCode === null) installing.app.kill();
   }
-  const running = await launch({ YAVIN_TEST_REGISTRY: registry.url });
+  const running = await launch(registryEnv(registry.url));
   const { app, page } = running;
   try {
     // Already trusted (not asked again); it reopens what it had open.
@@ -140,7 +141,7 @@ test("installed Yavin runs Hello World in the real host, end to end, and ends th
 });
 
 test("a crashed host is reported; Restart starts a new real host and the extension works again", async () => {
-  const running = await launch({ YAVIN_TEST_REGISTRY: registry.url });
+  const running = await launch(registryEnv(registry.url));
   const { app, page } = running;
   try {
     await trust(page, true);
@@ -172,7 +173,7 @@ test("a crashed host is reported; Restart starts a new real host and the extensi
 });
 
 test("switching workspace ends A's host; B starts from nothing; A's state comes back with A", async () => {
-  const running = await launch({ YAVIN_TEST_REGISTRY: registry.url });
+  const running = await launch(registryEnv(registry.url));
   const { app, page } = running;
   try {
     await trust(page, true);
@@ -214,7 +215,7 @@ test("without its host, installed Yavin says so and everything else works", asyn
   const packaged = host()!;
   const aside = `${packaged}.aside`;
   renameSync(packaged, aside);
-  const running = await launch({ YAVIN_TEST_REGISTRY: registry.url });
+  const running = await launch(registryEnv(registry.url));
   const { app, page } = running;
   try {
     await trust(page, true);

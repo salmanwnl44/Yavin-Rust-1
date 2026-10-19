@@ -1,5 +1,9 @@
 {
   "schema": 1,
+  "registryId": "yavin-official",
+  "sequence": 1,
+  "issuedAt": "2026-10-19",
+  "expiresAt": "2027-10-19",
   "name": "Yavin Extensions",
   "categories": [
     {

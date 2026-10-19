@@ -189,6 +189,14 @@ interface Commands {
   // --- Extension marketplace and installer (IDE-09) ---
   marketplace_default_registry: { args: Record<string, never>; result: string };
   marketplace_get_text: { args: { registryUrl: string; path: string }; result: string };
+  /** Yavin's registry index, authenticated natively (EXT-20), with what that found. */
+  marketplace_index: {
+    args: { registryUrl: string };
+    result: {
+      text: string;
+      verification: import("./extensions/marketplace/registryTrust.ts").IndexVerification;
+    };
+  };
   marketplace_get_icon: { args: { registryUrl: string; path: string }; result: string };
   /** Open VSX (EXT-03, `src-tauri/src/openvsx.rs`): an answer's text, validated by the caller. */
   marketplace_openvsx: {
@@ -788,8 +796,10 @@ export interface NativeSignature {
     | "keyExpired"
     | "wrongNamespace"
     | "malformed"
-    | "unavailable";
-  /** The registry's origin, or `file`. */
+    | "unavailable"
+    /** Yavin's registry (EXT-20): the package is the one its signed index lists. */
+    | "indexSigned";
+  /** The registry's origin, or `file` (for a signed index: the registry's base URL). */
   registry: string;
   keyId?: string | null;
   namespace: string;

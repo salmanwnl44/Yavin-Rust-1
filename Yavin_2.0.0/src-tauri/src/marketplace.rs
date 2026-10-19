@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::State;
 
@@ -536,23 +536,84 @@ pub struct Staged {
 }
 
 /// What `registry`'s own index says of `id` at `version`: its package's path, SHA-256 and size.
-fn index_entry(
+/// The registry's index (its exact bytes) and what authenticating it found (EXT-20:
+/// `registry_trust`): the index and its signature file fetched natively, checked against the
+/// anchors Yavin pins -- never against anything the registry or the window supplies -- and,
+/// verified, remembered as the highest accepted from that registry (in `root`), so an older
+/// one is refused later as a replay.
+pub fn authenticated_index(
     registry: &Registry,
-    id: &str,
-    version: &str,
-) -> Result<(String, String, u64), String> {
-    let mut bytes = Vec::new();
-    fetch(
-        registry,
-        "index.json",
-        Kind::Text,
-        MAX_INDEX,
-        &mut |chunk| {
+    root: Option<&Path>,
+) -> Result<(Vec<u8>, crate::registry_trust::IndexVerification), String> {
+    let read = |path: &str, max: u64| -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        fetch(registry, path, Kind::Text, max, &mut |chunk| {
             bytes.extend_from_slice(chunk);
             Ok(())
-        },
-    )?;
-    let index: serde_json::Value = serde_json::from_slice(&bytes)
+        })?;
+        Ok(bytes)
+    };
+    let index = read("index.json", MAX_INDEX)?;
+    let signature = match read(
+        crate::registry_trust::SIGNATURE_FILE,
+        crate::registry_trust::MAX_SIGNATURE,
+    ) {
+        Ok(bytes) => Some(bytes),
+        // Not served: unsigned (refused for a pinned registry).
+        Err(e) if e.starts_with("NotFound") => None,
+        Err(e) => return Err(e),
+    };
+    let anchors = crate::registry_trust::anchors();
+    let registry_id = anchors
+        .as_ref()
+        .ok()
+        .and_then(|a| a.for_base(&registry.base))
+        .map(|a| a.id.clone());
+    let seen = match (root, &registry_id) {
+        (Some(root), Some(id)) => crate::registry_trust::read_seen(root).remove(id),
+        _ => None,
+    };
+    let verification = crate::registry_trust::authenticate(
+        &anchors,
+        &registry.base,
+        &index,
+        signature.as_deref(),
+        seen.as_ref(),
+        crate::package_trust::today(),
+    );
+    if let Some(root) = root {
+        crate::registry_trust::record_seen(root, &verification)?;
+    }
+    Ok((index, verification))
+}
+
+/// The registry's index with its verification, as the window shows it (EXT-20).
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryIndex {
+    pub text: String,
+    pub verification: crate::registry_trust::IndexVerification,
+}
+
+/// The index of Yavin's registry at `registry_url`, authenticated natively (EXT-20). What is
+/// shown is only shown: an install authenticates the index again, natively, whatever the
+/// window holds.
+#[tauri::command(async)]
+pub fn marketplace_index(
+    service: State<'_, ExtensionService>,
+    registry_url: String,
+) -> Result<RegistryIndex, String> {
+    let registry = registry(&registry_url)?;
+    let root = service.root_folder().ok();
+    let (bytes, verification) = authenticated_index(&registry, root.as_deref())?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| "UnexpectedContent: the registry's index is not UTF-8 text.".to_string())?;
+    Ok(RegistryIndex { text, verification })
+}
+
+/// `id` at `version` in an index (its bytes): the package's path, SHA-256 and size.
+fn index_entry(bytes: &[u8], id: &str, version: &str) -> Result<(String, String, u64), String> {
+    let index: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|_| "UnexpectedContent: the registry's index is not JSON.".to_string())?;
     let published = index["extensions"]
         .as_array()
@@ -625,6 +686,9 @@ fn stage_package(
     };
     let (op, folder) = service.begin(expected_id, expected_version, &label)?;
     let archive = folder.join("package.yvx");
+    // A package from a registry whose index could not be authenticated (EXT-20): only one
+    // with no code is installed from it.
+    let mut unauthenticated = false;
     let result = (|| {
         // What the package's signature is found to be (EXT-09): Open VSX packages must verify
         // under a pinned key (`openvsx::download`); Yavin's registry and a file are not signed
@@ -649,9 +713,21 @@ fn stage_package(
                 size,
             } => {
                 let registry = registry(&registry_url)?;
-                // The renderer names the package; the registry's index vouches for it.
+                // The renderer names the package; the registry's index -- authenticated here,
+                // natively (EXT-20) -- vouches for it. A pinned registry whose index does not
+                // verify installs nothing; one with no anchor only what has no code (below).
+                let (index, verification) =
+                    authenticated_index(&registry, service.root_folder().ok().as_deref())?;
+                let pinned = verification.status != crate::registry_trust::IndexStatus::Unanchored;
+                if pinned && !verification.status.verified() {
+                    return Err(crate::registry_trust::refusal(
+                        verification.status,
+                        &format!("{expected_id} {expected_version}"),
+                    ));
+                }
+                unauthenticated = !verification.status.verified();
                 let (indexed_path, indexed_sha256, indexed_size) =
-                    index_entry(&registry, expected_id, expected_version)?;
+                    index_entry(&index, expected_id, expected_version)?;
                 if indexed_path != path
                     || !indexed_sha256.eq_ignore_ascii_case(&sha256)
                     || indexed_size != size
@@ -686,7 +762,19 @@ fn stage_package(
                         "IntegrityFailed: the package's SHA-256 is {actual}, but the registry says {sha256}."
                     ));
                 }
-                let signature = unsigned(&registry.origin, &actual);
+                // Verified: bound to this registry (its base URL), the key and the package's
+                // SHA-256, which the signed index listed. Otherwise unsigned, as before.
+                let signature = match (&verification.key_id, verification.status.verified()) {
+                    (Some(key_id), true) => SignatureRecord {
+                        status: SignatureStatus::IndexSigned,
+                        registry: registry.base.clone(),
+                        key_id: Some(key_id.clone()),
+                        sha256: actual.to_ascii_lowercase(),
+                        store_revision: verification.anchors_revision,
+                        ..unsigned(&registry.origin, &actual)
+                    },
+                    _ => unsigned(&registry.origin, &actual),
+                };
                 (actual, read, signature)
             }
             PackageSource::File { path } => {
@@ -733,6 +821,16 @@ fn stage_package(
                 ))
             }
             _ => {}
+        }
+        // Code from a registry whose index could not be authenticated: refused (EXT-20).
+        let has_code = serde_json::from_str::<serde_json::Value>(&manifest)
+            .ok()
+            .is_some_and(|m| m.get("main").is_some());
+        if unauthenticated && has_code {
+            return Err(crate::registry_trust::refusal(
+                crate::registry_trust::IndexStatus::Unanchored,
+                &format!("{expected_id} {expected_version}"),
+            ));
         }
         // A VS Code package: its declarative contributions, adapted (EXT-04).
         if format == Format::Vsix {
@@ -1090,7 +1188,8 @@ pub(crate) mod tests {
         .unwrap();
         let body = good.clone();
         // The registry's index: what each case says the package is.
-        let index = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        // Signed for a pinned test registry (EXT-20): without that, its code is not installed.
+        let index = std::sync::Arc::new(std::sync::Mutex::new((String::new(), String::new())));
         let served = index.clone();
         let base = serve(move |path| {
             let octet = vec![("Content-Type", "application/octet-stream".to_string())];
@@ -1098,7 +1197,12 @@ pub(crate) mod tests {
                 "/registry/index.json" => (
                     200,
                     vec![("Content-Type", "application/json".into())],
-                    served.lock().unwrap().clone().into_bytes(),
+                    served.lock().unwrap().0.clone().into_bytes(),
+                ),
+                "/registry/index.json.sig" => (
+                    200,
+                    vec![("Content-Type", "text/plain".into())],
+                    served.lock().unwrap().1.clone().into_bytes(),
                 ),
                 "/registry/good.yvx" => (200, octet, body.clone()),
                 "/registry/html.yvx" => (
@@ -1117,110 +1221,119 @@ pub(crate) mod tests {
                 _ => (404, vec![], vec![]),
             }
         });
+        let sequence = std::sync::atomic::AtomicU64::new(1);
         let describe = |id: &str, version: &str, path: &str, sha256: &str, size: u64| {
-            *index.lock().unwrap() = serde_json::json!({"schema": 1, "extensions": [{"id": id, "versions": [{"version": version, "package": path, "sha256": sha256, "size": size}]}]}).to_string();
+            *index.lock().unwrap() = crate::registry_trust::fixtures::signed(
+                serde_json::json!({"extensions": [{"id": id, "versions": [{"version": version, "package": path, "sha256": sha256, "size": size}]}]}),
+                sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            );
         };
-        let service = ExtensionService::new(dir.join("root"), Vec::new());
-        // Each case stages again at once, as if the one before had lost its window.
-        *service.abandoned_after.lock().unwrap() = Some(std::time::Duration::ZERO);
-        let from = |path: &str, sha256: &str, size: u64| PackageSource::Registry {
-            registry_url: base.clone(),
-            path: path.into(),
-            sha256: sha256.into(),
-            size,
-        };
-        let n = good.len() as u64;
-        describe("acme.hello", "1.0.0", "good.yvx", &sha(&good), n);
-        let staged = stage(
-            &service,
-            from("good.yvx", &sha(&good), n),
-            "acme.hello",
-            "1.0.0",
-        )
-        .unwrap();
-        assert_eq!(staged.manifest, MANIFEST);
-        let staging = dir.join("root").join(crate::extension_service::STAGING);
-        assert!(staging
-            .join(&staged.token)
-            .join("files")
-            .join("extension.js")
-            .is_file());
-        // A same-host redirect is followed.
-        describe("acme.hello", "1.0.0", "moved.yvx", &sha(&good), n);
-        assert!(stage(
-            &service,
-            from("moved.yvx", &sha(&good), n),
-            "acme.hello",
-            "1.0.0"
-        )
-        .is_ok());
-        for (path, sha256, size, why) in [
-            ("good.yvx", "0".repeat(64), n, "IntegrityFailed"),
-            ("good.yvx", sha(&good), n - 1, "TooLarge"),
-            ("good.yvx", sha(&good), n + 1, "IntegrityFailed"),
-            ("html.yvx", sha(&good), n, "UnexpectedContent"),
-            ("away.yvx", sha(&good), n, "UnexpectedRedirect"),
-            ("missing.yvx", sha(&good), n, "NotFound"),
-            ("../good.yvx", sha(&good), n, "OutsideRegistry"),
-            ("good.yvx", sha(&good), LIMITS.package + 1, "UnsafePackage"),
-        ] {
-            describe("acme.hello", "1.0.0", path, &sha256, size);
-            let error =
-                stage(&service, from(path, &sha256, size), "acme.hello", "1.0.0").unwrap_err();
-            assert!(error.starts_with(why), "{why}: {error}");
-        }
-        // The renderer's word is not enough: the index must say the same.
-        describe("acme.hello", "1.0.0", "good.yvx", &sha(&good), n);
-        for (path, sha256, size) in [
-            ("good.yvx", "0".repeat(64), n),
-            ("good.yvx", sha(&good), n + 1),
-            ("moved.yvx", sha(&good), n),
-        ] {
-            let error =
-                stage(&service, from(path, &sha256, size), "acme.hello", "1.0.0").unwrap_err();
-            assert!(error.contains("index describes"), "{error}");
-        }
-        let unlisted = stage(
-            &service,
-            from("good.yvx", &sha(&good), n),
-            "acme.hello",
-            "3.0.0",
-        )
-        .unwrap_err();
-        assert!(unlisted.starts_with("NotFound"), "{unlisted}");
-        describe("acme.other", "1.0.0", "good.yvx", &sha(&good), n);
-        let mismatch = stage(
-            &service,
-            from("good.yvx", &sha(&good), n),
-            "acme.other",
-            "1.0.0",
-        )
-        .unwrap_err();
-        assert!(mismatch.starts_with("ManifestMismatch"), "{mismatch}");
-        describe("acme.hello", "2.0.0", "good.yvx", &sha(&good), n);
-        let version = stage(
-            &service,
-            from("good.yvx", &sha(&good), n),
-            "acme.hello",
-            "2.0.0",
-        )
-        .unwrap_err();
-        assert!(version.starts_with("ManifestMismatch"), "{version}");
-        // Nothing of a refused package is left in staging; a newer staging of the same id
-        // replaced the idle one before it.
-        let left: Vec<_> = fs::read_dir(&staging).unwrap().collect();
-        assert_eq!(left.len(), 0);
-        let missing = stage(
-            &service,
-            PackageSource::File {
-                path: dir.join("nope.yvx").to_string_lossy().into(),
+        crate::registry_trust::with_anchors(
+            crate::registry_trust::fixtures::anchors_for(&base),
+            || {
+                let service = ExtensionService::new(dir.join("root"), Vec::new());
+                // Each case stages again at once, as if the one before had lost its window.
+                *service.abandoned_after.lock().unwrap() = Some(std::time::Duration::ZERO);
+                let from = |path: &str, sha256: &str, size: u64| PackageSource::Registry {
+                    registry_url: base.clone(),
+                    path: path.into(),
+                    sha256: sha256.into(),
+                    size,
+                };
+                let n = good.len() as u64;
+                describe("acme.hello", "1.0.0", "good.yvx", &sha(&good), n);
+                let staged = stage(
+                    &service,
+                    from("good.yvx", &sha(&good), n),
+                    "acme.hello",
+                    "1.0.0",
+                )
+                .unwrap();
+                assert_eq!(staged.manifest, MANIFEST);
+                let staging = dir.join("root").join(crate::extension_service::STAGING);
+                assert!(staging
+                    .join(&staged.token)
+                    .join("files")
+                    .join("extension.js")
+                    .is_file());
+                // A same-host redirect is followed.
+                describe("acme.hello", "1.0.0", "moved.yvx", &sha(&good), n);
+                assert!(stage(
+                    &service,
+                    from("moved.yvx", &sha(&good), n),
+                    "acme.hello",
+                    "1.0.0"
+                )
+                .is_ok());
+                for (path, sha256, size, why) in [
+                    ("good.yvx", "0".repeat(64), n, "IntegrityFailed"),
+                    ("good.yvx", sha(&good), n - 1, "TooLarge"),
+                    ("good.yvx", sha(&good), n + 1, "IntegrityFailed"),
+                    ("html.yvx", sha(&good), n, "UnexpectedContent"),
+                    ("away.yvx", sha(&good), n, "UnexpectedRedirect"),
+                    ("missing.yvx", sha(&good), n, "NotFound"),
+                    ("../good.yvx", sha(&good), n, "OutsideRegistry"),
+                    ("good.yvx", sha(&good), LIMITS.package + 1, "UnsafePackage"),
+                ] {
+                    describe("acme.hello", "1.0.0", path, &sha256, size);
+                    let error = stage(&service, from(path, &sha256, size), "acme.hello", "1.0.0")
+                        .unwrap_err();
+                    assert!(error.starts_with(why), "{why}: {error}");
+                }
+                // The renderer's word is not enough: the index must say the same.
+                describe("acme.hello", "1.0.0", "good.yvx", &sha(&good), n);
+                for (path, sha256, size) in [
+                    ("good.yvx", "0".repeat(64), n),
+                    ("good.yvx", sha(&good), n + 1),
+                    ("moved.yvx", sha(&good), n),
+                ] {
+                    let error = stage(&service, from(path, &sha256, size), "acme.hello", "1.0.0")
+                        .unwrap_err();
+                    assert!(error.contains("index describes"), "{error}");
+                }
+                let unlisted = stage(
+                    &service,
+                    from("good.yvx", &sha(&good), n),
+                    "acme.hello",
+                    "3.0.0",
+                )
+                .unwrap_err();
+                assert!(unlisted.starts_with("NotFound"), "{unlisted}");
+                describe("acme.other", "1.0.0", "good.yvx", &sha(&good), n);
+                let mismatch = stage(
+                    &service,
+                    from("good.yvx", &sha(&good), n),
+                    "acme.other",
+                    "1.0.0",
+                )
+                .unwrap_err();
+                assert!(mismatch.starts_with("ManifestMismatch"), "{mismatch}");
+                describe("acme.hello", "2.0.0", "good.yvx", &sha(&good), n);
+                let version = stage(
+                    &service,
+                    from("good.yvx", &sha(&good), n),
+                    "acme.hello",
+                    "2.0.0",
+                )
+                .unwrap_err();
+                assert!(version.starts_with("ManifestMismatch"), "{version}");
+                // Nothing of a refused package is left in staging; a newer staging of the same id
+                // replaced the idle one before it.
+                let left: Vec<_> = fs::read_dir(&staging).unwrap().collect();
+                assert_eq!(left.len(), 0);
+                let missing = stage(
+                    &service,
+                    PackageSource::File {
+                        path: dir.join("nope.yvx").to_string_lossy().into(),
+                    },
+                    "acme.hello",
+                    "1.0.0",
+                )
+                .unwrap_err();
+                assert!(missing.starts_with("PackageMissing"), "{missing}");
+                let _ = fs::remove_dir_all(&dir);
             },
-            "acme.hello",
-            "1.0.0",
-        )
-        .unwrap_err();
-        assert!(missing.starts_with("PackageMissing"), "{missing}");
-        let _ = fs::remove_dir_all(&dir);
+        );
     }
 }
 

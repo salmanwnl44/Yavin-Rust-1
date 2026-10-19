@@ -35,6 +35,7 @@ mod openvsx;
 mod package_trust;
 mod paths;
 mod ports;
+mod registry_trust;
 mod session;
 mod terminal;
 mod terminal_shell;
@@ -895,6 +896,7 @@ pub fn run() {
             ext_host_stop_all,
             marketplace::marketplace_default_registry,
             marketplace::marketplace_get_text,
+            marketplace::marketplace_index,
             marketplace::marketplace_get_icon,
             marketplace::extensions_stage,
             marketplace::extensions_commit,

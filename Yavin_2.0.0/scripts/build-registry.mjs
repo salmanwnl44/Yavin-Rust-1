@@ -6,7 +6,15 @@
 //
 //   node scripts/build-registry.mjs           write the registry
 //   node scripts/build-registry.mjs --check   fail if the written registry is out of date
-import { createHash } from "node:crypto";
+//
+// The index is signed (EXT-20): `registry/index.json.sig`, Ed25519 over a domain prefix and the
+// exact bytes of `index.json`, with the key Yavin pins (`src-tauri/src/registry_anchors.json`).
+// The private key is never in the repository: `YAVIN_REGISTRY_SIGNING_KEY` names it (a PKCS#8
+// PEM; default `~/.yavin-registry/signing-key.pem`). It is needed only when the content changes:
+// then `sequence` rises and the dates are renewed; unchanged content keeps the published index
+// and signature, byte for byte (so `--check` needs no key).
+import { createHash, createPrivateKey, sign } from "node:crypto";
+import { homedir } from "node:os";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -237,14 +245,76 @@ for (const entry of catalog.extensions) {
     versions: versions.reverse(),
   });
 }
-const index = {
+const content = {
   schema: catalog.schema,
   name: catalog.name,
   categories: catalog.categories,
   recommended: catalog.recommended,
   extensions,
 };
-written.set("index.json", Buffer.from(`${JSON.stringify(index, null, 2)}\n`));
+// --- The signed index (EXT-20) ----------------------------------------------------------------
+const REGISTRY_ID = "yavin-official";
+const KEY_ID = "yavin-registry-2026-10-19";
+const DOMAIN = Buffer.from("Yavin.RegistryIndex.v1\0", "utf8");
+const VALID_DAYS = 365;
+const FRESHNESS = ["registryId", "sequence", "issuedAt", "expiresAt"];
+const contentOf = (index) =>
+  JSON.stringify(Object.fromEntries(Object.entries(index).filter(([k]) => !FRESHNESS.includes(k))));
+const indexFile = join(out, "index.json");
+const signatureFile = join(out, "index.json.sig");
+const previous = existsSync(indexFile) ? JSON.parse(readFileSync(indexFile, "utf8")) : null;
+if (
+  previous &&
+  existsSync(signatureFile) &&
+  previous.registryId === REGISTRY_ID &&
+  contentOf(previous) === contentOf(content)
+) {
+  // The same content: the published index and its signature, as they are.
+  written.set("index.json", readFileSync(indexFile));
+  written.set("index.json.sig", readFileSync(signatureFile));
+} else {
+  const day = (d) => d.toISOString().slice(0, 10);
+  const now = new Date();
+  const { schema, ...rest } = content;
+  const signedIndex = {
+    schema,
+    registryId: REGISTRY_ID,
+    sequence: (previous?.sequence ?? 0) + 1,
+    issuedAt: day(now),
+    expiresAt: day(new Date(now.getTime() + VALID_DAYS * 86_400_000)),
+    ...rest,
+  };
+  const bytes = Buffer.from(`${JSON.stringify(signedIndex, null, 2)}\n`);
+  written.set("index.json", bytes);
+  if (!check) {
+    const keyFile =
+      process.env.YAVIN_REGISTRY_SIGNING_KEY ??
+      join(homedir(), ".yavin-registry", "signing-key.pem");
+    if (!existsSync(keyFile)) {
+      console.error(
+        `The registry changed, so its index must be signed again: no signing key at ${keyFile} (set YAVIN_REGISTRY_SIGNING_KEY).`,
+      );
+      process.exit(1);
+    }
+    const signature = sign(
+      null,
+      Buffer.concat([DOMAIN, bytes]),
+      createPrivateKey(readFileSync(keyFile)),
+    );
+    written.set(
+      "index.json.sig",
+      Buffer.from(
+        JSON.stringify({
+          schema: 1,
+          registryId: REGISTRY_ID,
+          keyId: KEY_ID,
+          algorithm: "ed25519",
+          signature: signature.toString("base64"),
+        }),
+      ),
+    );
+  }
+}
 
 // A published version is immutable: the same version with other bytes would install different
 // code under a checksum users already trust. Change the content, change the version.

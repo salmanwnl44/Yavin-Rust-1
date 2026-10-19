@@ -52,6 +52,12 @@ export function describeSignature(
         detail: `Exactly the package ${host} published: its signature verifies under the key Yavin pins for ${host}${key}. That does not verify the publisher's identity -- ${host} signs every package it hosts.`,
         signed: true,
       };
+    case "indexSigned":
+      return {
+        label: "Verified registry metadata",
+        detail: `Exactly the package Yavin's registry lists by SHA-256, and that list is signed with the key this Yavin pins for the registry${key}. The package itself is not signed, and that does not verify who wrote it.`,
+        signed: true,
+      };
     case "publisherSigned":
       return {
         label: `Signed by the publisher "${signature.namespace}"`,

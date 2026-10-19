@@ -965,6 +965,30 @@ async function desktop(
                 });
               if (request.kind === "document") throw "NotFound: no document.";
             }
+            // EXT-20: the index, authenticated natively -- as a test says it was (verified by default).
+            if (command === "marketplace_index") {
+              if (market.down)
+                throw "MarketplaceUnavailable: the marketplace could not be reached (offline).";
+              const delay = setup.marketplace?.indexDelayMs ?? 0;
+              if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+              const said = (
+                window as unknown as { __registryVerification?: Record<string, unknown> }
+              ).__registryVerification;
+              return {
+                text: setup.market.index,
+                verification: {
+                  status: "verified",
+                  registryId: "yavin-official",
+                  keyId: "yavin-registry-2026-10-19",
+                  sequence: 3,
+                  issuedAt: "2026-10-19",
+                  expiresAt: "2027-10-19",
+                  sha256: "a".repeat(64),
+                  anchorsRevision: 1,
+                  ...said,
+                },
+              };
+            }
             if (command === "marketplace_get_text" || command === "marketplace_get_icon") {
               if (market.down)
                 throw "MarketplaceUnavailable: the marketplace could not be reached (offline).";
@@ -4160,6 +4184,43 @@ test("EXT-17 a fallback: the intact previous version is used, the one it replace
   await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
     "Updater 1.1.0",
   );
+});
+
+test("EXT-20 the registry's index: verified said quietly; altered, untrusted, unpinned or offline said with why and what to do", async ({
+  page,
+}) => {
+  await desktop(page);
+  const view = await extensionsView(page);
+  const notice = view.getByTestId("registry-trust");
+  await expect(notice).toHaveAttribute("data-tone", "good");
+  await expect(notice).toHaveText("Registry index verified");
+  await expect(notice).toHaveAttribute(
+    "title",
+    /key yavin-registry-2026-10-19.*not who wrote them/,
+  );
+  const refresh = async (said: Record<string, unknown> | null) => {
+    await page.evaluate((said) => {
+      (window as unknown as { __registryVerification?: unknown }).__registryVerification =
+        said ?? undefined;
+    }, said);
+    await view.getByRole("button", { name: "Refresh marketplace" }).click();
+  };
+  await refresh({ status: "invalid" });
+  await expect(notice).toHaveAttribute("data-tone", "error");
+  await expect(notice).toContainText("Registry index altered");
+  await expect(notice).toContainText(
+    "changed after it was signed. Nothing is installed or updated from it.",
+  );
+  await refresh({ status: "unknownKey", keyId: "someone-else" });
+  await expect(notice).toContainText("Registry key not trusted");
+  await expect(notice).toContainText("update Yavin to get the new one");
+  await refresh({ status: "replay" });
+  await expect(notice).toContainText("Older registry index");
+  await refresh({ status: "unanchored", registryId: null, keyId: null });
+  await expect(notice).toHaveAttribute("data-tone", "warning");
+  await expect(notice).toContainText("extensions with code cannot");
+  await refresh(null);
+  await expect(notice).toHaveText("Registry index verified");
 });
 
 test("permissions: a change the native side refuses is never shown as made", async ({ page }) => {

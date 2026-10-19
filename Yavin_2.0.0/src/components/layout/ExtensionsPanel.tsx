@@ -16,6 +16,7 @@ import type {
 import { CardButton, ExtensionCard } from "../extensions/ExtensionCard";
 import { ExtensionProfiles, ProfileSwitcher } from "../extensions/ExtensionProfiles";
 import { MANAGE_PROFILES_EVENT } from "../extensions/ExtensionDetails";
+import { RegistryTrustNotice } from "../extensions/RegistryTrustNotice";
 import { ExtensionDiagnostics } from "../extensions/ExtensionDiagnostics";
 import { nativeDiagnostics } from "../../services/extensions/diagnostics";
 import { profileStore } from "../../services/extensions/profiles";
@@ -778,6 +779,8 @@ export function ExtensionsPanel({
           </div>
         )}
       </div>
+      {/* EXT-20: whether Yavin's registry index was authenticated. */}
+      {market.providerId !== "openvsx" && <RegistryTrustNotice />}
 
       <div className="min-h-0 flex-1 overflow-y-auto pb-3">
         {(view === "all" || view === "installed") && (!searching || installedShown.length > 0) && (

@@ -26,6 +26,8 @@ import {
   launch,
   message,
   palette,
+  registryEnv,
+  signedIndex,
   trust,
   type Running,
 } from "./harness";
@@ -40,7 +42,9 @@ test.skip(
   "Run through scripts/e2e-real-host.mjs, which builds and extracts the installer.",
 );
 
-/** The registry server: the real files; `/tampered/` with a wrong checksum; offline on demand. */
+/** The registry server: the real files, its index signed under the run's test key (EXT-20);
+ *  `/tampered/` an index that lists wrong checksums (signed: the registry published them);
+ *  `/altered/` an index changed after it was signed; offline on demand. */
 const server = { offline: false, requests: [] as string[] };
 let http: Server;
 let base = "";
@@ -48,6 +52,7 @@ const TYPES: Record<string, string> = {
   ".json": "text/plain; charset=utf-8",
   ".md": "text/plain; charset=utf-8",
   ".png": "image/png",
+  ".sig": "text/plain; charset=utf-8",
   ".yvx": "application/octet-stream",
 };
 
@@ -61,18 +66,26 @@ test.beforeAll(async () => {
     }
     let path = decodeURIComponent((request.url ?? "/").split("?")[0]);
     const tampered = path.startsWith("/tampered/");
-    path = path.replace(/^\/(tampered\/)?/, "");
+    const altered = path.startsWith("/altered/");
+    path = path.replace(/^\/(tampered\/|altered\/)?/, "");
     const file = normalize(join(root, path));
     if (!file.startsWith(root) || !existsSync(file)) {
       response.writeHead(404).end();
       return;
     }
     let body = readFileSync(file);
-    if (tampered && path === "index.json") {
-      const index = JSON.parse(body.toString("utf8"));
-      for (const extension of index.extensions)
-        for (const version of extension.versions) version.sha256 = "0".repeat(64);
-      body = Buffer.from(JSON.stringify(index));
+    if (path === "index.json" || path === "index.json.sig") {
+      const index = JSON.parse(readFileSync(join(root, "index.json"), "utf8"));
+      const zeroed = () => {
+        const copy = structuredClone(index);
+        for (const extension of copy.extensions)
+          for (const version of extension.versions) version.sha256 = "0".repeat(64);
+        return copy;
+      };
+      const signed = signedIndex(tampered ? zeroed() : index);
+      // Altered: the index changed after it was signed -- served beside the genuine signature.
+      const text = altered ? signedIndex(zeroed()).text : signed.text;
+      body = Buffer.from(path === "index.json" ? text : signed.signature);
     }
     response.writeHead(200, {
       "Content-Type": TYPES[extname(file)] ?? "application/octet-stream",
@@ -105,7 +118,7 @@ const card = (scope: ReturnType<Running["page"]["getByRole"]>, name: string) =>
   scope.getByRole("group", { name, exact: true }).first();
 
 async function start(registry = base) {
-  const running = await launch({ YAVIN_TEST_REGISTRY: registry });
+  const running = await launch(registryEnv(registry));
   await trust(running.page, true);
   return running;
 }
@@ -464,7 +477,7 @@ function asVersion1() {
 /** Yavin started again over the same profile: its folder is already trusted (not asked), and
  *  it reopens what it had open (a sidebar, an editor), so only the window itself is waited for. */
 async function restart() {
-  const running = await launch({ YAVIN_TEST_REGISTRY: base });
+  const running = await launch(registryEnv(base));
   await expect(
     running.page.getByTitle("Extensions & Plugins (Ctrl+Shift+X)", { exact: true }),
   ).toBeVisible({ timeout: 30_000 });
@@ -530,7 +543,10 @@ test("EXT-17/EXT-19 an older inventory: upgraded, its copy not checked and its c
     await expect(details.getByTestId("extension-integrity")).toHaveCount(0);
     await details.getByRole("tab", { name: "Requirements" }).click();
     await expect(details.getByTestId("extension-files")).toContainText("Verified Files");
-    await expect(details.getByTestId("extension-signature")).toContainText("Unsigned");
+    // EXT-20: reinstalled from a registry whose index verifies -- its record says so.
+    await expect(details.getByTestId("extension-signature")).toContainText(
+      "Verified registry metadata",
+    );
     const bound = JSON.parse(readFileSync(join(EXTENSIONS, "inventory.json"), "utf8"));
     expect(bound.extensions["yavin.word-count"].active.filesSha256).toMatch(/^[0-9a-f]{64}$/);
     // EXT-19: vouched for -- an authenticated record -- and now it runs.
@@ -755,6 +771,61 @@ test("EXT-19 a forged trust record, a lost trust key and changed files: each ref
     await review(running.page, "Install and allow");
     await count();
     await expect(message(running.page)).toContainText("notes.md:");
+    await close(running);
+  } finally {
+    if (running.app.exitCode === null) running.app.kill();
+  }
+});
+
+test("EXT-20 the registry's index: verified, it installs; altered after signing, it is said and its update refused, the installed version kept", async () => {
+  let running = await start();
+  try {
+    let view = await extensionsView(running.page);
+    await expect(view.getByTestId("registry-trust")).toHaveText("Registry index verified");
+    await view.getByRole("searchbox", { name: "Search extensions" }).fill("hello");
+    await card(
+      view.getByRole("region", { name: "Marketplace results" }),
+      "Hello World (sample)",
+    ).click();
+    const details = running.page.getByRole("region", { name: "Extension: Hello World (sample)" });
+    await details.getByRole("tab", { name: "Information" }).click();
+    await details.getByRole("button", { name: "Install version 2.0.1" }).click();
+    await review(running.page, "Install and allow");
+    await expect(details.getByRole("region", { name: "Versions" })).toContainText("Installed");
+    // Recorded as from the signed index -- never as a publisher's signature.
+    await details.getByRole("tab", { name: "Requirements" }).click();
+    await expect(details.getByTestId("extension-signature")).toContainText(
+      "Verified registry metadata",
+    );
+    await expect(details.getByTestId("extension-signature")).toContainText(
+      "does not verify who wrote it",
+    );
+    await close(running);
+    const before = readFileSync(join(EXTENSIONS, "inventory.json"), "utf8");
+
+    // The same registry, its index changed after it was signed (checksums replaced).
+    running = await launch(registryEnv(`${base}altered/`));
+    await expect(
+      running.page.getByTitle("Extensions & Plugins (Ctrl+Shift+X)", { exact: true }),
+    ).toBeVisible({ timeout: 30_000 });
+    view = await extensionsView(running.page);
+    const notice = view.getByTestId("registry-trust");
+    await expect(notice).toHaveAttribute("data-tone", "error");
+    await expect(notice).toContainText("Registry index altered");
+    await palette(running.page, "Extensions: Check for Updates");
+    const updates = view.getByRole("region", { name: "Updates" });
+    await card(updates, "Hello World (sample)")
+      .getByRole("button", { name: "Update Hello World (sample)" })
+      .click();
+    // Refused before anything is staged (so before any review is asked).
+    await expect(card(updates, "Hello World (sample)").getByRole("alert")).toContainText(
+      "changed after it was signed",
+    );
+    // Refused natively: the installed version, its grant and records exactly as they were.
+    expect(readFileSync(join(EXTENSIONS, "inventory.json"), "utf8")).toBe(before);
+    expect(leftovers()).toEqual([]);
+    await palette(running.page, "Hello World: Say Hello");
+    await expect(message(running.page)).toContainText("Hello, world!");
     await close(running);
   } finally {
     if (running.app.exitCode === null) running.app.kill();

@@ -685,10 +685,20 @@ fn record_matches_source(s: &SignatureRecord, source: &str) -> bool {
     };
     match source.split_once(' ') {
         Some(("openvsx", url)) => origin_of(url).is_some_and(|o| o == s.registry),
-        Some(("registry", url)) => {
-            !s.status.trusted() && origin_of(url).is_some_and(|o| o == s.registry)
+        // Yavin's registry: a signed index of that very registry (EXT-20: its base URL, not
+        // just its origin), or unsigned from its origin.
+        Some(("registry", url)) => match s.status {
+            crate::package_trust::SignatureStatus::IndexSigned => {
+                crate::marketplace::registry(url).is_ok_and(|registry| registry.base == s.registry)
+            }
+            _ => !s.status.trusted() && origin_of(url).is_some_and(|o| o == s.registry),
+        },
+        // Never signed: neither a package signature nor a signed index vouches for a file.
+        None if source == "file" => {
+            !s.status.trusted()
+                && s.status != crate::package_trust::SignatureStatus::IndexSigned
+                && s.registry == "file"
         }
-        None if source == "file" => !s.status.trusted() && s.registry == "file",
         _ => false,
     }
 }
@@ -821,6 +831,11 @@ impl ExtensionService {
 
     pub fn set_paths(&self, root: PathBuf, development: Vec<PathBuf>) {
         let _ = self.paths.set(Paths { root, development });
+    }
+
+    /// Yavin's extensions folder (EXT-20: where a registry's accepted index is remembered).
+    pub fn root_folder(&self) -> Result<PathBuf, String> {
+        self.paths().map(|paths| paths.root.clone())
     }
 
     fn paths(&self) -> Result<&Paths, String> {
