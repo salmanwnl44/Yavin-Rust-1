@@ -924,3 +924,48 @@ fn an_unreadable_replay_record_refuses_installs_until_reset() {
         }
     });
 }
+
+/// EXT-23: a signature record is shown only for the very bytes it was checked against. One
+/// whose SHA-256 is not the copy's package -- the inventory edited -- is never listed (the
+/// page would say "Verified registry metadata" for bytes it never matched), and the copy does
+/// not run (its trust record binds the record too, EXT-19).
+#[test]
+fn a_listed_signature_record_must_be_the_copys_own() {
+    let dir = scratch("own-record");
+    let served = Served::new();
+    let v1 = package_of(&dir, "1.0.0", "module.exports = 1;");
+    served.publish(&[("acme.hello", "1.0.0", &v1)], 1);
+    with_anchors(fixtures::anchors_for(&served.base), || {
+        let root = dir.join("extensions");
+        let service = ExtensionService::new(root.clone(), Vec::new());
+        install(&service, from(&served, "1.0.0", &v1), "1.0.0").unwrap();
+        drop(service);
+        for name in [
+            crate::extension_service::INVENTORY,
+            crate::extension_service::LAST_GOOD,
+        ] {
+            let path = root.join(name);
+            let mut value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            value["extensions"]["acme.hello"]["active"]["signature"]["sha256"] =
+                serde_json::json!("0".repeat(64));
+            std::fs::write(&path, value.to_string()).unwrap();
+        }
+        let service = ExtensionService::new(root, Vec::new());
+        let listed = service
+            .list(None)
+            .unwrap()
+            .extensions
+            .into_iter()
+            .find(|e| e.id.as_deref() == Some("acme.hello"))
+            .unwrap();
+        assert!(
+            listed.signature.is_none(),
+            "not this copy's record: not shown"
+        );
+        assert!(service
+            .host_copy("acme.hello")
+            .unwrap_err()
+            .starts_with("TrustStateInvalid"));
+    });
+}

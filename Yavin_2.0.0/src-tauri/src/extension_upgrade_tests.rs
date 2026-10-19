@@ -723,3 +723,32 @@ fn ext22_the_listing_says_where_the_copy_in_use_came_from() {
         ("unknown", None, None)
     );
 }
+
+/// EXT-23: an older Yavin (before EXT-17) that set both files aside as a newer one's
+/// (`.v<N>-<ms>.bak`, N past this Yavin's) leaves no inventory and no last good copy. This Yavin
+/// cannot read them, so it must not rebuild over them either: it refuses, on every start, and
+/// nothing in the folder changes -- the newer Yavin finds them there.
+#[test]
+fn ext23_newer_inventories_an_older_yavin_set_aside_are_never_rebuilt_over() {
+    let fx = fixture("ext23-newer-set-aside");
+    let backend = rich(&fx);
+    let newer = INVENTORY_VERSION + 1;
+    for name in [INVENTORY, LAST_GOOD] {
+        let mut value = raw(&fx, name);
+        value["version"] = serde_json::json!(newer);
+        fs::write(
+            fx.root.join(format!("{name}.v{newer}-1790000000000.bak")),
+            value.to_string(),
+        )
+        .unwrap();
+        fs::remove_file(fx.root.join(name)).unwrap();
+    }
+    let before = everything(&fx);
+    for _ in 0..3 {
+        let refused = restart(&fx, &backend).list(None).unwrap_err();
+        assert!(refused.starts_with("InventoryUnsupported"), "{refused}");
+        assert_eq!(everything(&fx), before, "nothing rebuilt or moved");
+    }
+    assert!(!fx.root.join(INVENTORY).exists());
+    assert!(backups(&fx, ".unrecovered").is_empty());
+}
