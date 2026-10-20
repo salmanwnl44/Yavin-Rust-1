@@ -374,16 +374,66 @@ fn shell_pid(recorder: &Recorder) -> u32 {
 }
 
 /// Whether a process with this id exists, asked of the OS.
-fn process_exists(pid: u32) -> bool {
-    if cfg!(windows) {
-        let listed = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+/// A process by identity: its PID and when it started (Windows FILETIME; 0 where the platform
+/// does not say). Windows reuses PIDs at once, and a process keeps naming a parent long gone, so a
+/// PID alone can name another process -- under load, a system service (EXT-24: the cause of this
+/// file's intermittent "outlived the kill").
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Process {
+    pid: u32,
+    started: u64,
+}
+
+/// Every process: PID, parent PID and start time.
+fn process_table() -> Vec<(u32, u32, u64)> {
+    let table = if cfg!(windows) {
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId) $(if ($_.CreationDate) { $_.CreationDate.ToFileTimeUtc() } else { 0 })\" }",
+            ])
             .output()
-            .expect("tasklist runs");
-        String::from_utf8_lossy(&listed.stdout).contains(&format!("\"{pid}\""))
+            .expect("the process table can be listed")
+            .stdout
+    } else {
+        std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=,ppid="])
+            .output()
+            .expect("the process table can be listed")
+            .stdout
+    };
+    String::from_utf8_lossy(&table)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let started = fields.next().and_then(|t| t.parse().ok()).unwrap_or(0);
+            Some((pid, ppid, started))
+        })
+        .collect()
+}
+
+/// The process running as `pid` now -- taken while it is known to be the one meant.
+fn identify(pid: u32) -> Process {
+    let started = process_table()
+        .into_iter()
+        .find(|&(p, _, _)| p == pid)
+        .map_or(0, |(_, _, started)| started);
+    Process { pid, started }
+}
+
+/// Whether that very process is still running: its PID, started at the same moment.
+fn still_running(process: Process) -> bool {
+    if cfg!(windows) {
+        process_table()
+            .into_iter()
+            .any(|(pid, _, started)| pid == process.pid && started == process.started)
     } else {
         std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
+            .args(["-0", &process.pid.to_string()])
             .status()
             .is_ok_and(|status| status.success())
     }
@@ -453,7 +503,7 @@ fn start_background_writer(
 
 /// After a generation's end: the shell's process is gone, and the background process it
 /// started has stopped (the file it appends to no longer grows) -- nothing is left orphaned.
-fn assert_nothing_left(shell: u32, writer: &BackgroundWriter) {
+fn assert_nothing_left(shell: Process, writer: &BackgroundWriter) {
     thread::sleep(Duration::from_millis(500));
     let after = writer.size();
     thread::sleep(Duration::from_millis(1500));
@@ -463,8 +513,8 @@ fn assert_nothing_left(shell: u32, writer: &BackgroundWriter) {
         "a process the shell started outlived it"
     );
     assert!(
-        !process_exists(shell),
-        "the shell's process {shell} is still running"
+        !still_running(shell),
+        "the shell's process {shell:?} is still running"
     );
 }
 
@@ -472,7 +522,7 @@ fn assert_nothing_left(shell: u32, writer: &BackgroundWriter) {
 fn killing_a_terminal_ends_everything_its_shell_started() {
     let terminals = Terminals::default();
     let recorder = start(&terminals, "t-tree", 1);
-    let shell = shell_pid(&recorder);
+    let shell = identify(shell_pid(&recorder));
     let writer = start_background_writer(&terminals, "t-tree", &recorder, "kill");
 
     kill(
@@ -496,7 +546,7 @@ fn killing_a_terminal_ends_everything_its_shell_started() {
 fn a_shell_that_exits_by_itself_takes_what_it_started_with_it() {
     let terminals = Terminals::default();
     let recorder = start(&terminals, "t-leave", 1);
-    let shell = shell_pid(&recorder);
+    let shell = identify(shell_pid(&recorder));
     let writer = start_background_writer(&terminals, "t-leave", &recorder, "exit");
 
     type_in(&terminals, "t-leave", 1, "exit\r");
@@ -1777,39 +1827,18 @@ fn a_shell_without_integration_sends_no_signals_and_works_as_before() {
 /// Every process descended from `root`, from one snapshot of the process table (pid, parent).
 /// Identity is by ancestry from this test's own shell, so no other process is ever looked at
 /// twice, let alone touched.
-fn descendants(root: u32) -> Vec<u32> {
-    let table = if cfg!(windows) {
-        std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId)\" }",
-            ])
-            .output()
-            .expect("the process table can be listed")
-            .stdout
-    } else {
-        std::process::Command::new("ps")
-            .args(["-A", "-o", "pid=,ppid="])
-            .output()
-            .expect("the process table can be listed")
-            .stdout
-    };
-    let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&table)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace().map(|f| f.parse::<u32>().ok());
-            Some((fields.next()??, fields.next()??))
-        })
-        .collect();
+fn descendants(root: Process) -> Vec<Process> {
+    let table = process_table();
     let mut found = vec![root];
     let mut at = 0;
     while at < found.len() {
         let parent = found[at];
-        for &(pid, ppid) in &pairs {
-            if ppid == parent && pid != parent && !found.contains(&pid) {
-                found.push(pid);
+        for &(pid, ppid, started) in &table {
+            let child = Process { pid, started };
+            // Started after its parent: else the PID it names as its parent was another's.
+            let after = parent.started == 0 || started >= parent.started;
+            if ppid == parent.pid && pid != parent.pid && after && !found.contains(&child) {
+                found.push(child);
             }
         }
         at += 1;
@@ -1822,7 +1851,7 @@ fn descendants(root: u32) -> Vec<u32> {
 fn killing_a_terminal_ends_its_shells_children_and_grandchildren_by_pid() {
     let terminals = Terminals::default();
     let recorder = start(&terminals, "t-pids", 1);
-    let shell = shell_pid(&recorder);
+    let shell = identify(shell_pid(&recorder));
     // shell -> child -> grandchild -> great-grandchild, each waiting on the next.
     let chain = if cfg!(windows) {
         "cmd /d /c \"cmd /d /c ping -n 600 127.0.0.1 >nul\"\r"
@@ -1854,22 +1883,18 @@ fn killing_a_terminal_ends_its_shells_children_and_grandchildren_by_pid() {
         "never ended"
     );
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut alive: Vec<u32> = tree
-        .iter()
-        .copied()
-        .filter(|&p| process_exists(p))
-        .collect();
+    let mut alive: Vec<Process> = tree.iter().copied().filter(|&p| still_running(p)).collect();
     while !alive.is_empty() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(250));
-        alive.retain(|&p| process_exists(p));
+        alive.retain(|&p| still_running(p));
     }
     assert!(
         alive.is_empty(),
         "outlived the kill: {alive:?} (of {tree:?})"
     );
     assert!(
-        !process_exists(shell),
-        "the shell {shell} outlived the kill"
+        !still_running(shell),
+        "the shell {shell:?} outlived the kill"
     );
 }
 
@@ -1886,7 +1911,7 @@ fn several_shells_at_once_keep_their_output_apart_and_all_end() {
                 .collect();
             started.into_iter().map(|t| t.join().unwrap()).collect()
         });
-        let shells: Vec<u32> = recorders.iter().map(|r| shell_pid(r)).collect();
+        let shells: Vec<Process> = recorders.iter().map(|r| identify(shell_pid(r))).collect();
         for (name, _) in names.iter().zip(&recorders) {
             type_in(&terminals, name, 1, &format!("echo marker-{name}-end\r"));
         }
@@ -1915,9 +1940,9 @@ fn several_shells_at_once_keep_their_output_apart_and_all_end() {
             assert_protocol_order(&recorder.snapshot(), 1);
         }
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut alive: Vec<u32> = shells.clone();
+        let mut alive: Vec<Process> = shells.clone();
         while !alive.is_empty() && Instant::now() < deadline {
-            alive.retain(|&pid| process_exists(pid));
+            alive.retain(|&process| still_running(process));
             if !alive.is_empty() {
                 thread::sleep(Duration::from_millis(250));
             }

@@ -1,5 +1,6 @@
+import { focusMovedSince, type FocusRequest } from "../../services/focusIntent";
 import { useEffect, useImperativeHandle, useRef, useState } from "react";
-import type { Ref } from "react";
+import type { Ref, RefObject } from "react";
 import { monaco } from "../../editor/monaco";
 import { TEST_HOOKS } from "../../editor/testHooks";
 import { monacoHost, monacoNaming, textModelOf } from "../../editor/monacoHost";
@@ -82,6 +83,7 @@ export default function CodeEditor({
   documentKey,
   documents,
   views,
+  focusRequest,
   editorRef,
   onState,
   wordWrap,
@@ -98,6 +100,8 @@ export default function CodeEditor({
 }: {
   documentKey: string;
   documents: DocumentService;
+  /** When the shown document was asked for (EXT-24, `focusIntent.ts`). */
+  focusRequest?: RefObject<{ key: string; request: FocusRequest } | null>;
   views: EditorViews;
   editorRef: Ref<EditorHandle>;
   onState: (state: EditorState) => void;
@@ -404,7 +408,10 @@ export default function CodeEditor({
     shown.current = { key: documentKey, doc, model };
     if (focusDecision.current?.key !== documentKey)
       focusDecision.current = { key: documentKey, take: views.takeFocus(documentKey) };
-    if (focusDecision.current.take) instance.focus();
+    // Not over a move the user made since asking -- this editor may have loaded seconds later.
+    const asked = focusRequest?.current;
+    const moved = asked?.key === documentKey && focusMovedSince(asked.request, container.current);
+    if (focusDecision.current.take && !moved) instance.focus();
     published.current = null;
     publish();
     publishCursor();

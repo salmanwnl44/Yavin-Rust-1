@@ -1,10 +1,11 @@
 {
   "schema": 1,
-  "revision": 1,
+  "revision": 2,
   "registries": [
     {
       "id": "yavin-official",
       "base": "https://raw.githubusercontent.com/salmanwnl44/Yavin-Rust-1/main/Yavin_2.0.0/registry/",
+      "minSequence": 1,
       "keys": [
         {
           "keyId": "yavin-registry-2026-10-19",

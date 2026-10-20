@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Yavin IDE",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "identifier": "com.yavin.ide",
   "build": {
     "beforeDevCommand": "node scripts/build-extension-host.mjs && npm run dev",
@@ -27,9 +27,21 @@
     }
   },
   "bundle": {
-    "resources": ["resources/search/rg.exe", "resources/search/COPYING", "resources/search/LICENSE-MIT", "resources/search/UNLICENSE", "resources/search/VERSION.txt", "resources/extension-host/*"],
+    "resources": [
+      "resources/search/rg.exe",
+      "resources/search/COPYING",
+      "resources/search/LICENSE-MIT",
+      "resources/search/UNLICENSE",
+      "resources/search/VERSION.txt",
+      "resources/extension-host/*"
+    ],
     "active": true,
-    "windows": { "allowDowngrades": false },
+    "windows": {
+      "allowDowngrades": false,
+      "wix": {
+        "upgradeCode": "7150e972-3adc-597c-95e0-96663d30edba"
+      }
+    },
     "targets": "all",
     "icon": [
       "icons/32x32.png",

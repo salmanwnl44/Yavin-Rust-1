@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test src/services/**/*.test.ts",
+    "test": "node --experimental-strip-types --test src/services/**/*.test.ts scripts/*.test.mjs",
     "test:ui": "playwright test",
     "test:real-host": "node scripts/e2e-real-host.mjs",
     "format": "prettier --write .",

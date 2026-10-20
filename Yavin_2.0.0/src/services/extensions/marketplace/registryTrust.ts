@@ -123,7 +123,7 @@ export function describeRegistryTrust(
     case "replay":
       return refused(
         "Older registry index",
-        "This registry served an older index than one Yavin already accepted from it -- a downgrade.",
+        "This registry served an older index than this Yavin accepts -- older than one it already accepted, or than the minimum its release requires: a downgrade.",
         "Try again later; if it persists, the registry or your connection may be tampered with.",
       );
     case "stateInvalid":

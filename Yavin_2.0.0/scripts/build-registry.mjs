@@ -5,15 +5,25 @@
 // the registry is what `YavinRegistryProvider` reads.
 //
 //   node scripts/build-registry.mjs           write the registry
-//   node scripts/build-registry.mjs --check   fail if the written registry is out of date
+//   node scripts/build-registry.mjs --check   fail if the written registry is out of date, or its
+//                                             index expires within YAVIN_REGISTRY_WARN_DAYS days
+//                                             (default 90): then it must be renewed
+//   node scripts/build-registry.mjs --renew   sign the index again with the next sequence and new
+//                                             dates though nothing changed (EXT-24) -- a release
+//                                             operator's step, with the production key; publish
+//                                             only the result, then check it with
+//                                             scripts/verify-registry.mjs
 //
 // The index is signed (EXT-20): `registry/index.json.sig`, Ed25519 over a domain prefix and the
 // exact bytes of `index.json`, with the key Yavin pins (`src-tauri/src/registry_anchors.json`).
 // The private key is never in the repository: `YAVIN_REGISTRY_SIGNING_KEY` names it (a PKCS#8
 // PEM; default `~/.yavin-registry/signing-key.pem`). It is needed only when the content changes:
 // then `sequence` rises and the dates are renewed; unchanged content keeps the published index
-// and signature, byte for byte (so `--check` needs no key).
-import { createHash, createPrivateKey, sign } from "node:crypto";
+// and signature, byte for byte (so `--check` needs no key), unless `--renew` is given. The
+// registry id and key id are the ones `registry_anchors.json` pins (the key must be active), and
+// every new signature is verified against the pinned public key over the exact bytes written,
+// before anything is written. A sequence is never reused: it is always the previous one plus one.
+import { createHash, createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
 import { homedir } from "node:os";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
@@ -23,8 +33,16 @@ import { deflateRawSync, deflateSync } from "node:zlib";
 import { readManifest } from "../src/services/extensions/manifest.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const out = join(root, "registry");
+// Tests point these elsewhere (a copy, a test key's anchors); a release uses the defaults.
+const out = process.env.YAVIN_REGISTRY_OUT ?? join(root, "registry");
+const anchorsFile =
+  process.env.YAVIN_REGISTRY_ANCHORS ?? join(root, "src-tauri", "src", "registry_anchors.json");
 const check = process.argv.includes("--check");
+const renew = process.argv.includes("--renew");
+if (check && renew) {
+  console.error("--check and --renew do not go together.");
+  process.exit(1);
+}
 const catalog = JSON.parse(readFileSync(join(out, "catalog.json"), "utf8"));
 
 // --- zip (store/deflate, no timestamps, no extra fields) ------------------------------------
@@ -253,8 +271,20 @@ const content = {
   extensions,
 };
 // --- The signed index (EXT-20) ----------------------------------------------------------------
-const REGISTRY_ID = "yavin-official";
+// What Yavin pins for its own registry (src-tauri/src/registry_anchors.json): the index must be
+// signed as that registry, with a key pinned for it and active.
+const pinned = JSON.parse(readFileSync(anchorsFile, "utf8")).registries.find(
+  (r) => r.id === "yavin-official",
+);
+const REGISTRY_ID = pinned.id;
 const KEY_ID = "yavin-registry-2026-10-19";
+const pinnedKey = pinned.keys.find((k) => k.keyId === KEY_ID);
+if (!pinnedKey || pinnedKey.status !== "active" || pinnedKey.algorithm !== "ed25519") {
+  console.error(
+    `The signing key ${KEY_ID} is not pinned as an active Ed25519 key for ${REGISTRY_ID}.`,
+  );
+  process.exit(1);
+}
 const DOMAIN = Buffer.from("Yavin.RegistryIndex.v1\0", "utf8");
 const VALID_DAYS = 365;
 const FRESHNESS = ["registryId", "sequence", "issuedAt", "expiresAt"];
@@ -264,6 +294,7 @@ const indexFile = join(out, "index.json");
 const signatureFile = join(out, "index.json.sig");
 const previous = existsSync(indexFile) ? JSON.parse(readFileSync(indexFile, "utf8")) : null;
 if (
+  !renew &&
   previous &&
   existsSync(signatureFile) &&
   previous.registryId === REGISTRY_ID &&
@@ -301,6 +332,15 @@ if (
       Buffer.concat([DOMAIN, bytes]),
       createPrivateKey(readFileSync(keyFile)),
     );
+    // The signature must verify under the key Yavin pins, over the very bytes written.
+    if (
+      !verify(null, Buffer.concat([DOMAIN, bytes]), createPublicKey(pinnedKey.publicKey), signature)
+    ) {
+      console.error(
+        `The signing key does not match the pinned key ${KEY_ID}: nothing was written.`,
+      );
+      process.exit(1);
+    }
     written.set(
       "index.json.sig",
       Buffer.from(
@@ -348,7 +388,21 @@ if (check) {
     );
     process.exit(1);
   }
-  console.log(`The registry is up to date (${written.size} files).`);
+  // Its expiry, ahead of time: an index past it installs no code.
+  const index = JSON.parse(readFileSync(indexFile, "utf8"));
+  const warnDays = Number(process.env.YAVIN_REGISTRY_WARN_DAYS ?? 90);
+  // Whole days, as Yavin counts them: the index is valid through its expiry day.
+  const left =
+    Date.parse(`${index.expiresAt}T00:00:00Z`) / 86_400_000 - Math.floor(Date.now() / 86_400_000);
+  if (!(left >= warnDays)) {
+    console.error(
+      `The registry index (sequence ${index.sequence}) expires on ${index.expiresAt}, in ${left} day(s) -- less than ${warnDays}: renew it (node scripts/build-registry.mjs --renew, with the signing key), publish it, then verify it (node scripts/verify-registry.mjs).`,
+    );
+    process.exit(1);
+  }
+  console.log(
+    `The registry is up to date (${written.size} files); its index expires on ${index.expiresAt}, in ${left} days.`,
+  );
 } else {
   for (const folder of ["packages", "docs", "icons"])
     rmSync(join(out, folder), { recursive: true, force: true });

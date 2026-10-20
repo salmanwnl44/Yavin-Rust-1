@@ -1,5 +1,28 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "identifier": "com.yavin.ide.e2e",
-  "bundle": { "targets": ["msi"] }
+  "app": {
+    "windows": [
+      {
+        "title": "Yavin IDE",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "decorations": false,
+        "dragDropEnabled": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port=9339"
+      }
+    ]
+  },
+  "bundle": {
+    "targets": [
+      "msi"
+    ],
+    "windows": {
+      "wix": {
+        "upgradeCode": "e6c1e04f-5ae6-4034-aeb8-35bd1f27214d"
+      }
+    }
+  }
 }

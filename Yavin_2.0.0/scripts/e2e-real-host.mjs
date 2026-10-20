@@ -9,7 +9,7 @@
 //
 //   node scripts/e2e-real-host.mjs [--skip-build] [playwright arguments...]
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +22,7 @@ const forward = args.filter((arg) => arg !== "--skip-build");
 const run = (command, list, options = {}) =>
   execFileSync(command, list, { cwd: root, stdio: "inherit", shell: true, ...options });
 
+const started = Date.now();
 if (!skipBuild)
   run("npx", [
     "tauri",
@@ -42,8 +43,15 @@ const bundles = join(
   "bundle",
   "msi",
 );
-const msi = readdirSync(bundles).find((name) => name.endsWith(".msi"));
-if (!msi) throw new Error(`No installer in ${bundles}`);
+// The installer just built, by its version -- never another one left in the folder (a release's,
+// an older build's): the run tests exactly what this checkout builds (EXT-24).
+const version = JSON.parse(
+  readFileSync(join(root, "src-tauri", "tauri.conf.json"), "utf8"),
+).version;
+const msi = readdirSync(bundles).find((name) => name === `Yavin IDE_${version}_x64_en-US.msi`);
+if (!msi) throw new Error(`No ${version} installer in ${bundles}`);
+if (!skipBuild && statSync(join(bundles, msi)).mtimeMs < started)
+  throw new Error(`${msi} is older than this build: it is not the one just built.`);
 const install = join(tmpdir(), "yavin-e2e-install");
 rmSync(install, { recursive: true, force: true });
 execFileSync("msiexec", ["/a", join(bundles, msi), "/qn", `TARGETDIR=${install}`], {

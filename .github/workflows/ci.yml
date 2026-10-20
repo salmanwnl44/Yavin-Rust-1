@@ -1,18 +1,80 @@
 name: Checks
 
+# EXT-24: each suite is its own job, so one failing never hides another (before, a failed UI step
+# skipped every Rust step). `release gate` fails unless every job required for this run passed --
+# a job skipped or cancelled counts as failed. Release tags (v*) also run the security mutation
+# proofs and the packaged-installer tests. No job here has any signing secret.
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  # Daily: the deployed registry's signature, freshness and expiry (the monitor).
+  schedule:
+    - cron: "17 5 * * *"
 
 permissions:
   contents: read
 
+defaults:
+  run:
+    working-directory: Yavin_2.0.0
+
 jobs:
-  check:
+  version:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the release tags
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Version is valid and above every release
+        run: node scripts/release-version.mjs
+      - name: Release tag matches the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/release-version.mjs --release=${{ github.ref_name }}
+
+  typescript:
+    if: github.event_name != 'schedule'
     runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: Yavin_2.0.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: Yavin_2.0.0/package-lock.json
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm test
+      - run: npm run build
+
+  ui:
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: Yavin_2.0.0/package-lock.json
+      - run: npm ci
+      # The GitHub reporter names each failing test as an annotation on the run.
+      - run: npx playwright test --reporter=github,line
+      - name: Keep the failures' traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-test-results-${{ github.sha }}
+          path: Yavin_2.0.0/test-results
+          retention-days: 14
+
+  rust:
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,22 +85,93 @@ jobs:
       - run: rustup update stable
       - run: rustup default stable
       - run: rustup component add rustfmt clippy
-      - run: npm ci
-      - run: npm run format:check
-      - run: npm test
-      - run: npm run test:ui
-      - run: npm run build
       - run: ./scripts/setup-search.ps1
         shell: pwsh
       - run: cargo fmt --all --check
         working-directory: Yavin_2.0.0/src-tauri
-      - run: cargo check --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        working-directory: Yavin_2.0.0/src-tauri
+      - run: cargo clippy --workspace --all-targets --locked --features test-registry -- -D warnings
         working-directory: Yavin_2.0.0/src-tauri
       - run: cargo test --workspace --locked
+        working-directory: Yavin_2.0.0/src-tauri
+      - run: cargo test --workspace --locked --features test-registry
         working-directory: Yavin_2.0.0/src-tauri
       # The terminal's output stress tests (up to 50 MB through the bounded stream), kept out of
       # the default run for time; real shells and process containment run above, on Windows.
       - run: cargo test -p yavin-ide --lib --locked terminal_stream::tests::stress -- --include-ignored
         working-directory: Yavin_2.0.0/src-tauri
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-        working-directory: Yavin_2.0.0/src-tauri
+
+  registry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: The registry in the repository is built, signed and not near expiry
+        run: node scripts/build-registry.mjs --check
+      - name: The deployed registry verifies under the pinned key
+        # Daily and on demand it must also be exactly the repository's (published); on a push or
+        # pull request the repository may legitimately be ahead of what is deployed.
+        run: >-
+          node scripts/verify-registry.mjs
+          ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && ' ' || '--local none' }}
+
+  mutations:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: rustup update stable
+      - run: rustup default stable
+      - run: ./scripts/setup-search.ps1
+        shell: pwsh
+      - name: Every security protection is caught by its tests when removed
+        run: node scripts/security-mutations.mjs
+
+  packaged:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: Yavin_2.0.0/package-lock.json
+      - run: rustup update stable
+      - run: rustup default stable
+      - run: npm ci
+      - run: ./scripts/setup-search.ps1
+        shell: pwsh
+      - name: The installer, built, extracted and driven end to end (test identifier)
+        run: npm run test:real-host
+
+  release-gate:
+    if: always()
+    needs: [version, typescript, ui, rust, registry, mutations, packaged]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every required job passed
+        working-directory: .
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          node -e '
+            const needs = JSON.parse(process.env.NEEDS);
+            const release = process.env.REF.startsWith("refs/tags/v") || process.env.EVENT === "workflow_dispatch";
+            const required = process.env.EVENT === "schedule"
+              ? ["registry"]
+              : ["version", "typescript", "ui", "rust", "registry", ...(release ? ["mutations", "packaged"] : [])];
+            const failed = required.filter((job) => needs[job]?.result !== "success");
+            for (const job of required) console.log(`${job}: ${needs[job]?.result ?? "missing"}`);
+            if (failed.length) { console.error(`required and not passed: ${failed.join(", ")}`); process.exit(1); }
+          '

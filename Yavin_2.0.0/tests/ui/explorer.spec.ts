@@ -277,6 +277,68 @@ test("Ctrl+click selects several entries and deletes them together", async ({ pa
   expect(await calls(page, "delete_path")).toHaveLength(3);
 });
 
+/** Holds the code editor's module back until `release` (EXT-24): the editor loads late, as the
+ *  first one in a session does on a busy machine. */
+async function lateEditor(page: Page) {
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => (release = resolve));
+  await page.route(/\/src\/components\/layout\/CodeEditor\.tsx/, async (route) => {
+    await released;
+    await route.continue();
+  });
+  return release;
+}
+
+test("EXT-24 an editor that loads late leaves focus where the user moved it: Delete deletes the selected files, not text", async ({
+  page,
+}) => {
+  const release = await lateEditor(page);
+  await explorer(page);
+  // Opened -- while the editor is still loading -- and then two more rows Ctrl+clicked.
+  await page.getByLabel("file.ts", { exact: true }).click();
+  await page.getByLabel("new.ts", { exact: true }).click({ modifiers: ["Control"] });
+  await page.getByLabel("conflict.ts", { exact: true }).click({ modifiers: ["Control"] });
+  release();
+  const editor = page.locator(".monaco-editor");
+  await expect(editor).toContainText("original"); // bound: its focus decision is made
+  await expect(page.getByLabel("conflict.ts", { exact: true })).toBeFocused();
+  await page.keyboard.press("Delete");
+  await expect(page.getByRole("dialog", { name: "Delete items" })).toContainText("these 3 items");
+  await page.keyboard.press("Escape");
+  await expect(editor).toContainText("original");
+});
+
+test("EXT-24 an editor that loads late takes focus for a file opened from Quick Open (the dialog restoring focus is no move)", async ({
+  page,
+}) => {
+  const release = await lateEditor(page);
+  await explorer(page);
+  const search = page.getByRole("combobox", { name: "Search files or commands" });
+  await expect(async () => {
+    await page.keyboard.press("Control+p");
+    await expect(search).toBeVisible({ timeout: 1000 });
+  }).toPass();
+  await search.fill("file.ts");
+  await search.press("Enter");
+  await expect(search).toBeHidden();
+  release();
+  const editor = page.locator(".monaco-editor");
+  await expect(editor).toContainText("original");
+  await expect(editor.getByRole("textbox")).toBeFocused();
+});
+
+test("EXT-24 an editor that loads late still takes focus when nothing moved since it was opened", async ({
+  page,
+}) => {
+  const release = await lateEditor(page);
+  await explorer(page);
+  await page.getByLabel("file.ts", { exact: true }).click();
+  release();
+  const editor = page.locator(".monaco-editor");
+  await expect(editor).toContainText("original");
+  await expect(editor.getByRole("textbox")).toBeFocused();
+});
+
 test("Shift+click selects the range between two entries", async ({ page }) => {
   await explorer(page);
   await page.getByLabel("conflict.ts", { exact: true }).click();

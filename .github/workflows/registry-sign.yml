@@ -1,0 +1,60 @@
+name: Registry signing (operator)
+
+# EXT-24: renews or re-signs Yavin's registry index with the production key, for a release
+# operator to review and publish. NOT ACTIVE until an operator has (1) created the GitHub
+# environment `registry-signing` with required reviewers and a deployment-branch rule limiting it
+# to `main`, and (2) stored the production private key (PKCS#8 PEM) in it as the environment
+# secret `YAVIN_REGISTRY_SIGNING_KEY`. Until then this job fails at its first step.
+#
+# It never publishes: it uploads the signed index as an artifact; the operator checks it and
+# commits it. Only manual runs; never on pull requests, so no fork or untrusted branch can reach
+# the secret. The key is written to a file only for the signing step and removed after, whatever
+# happens; it is never printed (GitHub also masks the secret in logs).
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why the index is being signed (renewal before expiry, a content change...)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    environment: registry-signing
+    defaults:
+      run:
+        working-directory: Yavin_2.0.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: The environment holds the key
+        env:
+          KEY: ${{ secrets.YAVIN_REGISTRY_SIGNING_KEY }}
+        run: test -n "$KEY" || { echo "The registry-signing environment has no YAVIN_REGISTRY_SIGNING_KEY."; exit 1; }
+      - name: Sign the index (the next sequence, new dates)
+        env:
+          KEY: ${{ secrets.YAVIN_REGISTRY_SIGNING_KEY }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          umask 077
+          key="$RUNNER_TEMP/registry-key.pem"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$KEY" > "$key"
+          echo "Signing because: $REASON"
+          YAVIN_REGISTRY_SIGNING_KEY="$key" node scripts/build-registry.mjs --renew
+      - name: The candidate verifies under the pinned key, before it is published
+        run: node scripts/verify-registry.mjs --files registry
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-registry-index-${{ github.run_id }}
+          path: |
+            Yavin_2.0.0/registry/index.json
+            Yavin_2.0.0/registry/index.json.sig
+          retention-days: 7

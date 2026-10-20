@@ -1,0 +1,1561 @@
+{
+  "note": "Each protection removed in turn: the named tests must then fail (EXT-24). Run with node scripts/security-mutations.mjs from Yavin_2.0.0. A pattern that no longer matches exactly once fails the run: re-target it.",
+  "mutations": [
+    {
+      "id": "EXT-09 M1",
+      "what": "install ignores the verdict",
+      "edits": [
+        {
+          "file": "src/openvsx.rs",
+          "from": "    if !status.trusted() {\n        return Err(package_trust::refusal(",
+          "to": "    if false && !status.trusted() {\n        return Err(package_trust::refusal("
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "openvsx"]
+    },
+    {
+      "id": "EXT-09 M2",
+      "what": "any signature verifies",
+      "edits": [
+        {
+          "file": "src/package_trust.rs",
+          "from": "        Err(_) => SignatureStatus::Invalid,",
+          "to": "        Err(_) => SignatureStatus::RegistrySigned,"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "package_trust", "openvsx"]
+    },
+    {
+      "id": "EXT-09 M3",
+      "what": "revocation ignored",
+      "edits": [
+        {
+          "file": "src/package_trust.rs",
+          "from": "    if anchor.revoked {",
+          "to": "    if false && anchor.revoked {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "package_trust", "openvsx"]
+    },
+    {
+      "id": "EXT-09 M4",
+      "what": "expiry ignored",
+      "edits": [
+        {
+          "file": "src/package_trust.rs",
+          "from": "    if anchor.not_after.is_some_and(|last| today > last) {",
+          "to": "    if false && anchor.not_after.is_some_and(|last| today > last) {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "package_trust"]
+    },
+    {
+      "id": "EXT-09 M5",
+      "what": "namespace scope ignored",
+      "edits": [
+        {
+          "file": "src/package_trust.rs",
+          "from": "    if anchor.publisher && !anchor.namespaces.contains(&namespace) {",
+          "to": "    if false && anchor.publisher && !anchor.namespaces.contains(&namespace) {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "package_trust"]
+    },
+    {
+      "id": "EXT-09 M6",
+      "what": "unknown key falls back to any pinned key",
+      "edits": [
+        {
+          "file": "src/package_trust.rs",
+          "from": "    let Some(anchor) = store.of(registry).find(|a| a.key_id == key_id) else {",
+          "to": "    let Some(anchor) = store.of(registry).find(|a| a.key_id == key_id || !a.revoked) else {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "package_trust", "openvsx"]
+    },
+    {
+      "id": "EXT-09 M7",
+      "what": "a missing signature passes",
+      "edits": [
+        {
+          "file": "src/openvsx.rs",
+          "from": "        return SignatureStatus::Missing;\n    }\n    let Ok(url) = file_url(meta, \"signature\", registry)",
+          "to": "        return SignatureStatus::RegistrySigned;\n    }\n    let Ok(url) = file_url(meta, \"signature\", registry)"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "openvsx"]
+    },
+    {
+      "id": "EXT-09 M8",
+      "what": "staged record not bound to the bytes",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "            .is_some_and(|s| !s.sha256.eq_ignore_ascii_case(sha256))",
+          "to": "            .is_some_and(|s| s.sha256.is_empty() && !s.sha256.eq_ignore_ascii_case(sha256))"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_service"]
+    },
+    {
+      "id": "EXT-09 M10",
+      "what": "rebuild keeps no-record as signed",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "                // Rebuilt from the folder alone: what its signature was is not known (EXT-09).\n                signature: None,",
+          "to": "                signature: Some(crate::package_trust::SignatureRecord { status: crate::package_trust::SignatureStatus::RegistrySigned, registry: String::new(), key_id: None, namespace: String::new(), sha256: String::new(), store_revision: 0 }),"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_service"]
+    },
+    {
+      "id": "EXT-10 M1",
+      "what": "no AppContainer",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/sandbox.rs",
+          "from": "        attributes.set(\n            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,\n            &capabilities as *const _ as _,\n            std::mem::size_of_val(&capabilities),\n            \"its AppContainer could not be set\",\n        )?;",
+          "to": "        let _ = &capabilities;"
+        }
+      ],
+      "args": ["-p", "ide-workspace", "--test", "sandbox"],
+      "also": [["-p", "yavin-ide", "--lib", "--", "extension_host"]]
+    },
+    {
+      "id": "EXT-10 M2",
+      "what": "every inheritable handle inherited",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/sandbox.rs",
+          "from": "        attributes.set(\n            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,\n            inherited.as_ptr() as _,\n            std::mem::size_of_val(&inherited),\n            \"the handles it inherits could not be limited\",\n        )?;",
+          "to": "        let _ = &inherited;"
+        }
+      ],
+      "args": ["-p", "ide-workspace", "--test", "sandbox"]
+    },
+    {
+      "id": "EXT-10 M3",
+      "what": "no job memory limit",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/sandbox.rs",
+          "from": "                    | JOB_OBJECT_LIMIT_JOB_MEMORY\n",
+          "to": ""
+        }
+      ],
+      "args": ["-p", "ide-workspace", "--test", "sandbox"],
+      "also": [["-p", "yavin-ide", "--lib", "--", "extension_host"]]
+    },
+    {
+      "id": "EXT-10 M4",
+      "what": "child processes allowed",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/sandbox.rs",
+          "from": "                    | JOB_OBJECT_LIMIT_ACTIVE_PROCESS\n",
+          "to": ""
+        },
+        {
+          "file": "crates/ide-workspace/src/sandbox.rs",
+          "from": "let child_policy: u32 = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;",
+          "to": "let child_policy: u32 = 0;"
+        }
+      ],
+      "args": ["-p", "ide-workspace", "--test", "sandbox"]
+    },
+    {
+      "id": "EXT-10 M5",
+      "what": "Yavin's environment inherited",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/sandbox.rs",
+          "from": "                environment.as_ptr() as _,",
+          "to": "                std::ptr::null(),"
+        }
+      ],
+      "args": ["-p", "ide-workspace", "--test", "sandbox"]
+    },
+    {
+      "id": "EXT-10 M6",
+      "what": "no mitigations",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/sandbox.rs",
+          "from": "let mitigations: u64 = MITIGATIONS;",
+          "to": "let mitigations: u64 = 0;"
+        }
+      ],
+      "args": ["-p", "ide-workspace", "--test", "sandbox"]
+    },
+    {
+      "id": "EXT-10 M7",
+      "what": "window's init limits trusted",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "let limits = shared.resources.limits(value.get(\"limits\"));",
+          "to": "let limits = value.get(\"limits\").cloned().unwrap_or(Value::Null);"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_host"]
+    },
+    {
+      "id": "EXT-10 M10",
+      "what": "no crash backstop",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "if crashes.len() >= MAX_CRASHES {",
+          "to": "if false && crashes.len() >= MAX_CRASHES {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_host"]
+    },
+    {
+      "id": "EXT-10 M11",
+      "what": "no message budget",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "        if self.tokens >= 1.0 {",
+          "to": "        if true || self.tokens >= 1.0 {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_host"]
+    },
+    {
+      "id": "EXT-10 M12",
+      "what": "watchdog never fires",
+      "edits": [
+        {
+          "file": "crates/ide-plugin-host/src/watchdog.rs",
+          "from": "if until != 0 && now > until {",
+          "to": "if false && until != 0 && now > until {"
+        }
+      ],
+      "args": ["-p", "ide-plugin-host", "--lib", "--", "watchdog"]
+    },
+    {
+      "id": "EXT-11 N1",
+      "what": "any window may speak to a host",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "        if host.owner != *owner {\n            return Err(\"NotOwner: this extension host belongs to another window.\".into());",
+          "to": "        if false && host.owner != *owner {\n            return Err(\"NotOwner: this extension host belongs to another window.\".into());"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_host"]
+    },
+    {
+      "id": "EXT-11 N2",
+      "what": "a start retires every window's hosts",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "self.retire_where(|host| host.owner.window == owner.window);",
+          "to": "self.retire_where(|_| true);"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_host"]
+    },
+    {
+      "id": "EXT-11 N3",
+      "what": "crashes counted for the whole application",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "let crashes = all.entry(owner.window.clone()).or_default();",
+          "to": "let crashes = all.entry(String::new()).or_default();"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_host"]
+    },
+    {
+      "id": "EXT-11 N4",
+      "what": "crashes recorded under one key",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "                .entry(self.window.clone())\n                .or_default()\n                .push_back(std::time::Instant::now());",
+          "to": "                .entry(String::new())\n                .or_default()\n                .push_back(std::time::Instant::now());"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_host"]
+    },
+    {
+      "id": "EXT-11 N5",
+      "what": "closing a window ends every window's hosts",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "    pub fn stop_window(&self, window: &str) {\n        self.retire_where(|host| host.owner.window == window);",
+          "to": "    pub fn stop_window(&self, _window: &str) {\n        self.retire_where(|_| true);"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_host"]
+    },
+    {
+      "id": "EXT-11 N6",
+      "what": "an earlier page may still start hosts",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "        if self.owner_of(&owner.window) != *owner {",
+          "to": "        if false && self.owner_of(&owner.window) != *owner {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_host"]
+    },
+    {
+      "id": "EXT-11 N7",
+      "what": "hosts start after exit",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "        if self.exiting.load(Ordering::SeqCst) {",
+          "to": "        if false && self.exiting.load(Ordering::SeqCst) {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_host"]
+    },
+    {
+      "id": "EXT-11 N8",
+      "what": "entering a workspace ends every host",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "            host.owner.window == window || host.workspace.as_deref() != workspace",
+          "to": "            let _ = (window, workspace);\n            true"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_host"]
+    },
+    {
+      "id": "EXT-11 N9",
+      "what": "a host acts in any workspace",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "    if bound != now {\n        return Err(Denial::new(",
+          "to": "    if false && bound != now {\n        return Err(Denial::new("
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_host"]
+    },
+    {
+      "id": "EXT-12 D2",
+      "what": "loads skip API and dependencies",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "        let requires = load_requirements(&inner, &listed, &chosen, &id)?;",
+          "to": "        let requires = Vec::new();\n        let _ = load_requirements;"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_dependencies", "ext12", "dependency"]
+    },
+    {
+      "id": "EXT-12 D4",
+      "what": "a dependent loads before its dependency",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "                if loaded.is_none() {\n                    return Err(format!(\n                        \"DependencyNotLoaded",
+          "to": "                if false && loaded.is_none() {\n                    return Err(format!(\n                        \"DependencyNotLoaded"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_dependencies", "ext12", "dependency"]
+    },
+    {
+      "id": "EXT-12 D5",
+      "what": "any API accepted",
+      "edits": [
+        {
+          "file": "src/extension_dependencies.rs",
+          "from": "        Some(range) if !range.matches(&api()) => Err(format!(",
+          "to": "        Some(range) if false && !range.matches(&api()) => Err(format!("
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_dependencies", "ext12", "dependency"]
+    },
+    {
+      "id": "EXT-12 D6",
+      "what": "a bare version read as a caret",
+      "edits": [
+        {
+          "file": "src/extension_dependencies.rs",
+          "from": "            comparators.push(if bare && Version::parse(part).is_ok() {",
+          "to": "            comparators.push(if false && bare && Version::parse(part).is_ok() {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_dependencies", "ext12", "dependency"]
+    },
+    {
+      "id": "EXT-12 D7",
+      "what": "installed dependents not checked",
+      "edits": [
+        {
+          "file": "src/extension_dependencies.rs",
+          "from": "                if !need.range.matches(&new.version) {\n                    return Err(Conflict::new(\n                        \"WouldBreakDependents\",",
+          "to": "                if false && !need.range.matches(&new.version) {\n                    return Err(Conflict::new(\n                        \"WouldBreakDependents\","
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_dependencies", "ext12", "dependency"]
+    },
+    {
+      "id": "EXT-12 D8",
+      "what": "cycles not checked",
+      "edits": [
+        {
+          "file": "src/extension_dependencies.rs",
+          "from": "    if let Some(path) = cycle(&edges) {\n        return Err(Conflict::new(\n            \"DependencyCycle\",",
+          "to": "    if let Some(path) = cycle(&edges).filter(|_| false) {\n        return Err(Conflict::new(\n            \"DependencyCycle\","
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_dependencies", "ext12", "dependency"]
+    },
+    {
+      "id": "EXT-12 D9",
+      "what": "installed dependencies replaceable",
+      "edits": [
+        {
+          "file": "src/extension_dependencies.rs",
+          "from": "        } else if !installed.is_empty() {\n            installed\n        } else {",
+          "to": "        } else if false && !installed.is_empty() {\n            installed\n        } else {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_dependencies", "ext12", "dependency"]
+    },
+    {
+      "id": "EXT-12 D10",
+      "what": "incompatibilities ignored",
+      "edits": [
+        {
+          "file": "src/extension_dependencies.rs",
+          "from": "fn clash(selected: &BTreeMap<&str, &Candidate>, candidate: &Candidate) -> Option<String> {\n    for other in selected.values() {",
+          "to": "fn clash(selected: &BTreeMap<&str, &Candidate>, candidate: &Candidate) -> Option<String> {\n    for other in selected.values().filter(|_| false) {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_dependencies", "ext12", "dependency"]
+    },
+    {
+      "id": "EXT-13 S1",
+      "what": "secret requests go to the window",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "        if method.starts_with(\"secrets.\") {",
+          "to": "        if false && method.starts_with(\"secrets.\") {"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext13",
+        "extension_secrets",
+        "extension_profiles",
+        "secrets_are_kept"
+      ]
+    },
+    {
+      "id": "EXT-13 S3",
+      "what": "any origin reads a secret",
+      "edits": [
+        {
+          "file": "src/extension_secrets.rs",
+          "from": "        if blob.id != owner.id || blob.origin != owner.origin {",
+          "to": "        if blob.id != owner.id {"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext13",
+        "extension_secrets",
+        "extension_profiles",
+        "secrets_are_kept"
+      ]
+    },
+    {
+      "id": "EXT-13 S4",
+      "what": "uninstall keeps secrets",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "        if let Err(why) = store.forget_extension(&id) {",
+          "to": "        if let Err(why) = Ok::<usize, String>(0) {"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext13",
+        "extension_secrets",
+        "extension_profiles",
+        "secrets_are_kept"
+      ]
+    },
+    {
+      "id": "EXT-13 S6",
+      "what": "deleting a profile keeps its secrets",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "        if store.available() {\n            store.forget_profile(id)?;\n        }",
+          "to": "        let _ = &store;"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext13",
+        "extension_secrets",
+        "extension_profiles",
+        "secrets_are_kept"
+      ]
+    },
+    {
+      "id": "EXT-13 S7",
+      "what": "selecting does not switch the enabled set",
+      "edits": [
+        {
+          "file": "src/extension_profiles.rs",
+          "from": "    let incoming = std::mem::take(&mut profiles.list.get_mut(id).expect(\"checked\").disabled);",
+          "to": "    let incoming = live.clone();"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext13",
+        "extension_secrets",
+        "extension_profiles",
+        "secrets_are_kept"
+      ]
+    },
+    {
+      "id": "EXT-13 S8",
+      "what": "a missing active profile is kept",
+      "edits": [
+        {
+          "file": "src/extension_profiles.rs",
+          "from": "    if !profiles.list.contains_key(&profiles.active) {\n        notes.push(format!(",
+          "to": "    if false && !profiles.list.contains_key(&profiles.active) {\n        notes.push(format!("
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext13",
+        "extension_secrets",
+        "extension_profiles",
+        "secrets_are_kept"
+      ]
+    },
+    {
+      "id": "EXT-13 S9",
+      "what": "workspace secrets shared across workspaces",
+      "edits": [
+        {
+          "file": "src/extension_secrets.rs",
+          "from": "            Some(root) => format!(\"workspace-{}\", short_hash(&root.to_lowercase())),",
+          "to": "            Some(_) => \"workspace\".to_string(),"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext13",
+        "extension_secrets",
+        "extension_profiles",
+        "secrets_are_kept"
+      ]
+    },
+    {
+      "id": "EXT-14 M1",
+      "what": "details kept unredacted",
+      "edits": [
+        {
+          "file": "src/extension_diagnostics.rs",
+          "from": "detail: event.detail.map(|d| redact(&d)).filter(|d| !d.is_empty()),",
+          "to": "detail: event.detail.filter(|d| !d.is_empty()),"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "extension_diagnostics",
+        "ext14",
+        "diagnostics_record",
+        "a_secret_store_failure",
+        "a_sandbox_failure_a_crash",
+        "an_open_vsx_version_is_installed"
+      ]
+    },
+    {
+      "id": "EXT-14 M2",
+      "what": "paths not redacted",
+      "edits": [
+        {
+          "file": "src/extension_diagnostics.rs",
+          "from": "    let replaced = if is_path(core) {\n        \"<path>\".to_string()",
+          "to": "    let replaced = if false && is_path(core) {\n        \"<path>\".to_string()"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "extension_diagnostics",
+        "ext14",
+        "diagnostics_record",
+        "a_secret_store_failure",
+        "a_sandbox_failure_a_crash",
+        "an_open_vsx_version_is_installed"
+      ]
+    },
+    {
+      "id": "EXT-14 M3",
+      "what": "credentials kept",
+      "edits": [
+        {
+          "file": "src/extension_diagnostics.rs",
+          "from": "            format!(\"{key}=<redacted>\")",
+          "to": "            core.to_string()"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "extension_diagnostics",
+        "ext14",
+        "diagnostics_record",
+        "a_secret_store_failure",
+        "a_sandbox_failure_a_crash",
+        "an_open_vsx_version_is_installed"
+      ]
+    },
+    {
+      "id": "EXT-14 M4",
+      "what": "every window sees every record",
+      "edits": [
+        {
+          "file": "src/extension_diagnostics.rs",
+          "from": "            .filter(|r| r.window.as_deref().is_none_or(|w| w == window))",
+          "to": "            .filter(|r| r.window.is_some() || r.window.is_none())"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "extension_diagnostics",
+        "ext14",
+        "diagnostics_record",
+        "a_secret_store_failure",
+        "a_sandbox_failure_a_crash",
+        "an_open_vsx_version_is_installed"
+      ]
+    },
+    {
+      "id": "EXT-14 M5",
+      "what": "floods not counted",
+      "edits": [
+        {
+          "file": "src/extension_diagnostics.rs",
+          "from": "        if let Some(earlier) = records.iter_mut().rev().find(|r| {",
+          "to": "        if let Some(earlier) = records.iter_mut().rev().filter(|_| false).find(|r| {"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "extension_diagnostics",
+        "ext14",
+        "diagnostics_record",
+        "a_secret_store_failure",
+        "a_sandbox_failure_a_crash",
+        "an_open_vsx_version_is_installed"
+      ]
+    },
+    {
+      "id": "EXT-14 M6",
+      "what": "records unbounded",
+      "edits": [
+        {
+          "file": "src/extension_diagnostics.rs",
+          "from": "        while records.len() > MAX_RECORDS {\n            records.pop_front();\n        }\n        drop(records);",
+          "to": "        drop(records);"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "extension_diagnostics",
+        "ext14",
+        "diagnostics_record",
+        "a_secret_store_failure",
+        "a_sandbox_failure_a_crash",
+        "an_open_vsx_version_is_installed"
+      ]
+    },
+    {
+      "id": "EXT-14 M7",
+      "what": "file never rotated",
+      "edits": [
+        {
+          "file": "src/extension_diagnostics.rs",
+          "from": "            if std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0) >= MAX_FILE {",
+          "to": "            if false && std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0) >= MAX_FILE {"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "extension_diagnostics",
+        "ext14",
+        "diagnostics_record",
+        "a_secret_store_failure",
+        "a_sandbox_failure_a_crash",
+        "an_open_vsx_version_is_installed"
+      ]
+    },
+    {
+      "id": "EXT-14 M8",
+      "what": "the window may report any code",
+      "edits": [
+        {
+          "file": "src/extension_diagnostics.rs",
+          "from": "        if !WINDOW_CODES.contains(&event.code.as_str()) {",
+          "to": "        if false && !WINDOW_CODES.contains(&event.code.as_str()) {"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "extension_diagnostics",
+        "ext14",
+        "diagnostics_record",
+        "a_secret_store_failure",
+        "a_sandbox_failure_a_crash",
+        "an_open_vsx_version_is_installed"
+      ]
+    },
+    {
+      "id": "EXT-14 M9",
+      "what": "safe mode loads code",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "        if self.safe_mode() {\n            return Err(format!(",
+          "to": "        if false && self.safe_mode() {\n            return Err(format!("
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "extension_diagnostics",
+        "ext14",
+        "diagnostics_record",
+        "a_secret_store_failure",
+        "a_sandbox_failure_a_crash",
+        "an_open_vsx_version_is_installed"
+      ]
+    },
+    {
+      "id": "EXT-14 M10",
+      "what": "crashes not recorded",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "            let code_name = if code == Some(ide_plugin_host_watchdog_exit()) {",
+          "to": "            let code_name = if true {"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "extension_diagnostics",
+        "ext14",
+        "diagnostics_record",
+        "a_secret_store_failure",
+        "a_sandbox_failure_a_crash",
+        "an_open_vsx_version_is_installed"
+      ]
+    },
+    {
+      "id": "EXT-17 M1",
+      "what": "migration marks nothing",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "        if copy.files_sha256.is_none() && copy.unchecked.is_none() {\n            copy.unchecked",
+          "to": "        if false && copy.files_sha256.is_none() && copy.unchecked.is_none() {\n            copy.unchecked"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext17", "ext15", "ext21", "ext23"]
+    },
+    {
+      "id": "EXT-17 M2",
+      "what": "signature shown for unchecked files",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "                    copy.files_sha256.is_some()\n                        && copy",
+          "to": "                    true\n                        && copy"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext17", "ext15", "ext21", "ext23"]
+    },
+    {
+      "id": "EXT-17 M4",
+      "what": "reinstall binds without comparing",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "            if actual.as_deref() != files_sha256.as_deref() {\n                mismatched",
+          "to": "            if false && actual.as_deref() != files_sha256.as_deref() {\n                mismatched"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext17", "ext15", "ext21", "ext23"]
+    },
+    {
+      "id": "EXT-17 M6",
+      "what": "a fallback forgets what it replaced",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "                                    r.replaced = Some(replaced.clone());",
+          "to": "                                    r.replaced = None;"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext17", "ext15", "ext21", "ext23"]
+    },
+    {
+      "id": "EXT-17 M7",
+      "what": "the changed copy kept to fall back on",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "                        .find(|c| Some(&c.folder) != mismatched.as_ref())",
+          "to": "                        .find(|_| true)"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext17", "ext15", "ext21", "ext23"]
+    },
+    {
+      "id": "EXT-17 M8",
+      "what": "the v1 original not kept",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "                write_durably(&original, &text).map_err(|e| {",
+          "to": "                Ok::<(), String>(()).map_err(|e: String| {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext17", "ext15", "ext21", "ext23"]
+    },
+    {
+      "id": "EXT-19 M1",
+      "what": "legacy copies run",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "                reason: Some(\"legacy\"),\n                runs: false,",
+          "to": "                reason: Some(\"legacy\"),\n                runs: true,"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext19", "ext17", "ext15", "extension_trust"]
+    },
+    {
+      "id": "EXT-19 M2",
+      "what": "adopted copies run",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "                reason: Some(\"adopted\"),\n                runs: false,",
+          "to": "                reason: Some(\"adopted\"),\n                runs: true,"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext19", "ext17", "ext15", "extension_trust"]
+    },
+    {
+      "id": "EXT-19 M3",
+      "what": "trust records not checked",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "                (Some(record), Ok(key)) => match key.verify(&trust_facts(id, copy), record) {",
+          "to": "                (Some(record), Ok(key)) => match Ok::<(), crate::extension_trust::TrustFailure>(()).or_else(|_: crate::extension_trust::TrustFailure| key.verify(&trust_facts(id, copy), record)) {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext19", "ext17", "ext15", "extension_trust"]
+    },
+    {
+      "id": "EXT-19 M4",
+      "what": "a missing record accepted",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "                (None, _) => untrusted(TrustFailure::Missing),",
+          "to": "                (None, _) => Integrity { state: \"verified\", reason: None, runs: true },"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext19", "ext17", "ext15", "extension_trust"]
+    },
+    {
+      "id": "EXT-19 M5",
+      "what": "the key id not checked",
+      "edits": [
+        {
+          "file": "src/extension_trust.rs",
+          "from": "        if record.key_id != self.id {\n            return Err(TrustFailure::Key);\n        }",
+          "to": ""
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext19", "ext17", "ext15", "extension_trust"]
+    },
+    {
+      "id": "EXT-19 M6",
+      "what": "the format not checked",
+      "edits": [
+        {
+          "file": "src/extension_trust.rs",
+          "from": "        if record.schema != RECORD_SCHEMA {\n            return Err(TrustFailure::Schema);\n        }",
+          "to": ""
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext19", "ext17", "ext15", "extension_trust"]
+    },
+    {
+      "id": "EXT-19 M7",
+      "what": "the source not bound",
+      "edits": [
+        {
+          "file": "src/extension_trust.rs",
+          "from": "    pub source: &'a str,\n    pub signature",
+          "to": "    #[serde(skip)]\n    pub source: &'a str,\n    pub signature"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext19", "ext17", "ext15", "extension_trust"]
+    },
+    {
+      "id": "EXT-19 M8",
+      "what": "a reinstall does not vouch",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "            bound.trust = self.seal(root, &id, &bound);",
+          "to": "            bound.trust = old.trust.clone();"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext19", "ext17", "ext15", "extension_trust"]
+    },
+    {
+      "id": "EXT-19 M9",
+      "what": "the fallback checked with the active copy's record",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "                            entry.integrity = Some(Integrity::of(&id, &previous, key.as_deref()));",
+          "to": "                            entry.integrity = Some(Integrity::of(&id, &record.active, key.as_deref()).runs.then(|| Integrity { state: \"verified\", reason: None, runs: true }).unwrap_or(Integrity { state: \"verified\", reason: None, runs: true }));"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext19", "ext17", "ext15", "extension_trust"]
+    },
+    {
+      "id": "EXT-19 M10",
+      "what": "the host given code it may not run",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "        if let Some(integrity) = chosen.integrity.as_ref().filter(|i| !i.runs) {",
+          "to": "        if let Some(integrity) = chosen.integrity.as_ref().filter(|i| !i.runs && false) {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext19", "ext17", "ext15", "extension_trust"]
+    },
+    {
+      "id": "EXT-19 M11",
+      "what": "a damaged key deleted, not kept",
+      "edits": [
+        {
+          "file": "src/extension_trust.rs",
+          "from": "                    fs::rename(&file, &aside)",
+          "to": "                    fs::remove_file(&file)"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext19", "ext17", "ext15", "extension_trust"]
+    },
+    {
+      "id": "EXT-20 M1",
+      "what": "the signature not checked",
+      "edits": [
+        {
+          "file": "src/registry_trust.rs",
+          "from": "        .verify_strict(&message, &Signature::from_bytes(&bytes))\n        .is_err()",
+          "to": "        .verify_strict(&message, &Signature::from_bytes(&bytes))\n        .is_err()\n        && false"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "registry_trust", "marketplace::tests"]
+    },
+    {
+      "id": "EXT-20 M2",
+      "what": "any pinned registry's anchor used for any base",
+      "edits": [
+        {
+          "file": "src/registry_trust.rs",
+          "from": "        self.registries.iter().find(|r| r.base == base)",
+          "to": "        self.registries.iter().find(|r| r.base == base || true)"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "registry_trust", "marketplace::tests"]
+    },
+    {
+      "id": "EXT-20 M3",
+      "what": "replays accepted",
+      "edits": [
+        {
+          "file": "src/registry_trust.rs",
+          "from": "        if sequence < seen.sequence || (sequence == seen.sequence && seen.sha256 != out.sha256) {",
+          "to": "        if false && (sequence < seen.sequence || (sequence == seen.sequence && seen.sha256 != out.sha256)) {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "registry_trust", "marketplace::tests"]
+    },
+    {
+      "id": "EXT-20 M4",
+      "what": "expired indexes accepted",
+      "edits": [
+        {
+          "file": "src/registry_trust.rs",
+          "from": "    if today > expires {",
+          "to": "    if false && today > expires {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "registry_trust", "marketplace::tests"]
+    },
+    {
+      "id": "EXT-20 M5",
+      "what": "duplicate keys accepted",
+      "edits": [
+        {
+          "file": "src/registry_trust.rs",
+          "from": "                if !keys.insert(key.clone()) {",
+          "to": "                if !keys.insert(key.clone()) && false {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "registry_trust", "marketplace::tests"]
+    },
+    {
+      "id": "EXT-20 M6",
+      "what": "the index's registry id not checked",
+      "edits": [
+        {
+          "file": "src/registry_trust.rs",
+          "from": "    if registry_id.as_deref() != Some(anchor.id.as_str()) {",
+          "to": "    if false && registry_id.as_deref() != Some(anchor.id.as_str()) {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "registry_trust", "marketplace::tests"]
+    },
+    {
+      "id": "EXT-20 M7",
+      "what": "revoked keys accepted",
+      "edits": [
+        {
+          "file": "src/registry_trust.rs",
+          "from": "    if key.revoked {\n        return finish(out, IndexStatus::KeyRevoked);",
+          "to": "    if key.revoked && false {\n        return finish(out, IndexStatus::KeyRevoked);"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "registry_trust", "marketplace::tests"]
+    },
+    {
+      "id": "EXT-20 M8",
+      "what": "a failed index installs anyway",
+      "edits": [
+        {
+          "file": "src/marketplace.rs",
+          "from": "                if pinned && !verification.status.verified() {",
+          "to": "                if false && pinned && !verification.status.verified() {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "registry_trust", "marketplace::tests"]
+    },
+    {
+      "id": "EXT-20 M9",
+      "what": "code from an unpinned registry installed",
+      "edits": [
+        {
+          "file": "src/marketplace.rs",
+          "from": "        if unauthenticated && has_code {",
+          "to": "        if false && unauthenticated && has_code {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "registry_trust", "marketplace::tests"]
+    },
+    {
+      "id": "EXT-20 M11",
+      "what": "an index-signed record bound by origin only",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "crate::marketplace::registry(url).is_ok_and(|registry| registry.base == s.registry)",
+          "to": "crate::marketplace::registry(url).is_ok_and(|registry| registry.base.starts_with(&s.registry) || registry.base == s.registry)"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "registry_trust",
+        "marketplace::tests",
+        "extension_service"
+      ]
+    },
+    {
+      "id": "EXT-21 M1",
+      "what": "a newer inventory moved aside again",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "            if version > INVENTORY_VERSION {\n                return Err(Unsupported::Newer(version));\n            }",
+          "to": ""
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext21",
+        "ext17",
+        "registry_trust",
+        "invalid_or_corrupted",
+        "s13_"
+      ]
+    },
+    {
+      "id": "EXT-21 M2",
+      "what": "an unreadable inventory taken for damage",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "            if version >= OLDEST_INVENTORY && parse_inventory(&text, version).is_none() {",
+          "to": "            if false && version >= OLDEST_INVENTORY && parse_inventory(&text, version).is_none() {"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext21",
+        "ext17",
+        "registry_trust",
+        "invalid_or_corrupted",
+        "s13_"
+      ]
+    },
+    {
+      "id": "EXT-21 M3",
+      "what": "an unreadable inventory recovered with nothing to recover from",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "                    _ => return Err(unsupported(\"the extension inventory\", why)),",
+          "to": "                    _ => Inventory::default(),"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext21",
+        "ext17",
+        "registry_trust",
+        "invalid_or_corrupted",
+        "s13_"
+      ]
+    },
+    {
+      "id": "EXT-21 M4",
+      "what": "set-aside inventories ignored before a rebuild",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "                if let Some((found, mut inventory)) = set_aside(&paths.root).into_iter().next() {",
+          "to": "                if let Some((found, mut inventory)) = set_aside(&paths.root).into_iter().next().filter(|_| false) {"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext21",
+        "ext17",
+        "registry_trust",
+        "invalid_or_corrupted",
+        "s13_"
+      ]
+    },
+    {
+      "id": "EXT-21 M5",
+      "what": "the replaced inventory not kept",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "            if let Ok(current) = fs::read(paths.root.join(INVENTORY)) {\n                write_durably(&replaced, &current)",
+          "to": "            if let Ok(current) = fs::read(paths.root.join(\"no-such-file\")) {\n                write_durably(&replaced, &current)"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext21",
+        "ext17",
+        "registry_trust",
+        "invalid_or_corrupted",
+        "s13_"
+      ]
+    },
+    {
+      "id": "EXT-21 M6",
+      "what": "any backup accepted as set aside",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "        (ours && digits(at)).then(|| at.parse().ok()).flatten()",
+          "to": "        let _ = (ours, digits(at));\n        Some(1)"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext21",
+        "ext17",
+        "registry_trust",
+        "invalid_or_corrupted",
+        "s13_"
+      ]
+    },
+    {
+      "id": "EXT-21 M7",
+      "what": "a set-aside inventory applied unasked",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "            .find(|(_, kept)| differs(kept, inventory))\n            .map(|(found, _)| found);",
+          "to": "            .find(|(_, kept)| differs(kept, inventory))\n            .map(|(found, _)| found);\n        if let Some(found) = &set_aside {\n            let file = found.file.clone();\n            drop(inner);\n            return self.restore_set_aside(&file);\n        }"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext21",
+        "ext17",
+        "registry_trust",
+        "invalid_or_corrupted",
+        "s13_"
+      ]
+    },
+    {
+      "id": "EXT-21 M8",
+      "what": "starting over while the inventory is in use",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "            if inner.inventory.is_some() {\n                return Err(\"InventoryInUse: the extension inventory is in use; there is nothing to set aside.\".into());\n            }\n            match self.load(paths) {\n                Err(error) if error.starts_with(\"InventoryUnsupported\") => {}\n                Err(error) => return Err(error),\n                Ok(_) => return Err(\"InventoryInUse: this Yavin can use the extension inventory; there is nothing to set aside.\".into()),\n            }",
+          "to": ""
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext21",
+        "ext17",
+        "registry_trust",
+        "invalid_or_corrupted",
+        "s13_"
+      ]
+    },
+    {
+      "id": "EXT-21 M9",
+      "what": "version 3 no longer read",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "        2 | 3 => Some(Inventory {",
+          "to": "        2 => Some(Inventory {"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext21",
+        "ext17",
+        "registry_trust",
+        "invalid_or_corrupted",
+        "s13_"
+      ]
+    },
+    {
+      "id": "EXT-21 M10",
+      "what": "dismissing deletes the set-aside file",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "        let _ = fs::rename(root.join(file), root.join(format!(\"{stem}.{how}.bak\")));",
+          "to": "        let _ = (stem, how);\n        let _ = fs::remove_file(root.join(file));"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext21",
+        "ext17",
+        "registry_trust",
+        "invalid_or_corrupted",
+        "s13_"
+      ]
+    },
+    {
+      "id": "EXT-21 M11",
+      "what": "an unreadable replay record read as nothing accepted",
+      "edits": [
+        {
+          "file": "src/registry_trust.rs",
+          "from": "    serde_json::from_slice(&bytes).map_err(|_| state_invalid())",
+          "to": "    Ok(serde_json::from_slice(&bytes).unwrap_or_default())"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext21",
+        "ext17",
+        "registry_trust",
+        "invalid_or_corrupted",
+        "s13_"
+      ]
+    },
+    {
+      "id": "EXT-21 M12",
+      "what": "an unreadable replay record not refused",
+      "edits": [
+        {
+          "file": "src/marketplace.rs",
+          "from": "    if state_invalid && verification.status.verified() {",
+          "to": "    if false && state_invalid && verification.status.verified() {"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "ext21",
+        "ext17",
+        "registry_trust",
+        "invalid_or_corrupted",
+        "s13_"
+      ]
+    },
+    {
+      "id": "EXT-09 M9",
+      "what": "listed record not bound to the copy",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": ".is_some_and(|sha| s.sha256.eq_ignore_ascii_case(sha))\n                        && record_matches_source(s, &copy.source)",
+          "to": ".is_some_and(|_| true)\n                        && record_matches_source(s, &copy.source)"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "registry_trust", "extension_service"]
+    },
+    {
+      "id": "EXT-10 M8",
+      "what": "no bound on waiting requests",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "if pending.len() >= MAX_PENDING && !pending.contains_key(&key) {",
+          "to": "if false && pending.len() >= MAX_PENDING && !pending.contains_key(&key) {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_host"]
+    },
+    {
+      "id": "EXT-10 M9",
+      "what": "starts not serialized",
+      "edits": [
+        {
+          "file": "src/extension_host.rs",
+          "from": "        let resources = resources.bounded();\n        let _one = held(&self.starting);",
+          "to": "        let resources = resources.bounded();\n        let _one = ();"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_host"]
+    },
+    {
+      "id": "EXT-12 D3",
+      "what": "requests skip dependencies",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "    for need in &copy.requires {\n        let gone = || {",
+          "to": "    for need in copy.requires.iter().filter(|_| false) {\n        let gone = || {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext12", "dependency", "extension_host"]
+    },
+    {
+      "id": "EXT-13 S2",
+      "what": "secrets without the grant",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "authorize_in(inv, copy, Some(crate::extension_permissions::SECRETS))?;",
+          "to": "authorize_in(inv, copy, None)?;"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext13", "extension_secrets", "secret"]
+    },
+    {
+      "id": "EXT-13 S5",
+      "what": "secrets shared across profiles",
+      "edits": [
+        {
+          "file": "src/extension_secrets.rs",
+          "from": "            self.base(),\n            scope.profile,\n            place",
+          "to": "            self.base(),\n            \"default\",\n            place"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext13", "extension_secrets", "secret"]
+    },
+    {
+      "id": "EXT-17 M3",
+      "what": "a copy that may not run is given to the host",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "chosen.integrity.as_ref().filter(|i| !i.runs) {",
+          "to": "chosen.integrity.as_ref().filter(|i| !i.runs && false) {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext17", "ext19", "ext15", "ext21"]
+    },
+    {
+      "id": "EXT-17 M5",
+      "what": "a newer inventory kept aside is rebuilt over",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "Loaded::Missing if newer_kept_aside(&paths.root).is_some() => Err(unsupported(",
+          "to": "Loaded::Missing if false && newer_kept_aside(&paths.root).is_some() => Err(unsupported("
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext17", "ext21"]
+    },
+    {
+      "id": "EXT-20 M10",
+      "what": "an index-signed record accepted for a file",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "                && s.status != crate::package_trust::SignatureStatus::IndexSigned\n",
+          "to": ""
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "registry_trust", "extension_service"]
+    },
+    {
+      "id": "EXT-24 F1",
+      "what": "no release-pinned freshness floor",
+      "edits": [
+        {
+          "file": "src/registry_trust.rs",
+          "from": "    if sequence < anchor.min_sequence {",
+          "to": "    if false && sequence < anchor.min_sequence {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "registry_trust"]
+    },
+    {
+      "id": "EXT-24 F2",
+      "what": "a floor lowered by one",
+      "edits": [
+        {
+          "file": "src/registry_trust.rs",
+          "from": "    if sequence < anchor.min_sequence {",
+          "to": "    if sequence < anchor.min_sequence.saturating_sub(1) {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "registry_trust"]
+    },
+    {
+      "id": "EXT-12 D1",
+      "what": "installs skip the graph",
+      "edits": [
+        {
+          "file": "src/extension_service.rs",
+          "from": "    fn resolvable(\n        &self,\n        inner: &mut Inner,\n        paths: &Paths,\n        id: &str,\n        version: &str,\n        manifest: &str,\n    ) -> Result<(), String> {\n",
+          "to": "    fn resolvable(\n        &self,\n        inner: &mut Inner,\n        paths: &Paths,\n        id: &str,\n        version: &str,\n        manifest: &str,\n    ) -> Result<(), String> {\n        #[allow(unreachable_code)]\n        return Ok(());\n"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "ext12", "extension_dependencies", "dependency"]
+    }
+  ]
+}

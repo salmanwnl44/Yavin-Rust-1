@@ -623,8 +623,10 @@ test("a modified file renamed in the Explorer keeps its row, its selection and a
     (call) => (call.args as string[])[0] === "status",
   ).length;
 
-  // Selected (a click, which also opens it), then the row takes the keyboard back for F2.
+  // Selected (a click, which also opens it -- and the editor takes focus, once it has loaded:
+  // EXT-24), then the row takes the keyboard back for F2.
   await row(page, "app.ts").click();
+  await expect(page.locator(".monaco-editor").getByRole("textbox")).toBeFocused();
   await row(page, "app.ts").focus();
   await page.keyboard.press("F2");
   const input = tree(page).getByRole("textbox");

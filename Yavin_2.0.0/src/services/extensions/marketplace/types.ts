@@ -310,7 +310,7 @@ export function marketplaceErrorOf(error: unknown, fallback: MarketplaceErrorCod
     ],
     RegistryReplay: [
       "SignatureFailed",
-      `The registry served an older index than one Yavin already accepted from it; ${what} was not installed.`,
+      `The registry served an older index than this Yavin accepts (a downgrade); ${what} was not installed.`,
     ],
     RegistryMetadataMalformed: [
       "SignatureFailed",

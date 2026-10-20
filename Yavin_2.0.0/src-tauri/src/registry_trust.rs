@@ -66,6 +66,8 @@ struct AnchorsFile {
 struct RegistryFile {
     id: String,
     base: String,
+    /// The lowest index sequence this release accepts from the registry (EXT-24): required.
+    min_sequence: u64,
     keys: Vec<KeyFile>,
 }
 
@@ -94,6 +96,11 @@ struct PinnedKey {
 pub struct RegistryAnchor {
     pub id: String,
     pub base: String,
+    /// The freshness floor this release pins (EXT-24): an index with a lower sequence is
+    /// refused as a replay on every device -- a first install, a reinstall, a reset or lost
+    /// record of accepted indexes included -- whatever the registry serves. Raised to the
+    /// published sequence with each Yavin release.
+    pub min_sequence: u64,
     keys: Vec<PinnedKey>,
 }
 
@@ -183,6 +190,7 @@ impl RegistryAnchors {
             registries.push(RegistryAnchor {
                 id: one.id,
                 base,
+                min_sequence: one.min_sequence,
                 keys,
             });
         }
@@ -197,6 +205,15 @@ impl RegistryAnchors {
         self.registries.iter().find(|r| r.base == base)
     }
 
+    /// These anchors with `min_sequence` as every registry's freshness floor (tests).
+    #[cfg(test)]
+    pub fn with_min_sequence(mut self, min_sequence: u64) -> RegistryAnchors {
+        for registry in &mut self.registries {
+            registry.min_sequence = min_sequence;
+        }
+        self
+    }
+
     /// One registry with one key, active (tests; and a test-registry build's loopback registry).
     pub fn single(
         id: &str,
@@ -209,6 +226,7 @@ impl RegistryAnchors {
             registries: vec![RegistryAnchor {
                 id: id.into(),
                 base: base.into(),
+                min_sequence: 0,
                 keys: vec![PinnedKey {
                     key_id: key_id.into(),
                     key: VerifyingKey::from_bytes(&key).map_err(|_| "not a valid key")?,
@@ -492,6 +510,11 @@ pub fn authenticate(
     if today > expires {
         return finish(out, IndexStatus::Expired);
     }
+    // Fresh enough for this release (EXT-24): not below the floor it pins -- the only floor a
+    // device that has accepted nothing yet has, and one no registry response can lower.
+    if sequence < anchor.min_sequence {
+        return finish(out, IndexStatus::Replay);
+    }
     if let Some(seen) = seen {
         if sequence < seen.sequence || (sequence == seen.sequence && seen.sha256 != out.sha256) {
             return finish(out, IndexStatus::Replay);
@@ -576,7 +599,7 @@ pub fn refusal(status: IndexStatus, label: &str) -> String {
         IndexStatus::WrongRegistry => format!("WrongRegistry: the index served here is signed for another registry. {label} was not installed."),
         IndexStatus::Expired => format!("RegistryMetadataExpired: the registry's index is past its expiry date; {label} was not installed. Try again later."),
         IndexStatus::StateInvalid => format!("{} {label} was not installed.", state_invalid()),
-        IndexStatus::Replay => format!("RegistryReplay: the registry served an older index than one Yavin already accepted from it (a downgrade). {label} was not installed."),
+        IndexStatus::Replay => format!("RegistryReplay: the registry served an older index than this Yavin accepts -- older than one it already accepted, or than the minimum this release requires (a downgrade). {label} was not installed."),
         IndexStatus::Malformed => format!("RegistryMetadataMalformed: the registry's index or its signature cannot be read unambiguously. {label} was not installed."),
         IndexStatus::Unavailable => format!("VerificationUnavailable: the registry's index could not be authenticated (no trust anchors); {label} was not installed."),
     }

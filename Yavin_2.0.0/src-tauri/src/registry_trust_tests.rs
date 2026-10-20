@@ -22,7 +22,7 @@ fn anchors_with(keys: &[(&str, u8, &str, Option<&str>)]) -> Result<RegistryAncho
         .collect();
     RegistryAnchors::parse(
         &serde_json::json!({"schema": 1, "revision": 3, "registries": [
-            {"id": "acme", "base": BASE, "keys": keys}
+            {"id": "acme", "base": BASE, "minSequence": 0, "keys": keys}
         ]})
         .to_string(),
     )
@@ -375,7 +375,7 @@ fn the_pinned_anchors_read_and_bind_the_official_registry() {
     // Malformed anchors refuse the whole file.
     for bad in [
         r#"{"schema":2,"revision":1,"registries":[]}"#,
-        r#"{"schema":1,"revision":1,"registries":[{"id":"a","base":"http://x.example/","keys":[]}]}"#,
+        r#"{"schema":1,"revision":1,"registries":[{"id":"a","base":"http://x.example/","minSequence":0,"keys":[]}]}"#,
         r#"{"schema":1,"revision":1,"registries":[],"extra":1}"#,
     ] {
         assert!(RegistryAnchors::parse(bad).is_err(), "{bad}");
@@ -968,4 +968,133 @@ fn a_listed_signature_record_must_be_the_copys_own() {
             .unwrap_err()
             .starts_with("TrustStateInvalid"));
     });
+}
+
+/// EXT-24: the freshness floor a release pins. A device that has accepted nothing -- a first
+/// install, a reinstall, a reset or lost record -- still refuses an index below it, whatever the
+/// registry serves; at or above it, the index is fresh. A device's own record above the floor
+/// still holds, and a floor above a device's record (an older release's) raises it. The floor is
+/// the registry's, not a key's: a rotated key's index is held to it the same.
+#[test]
+fn a_release_pinned_floor_refuses_older_indexes_on_every_device() {
+    let floor = |n| anchors().map(|a| a.with_min_sequence(n));
+    let signed = |sequence, seed, key| {
+        let text = index(sequence, "acme", "2027-01-01");
+        let sig = sign(seed, key, "acme", &text);
+        (text, sig)
+    };
+    // Nothing accepted on this device: below the floor refused, at and above it accepted.
+    for (sequence, expected) in [
+        (3, IndexStatus::Replay),
+        (4, IndexStatus::Verified),
+        (9, IndexStatus::Verified),
+    ] {
+        let (text, sig) = signed(sequence, 7, "k1");
+        assert_eq!(
+            status(&floor(4), &text, Some(&sig), None),
+            expected,
+            "{sequence}"
+        );
+    }
+    // The device's record above the floor still holds: an index between them is a replay.
+    let (five, five_sig) = signed(5, 7, "k1");
+    let seen = Seen {
+        sequence: 6,
+        sha256: "x".into(),
+    };
+    assert_eq!(
+        status(&floor(4), &five, Some(&five_sig), Some(&seen)),
+        IndexStatus::Replay
+    );
+    // A record below the floor (kept from an older release): the floor wins.
+    let low = Seen {
+        sequence: 2,
+        sha256: "x".into(),
+    };
+    let (three, three_sig) = signed(3, 7, "k1");
+    assert_eq!(
+        status(&floor(4), &three, Some(&three_sig), Some(&low)),
+        IndexStatus::Replay
+    );
+    // A rotated key (k2 beside the revoked k1) is held to the same floor.
+    let rotated = anchors_with(&[("k1", 7, "revoked", None), ("k2", 8, "active", None)])
+        .map(|a| a.with_min_sequence(4));
+    let (old, old_sig) = signed(3, 8, "k2");
+    assert_eq!(
+        status(&rotated, &old, Some(&old_sig), None),
+        IndexStatus::Replay
+    );
+    let (new, new_sig) = signed(4, 8, "k2");
+    assert_eq!(
+        status(&rotated, &new, Some(&new_sig), None),
+        IndexStatus::Verified
+    );
+    // An expired index is expired whatever its sequence.
+    let expired = index(9, "acme", "2026-10-18");
+    let expired_sig = sign(7, "k1", "acme", &expired);
+    assert_eq!(
+        status(&floor(4), &expired, Some(&expired_sig), None),
+        IndexStatus::Expired
+    );
+}
+
+/// EXT-24: the floor needs no record at all -- the replay record reset by the user (kept aside),
+/// or lost -- and an older signed index is still refused, through the real installer; the
+/// record is not written for a refused index; one at the floor installs.
+#[test]
+fn the_floor_holds_after_the_replay_record_is_reset_or_lost() {
+    let dir = scratch("floor");
+    let served = Served::new();
+    let v1 = package_of(&dir, "1.0.0", "module.exports = 1;");
+    with_anchors(
+        fixtures::anchors_for(&served.base).map(|a| a.with_min_sequence(5)),
+        || {
+            let root = dir.join("extensions");
+            let state = root.join(STATE_FILE);
+            let service = ExtensionService::new(root.clone(), Vec::new());
+            // An old, properly signed index (sequence 4): refused on this fresh device.
+            served.publish(&[("acme.hello", "1.0.0", &v1)], 4);
+            let refused = install(&service, from(&served, "1.0.0", &v1), "1.0.0").unwrap_err();
+            assert!(refused.starts_with("RegistryReplay"), "{refused}");
+            assert!(!state.exists(), "nothing recorded for a refused index");
+            // At the floor: installs, and is recorded.
+            served.publish(&[("acme.hello", "1.0.0", &v1)], 5);
+            install(&service, from(&served, "1.0.0", &v1), "1.0.0").unwrap();
+            assert_eq!(read_seen(&root).unwrap()[fixtures::REGISTRY_ID].sequence, 5);
+            service.uninstall("acme.hello").unwrap();
+            // The record reset (kept aside), then lost: the old index is still refused.
+            let kept = reset_seen(&root).unwrap().unwrap();
+            assert!(kept.exists());
+            served.publish(&[("acme.hello", "1.0.0", &v1)], 4);
+            for _ in ["reset", "lost"] {
+                let refused = install(&service, from(&served, "1.0.0", &v1), "1.0.0").unwrap_err();
+                assert!(refused.starts_with("RegistryReplay"), "{refused}");
+                let _ = std::fs::remove_file(&state);
+            }
+        },
+    );
+}
+
+/// EXT-24: the release's pinned floor is the published registry's sequence or below -- else
+/// this Yavin would refuse the live index -- and every pinned registry has one.
+#[test]
+fn the_pinned_floor_admits_the_published_registry() {
+    let pinned = RegistryAnchors::parse(BUILTIN).unwrap();
+    let official = pinned
+        .for_base(
+            "https://raw.githubusercontent.com/salmanwnl44/Yavin-Rust-1/main/Yavin_2.0.0/registry/",
+        )
+        .unwrap();
+    let published: serde_json::Value =
+        serde_json::from_str(include_str!("../../registry/index.json")).unwrap();
+    let sequence = published["sequence"].as_u64().unwrap();
+    assert!(official.min_sequence >= 1, "a floor is pinned");
+    assert!(
+        official.min_sequence <= sequence,
+        "the floor {} admits the published sequence {sequence}",
+        official.min_sequence
+    );
+    // A floor is required: anchors without one are refused whole.
+    let without = BUILTIN.replace("\"minSequence\": 1,", "");
+    assert!(RegistryAnchors::parse(&without).is_err());
 }

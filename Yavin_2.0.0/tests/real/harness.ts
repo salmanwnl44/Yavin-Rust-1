@@ -6,11 +6,15 @@
  */
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { generateKeyPairSync, sign } from "node:crypto";
-import { readdirSync, rmSync } from "node:fs";
+import { readdirSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { chromium, expect, type Browser, type Locator, type Page } from "@playwright/test";
 
-export const INSTALL = process.env.YAVIN_E2E_INSTALL ?? "";
+// Its real, long form (EXT-24): a temporary folder can be named in 8.3 form (C:UsersSALMAN~1...),
+// while Windows reports a running process by its long path -- the same file, spelled two ways.
+export const INSTALL = process.env.YAVIN_E2E_INSTALL
+  ? realpathSync.native(process.env.YAVIN_E2E_INSTALL)
+  : "";
 export const IDENTIFIER = "com.yavin.ide.e2e";
 const PORT = 9339;
 export const CONFIG = join(process.env.APPDATA ?? "", IDENTIFIER);

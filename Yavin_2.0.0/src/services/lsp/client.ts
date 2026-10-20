@@ -1,3 +1,4 @@
+import { APP_VERSION } from "../../appVersion.ts";
 import { createConnection } from "./jsonrpc.ts";
 import type { Connection, MessageChannel, RequestOptions } from "./jsonrpc.ts";
 import { encodingOf } from "./positions.ts";
@@ -184,7 +185,7 @@ export function createLanguageClient(init: {
 
   const initializeParams = () => ({
     processId: null,
-    clientInfo: { name: "Yavin", version: "2.1.0" },
+    clientInfo: { name: "Yavin", version: APP_VERSION },
     locale: "en",
     rootPath: root.path,
     rootUri: root.uri,

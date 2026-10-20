@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ComponentProps, ReactNode, Ref } from "react";
 import type { EditorHandle, EditorState, LanguageFeatures } from "../../editor/editorTypes";
 import type { DocumentService } from "../../services/documents";
@@ -15,6 +15,7 @@ import { EditorBoundary } from "./EditorBoundary";
 import { ContextMenu } from "../ui/ContextMenu";
 import type { MenuItem } from "../ui/ContextMenu";
 import type { WelcomeHint } from "../welcome/WelcomePage";
+import { noteFocusRequest, type FocusRequest } from "../../services/focusIntent";
 
 /**
  * The code editor (Monaco), loaded when an editor is first shown rather than with the window:
@@ -170,6 +171,14 @@ export function EditorArea({
   // A lazy component keeps a failed load for good, so each retry is a new one.
   const [attempt, setAttempt] = useState(0);
   const CodeEditor = useMemo(() => lazy(loadCodeEditor), [attempt]);
+  // When the shown document was asked for (EXT-24): an editor that loads late takes focus only
+  // if the user has not moved it somewhere new since (focusIntent.ts).
+  const focusRequest = useRef<{ key: string; request: FocusRequest } | null>(null);
+  const shownKey = activeTab && activeTab.id !== "welcome" ? activeTab.path : null;
+  useLayoutEffect(() => {
+    if (shownKey && focusRequest.current?.key !== shownKey)
+      focusRequest.current = { key: shownKey, request: noteFocusRequest() };
+  }, [shownKey]);
 
   const getBreadcrumbs = () => {
     if (!activeTab || activeTab.id === "welcome") return "Yavin IDE › Welcome";
@@ -467,6 +476,7 @@ export function EditorArea({
                       documentKey={activeTab.path}
                       documents={documents}
                       views={views}
+                      focusRequest={focusRequest}
                       editorRef={editorRef}
                       onState={onEditorState}
                       wordWrap={wordWrap}
