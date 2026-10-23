@@ -18,6 +18,20 @@
   // The operating system's random bytes (EXT-28), for the layer's `crypto`: hex, or nothing.
   const random = globalThis.__yavin_random;
   delete globalThis.__yavin_random;
+  // EXT-32: the extension's workers, kept by the host (`worker.rs`): started, given messages and
+  // ended through these; what a worker posts, and its failures, come back as `worker` entries.
+  let onWorker = null;
+  const workerHost = Object.freeze({
+    start: globalThis.__yavin_worker_start,
+    post: globalThis.__yavin_worker_post,
+    end: globalThis.__yavin_worker_end,
+    listen(listener) {
+      onWorker = listener;
+    },
+  });
+  delete globalThis.__yavin_worker_start;
+  delete globalThis.__yavin_worker_post;
+  delete globalThis.__yavin_worker_end;
   const ids = {
     extensionId: init.extensionId,
     workspaceId: init.workspaceId,
@@ -95,6 +109,9 @@
   };
 
   // --- Timers and text (EXT-25) ------------------------------------------------------------------
+  // EXT-32: from here to its end mark, workers have the same (`worker.js`; runtime.rs takes this
+  // part of this file for them). It uses only `setTimer` and `clearTimer`, and defines `timers`.
+  // <yavin-platform>
   const timers = new Map();
   let nextTimer = 1;
   /** A timer's handle: a number to the code that adds it, a Node.js `Timeout` to the code that asks. */
@@ -223,6 +240,7 @@
       }
       return out;
     };
+  // </yavin-platform>
 
   const yavin = Object.freeze({
     version: init.apiVersion,
@@ -467,6 +485,11 @@
       } catch (error) {
         log("error")(`A timer threw: ${error && error.message}`);
       }
+      return;
+    }
+    // Only the host makes these (Yavin's protocol has no such type).
+    if (message.type === "worker") {
+      if (onWorker) onWorker(message);
       return;
     }
     if (message.type === "event") {

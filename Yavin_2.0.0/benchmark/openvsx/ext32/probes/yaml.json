@@ -1,0 +1,434 @@
+{
+  "answers": {
+    "probe-activate": {
+      "ok": true,
+      "result": null
+    },
+    "probe-completion-0": {
+      "ok": true,
+      "result": [
+        {
+          "insertText": "mode: ",
+          "label": "mode"
+        }
+      ]
+    },
+    "probe-formatting-50": {
+      "ok": true,
+      "result": []
+    },
+    "probe-hover-10": {
+      "ok": true,
+      "result": null
+    },
+    "probe-symbols-30": {
+      "ok": true,
+      "result": [
+        {
+          "detail": "probe",
+          "name": "name",
+          "range": {
+            "endColumn": 12,
+            "endLine": 2,
+            "startColumn": 1,
+            "startLine": 2
+          }
+        },
+        {
+          "detail": "zero",
+          "name": "replicas",
+          "range": {
+            "endColumn": 15,
+            "endLine": 3,
+            "startColumn": 1,
+            "startLine": 3
+          }
+        },
+        {
+          "detail": "1",
+          "name": "extra",
+          "range": {
+            "endColumn": 9,
+            "endLine": 4,
+            "startColumn": 1,
+            "startLine": 4
+          }
+        }
+      ]
+    }
+  },
+  "denied": [],
+  "diagnostics": [
+    {
+      "collection": "redhat.vscode-yaml#diagnostics#1",
+      "entries": [
+        {
+          "diagnostics": [
+            {
+              "code": {
+                "value": "0"
+              },
+              "message": "Incorrect type. Expected \"integer\".",
+              "range": {
+                "endColumn": 15,
+                "endLine": 3,
+                "startColumn": 11,
+                "startLine": 3
+              },
+              "severity": "error",
+              "source": "yaml-schema: file:///c%3A/work/schema.json"
+            },
+            {
+              "code": {
+                "value": "513"
+              },
+              "message": "Property extra is not allowed.",
+              "range": {
+                "endColumn": 6,
+                "endLine": 4,
+                "startColumn": 1,
+                "startLine": 4
+              },
+              "severity": "error",
+              "source": "yaml-schema: file:///c%3A/work/schema.json"
+            }
+          ],
+          "uri": "file:///c:/work/probe.yaml"
+        }
+      ],
+      "name": "yaml"
+    }
+  ],
+  "id": "redhat.vscode-yaml",
+  "logs": [
+    "The setting \"telemetry.enableTelemetry\" is not available in Yavin; undefined is used.",
+    "The setting \"telemetry.enableCrashReporter\" is not available in Yavin; undefined is used.",
+    "The setting \"telemetry.telemetryLevel\" is not available in Yavin; the extension's own default is used.",
+    "languages.registerCodeLensProvider: Yavin's editor does not show what this provider gives; it is registered and not asked.",
+    "languages.registerOnTypeFormattingEditProvider: Yavin's editor does not show what this provider gives; it is registered and not asked.",
+    "languages.registerRenameProvider: Yavin's editor does not show what this provider gives; it is registered and not asked.",
+    "languages.registerDocumentLinkProvider: Yavin's editor does not show what this provider gives; it is registered and not asked.",
+    "languages.registerFoldingRangeProvider: Yavin's editor does not show what this provider gives; it is registered and not asked.",
+    "languages.registerSelectionRangeProvider: Yavin's editor does not show what this provider gives; it is registered and not asked.",
+    "The setting \"http\" is not available in Yavin; undefined is used.",
+    "The setting \"[yaml]\" is not available in Yavin; undefined is used.",
+    "The setting \"editor\" is not available in Yavin; undefined is used.",
+    "The setting \"files.trimTrailingWhitespace\" is not available in Yavin; undefined is used.",
+    "The setting \"files.trimFinalNewlines\" is not available in Yavin; undefined is used.",
+    "The setting \"files.insertFinalNewline\" is not available in Yavin; undefined is used."
+  ],
+  "registered": [
+    {
+      "kind": "completion",
+      "language": "yaml",
+      "providerId": "redhat.vscode-yaml#completion#1"
+    },
+    {
+      "kind": "completion",
+      "language": "yaml-textmate",
+      "providerId": "redhat.vscode-yaml#completion#2"
+    },
+    {
+      "kind": "completion",
+      "language": "yaml-tmlanguage",
+      "providerId": "redhat.vscode-yaml#completion#3"
+    },
+    {
+      "kind": "completion",
+      "language": "ansible",
+      "providerId": "redhat.vscode-yaml#completion#4"
+    },
+    {
+      "kind": "completion",
+      "language": "azure-pipelines",
+      "providerId": "redhat.vscode-yaml#completion#5"
+    },
+    {
+      "kind": "completion",
+      "language": "dockercompose",
+      "providerId": "redhat.vscode-yaml#completion#6"
+    },
+    {
+      "kind": "completion",
+      "language": "github-actions-workflow",
+      "providerId": "redhat.vscode-yaml#completion#7"
+    },
+    {
+      "kind": "completion",
+      "language": "home-assistant",
+      "providerId": "redhat.vscode-yaml#completion#8"
+    },
+    {
+      "kind": "completion",
+      "language": "manifest-yaml",
+      "providerId": "redhat.vscode-yaml#completion#9"
+    },
+    {
+      "kind": "completion",
+      "language": "spring-boot-properties-yaml",
+      "providerId": "redhat.vscode-yaml#completion#10"
+    },
+    {
+      "kind": "hover",
+      "language": "yaml",
+      "providerId": "redhat.vscode-yaml#hover#11"
+    },
+    {
+      "kind": "hover",
+      "language": "yaml-textmate",
+      "providerId": "redhat.vscode-yaml#hover#12"
+    },
+    {
+      "kind": "hover",
+      "language": "yaml-tmlanguage",
+      "providerId": "redhat.vscode-yaml#hover#13"
+    },
+    {
+      "kind": "hover",
+      "language": "ansible",
+      "providerId": "redhat.vscode-yaml#hover#14"
+    },
+    {
+      "kind": "hover",
+      "language": "azure-pipelines",
+      "providerId": "redhat.vscode-yaml#hover#15"
+    },
+    {
+      "kind": "hover",
+      "language": "dockercompose",
+      "providerId": "redhat.vscode-yaml#hover#16"
+    },
+    {
+      "kind": "hover",
+      "language": "github-actions-workflow",
+      "providerId": "redhat.vscode-yaml#hover#17"
+    },
+    {
+      "kind": "hover",
+      "language": "home-assistant",
+      "providerId": "redhat.vscode-yaml#hover#18"
+    },
+    {
+      "kind": "hover",
+      "language": "manifest-yaml",
+      "providerId": "redhat.vscode-yaml#hover#19"
+    },
+    {
+      "kind": "hover",
+      "language": "spring-boot-properties-yaml",
+      "providerId": "redhat.vscode-yaml#hover#20"
+    },
+    {
+      "kind": "definition",
+      "language": "yaml",
+      "providerId": "redhat.vscode-yaml#definition#21"
+    },
+    {
+      "kind": "definition",
+      "language": "yaml-textmate",
+      "providerId": "redhat.vscode-yaml#definition#22"
+    },
+    {
+      "kind": "definition",
+      "language": "yaml-tmlanguage",
+      "providerId": "redhat.vscode-yaml#definition#23"
+    },
+    {
+      "kind": "definition",
+      "language": "ansible",
+      "providerId": "redhat.vscode-yaml#definition#24"
+    },
+    {
+      "kind": "definition",
+      "language": "azure-pipelines",
+      "providerId": "redhat.vscode-yaml#definition#25"
+    },
+    {
+      "kind": "definition",
+      "language": "dockercompose",
+      "providerId": "redhat.vscode-yaml#definition#26"
+    },
+    {
+      "kind": "definition",
+      "language": "github-actions-workflow",
+      "providerId": "redhat.vscode-yaml#definition#27"
+    },
+    {
+      "kind": "definition",
+      "language": "home-assistant",
+      "providerId": "redhat.vscode-yaml#definition#28"
+    },
+    {
+      "kind": "definition",
+      "language": "manifest-yaml",
+      "providerId": "redhat.vscode-yaml#definition#29"
+    },
+    {
+      "kind": "definition",
+      "language": "spring-boot-properties-yaml",
+      "providerId": "redhat.vscode-yaml#definition#30"
+    },
+    {
+      "kind": "symbols",
+      "language": "yaml",
+      "providerId": "redhat.vscode-yaml#symbols#31"
+    },
+    {
+      "kind": "symbols",
+      "language": "yaml-textmate",
+      "providerId": "redhat.vscode-yaml#symbols#32"
+    },
+    {
+      "kind": "symbols",
+      "language": "yaml-tmlanguage",
+      "providerId": "redhat.vscode-yaml#symbols#33"
+    },
+    {
+      "kind": "symbols",
+      "language": "ansible",
+      "providerId": "redhat.vscode-yaml#symbols#34"
+    },
+    {
+      "kind": "symbols",
+      "language": "azure-pipelines",
+      "providerId": "redhat.vscode-yaml#symbols#35"
+    },
+    {
+      "kind": "symbols",
+      "language": "dockercompose",
+      "providerId": "redhat.vscode-yaml#symbols#36"
+    },
+    {
+      "kind": "symbols",
+      "language": "github-actions-workflow",
+      "providerId": "redhat.vscode-yaml#symbols#37"
+    },
+    {
+      "kind": "symbols",
+      "language": "home-assistant",
+      "providerId": "redhat.vscode-yaml#symbols#38"
+    },
+    {
+      "kind": "symbols",
+      "language": "manifest-yaml",
+      "providerId": "redhat.vscode-yaml#symbols#39"
+    },
+    {
+      "kind": "symbols",
+      "language": "spring-boot-properties-yaml",
+      "providerId": "redhat.vscode-yaml#symbols#40"
+    },
+    {
+      "kind": "codeActions",
+      "language": "yaml",
+      "providerId": "redhat.vscode-yaml#codeActions#41"
+    },
+    {
+      "kind": "codeActions",
+      "language": "yaml-textmate",
+      "providerId": "redhat.vscode-yaml#codeActions#42"
+    },
+    {
+      "kind": "codeActions",
+      "language": "yaml-tmlanguage",
+      "providerId": "redhat.vscode-yaml#codeActions#43"
+    },
+    {
+      "kind": "codeActions",
+      "language": "ansible",
+      "providerId": "redhat.vscode-yaml#codeActions#44"
+    },
+    {
+      "kind": "codeActions",
+      "language": "azure-pipelines",
+      "providerId": "redhat.vscode-yaml#codeActions#45"
+    },
+    {
+      "kind": "codeActions",
+      "language": "dockercompose",
+      "providerId": "redhat.vscode-yaml#codeActions#46"
+    },
+    {
+      "kind": "codeActions",
+      "language": "github-actions-workflow",
+      "providerId": "redhat.vscode-yaml#codeActions#47"
+    },
+    {
+      "kind": "codeActions",
+      "language": "home-assistant",
+      "providerId": "redhat.vscode-yaml#codeActions#48"
+    },
+    {
+      "kind": "codeActions",
+      "language": "manifest-yaml",
+      "providerId": "redhat.vscode-yaml#codeActions#49"
+    },
+    {
+      "kind": "codeActions",
+      "language": "spring-boot-properties-yaml",
+      "providerId": "redhat.vscode-yaml#codeActions#50"
+    },
+    {
+      "kind": "formatting",
+      "language": "yaml",
+      "providerId": "redhat.vscode-yaml#formatting#51"
+    },
+    {
+      "kind": "formatting",
+      "language": "yaml-textmate",
+      "providerId": "redhat.vscode-yaml#formatting#52"
+    },
+    {
+      "kind": "formatting",
+      "language": "yaml-tmlanguage",
+      "providerId": "redhat.vscode-yaml#formatting#53"
+    },
+    {
+      "kind": "formatting",
+      "language": "ansible",
+      "providerId": "redhat.vscode-yaml#formatting#54"
+    },
+    {
+      "kind": "formatting",
+      "language": "azure-pipelines",
+      "providerId": "redhat.vscode-yaml#formatting#55"
+    },
+    {
+      "kind": "formatting",
+      "language": "dockercompose",
+      "providerId": "redhat.vscode-yaml#formatting#56"
+    },
+    {
+      "kind": "formatting",
+      "language": "github-actions-workflow",
+      "providerId": "redhat.vscode-yaml#formatting#57"
+    },
+    {
+      "kind": "formatting",
+      "language": "home-assistant",
+      "providerId": "redhat.vscode-yaml#formatting#58"
+    },
+    {
+      "kind": "formatting",
+      "language": "manifest-yaml",
+      "providerId": "redhat.vscode-yaml#formatting#59"
+    },
+    {
+      "kind": "formatting",
+      "language": "spring-boot-properties-yaml",
+      "providerId": "redhat.vscode-yaml#formatting#60"
+    }
+  ],
+  "requests": {
+    "diagnostics.set": 1,
+    "documents.all": 1,
+    "documents.getText": 1,
+    "editor.active": 5,
+    "events.subscribe": 8,
+    "fs.readFile": 5,
+    "languages.register": 60,
+    "statusBar.set": 2,
+    "window.state": 1
+  },
+  "unsupported": []
+}

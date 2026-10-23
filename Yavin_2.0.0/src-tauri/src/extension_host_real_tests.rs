@@ -2767,3 +2767,225 @@ impl Yavin {
         None
     }
 }
+
+/// EXT-32: one benchmark extension's language features, probed in the sandboxed host -- installed
+/// through Yavin's install path from the benchmark's package, activated, a document of its
+/// language opened, and what it does recorded for 20 s: the providers it registers, the
+/// diagnostics it publishes, the requests it makes and the windows' answers to them.
+///
+/// Ignored (it runs third-party code, sandboxed): `YAVIN_BENCH_OUT=<benchmark folder>
+/// YAVIN_PROBE_ID=<id> YAVIN_PROBE_LANGUAGE=<language> YAVIN_PROBE_DOCUMENT=<file> cargo test
+/// open_vsx_language_probe -- --ignored`; the record is `<benchmark folder>/<id>/probe.json`.
+#[test]
+#[ignore = "runs a downloaded VS Code extension in the sandboxed host"]
+fn open_vsx_language_probe() {
+    let out = PathBuf::from(std::env::var("YAVIN_BENCH_OUT").expect("the benchmark folder"));
+    let id = std::env::var("YAVIN_PROBE_ID").expect("the extension's id");
+    let language = std::env::var("YAVIN_PROBE_LANGUAGE").expect("the document's language");
+    let text = std::fs::read_to_string(std::env::var("YAVIN_PROBE_DOCUMENT").expect("a document"))
+        .unwrap();
+    let native: Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("native.json")).unwrap()).unwrap();
+    let entry = native["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == json!(id))
+        .expect("the extension is in the benchmark")
+        .clone();
+    let manifest = &entry["adapt"]["manifest"];
+    let version = entry["version"].as_str().unwrap();
+    let yavin = Yavin::new("openvsx-probe", &[]);
+    let staged = crate::marketplace::stage(
+        &yavin.extensions,
+        crate::marketplace::PackageSource::File {
+            path: out.join(&id).join("package.vsix").to_string_lossy().into(),
+        },
+        &id,
+        version,
+    )
+    .expect("staged");
+    let mut committed = yavin.extensions.commit(&staged.token, &id);
+    for _ in 0..5 {
+        if !committed.as_ref().is_err_and(|e| e.contains("os error 5")) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        committed = yavin.extensions.commit(&staged.token, &id);
+    }
+    committed.expect("committed");
+    yavin.extensions.finish(&staged.token, &id, true).unwrap();
+    let requested: Vec<String> = manifest["permissions"]["request"]
+        .as_array()
+        .map(|l| {
+            l.iter()
+                .filter_map(|c| c.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    yavin.extensions.set_grants(&id, None, &requested).unwrap();
+    let mut configuration = serde_json::Map::new();
+    for (key, setting) in manifest["contributes"]["configuration"]["properties"]
+        .as_object()
+        .into_iter()
+        .flatten()
+    {
+        configuration.insert(key.clone(), setting["default"].clone());
+    }
+    let generation = 40_000;
+    let session = yavin.start();
+    yavin
+        .send(session, json!({"type": "init", "workspaceId": WS, "hostGeneration": generation, "workspaceFolder": "C:/work", "apiVersion": "2.1.0", "limits": {"memoryBytes": 128 * 1024 * 1024, "loadMs": 10_000, "callMs": 3000}}))
+        .unwrap();
+    assert_eq!(yavin.next_message(session)["type"], "ready");
+    let mut seen = Seen::default();
+    let loaded = yavin.load_seeing(session, generation, &id, &mut seen);
+    assert_eq!(loaded["type"], "loaded", "{loaded}");
+    let uri = format!("file:///c%3A/work/probe.{language}");
+    let doc = json!({"uri": uri, "resourceId": format!("file:///c:/work/probe.{language}"), "languageId": language, "version": 1, "source": "disk", "dirty": false});
+    let _ = &seen;
+    // Activated, then the document opened; after 8 s its providers of this language are asked
+    // (as the editor asks them): symbols, completion and hover at the second line's start,
+    // formatting.
+    yavin.to(session, generation, &id, json!({"type": "request", "requestId": "probe-activate", "method": "activate", "params": {"globalState": {}, "workspaceState": {}, "configuration": configuration}}));
+    yavin.to(
+        session,
+        generation,
+        &id,
+        json!({"type": "event", "event": "documents.open", "payload": doc}),
+    );
+    let mut record = json!({"id": id});
+    let mut registered: Vec<Value> = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut requests = std::collections::BTreeMap::<String, u64>::new();
+    let mut logs = Vec::new();
+    let mut unsupported = Vec::new();
+    let mut denied = Vec::new();
+    let mut answers = serde_json::Map::new();
+    let started = Instant::now();
+    let mut asked = false;
+    while started.elapsed() < Duration::from_secs(20) {
+        if !asked && started.elapsed() > Duration::from_secs(8) {
+            asked = true;
+            for (n, one) in registered.iter().enumerate() {
+                let kind = one["kind"].as_str().unwrap_or("");
+                if one["language"] != json!(language)
+                    || !["symbols", "completion", "hover", "formatting"].contains(&kind)
+                {
+                    continue;
+                }
+                let extra = if kind == "formatting" {
+                    json!({"options": {"tabSize": 2, "insertSpaces": true}, "token": format!("{id}#token#{}", 900 + n)})
+                } else {
+                    Value::Null
+                };
+                // Where completion and hover are asked: YAVIN_PROBE_AT="line:column" (1-based), else 2:1.
+                let at: Vec<u64> = std::env::var("YAVIN_PROBE_AT")
+                    .unwrap_or_else(|_| "2:1".into())
+                    .split(':')
+                    .filter_map(|n| n.parse().ok())
+                    .collect();
+                let position = if kind == "completion" || kind == "hover" {
+                    json!({"line": at.first().copied().unwrap_or(2), "column": at.get(1).copied().unwrap_or(1)})
+                } else {
+                    Value::Null
+                };
+                yavin.to(session, generation, &id, json!({"type": "request", "requestId": format!("probe-{kind}-{n}"), "method": "provider.invoke", "params": {"providerId": one["providerId"], "kind": kind, "document": doc, "position": position, "extra": extra}}));
+            }
+        }
+        let Ok((s, event)) = yavin.events.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
+        if s != session {
+            continue;
+        }
+        match event {
+            Event::Exit(code, error) => {
+                record["exited"] = json!(format!("{code:?} {error:?}"));
+                break;
+            }
+            Event::Denied(d) => {
+                denied.push(json!({"method": d.method, "capability": d.capability, "code": d.code}))
+            }
+            Event::Message(message) => match message["type"].as_str() {
+                Some("log") => {
+                    let line: String = message["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(400)
+                        .collect();
+                    if line.starts_with("UnsupportedApi:") && !unsupported.contains(&line) {
+                        unsupported.push(line.clone());
+                    }
+                    if logs.len() < 300 {
+                        logs.push(line);
+                    }
+                }
+                Some("response") => {
+                    let request = message["requestId"].as_str().unwrap_or("").to_string();
+                    if request.starts_with("probe-") {
+                        let mut answer = message.clone();
+                        if let Some(object) = answer.as_object_mut() {
+                            for key in [
+                                "extensionId",
+                                "workspaceId",
+                                "hostGeneration",
+                                "type",
+                                "requestId",
+                            ] {
+                                object.remove(key);
+                            }
+                        }
+                        answers.insert(request, answer);
+                    }
+                }
+                Some("request") => {
+                    let method = message["method"].as_str().unwrap_or("").to_string();
+                    *requests.entry(method.clone()).or_default() += 1;
+                    let params = &message["params"];
+                    if method == "languages.register" {
+                        registered.push(json!({"kind": params["kind"], "language": params["language"], "providerId": params["providerId"]}));
+                    }
+                    if method == "diagnostics.set" {
+                        diagnostics.push(params.clone());
+                    }
+                    let result = match method.as_str() {
+                        "documents.all" => json!([doc]),
+                        "documents.get" => doc.clone(),
+                        "documents.getText" => json!(text),
+                        "editor.active" => {
+                            json!({"document": doc, "selection": {"startLine": 1, "startColumn": 1, "endLine": 1, "endColumn": 1}})
+                        }
+                        "window.state" => json!({"focused": true}),
+                        // A file of the workspace (YAVIN_PROBE_WORKSPACE), as the window reads it.
+                        "fs.readFile" => std::env::var("YAVIN_PROBE_WORKSPACE")
+                            .ok()
+                            .and_then(|root| {
+                                std::fs::read_to_string(
+                                    Path::new(&root).join(params["path"].as_str().unwrap_or("")),
+                                )
+                                .ok()
+                            })
+                            .map(Value::from)
+                            .unwrap_or(Value::Null),
+                        _ => Value::Null,
+                    };
+                    yavin.to(session, generation, &id, json!({"type": "response", "requestId": message["requestId"], "ok": true, "result": result}));
+                }
+                _ => {}
+            },
+        }
+    }
+    record["registered"] = json!(registered);
+    record["diagnostics"] = json!(diagnostics);
+    record["answers"] = Value::Object(answers);
+    record["requests"] = json!(requests);
+    record["denied"] = json!(denied);
+    record["logs"] = json!(logs);
+    record["unsupported"] = json!(unsupported);
+    yavin.sessions.stop(session);
+    let path = out.join(&id).join("probe.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+    eprintln!("probe written to {}", path.display());
+}

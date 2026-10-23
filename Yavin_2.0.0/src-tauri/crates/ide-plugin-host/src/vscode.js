@@ -1972,6 +1972,109 @@
       saidOnce.add(what);
       log("warn")(`Webviews: ${what}`);
     };
+    // --- Workers (EXT-32) -----------------------------------------------------------------------------
+    // `new Worker(url)`: a web extension's background script -- a language server, typically -- run
+    // by the host as a QuickJS runtime of its own (`worker.rs`). Its script is a file of this
+    // package (one this extension's code was loaded with); it speaks only to this extension, by
+    // `postMessage`, in JSON values. Not provided: module workers, scripts from elsewhere (blob:,
+    // data:, the network), transferables, `SharedWorker`.
+    const MAX_WORKER_MESSAGE = 4 * 1024 * 1024;
+    /** The host's answer for a worker that has ended (`worker.rs`). */
+    const ENDED = "That worker has ended.";
+    const workers = new Map();
+    let nextWorker = 1;
+    if (workerHost.listen)
+      workerHost.listen((message) => {
+        const worker = workers.get(message.id);
+        if (worker) worker._receive(message);
+      });
+    class Worker {
+      constructor(url, options) {
+        if (typeof workerHost.start !== "function") throw unsupported("Worker", "this host runs no workers");
+        const o = options || {};
+        if (o.type === "module") throw unsupported("module workers", "a worker's script is a classic script");
+        const text = String(url);
+        const scheme = (/^([a-z][a-z0-9+.-]*):/i.exec(text) || [])[1];
+        if (scheme && scheme.toLowerCase() !== "file")
+          throw unsupported(`Workers from ${scheme.toLowerCase()}: addresses`, "a worker's script is a file of its extension's package");
+        const relative = insideCopy(scheme ? Uri.parse(text) : Uri.file(text));
+        const source = relative ? files[relative] : undefined;
+        if (typeof source !== "string" || !/\.(c?js)$/i.test(relative))
+          throw Object.assign(new Error(`A worker's script is a JavaScript file of its extension's package: ${text.slice(0, 200)} is not one.`), { name: "SecurityError", code: "SecurityError" });
+        this._id = nextWorker++;
+        this._ended = false;
+        this._handlers = { message: null, messageerror: null, error: null };
+        this._listeners = { message: new Set(), messageerror: new Set(), error: new Set() };
+        const refused = workerHost.start(this._id, source, text, String(o.name || ""));
+        if (refused) throw new Error(refused);
+        workers.set(this._id, this);
+      }
+      postMessage(data) {
+        if (this._ended) return;
+        const text = JSON.stringify(data === undefined ? null : data);
+        if (text === undefined) throw Object.assign(new Error("A worker's message is JSON: this one cannot be sent."), { name: "DataCloneError" });
+        if (text.length > MAX_WORKER_MESSAGE) throw new RangeError(`A worker's message is at most ${MAX_WORKER_MESSAGE / 1024 / 1024} MiB of JSON.`);
+        const refused = workerHost.post(this._id, text);
+        // A worker that has ended (it closed itself, or failed) takes nothing more, silently, as a
+        // browser's does.
+        if (refused === ENDED) this._ended = true;
+        else if (refused) throw new Error(refused);
+      }
+      terminate() {
+        if (this._ended) return;
+        this._ended = true;
+        workers.delete(this._id);
+        workerHost.end(this._id);
+      }
+      addEventListener(type, listener) {
+        if (this._listeners[type] && (typeof listener === "function" || (listener && typeof listener.handleEvent === "function"))) this._listeners[type].add(listener);
+      }
+      removeEventListener(type, listener) {
+        if (this._listeners[type]) this._listeners[type].delete(listener);
+      }
+      _dispatch(type, event) {
+        for (const listener of [this._handlers[type], ...this._listeners[type]].filter(Boolean))
+          try {
+            if (typeof listener === "function") listener.call(this, event);
+            else listener.handleEvent(event);
+          } catch (error) {
+            log("error")(`A worker's ${type} listener threw: ${error && error.message}`);
+          }
+      }
+      _receive(message) {
+        if (this._ended) return;
+        if (message.kind === "message") {
+          let data;
+          try {
+            data = JSON.parse(message.data);
+          } catch {
+            this._dispatch("messageerror", { type: "messageerror", data: null, target: this });
+            return;
+          }
+          this._dispatch("message", { type: "message", data, target: this, currentTarget: this, origin: "", lastEventId: "", ports: [] });
+          return;
+        }
+        if (message.kind === "error") {
+          if (message.ended) {
+            this._ended = true;
+            workers.delete(this._id);
+          }
+          const text = String(message.text || "The worker failed.");
+          this._dispatch("error", { type: "error", message: text, filename: "", lineno: 0, colno: 0, error: new Error(text), target: this, preventDefault() {} });
+        }
+      }
+    }
+    for (const type of ["message", "messageerror", "error"])
+      Object.defineProperty(Worker.prototype, `on${type}`, {
+        get() {
+          return this._handlers[type];
+        },
+        set(value) {
+          this._handlers[type] = typeof value === "function" ? value : null;
+        },
+        configurable: true,
+      });
+    if (typeof globalThis.Worker === "undefined") globalThis.Worker = Worker;
     const webviewToken = () => Array.from(web.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
     const messageText = (message) => {
       const text = JSON.stringify(message === undefined ? null : message);
@@ -2676,7 +2779,94 @@
       return out;
     };
 
+    // --- Tabs (EXT-32) -------------------------------------------------------------------------------
+    // The window's tabs as far as an extension knows them: one group, a text tab for each document
+    // Yavin told it is open (`documents.open` / `documents.close`), the active editor's marked.
+    // Language clients follow them (which documents to pull diagnostics for). Closing tabs is
+    // the user's.
+    class TabInputText {
+      constructor(uri) {
+        this.uri = uri;
+      }
+    }
+    class TabInputTextDiff {
+      constructor(original, modified) {
+        this.original = original;
+        this.modified = modified;
+      }
+    }
+    class TabInputCustom {
+      constructor(uri, viewType) {
+        this.uri = uri;
+        this.viewType = viewType;
+      }
+    }
+    class TabInputWebview {
+      constructor(viewType) {
+        this.viewType = viewType;
+      }
+    }
+    class TabInputNotebook {
+      constructor(uri, notebookType) {
+        this.uri = uri;
+        this.notebookType = notebookType;
+      }
+    }
+    class TabInputNotebookDiff {
+      constructor(original, modified, notebookType) {
+        this.original = original;
+        this.modified = modified;
+        this.notebookType = notebookType;
+      }
+    }
+    class TabInputTerminal {}
+    const tabsChanged = new EventEmitter();
+    /** A text tab for the document at `uri` (its text): its own Uri object while it is open. */
+    const tabOf = (uri, group) =>
+      Object.freeze({
+        label: posix.basename(Uri.parse(uri).path),
+        group,
+        input: new TabInputText(docs.get(uri) ? docs.get(uri).document.uri : Uri.parse(uri)),
+        isActive: !!active && active.uri === uri,
+        isDirty: !!(docs.get(uri) && docs.get(uri).info.dirty),
+        isPinned: false,
+        isPreview: false,
+      });
+    const tabGroup = () => {
+      const group = { isActive: true, viewColumn: enums.ViewColumn.One, tabs: [], activeTab: undefined };
+      group.tabs = [...docs.values()].filter((entry) => !entry.closed).map((entry) => tabOf(entry.info.uri, group));
+      group.activeTab = group.tabs.find((tab) => tab.isActive);
+      return Object.freeze(group);
+    };
+    let followingTabs = false;
+    const followTabs = () => {
+      if (followingTabs) return;
+      followingTabs = true;
+      subscribe("documents.open", async (info) => {
+        const entry = await documentFor(info);
+        if (entry) tabsChanged.fire({ opened: [tabOf(entry.info.uri, tabGroup())], closed: [], changed: [] });
+      });
+      subscribe("documents.close", (info) => {
+        tabsChanged.fire({ opened: [], closed: [tabOf(info.uri, tabGroup())], changed: [] });
+      });
+    };
+    const tabGroups = Object.freeze({
+      get all() {
+        return [tabGroup()];
+      },
+      get activeTabGroup() {
+        return tabGroup();
+      },
+      onDidChangeTabs(listener, thisArg, disposables) {
+        followTabs();
+        return tabsChanged.event(listener, thisArg, disposables);
+      },
+      // One group, always: it never changes.
+      onDidChangeTabGroups: never,
+      close: unsupportedAsync("window.tabGroups.close", "closing tabs is the user's"),
+    });
     const windowApi = {
+      tabGroups,
       showInformationMessage: message("info"),
       showWarningMessage: message("warning"),
       showErrorMessage: message("error"),
@@ -2771,7 +2961,7 @@
     };
     for (const name of ["showOpenDialog", "showSaveDialog", "showWorkspaceFolderPick", "createQuickPick", "createInputBox", "registerWebviewPanelSerializer", "registerWebviewViewProvider", "registerCustomEditorProvider", "createTerminal", "registerTerminalLinkProvider", "registerTerminalProfileProvider", "registerUriHandler", "registerFileDecorationProvider", "onDidChangeTextEditorVisibleRanges", "onDidChangeTextEditorOptions", "onDidChangeTextEditorViewColumn", "onDidChangeActiveColorTheme", "onDidChangeActiveTerminal", "onDidOpenTerminal", "onDidCloseTerminal", "showNotebookDocument", "createWebviewTextEditorInset"])
       windowApi[name] = unsupportedFn(`window.${name}`);
-    for (const name of ["activeColorTheme", "tabGroups", "terminals", "activeTerminal", "activeNotebookEditor", "visibleNotebookEditors"])
+    for (const name of ["activeColorTheme", "terminals", "activeTerminal", "activeNotebookEditor", "visibleNotebookEditors"])
       throwingGetter(windowApi, name, `window.${name}`);
 
     // --- Workspace ---------------------------------------------------------------------------------
@@ -2843,6 +3033,12 @@
       return registration;
     }
     const decoder = (bytes) => new TextDecoder().decode(bytes);
+    // EXT-32: content providers -- an extension's own virtual documents (a scheme of its own),
+    // which its own `openTextDocument` reads from its provider, afresh each time. Yavin's editor
+    // does not show them (they are the extension's, not the window's documents).
+    const contentProviders = new Map();
+    const MAX_VIRTUAL_DOCUMENT = 8 * 1024 * 1024;
+    const RESERVED_SCHEMES = new Set(["file", "untitled", "http", "https", "data", "vscode", "vscode-userdata", "yavin-storage", "yavin-webview"]);
     const workspaceApi = {
       get workspaceFolders() { return folders; },
       get rootPath() { return folder ? folder.fsPath : undefined; },
@@ -2890,11 +3086,33 @@
           docs.delete(info.uri);
           listener.call(thisArg, entry.document);
         }, disposables),
+      registerTextDocumentContentProvider(scheme, provider) {
+        const name = String(scheme || "");
+        if (!/^[a-z][a-z0-9+.-]*$/i.test(name) || RESERVED_SCHEMES.has(name.toLowerCase()))
+          throw new Error(`A content provider's scheme is its own: "${name.slice(0, 50)}" cannot be one.`);
+        if (!provider || typeof provider.provideTextDocumentContent !== "function")
+          throw new TypeError("A content provider has provideTextDocumentContent.");
+        if (contentProviders.has(name)) throw new Error(`A content provider for "${name}" is registered already.`);
+        contentProviders.set(name, provider);
+        return new Disposable(() => {
+          if (contentProviders.get(name) === provider) contentProviders.delete(name);
+        });
+      },
       async openTextDocument(target) {
         if (target && typeof target === "object" && !(target instanceof Uri) && !target.scheme)
           throw unsupported("workspace.openTextDocument({content, language})", "untitled documents are made by the user");
         const uri = target instanceof Uri ? target : Uri.file(String(target));
         const key = uri.toString();
+        const provider = contentProviders.get(uri.scheme);
+        if (provider) {
+          const source = new CancellationTokenSource();
+          const content = await provider.provideTextDocumentContent(uri, source.token);
+          const text = content === undefined || content === null ? "" : String(content);
+          if (text.length > MAX_VIRTUAL_DOCUMENT) throw new RangeError(`A virtual document is at most ${MAX_VIRTUAL_DOCUMENT / 1024 / 1024} MiB.`);
+          const entry = { info: { uri: key, languageId: "plaintext", version: 1, source: "virtual", dirty: false }, text, closed: false };
+          entry.document = textDocument(entry);
+          return entry.document;
+        }
         const info = (await ask("documents.get", { uri: key })) || null;
         if (info) {
           const entry = await documentFor(info);
@@ -2939,7 +3157,7 @@
         "workspace.fs",
       ),
     };
-    for (const name of ["findFiles", "saveAll", "registerTextDocumentContentProvider", "registerFileSystemProvider", "registerTaskProvider", "registerNotebookSerializer", "onDidCreateFiles", "onDidDeleteFiles", "onDidRenameFiles", "onWillCreateFiles", "onWillDeleteFiles", "onWillRenameFiles", "openNotebookDocument", "updateWorkspaceFolders", "onDidOpenNotebookDocument", "onDidCloseNotebookDocument", "onDidChangeNotebookDocument", "decode", "encode", "findTextInFiles", "save", "saveAs"])
+    for (const name of ["findFiles", "saveAll", "registerFileSystemProvider", "registerTaskProvider", "registerNotebookSerializer", "onDidCreateFiles", "onDidDeleteFiles", "onDidRenameFiles", "onWillCreateFiles", "onWillDeleteFiles", "onWillRenameFiles", "openNotebookDocument", "updateWorkspaceFolders", "onDidOpenNotebookDocument", "onDidCloseNotebookDocument", "onDidChangeNotebookDocument", "decode", "encode", "findTextInFiles", "save", "saveAs"])
       workspaceApi[name] = unsupportedFn(`workspace.${name}`);
     throwingGetter(workspaceApi, "notebookDocuments", "workspace.notebookDocuments");
     void decoder;
@@ -2959,12 +3177,21 @@
       const registrations = languagesOf(selector).map((language) => provider(kind)(language, adapt));
       return new Disposable(() => registrations.forEach((r) => r.dispose()));
     };
-    const withDocument = async (document, position, run) => {
-      await refreshActive();
-      const entry = await documentFor(document);
-      if (!entry) return null;
-      const pos = position ? new Position(position.line - 1, position.column - 1) : null;
-      return run(entry.document, pos);
+    /** `run` with the document, the position, and (EXT-32) a token cancelled when Yavin stops
+     * waiting -- a language client cancels its server's request with it. */
+    const withDocument = async (document, position, run, extra) => {
+      // The token exists from the request's first moment: a cancellation that arrives while the
+      // document is fetched is not lost.
+      const token = tokenFor(extra);
+      try {
+        await refreshActive();
+        const entry = await documentFor(document);
+        if (!entry) return null;
+        const pos = position ? new Position(position.line - 1, position.column - 1) : null;
+        return await run(entry.document, pos, token);
+      } finally {
+        releaseToken(extra);
+      }
     };
     const locationsOf = (value) =>
       (Array.isArray(value) ? value : value ? [value] : [])
@@ -2977,9 +3204,9 @@
     const languagesApi = {
       registerCompletionItemProvider: (selector, provider) =>
         providerFor("completion", selector, {
-          provideCompletionItems: (document, position) =>
-            withDocument(document, position, async (doc, pos) => {
-              const result = await provider.provideCompletionItems(doc, pos, neverCancelled, { triggerKind: 0, triggerCharacter: undefined });
+          provideCompletionItems: (document, position, extra) =>
+            withDocument(document, position, async (doc, pos, token) => {
+              const result = await provider.provideCompletionItems(doc, pos, token, { triggerKind: 0, triggerCharacter: undefined });
               const items = Array.isArray(result) ? result : result && Array.isArray(result.items) ? result.items : [];
               return items.slice(0, 500).map((item) => {
                 const label = typeof item.label === "string" ? item.label : item.label && item.label.label;
@@ -2989,31 +3216,31 @@
                 if (typeof item.detail === "string") out.detail = item.detail;
                 return out;
               });
-            }),
+            }, extra),
         }),
       registerHoverProvider: (selector, provider) =>
         providerFor("hover", selector, {
-          provideHover: (document, position) =>
-            withDocument(document, position, async (doc, pos) => {
-              const hover = await provider.provideHover(doc, pos, neverCancelled);
+          provideHover: (document, position, extra) =>
+            withDocument(document, position, async (doc, pos, token) => {
+              const hover = await provider.provideHover(doc, pos, token);
               const contents = hover ? hoverText(hover.contents) : "";
               return contents ? { contents } : null;
-            }),
+            }, extra),
         }),
       registerDefinitionProvider: (selector, provider) =>
         providerFor("definition", selector, {
-          provideDefinition: (document, position) =>
-            withDocument(document, position, async (doc, pos) => locationsOf(await provider.provideDefinition(doc, pos, neverCancelled))),
+          provideDefinition: (document, position, extra) =>
+            withDocument(document, position, async (doc, pos, token) => locationsOf(await provider.provideDefinition(doc, pos, token)), extra),
         }),
       registerReferenceProvider: (selector, provider) =>
         providerFor("references", selector, {
-          provideReferences: (document, position) =>
-            withDocument(document, position, async (doc, pos) => locationsOf(await provider.provideReferences(doc, pos, { includeDeclaration: true }, neverCancelled))),
+          provideReferences: (document, position, extra) =>
+            withDocument(document, position, async (doc, pos, token) => locationsOf(await provider.provideReferences(doc, pos, { includeDeclaration: true }, token)), extra),
         }),
       registerDocumentSymbolProvider: (selector, provider) =>
         providerFor("symbols", selector, {
-          provideDocumentSymbols: (document) =>
-            withDocument(document, null, async (doc) => {
+          provideDocumentSymbols: (document, _position, extra) =>
+            withDocument(document, null, async (doc, _pos, token) => {
               const out = [];
               const visit = (list) => {
                 for (const one of list || []) {
@@ -3023,9 +3250,9 @@
                   visit(one.children);
                 }
               };
-              visit(await provider.provideDocumentSymbols(doc, neverCancelled));
+              visit(await provider.provideDocumentSymbols(doc, token));
               return out;
-            }),
+            }, extra),
         }),
       createDiagnosticCollection,
       registerDocumentFormattingEditProvider: (selector, provider) =>
@@ -3075,7 +3302,22 @@
         return best;
       },
     };
-    for (const name of ["registerCodeLensProvider", "registerOnTypeFormattingEditProvider", "registerSignatureHelpProvider", "registerRenameProvider", "registerDocumentHighlightProvider", "registerDocumentLinkProvider", "registerColorProvider", "registerFoldingRangeProvider", "registerSelectionRangeProvider", "registerCallHierarchyProvider", "registerTypeHierarchyProvider", "registerDocumentSemanticTokensProvider", "registerDocumentRangeSemanticTokensProvider", "registerInlayHintsProvider", "registerImplementationProvider", "registerTypeDefinitionProvider", "registerDeclarationProvider", "registerWorkspaceSymbolProvider", "registerEvaluatableExpressionProvider", "registerInlineValuesProvider", "registerLinkedEditingRangeProvider", "registerInlineCompletionItemProvider", "registerDocumentDropEditProvider", "setLanguageConfiguration", "getLanguages", "setTextDocumentLanguage", "getDiagnostics", "onDidChangeDiagnostics", "createLanguageStatusItem"])
+    // EXT-32: providers of what Yavin's editor does not show (code lenses, folding, links, colours,
+    // inlay hints, ...): registered, and never asked -- said once in the extension's log. A
+    // language client registers one for each of its server's capabilities; refusing them ended
+    // the client's start, and with it the language features Yavin does show (STUB in
+    // `vscodeApi.json`: inert, not pretended).
+    const INERT_PROVIDERS = ["registerCodeLensProvider", "registerOnTypeFormattingEditProvider", "registerSignatureHelpProvider", "registerRenameProvider", "registerDocumentHighlightProvider", "registerDocumentLinkProvider", "registerColorProvider", "registerFoldingRangeProvider", "registerSelectionRangeProvider", "registerCallHierarchyProvider", "registerTypeHierarchyProvider", "registerDocumentSemanticTokensProvider", "registerDocumentRangeSemanticTokensProvider", "registerInlayHintsProvider", "registerImplementationProvider", "registerTypeDefinitionProvider", "registerDeclarationProvider", "registerWorkspaceSymbolProvider", "registerEvaluatableExpressionProvider", "registerInlineValuesProvider", "registerLinkedEditingRangeProvider", "registerInlineCompletionItemProvider", "registerDocumentDropEditProvider"];
+    const inertSaid = new Set();
+    for (const name of INERT_PROVIDERS)
+      languagesApi[name] = function () {
+        if (!inertSaid.has(name)) {
+          inertSaid.add(name);
+          log("info")(`languages.${name}: Yavin's editor does not show what this provider gives; it is registered and not asked.`);
+        }
+        return new Disposable(() => {});
+      };
+    for (const name of ["setLanguageConfiguration", "getLanguages", "setTextDocumentLanguage", "getDiagnostics", "onDidChangeDiagnostics", "createLanguageStatusItem"])
       languagesApi[name] = unsupportedFn(`languages.${name}`);
 
     // --- Environment, extensions, l10n ---------------------------------------------------------------
@@ -3169,6 +3411,7 @@
         InlayHintLabelPart, InlineValueText, InlineValueVariableLookup, InlineValueEvaluatableExpression, EvaluatableExpression,
         InlineCompletionItem, InlineCompletionList, LinkedEditingRanges, SemanticTokens, SemanticTokensEdit, SemanticTokensEdits,
         SemanticTokensBuilder, DocumentDropEdit, SnippetTextEdit,
+        TabInputText, TabInputTextDiff, TabInputCustom, TabInputWebview, TabInputNotebook, TabInputNotebookDiff, TabInputTerminal,
         ...enums,
       }),
       "vscode",
@@ -3207,7 +3450,13 @@
         languageModelAccessInformation: undefined,
       };
       if (!state.workspace) context.workspaceState = storage("global");
-      for (const name of ["storageUri", "storagePath", "globalStorageUri", "globalStoragePath", "logUri", "logPath", "environmentVariableCollection"])
+      // EXT-32: its storage and log locations, as addresses only -- a scheme of their own that
+      // nothing reads or writes (workspace.fs refuses them): code that computes paths from them
+      // goes on (Red Hat's telemetry, before YAML's language server starts); a write fails, as an
+      // extension without a folder of its own must find.
+      for (const [name, place] of [["globalStorageUri", "global"], ["storageUri", "workspace"], ["logUri", "log"]])
+        Object.defineProperty(context, name, { value: Uri.from({ scheme: "yavin-storage", path: `/${init.extensionId}/${place}` }), enumerable: true });
+      for (const name of ["storagePath", "globalStoragePath", "logPath", "environmentVariableCollection"])
         throwingGetter(context, name, `ExtensionContext.${name}`, "extensions have no folder of their own to write to in Yavin");
       return context;
     };

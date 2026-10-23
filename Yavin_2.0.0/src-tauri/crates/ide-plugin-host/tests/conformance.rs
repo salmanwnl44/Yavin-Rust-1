@@ -1066,8 +1066,11 @@ fn context_state_secrets_paths_and_deactivation() {
       const secret = await c.secrets.get("token");
       const gone = await c.secrets.get("never");
       await c.secrets.delete("token");
-      let storage;
-      try { c.globalStorageUri; } catch (e) { storage = e.code; }
+      // EXT-32: storage addresses of a scheme nothing reads or writes; the Node.js paths stay unsupported.
+      let read, path;
+      try { await vscode.workspace.fs.readFile(vscode.Uri.joinPath(c.globalStorageUri, "state.json")); read = "READ"; } catch (e) { read = e.code; }
+      try { c.globalStoragePath; path = "GIVEN"; } catch (e) { path = e.code; }
+      const storage = { global: c.globalStorageUri.toString(), workspace: c.storageUri.toString(), log: c.logUri.toString(), read, path };
       return { count: c.globalState.get("count"), fallback: c.globalState.get("absent", 7), keys: c.globalState.keys().sort(),
                local: c.workspaceState.get("local"), secret, gone: gone ?? "undefined", storage,
                path: c.extensionPath, abs: c.asAbsolutePath("media/a.png"), uri: c.extensionUri.fsPath, mode: c.extensionMode,
@@ -1079,7 +1082,10 @@ fn context_state_secrets_paths_and_deactivation() {
     assert_eq!(value["local"], true);
     assert_eq!(value["secret"], "s3cret");
     assert_eq!(value["gone"], "undefined");
-    assert_eq!(value["storage"], "UnsupportedApi");
+    assert_eq!(
+        value["storage"],
+        json!({"global": "yavin-storage:/acme.probe/global", "workspace": "yavin-storage:/acme.probe/workspace", "log": "yavin-storage:/acme.probe/log", "read": "NoPermissions", "path": "UnsupportedApi"})
+    );
     assert_eq!(value["path"], r"C:\ext\acme.probe\extension");
     assert_eq!(value["abs"], r"C:\ext\acme.probe\extension\media\a.png");
     assert_eq!(value["uri"], r"c:\ext\acme.probe\extension");

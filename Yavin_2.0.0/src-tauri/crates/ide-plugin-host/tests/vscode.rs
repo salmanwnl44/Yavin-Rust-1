@@ -218,7 +218,7 @@ exports.activate = function (context) {
     webview: outcome(() => vscode.window.registerWebviewViewProvider("x", {})),
     debug: outcome(() => vscode.debug.startDebugging(undefined, "x")),
     scm: outcome(() => vscode.scm.createSourceControl("git", "Git")),
-    rename: outcome(() => vscode.languages.registerRenameProvider("x", {})),
+    languageConfiguration: outcome(() => vscode.languages.setLanguageConfiguration("x", {})),
     unknownMember: outcome(() => vscode.window.someFutureApi()),
     machineId: outcome(() => vscode.env.machineId),
     storage: outcome(() => ({}).x),
@@ -292,7 +292,10 @@ exports.activate = function (context) {
     unsupported("webview", "window.registerWebviewViewProvider");
     unsupported("debug", "debug.startDebugging");
     unsupported("scm", "scm.createSourceControl");
-    unsupported("rename", "languages.registerRenameProvider");
+    unsupported(
+        "languageConfiguration",
+        "languages.setLanguageConfiguration",
+    );
     unsupported("unknownMember", "window.someFutureApi");
     unsupported("machineId", "env.machineId");
     unsupported("readFile", "Node.js fs.readFileSync");

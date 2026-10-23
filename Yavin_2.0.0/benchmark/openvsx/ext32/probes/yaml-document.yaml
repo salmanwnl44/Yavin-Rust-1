@@ -1,0 +1,4 @@
+# yaml-language-server: $schema=./schema.json
+name: probe
+replicas: zero
+extra: 1

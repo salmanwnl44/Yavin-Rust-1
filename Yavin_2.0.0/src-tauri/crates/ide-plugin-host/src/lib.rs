@@ -24,6 +24,9 @@
 //!
 //! - **Watchdog.** An entry still running at twice its deadline plus a second -- code QuickJS
 //!   could not interrupt -- ends this process (`watchdog`, EXT-10).
+//! - **Workers (EXT-32).** An extension's `new Worker(...)` is a runtime of its own, owned by
+//!   that extension's (`worker`): it speaks only to its extension, and each entry into it is one
+//!   step between the extensions' own, under the same deadline and watchdog (`pump`).
 //!
 //! **The OS sandbox (EXT-10).** Yavin starts this process in a Windows AppContainer with no
 //! capabilities, in a job of its own (`ide_workspace::sandbox`): no file but its program and the
@@ -34,6 +37,7 @@
 pub mod protocol;
 mod runtime;
 pub mod watchdog;
+mod worker;
 
 use ide_workspace::lsp_framing::{frame, FrameReader};
 use protocol::{HostLimits, Inbound, MAX_MESSAGE};
@@ -68,6 +72,67 @@ fn write(out: &mut impl Write, message: &Value) {
     }
     let _ = out.write_all(&frame(&text));
     let _ = out.flush();
+}
+
+/// Stamps what an extension sent with its identity, as every message from the host is.
+fn stamped(mut message: Value, extension_id: &str, host: &Identity) -> Value {
+    if let Some(object) = message.as_object_mut() {
+        object.insert("extensionId".into(), json!(extension_id));
+        object.insert("workspaceId".into(), json!(host.workspace_id));
+        object.insert("hostGeneration".into(), json!(host.generation));
+    }
+    message
+}
+
+/// The most worker steps (`ExtensionRuntime::pump_step`) in one turn of the loop, and the time
+/// they may take, before it reads its input and fires its timers again: a busy worker shares
+/// the host, it does not hold it.
+const MAX_WORKER_STEPS: usize = 256;
+const MAX_WORKER_TURN: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// EXT-32: the extensions' workers' work -- each step one entry, under the watchdog, each
+/// extension in turn -- until there is none, or the turn's steps are spent.
+fn pump(
+    extensions: &mut HashMap<String, ExtensionRuntime>,
+    host: &Identity,
+    watchdog: &watchdog::Watchdog,
+    output: &mut impl Write,
+) {
+    let mut ids: Vec<String> = extensions.keys().cloned().collect();
+    ids.sort();
+    let mut steps = 0;
+    let started = Instant::now();
+    loop {
+        let mut worked = false;
+        for id in &ids {
+            let running: usize = extensions
+                .values()
+                .map(ExtensionRuntime::worker_count)
+                .sum();
+            let capacity = worker::MAX_HOST_WORKERS.saturating_sub(running);
+            let Some(runtime) = extensions.get_mut(id) else {
+                continue;
+            };
+            // A start runs the worker's script under the load deadline; anything else, the call's.
+            watchdog.enter(host.limits.load_ms.max(host.limits.call_ms));
+            let sent = runtime.pump_step(&host.limits, capacity);
+            watchdog.leave();
+            let Some(sent) = sent else {
+                continue;
+            };
+            worked = true;
+            steps += 1;
+            for outgoing in sent {
+                write(output, &stamped(outgoing, id, host));
+            }
+            if steps >= MAX_WORKER_STEPS || started.elapsed() >= MAX_WORKER_TURN {
+                return;
+            }
+        }
+        if !worked {
+            return;
+        }
+    }
 }
 
 /// Input as it arrives: framed messages, the end of input, or a stream that cannot be read.
@@ -140,6 +205,7 @@ pub fn run(mut input: impl Read + Send + 'static, mut output: impl Write) -> i32
                             write(&mut output, &outgoing);
                         }
                     }
+                    pump(&mut extensions, host, &watchdog, &mut output);
                 }
                 continue;
             }
@@ -286,6 +352,10 @@ pub fn run(mut input: impl Read + Send + 'static, mut output: impl Write) -> i32
                     }
                 }
             }
+        }
+        // What the messages set going in workers.
+        if let Some(host) = identity.as_ref() {
+            pump(&mut extensions, host, &watchdog, &mut output);
         }
     }
 }

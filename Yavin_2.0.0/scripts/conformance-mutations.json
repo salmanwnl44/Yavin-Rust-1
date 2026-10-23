@@ -1,5 +1,5 @@
 {
-  "note": "EXT-27: behaviours of the VS Code compatibility layer and its window side, each broken in turn; the tests named must catch it (scripts/conformance-mutations.mjs). Paths are relative to Yavin_2.0.0. EXT-28 adds R1-R21: the runtime (web.js, intl.js, the loader, the random source, rejection reports), each caught by tests/runtime.rs. EXT-29 adds C1-C9 (the window side: prompts, problems, will-save, file events, ownership) and S1-S7 (the layer: watchers, prompts, tokens, validation, code actions, diagnostics batches). EXT-30 adds I1-I8: file icon themes (paths kept inside the package, SVG only and bounded, VS Code's choice of icon, a disabled extension's theme, the manifest's check). EXT-31 adds V01-V09: webview panels (ownership, bounded and ready-gated frame messages, disposal with the extension, messages to the owner only, resource roots, the window's update loop, the window's permission rule), and V10-V11 (only the page the frame was last given is ready; a frame that kept an earlier page is given its page again).",
+  "note": "EXT-27: behaviours of the VS Code compatibility layer and its window side, each broken in turn; the tests named must catch it (scripts/conformance-mutations.mjs). Paths are relative to Yavin_2.0.0. EXT-28 adds R1-R21: the runtime (web.js, intl.js, the loader, the random source, rejection reports), each caught by tests/runtime.rs. EXT-29 adds C1-C9 (the window side: prompts, problems, will-save, file events, ownership) and S1-S7 (the layer: watchers, prompts, tokens, validation, code actions, diagnostics batches). EXT-30 adds I1-I8: file icon themes (paths kept inside the package, SVG only and bounded, VS Code's choice of icon, a disabled extension's theme, the manifest's check). EXT-31 adds V01-V09: webview panels (ownership, bounded and ready-gated frame messages, disposal with the extension, messages to the owner only, resource roots, the window's update loop, the window's permission rule), and V10-V11 (only the page the frame was last given is ready; a frame that kept an earlier page is given its page again). EXT-32 adds Z01-Z06: the layer for language clients (cancellation tokens for completion, hover and symbols; inert providers said once; tabs; content providers' schemes; storage addresses; an ended worker's silence).",
   "mutations": [
     {
       "id": "EXT-27 B1",
@@ -891,6 +891,99 @@
         }
       ],
       "node": ["src/services/extensions/vscodeWebview.test.ts"]
+    },
+    {
+      "id": "EXT-32 Z01",
+      "what": "completion, hover and symbols get a token that is never cancelled",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "      // document is fetched is not lost.\n      const token = tokenFor(extra);",
+          "to": "      // document is fetched is not lost.\n      const token = neverCancelled;"
+        }
+      ],
+      "cargo": [
+        "-p",
+        "ide-plugin-host",
+        "--test",
+        "core_api",
+        "--",
+        "completion_hover_and_symbols_are_given_a_token"
+      ]
+    },
+    {
+      "id": "EXT-32 Z02",
+      "what": "an inert provider is said each time it is registered",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "        if (!inertSaid.has(name)) {",
+          "to": "        if (true) {"
+        }
+      ],
+      "cargo": [
+        "-p",
+        "ide-plugin-host",
+        "--test",
+        "core_api",
+        "--",
+        "providers_yavin_does_not_show"
+      ]
+    },
+    {
+      "id": "EXT-32 Z03",
+      "what": "a closed document's tab is not said to have closed",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "        tabsChanged.fire({ opened: [], closed: [tabOf(info.uri, tabGroup())], changed: [] });",
+          "to": "        void info;"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "core_api", "--", "tabs_are_the_open_documents"]
+    },
+    {
+      "id": "EXT-32 Z04",
+      "what": "a content provider may take file:, http(s): or Yavin's own schemes",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "        if (!/^[a-z][a-z0-9+.-]*$/i.test(name) || RESERVED_SCHEMES.has(name.toLowerCase()))",
+          "to": "        if (!/^[a-z][a-z0-9+.-]*$/i.test(name))"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "core_api", "--", "a_content_provider_answers"]
+    },
+    {
+      "id": "EXT-32 Z05",
+      "what": "the storage addresses are file paths (a folder Yavin does not give)",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "Uri.from({ scheme: \"yavin-storage\", path: `/${init.extensionId}/${place}` })",
+          "to": "Uri.file(`C:/storage/${init.extensionId}/${place}`)"
+        }
+      ],
+      "cargo": [
+        "-p",
+        "ide-plugin-host",
+        "--test",
+        "conformance",
+        "--",
+        "context_state_secrets_paths"
+      ]
+    },
+    {
+      "id": "EXT-32 Z06",
+      "what": "posting to an ended worker throws (a browser's is silent)",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "        if (refused === ENDED) this._ended = true;\n        else if (refused) throw new Error(refused);",
+          "to": "        if (refused) throw new Error(refused);"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "workers", "--", "messages_pass_both_ways"]
     }
   ]
 }

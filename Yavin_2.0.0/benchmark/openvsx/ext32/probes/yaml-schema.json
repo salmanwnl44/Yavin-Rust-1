@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "name": { "type": "string", "description": "The probe's name." },
+    "replicas": { "type": "integer", "minimum": 1, "description": "How many copies run." },
+    "mode": { "enum": ["fast", "safe"], "description": "How it runs." }
+  },
+  "required": ["name"],
+  "additionalProperties": false
+}

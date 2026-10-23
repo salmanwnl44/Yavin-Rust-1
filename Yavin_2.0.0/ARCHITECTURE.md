@@ -2117,6 +2117,16 @@ Copies installed before EXT-25 keep the manifest they were installed with, which
   - **The page's API** (`src-tauri/src/webview_bootstrap.js`, inserted before the extension's own `<head>` content): `acquireVsCodeApi()` once (postMessage, getState, setState), VS Code's theme variables and body classes in Yavin's colours, links that do not navigate.
   - **Bounds** (`services/extensions/webviews.ts`): messages 1 MiB of JSON each way, 500 a second from a frame, 64 queued until the page is ready; state 256 KiB (written natively at most every 200 ms); 16 panels an extension, 32 a window, 8 kept alive while hidden.
   - **Lifetime.** A panel is disposed when its tab closes, and with its extension's stop, disable, crash or uninstall, a workspace switch, a reload of the window (`on_page_load`) and the window's closing. Panels are not restored after a reload (no serializer).
+- **Workers and language clients (EXT-32).** `new Worker(url)` in a VS Code extension's code runs a QuickJS runtime of its own in the host (`crates/ide-plugin-host/src/worker.rs`, its scope `worker.js`; the reasons are in its module documentation and the audit, Part H). Web extensions' language servers run there, Red Hat YAML's among them, and speak LSP to the extension's own client. Yavin sees only the extension's providers and diagnostics, as from any extension: no parallel language service, and no process.
+  - **Isolation.** The worker speaks only to its extension (`postMessage`, JSON values). It has no requests, events, files, network, `importScripts`, nested workers, `require` or `process`. Its script is a JavaScript file of its package, already loaded with the extension's code. The host's functions are removed before its script runs.
+  - **Ownership.** Workers live in their extension's `ExtensionRuntime` and are dropped with it: unload (stop, disable, uninstall, crash) and the host's end (workspace switch, window close). Ids are the extension's own.
+  - **Bounds.** 4 workers an extension and 16 a host; 4 MiB of JSON a message and 1000 waiting each way; a 16 MiB script; the host's memory limit and deadlines on every entry, a worker past its deadline ended and its extension told. Each entry is one step of the host's loop (`ExtensionRuntime::pump_step`), at most 256 steps or 50 ms a turn, so a worker shares the host and does not hold it.
+  - **The layer, for language clients.**
+    - `window.tabGroups` gives one group of the open documents' text tabs.
+    - `workspace.registerTextDocumentContentProvider` gives the extension's own scheme's documents, read by its own `openTextDocument`.
+    - `ExtensionContext.globalStorageUri`, `storageUri` and `logUri` are addresses of a scheme nothing reads or writes (`yavin-storage:`): still no folder of its own.
+    - Providers of what the editor does not show (code lenses, folding, links, colours, inlay hints, semantic tokens, …) are registered inert and said once.
+    - Completion, hover, definition, references and symbols get the cancellation token the window cancels when it stops waiting, as formatting did since EXT-29.
 
 **New in the extension API (2.1.0, additive)**:
 
@@ -2148,7 +2158,7 @@ Copies installed before EXT-25 keep the manifest they were installed with, which
 
 - Custom editors, webview views (`registerWebviewViewProvider`) and webview serializers; tree views (EXT-31 provides webview panels; no benchmark extension was found blocked by tree views, see the audit, Part G).
 - Source control, testing, debug, tasks, notebooks, authentication and terminals.
-- Language servers started by extensions: they need a process or a worker, and an extension may start neither.
+- Language servers started by extensions as processes (no process execution; a future capability design). Since EXT-32 a server in a Web Worker runs (H2 of the audit's Part H), but not one that needs WebAssembly or the network.
 - `createQuickPick` and `createInputBox`, `languages.getDiagnostics` and `onDidChangeDiagnostics`, file-operation events (EXT-29 provides the simple pickers, file watchers, save events, formatting and code actions).
 - ES modules, native modules and Node.js's system modules.
 - Product icon themes; file icon themes drawn with a font or PNG (EXT-30 shows file icon themes' SVG icons).

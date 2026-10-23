@@ -1,5 +1,5 @@
 {
-  "about": "EXT-25, graded by evidence at EXT-26 by behavioural tests at EXT-27, and its runtime part again at EXT-28: what Yavin provides of the VS Code extension API, through the compatibility layer (src-tauri/crates/ide-plugin-host/src/vscode.js) and the VS Code package adapter (src-tauri/src/vsix.rs). FULL: as VS Code documents it, and tested. PARTIAL: provided with the limitation noted, and tested. STUB: present but fabricated or inert. UNSUPPORTED: fails with an UnsupportedApi error naming it (logged once). NOT VERIFIED: implemented (`implemented` says how far) but no test or benchmark run exercises its behaviour. `evidence`: L1 present (the inventory test), L2 behaviour tested, L3 exercised by real extensions in the Open VSX benchmark. 'baseline' is before EXT-25, when no VS Code extension code ran at all. Checked against the layer by crates/ide-plugin-host/tests/vscode.rs (the_inventory_matches_the_layer). EXT-27 adds L4: the window (tests/ui) and the packaged application (tests/real). EXT-29 adds the pickers, file watchers, save and selection events, formatting and code-action providers, and diagnostics in the Problems view. EXT-30 adds file icon themes (their SVG icons). EXT-31 adds webview panels.",
+  "about": "EXT-25, graded by evidence at EXT-26 by behavioural tests at EXT-27, and its runtime part again at EXT-28: what Yavin provides of the VS Code extension API, through the compatibility layer (src-tauri/crates/ide-plugin-host/src/vscode.js) and the VS Code package adapter (src-tauri/src/vsix.rs). FULL: as VS Code documents it, and tested. PARTIAL: provided with the limitation noted, and tested. STUB: present but fabricated or inert. UNSUPPORTED: fails with an UnsupportedApi error naming it (logged once). NOT VERIFIED: implemented (`implemented` says how far) but no test or benchmark run exercises its behaviour. `evidence`: L1 present (the inventory test), L2 behaviour tested, L3 exercised by real extensions in the Open VSX benchmark. 'baseline' is before EXT-25, when no VS Code extension code ran at all. Checked against the layer by crates/ide-plugin-host/tests/vscode.rs (the_inventory_matches_the_layer). EXT-27 adds L4: the window (tests/ui) and the packaged application (tests/real). EXT-29 adds the pickers, file watchers, save and selection events, formatting and code-action providers, and diagnostics in the Problems view. EXT-30 adds file icon themes (their SVG icons). EXT-31 adds webview panels. EXT-32 adds tabs, content providers and storage addresses, and inert providers of what Yavin's editor does not show (STUB); workers (`new Worker`) are the host's, outside this API (`worker.rs`).",
   "level": "1.90.0",
   "statuses": ["FULL", "PARTIAL", "STUB", "UNSUPPORTED", "NOT VERIFIED"],
   "api": [
@@ -406,9 +406,13 @@
     {
       "api": "window.tabGroups",
       "tier": 3,
-      "status": "UNSUPPORTED",
+      "status": "PARTIAL",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (tabs_are_the_open_documents…)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): its language client follows the tabs to pull diagnostics"
+      ],
+      "notes": "EXT-32: one group; a text tab (TabInputText) for each document Yavin told the extension is open, the active editor's marked; onDidChangeTabs on documents.open and documents.close; onDidChangeTabGroups never fires (one group); close is refused (closing tabs is the user's). The TabInput* classes are provided."
     },
     {
       "api": "window.registerUriHandler",
@@ -649,9 +653,13 @@
     {
       "api": "workspace.registerTextDocumentContentProvider",
       "tier": 2,
-      "status": "UNSUPPORTED",
+      "status": "PARTIAL",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (a_content_provider_answers_the_extensions_own_virtual_documents…)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): registers its schema provider at start"
+      ],
+      "notes": "EXT-32: a scheme of the extension's own (not file, untitled, http(s), data or Yavin's): its own workspace.openTextDocument of that scheme reads the provider, afresh each time, at most 8 MiB. Yavin's editor does not show such documents; onDidChange is not followed (each open asks again)."
     },
     {
       "api": "workspace.registerFileSystemProvider",
@@ -829,86 +837,134 @@
     {
       "api": "languages.registerSignatureHelpProvider",
       "tier": 2,
-      "status": "UNSUPPORTED",
+      "status": "STUB",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (providers_yavin_does_not_show_are_registered_inert…)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): its client starts with them registered"
+      ],
+      "notes": "EXT-32: registered and never asked -- Yavin's editor does not show what it gives; said once in the extension's log. (A language client registers one for each capability of its server: refusing it ended the client's start.)"
     },
     {
       "api": "languages.registerCodeLensProvider",
       "tier": 2,
-      "status": "UNSUPPORTED",
+      "status": "STUB",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (providers_yavin_does_not_show_are_registered_inert…)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): its client starts with them registered"
+      ],
+      "notes": "EXT-32: registered and never asked -- Yavin's editor does not show what it gives; said once in the extension's log. (A language client registers one for each capability of its server: refusing it ended the client's start.)"
     },
     {
       "api": "languages.registerRenameProvider",
       "tier": 2,
-      "status": "UNSUPPORTED",
+      "status": "STUB",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (providers_yavin_does_not_show_are_registered_inert…)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): its client starts with them registered"
+      ],
+      "notes": "EXT-32: registered and never asked -- Yavin's editor does not show what it gives; said once in the extension's log. (A language client registers one for each capability of its server: refusing it ended the client's start.)"
     },
     {
       "api": "languages.registerDocumentHighlightProvider",
       "tier": 2,
-      "status": "UNSUPPORTED",
+      "status": "STUB",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (providers_yavin_does_not_show_are_registered_inert…)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): its client starts with them registered"
+      ],
+      "notes": "EXT-32: registered and never asked -- Yavin's editor does not show what it gives; said once in the extension's log. (A language client registers one for each capability of its server: refusing it ended the client's start.)"
     },
     {
       "api": "languages.registerDocumentLinkProvider",
       "tier": 2,
-      "status": "UNSUPPORTED",
+      "status": "STUB",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (providers_yavin_does_not_show_are_registered_inert…)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): its client starts with them registered"
+      ],
+      "notes": "EXT-32: registered and never asked -- Yavin's editor does not show what it gives; said once in the extension's log. (A language client registers one for each capability of its server: refusing it ended the client's start.)"
     },
     {
       "api": "languages.registerColorProvider",
       "tier": 2,
-      "status": "UNSUPPORTED",
+      "status": "STUB",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (providers_yavin_does_not_show_are_registered_inert…)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): its client starts with them registered"
+      ],
+      "notes": "EXT-32: registered and never asked -- Yavin's editor does not show what it gives; said once in the extension's log. (A language client registers one for each capability of its server: refusing it ended the client's start.)"
     },
     {
       "api": "languages.registerFoldingRangeProvider",
       "tier": 2,
-      "status": "UNSUPPORTED",
+      "status": "STUB",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (providers_yavin_does_not_show_are_registered_inert…)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): its client starts with them registered"
+      ],
+      "notes": "EXT-32: registered and never asked -- Yavin's editor does not show what it gives; said once in the extension's log. (A language client registers one for each capability of its server: refusing it ended the client's start.)"
     },
     {
       "api": "languages.registerDocumentSemanticTokensProvider",
       "tier": 2,
-      "status": "UNSUPPORTED",
+      "status": "STUB",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (providers_yavin_does_not_show_are_registered_inert…)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): its client starts with them registered"
+      ],
+      "notes": "EXT-32: registered and never asked -- Yavin's editor does not show what it gives; said once in the extension's log. (A language client registers one for each capability of its server: refusing it ended the client's start.)"
     },
     {
       "api": "languages.registerInlayHintsProvider",
       "tier": 3,
-      "status": "UNSUPPORTED",
+      "status": "STUB",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (providers_yavin_does_not_show_are_registered_inert…)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): its client starts with them registered"
+      ],
+      "notes": "EXT-32: registered and never asked -- Yavin's editor does not show what it gives; said once in the extension's log. (A language client registers one for each capability of its server: refusing it ended the client's start.)"
     },
     {
       "api": "languages.registerOnTypeFormattingEditProvider",
       "tier": 2,
-      "status": "UNSUPPORTED",
+      "status": "STUB",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (providers_yavin_does_not_show_are_registered_inert…)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): its client starts with them registered"
+      ],
+      "notes": "EXT-32: registered and never asked -- Yavin's editor does not show what it gives; said once in the extension's log. (A language client registers one for each capability of its server: refusing it ended the client's start.)"
     },
     {
       "api": "languages.registerWorkspaceSymbolProvider",
       "tier": 2,
-      "status": "UNSUPPORTED",
+      "status": "STUB",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (providers_yavin_does_not_show_are_registered_inert…)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): its client starts with them registered"
+      ],
+      "notes": "EXT-32: registered and never asked -- Yavin's editor does not show what it gives; said once in the extension's log. (A language client registers one for each capability of its server: refusing it ended the client's start.)"
     },
     {
       "api": "languages.registerInlineCompletionItemProvider",
       "tier": 3,
-      "status": "UNSUPPORTED",
+      "status": "STUB",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (providers_yavin_does_not_show_are_registered_inert…)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): its client starts with them registered"
+      ],
+      "notes": "EXT-32: registered and never asked -- Yavin's editor does not show what it gives; said once in the extension's log. (A language client registers one for each capability of its server: refusing it ended the client's start.)"
     },
     {
       "api": "languages.setLanguageConfiguration",
@@ -1158,10 +1214,13 @@
     {
       "api": "ExtensionContext.storageUri",
       "tier": 1,
-      "status": "UNSUPPORTED",
+      "status": "PARTIAL",
       "baseline": "UNSUPPORTED",
-      "notes": "Also storagePath, globalStorageUri, globalStoragePath, logUri, logPath: extensions have no folder to write to.",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "notes": "EXT-32: storageUri, globalStorageUri and logUri are addresses only, of a scheme of their own (yavin-storage:) that nothing reads or writes: workspace.fs refuses them, so code computing paths from them goes on and a write fails. storagePath, globalStoragePath and logPath stay unsupported (no Node.js fs).",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (context_state_secrets_paths_and_deactivation)",
+        "L3: Red Hat YAML from Open VSX in the sandboxed host (extension_host_real_tests::open_vsx_language_probe; benchmark/openvsx/ext32/): Red Hat's telemetry computes its folder from globalStorageUri before the language server starts"
+      ]
     },
     {
       "api": "ExtensionContext.environmentVariableCollection",

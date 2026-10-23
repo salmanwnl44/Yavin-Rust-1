@@ -61,6 +61,9 @@ const CAUSES = {
   esm: "Is an ES module (not supported)",
   platform:
     "Needs a VS Code subsystem Yavin lacks for extensions: debug, testing, source control, terminals or tasks",
+  network:
+    "Needs the network from its code or its worker (a schema store, a registry): neither has any (EXT-32)",
+  wasm: "Needs WebAssembly: QuickJS, the extensions' and workers' engine, has none (EXT-32)",
 };
 
 /** The roadmap's phases, in order; a cause or an API belongs to the first phase that removes it. */
@@ -94,6 +97,8 @@ const PHASE_OF_CAUSE = {
   process: "P6",
   platform: "P7",
   esm: "P2",
+  network: "P6",
+  wasm: "P5",
 };
 /** An unsupported API's phase, from its namespace and name. */
 function phaseOfApi(api) {
@@ -182,8 +187,8 @@ const JUDGED = {
   "tamasfe.even-better-toml": [
     "TOML language server (taplo, WebAssembly)",
     "No",
-    ["worker"],
-    "Installs since EXT-30 (21.0 MiB); its server is WebAssembly in a worker (activation: Worker is not defined).",
+    ["policy", "wasm"],
+    "Installs since EXT-30 (21.0 MiB). Since EXT-32 it can start a worker, but its worker's script -- the taplo server as WebAssembly embedded in JavaScript, 35.7 MB -- is more than Yavin loads as code, and QuickJS has no WebAssembly.",
   ],
   "esbenp.prettier-vscode": [
     "Formatting with Prettier",
@@ -218,14 +223,14 @@ const JUDGED = {
   "streetsidesoftware.code-spell-checker": [
     "Spell checking",
     "No",
-    ["coreapi", "worker"],
-    "Loads since EXT-28 (URL); activation needs ExtensionContext.globalStorageUri; its checker runs as a language server in a separate runtime.",
+    ["syncfs", "process"],
+    "Loads since EXT-28 (URL); since EXT-32 its storage address is given, and activation stops at Node.js os.release; its checker is a Node.js language server in a process of its own.",
   ],
   "timonwong.shellcheck": [
     "Linting shell scripts (shellcheck)",
     "No",
-    ["process", "coreapi"],
-    "Runs the shellcheck binary; activation passes code actions since EXT-29 and stops at registerDocumentLinkProvider.",
+    ["process"],
+    "Activates since EXT-32 (3/4 commands; its document-link provider is registered, not shown); linting runs the shellcheck binary.",
   ],
   "davidanson.vscode-markdownlint": [
     "Linting Markdown",
@@ -241,9 +246,9 @@ const JUDGED = {
   ],
   "redhat.vscode-yaml": [
     "YAML language support",
-    "No",
-    ["worker"],
-    "Loads and activates since EXT-28 (crypto, navigator, Intl.DateTimeFormat); its grammar-less features are a language server (a worker in its web build).",
+    "Partly",
+    ["network"],
+    "Since EXT-32 its language server runs in a Yavin worker: syntax and schema problems in Problems, completion, hover and document symbols (language probe; packaged test yaml.spec.ts). Schemas from a workspace file work; schemas from the network (SchemaStore) do not; its web build's formatter does nothing (upstream); folding, links and code lenses are registered but not shown.",
   ],
   "rust-lang.rust-analyzer": [
     "Rust language server",
@@ -326,8 +331,8 @@ const JUDGED = {
   "gruntfuggly.todo-tree": [
     "TODO tree",
     "No",
-    ["coreapi", "process"],
-    "A text document content provider; it searches with ripgrep (a process).",
+    ["syncfs", "process"],
+    "Its content provider registers since EXT-32; activation stops at Node.js fs.existsSync; it searches with ripgrep (a process).",
   ],
   "alefragnani.project-manager": [
     "Project list",
@@ -364,7 +369,7 @@ const JUDGED = {
     "Test explorer",
     "No",
     ["coreapi", "process"],
-    "Code lens; test adapters start processes.",
+    "Its code lenses register (not shown) since EXT-32; activation stops at a document selector without a language; test adapters start processes.",
   ],
   "vitest.explorer": ["Vitest", "No", ["platform", "process"], "The testing API; runs vitest."],
   "orta.vscode-jest": ["Jest", "No", ["syncfs", "process", "platform"], "process.cwd; runs jest."],
@@ -440,7 +445,7 @@ const JUDGED = {
     "Coloured CSV columns",
     "Partly",
     ["coreapi"],
-    "Its grammar applies; its semantic-token provider is unsupported.",
+    "Its grammar applies; activates since EXT-32 and 21/24 commands run (alignment, RBQL); its colours are a semantic-token provider, registered but not shown (Yavin's editor shows no semantic tokens from extensions).",
   ],
 };
 

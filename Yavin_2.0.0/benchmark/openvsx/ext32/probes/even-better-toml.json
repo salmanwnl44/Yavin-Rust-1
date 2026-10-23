@@ -1,0 +1,24 @@
+{
+  "answers": {
+    "probe-activate": {
+      "error": {
+        "code": "SecurityError",
+        "message": "A worker's script is a JavaScript file of its extension's package: file:///C:/Users/<user>/AppData/Local/Temp/yavin-ext-e2e-openvsx-probe-20396/extensions/.store/tamasfe.even-better-toml/0.21.2-f3dc44f1/extension/dist/server-worker.js is not one."
+      },
+      "ok": false
+    }
+  },
+  "denied": [],
+  "diagnostics": [],
+  "id": "tamasfe.even-better-toml",
+  "logs": ["true"],
+  "registered": [],
+  "requests": {
+    "documents.all": 1,
+    "documents.getText": 1,
+    "editor.active": 1,
+    "events.subscribe": 1,
+    "window.state": 1
+  },
+  "unsupported": []
+}

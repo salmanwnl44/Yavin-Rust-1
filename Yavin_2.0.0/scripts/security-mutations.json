@@ -1952,6 +1952,179 @@
         }
       ],
       "args": ["-p", "yavin-ide", "--lib", "--", "extension_permissions"]
+    },
+    {
+      "id": "EXT-32 Y01",
+      "what": "a worker keeps the host's functions (it could send what it likes as its own)",
+      "edits": [
+        {
+          "file": "crates/ide-plugin-host/src/worker.js",
+          "from": "  for (const name of [\"__yavin_worker_send\", \"__yavin_timer\", \"__yavin_untimer\", \"__yavin_random\"]) delete globalThis[name];",
+          "to": "  void 0;"
+        }
+      ],
+      "args": ["-p", "ide-plugin-host", "--test", "workers", "--", "a_worker_has_a_workers_scope"]
+    },
+    {
+      "id": "EXT-32 Y02",
+      "what": "a worker's script can replace how the host enters it",
+      "edits": [
+        {
+          "file": "crates/ide-plugin-host/src/worker.rs",
+          "from": "            for name in [\"__yavin_worker_receive\", \"__yavin_worker_uncaught\"] {",
+          "to": "            for name in [] as [&str; 0] {"
+        }
+      ],
+      "args": ["-p", "ide-plugin-host", "--test", "workers", "--", "a_worker_has_a_workers_scope"]
+    },
+    {
+      "id": "EXT-32 Y03",
+      "what": "any file of the package (not only its JavaScript) is a worker's script",
+      "edits": [
+        {
+          "file": "crates/ide-plugin-host/src/vscode.js",
+          "from": "        if (typeof source !== \"string\" || !/\\.(c?js)$/i.test(relative))",
+          "to": "        if (typeof source !== \"string\")"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-plugin-host",
+        "--test",
+        "workers",
+        "--",
+        "only_its_packages_javascript_files"
+      ]
+    },
+    {
+      "id": "EXT-32 Y04",
+      "what": "a worker's messages to its extension are not bounded",
+      "edits": [
+        {
+          "file": "crates/ide-plugin-host/src/worker.js",
+          "from": "    if (text.length > init.maxMessage) throw new RangeError(`A worker's message is at most ${init.maxMessage / 1024 / 1024} MiB of JSON.`);",
+          "to": "    void 0;"
+        },
+        {
+          "file": "crates/ide-plugin-host/src/worker.rs",
+          "from": "                        if data.len() > MAX_WORKER_MESSAGE || queue.len() >= MAX_QUEUED {",
+          "to": "                        if queue.len() >= MAX_QUEUED {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-plugin-host",
+        "--test",
+        "workers",
+        "--",
+        "messages_and_workers_are_bounded"
+      ]
+    },
+    {
+      "id": "EXT-32 Y05",
+      "what": "an extension's messages to its worker are not bounded (natively)",
+      "edits": [
+        {
+          "file": "crates/ide-plugin-host/src/worker.rs",
+          "from": "        if data.len() > MAX_WORKER_MESSAGE {",
+          "to": "        if false {"
+        }
+      ],
+      "args": ["-p", "ide-plugin-host", "--lib", "--", "an_extensions_requests_of_its_workers"]
+    },
+    {
+      "id": "EXT-32 Y06",
+      "what": "an extension may start any number of workers",
+      "edits": [
+        {
+          "file": "crates/ide-plugin-host/src/worker.rs",
+          "from": "        if self.known.len() >= MAX_WORKERS {",
+          "to": "        if false {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-plugin-host",
+        "--test",
+        "workers",
+        "--",
+        "messages_and_workers_are_bounded"
+      ],
+      "also": [["-p", "ide-plugin-host", "--lib", "--", "an_extensions_requests_of_its_workers"]]
+    },
+    {
+      "id": "EXT-32 Y07",
+      "what": "messages may wait for a worker without bound",
+      "edits": [
+        {
+          "file": "crates/ide-plugin-host/src/worker.rs",
+          "from": "        if *undelivered >= MAX_QUEUED {",
+          "to": "        if false {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-plugin-host",
+        "--test",
+        "workers",
+        "--",
+        "messages_and_workers_are_bounded"
+      ]
+    },
+    {
+      "id": "EXT-32 Y08",
+      "what": "a worker that runs past its deadline is kept",
+      "edits": [
+        {
+          "file": "crates/ide-plugin-host/src/runtime.rs",
+          "from": "            self.requests.borrow_mut().delivered(id);\n            if let Err(reason) = entered {\n                self.end_worker(id, reason);\n            }",
+          "to": "            self.requests.borrow_mut().delivered(id);\n            let _ = entered;"
+        }
+      ],
+      "args": ["-p", "ide-plugin-host", "--test", "workers", "--", "runs_forever_is_ended"]
+    },
+    {
+      "id": "EXT-32 Y09",
+      "what": "a worker's entries have no deadline",
+      "edits": [
+        {
+          "file": "crates/ide-plugin-host/src/worker.rs",
+          "from": "        runtime.set_interrupt_handler(Some(Box::new(move || {\n            watched.get().is_some_and(|until| Instant::now() > until)\n        })));\n        let context = Context::full(&runtime).map_err(|e| e.to_string())?;",
+          "to": "        runtime.set_interrupt_handler(Some(Box::new(move || {\n            let _ = &watched;\n            false\n        })));\n        let context = Context::full(&runtime).map_err(|e| e.to_string())?;"
+        }
+      ],
+      "args": ["-p", "ide-plugin-host", "--test", "workers", "--", "runs_forever_is_ended"]
+    },
+    {
+      "id": "EXT-32 Y10",
+      "what": "a host runs any number of workers across its extensions",
+      "edits": [
+        {
+          "file": "crates/ide-plugin-host/src/runtime.rs",
+          "from": "                    let started = if capacity == 0 {",
+          "to": "                    let started = if capacity == usize::MAX {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-plugin-host",
+        "--test",
+        "workers",
+        "--",
+        "a_host_runs_at_most_sixteen_workers"
+      ]
+    },
+    {
+      "id": "EXT-32 Y11",
+      "what": "a worker's script errors are not said to its extension",
+      "edits": [
+        {
+          "file": "crates/ide-plugin-host/src/worker.js",
+          "from": "    out({ kind: \"error\", text });",
+          "to": "    void text;"
+        }
+      ],
+      "args": ["-p", "ide-plugin-host", "--test", "workers", "--", "a_worker_that_throws"]
     }
   ]
 }

@@ -6,10 +6,11 @@
 //! their own (`fire_due`), under the same deadline as any message. Nothing waits in the script.
 
 use crate::protocol::HostLimits;
+use crate::worker::{FromWorker, Worker, WorkerRequest, WorkerRequests};
 use rquickjs::{Context, Ctx, Function, Persistent, Runtime};
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,13 @@ pub struct ExtensionRuntime {
     timers: Rc<RefCell<BTreeMap<u32, Timer>>>,
     /// Promises rejected with no handler yet (EXT-28), and why: said after the entry's jobs.
     rejected: Rejected,
+    /// Its workers (EXT-32, `worker.rs`): what it asked of them, and those running.
+    requests: Rc<RefCell<WorkerRequests>>,
+    workers: BTreeMap<u32, Worker>,
+    /// What it is to hear of its workers ending, not yet given it.
+    notices: VecDeque<Value>,
+    /// The worker served last, so each is served in turn.
+    turn: u32,
 }
 
 type Rejected = Rc<RefCell<Vec<(Persistent<rquickjs::Value<'static>>, String)>>>;
@@ -164,6 +172,8 @@ impl ExtensionRuntime {
             .replace("/*__YAVIN_VSCODE__*/", &format!("{WEB}\n{INTL}\n{VSCODE}"))
             .replace("__YAVIN_INIT__", &init.to_string());
         let timers: Rc<RefCell<BTreeMap<u32, Timer>>> = Rc::new(RefCell::new(BTreeMap::new()));
+        let requests: Rc<RefCell<WorkerRequests>> =
+            Rc::new(RefCell::new(WorkerRequests::default()));
         deadline.set(Some(Instant::now() + Duration::from_millis(limits.load_ms)));
         let loaded = context.with(|ctx| -> Result<Persistent<Function<'static>>, Value> {
             let sink = outbox.clone();
@@ -229,6 +239,38 @@ impl ExtensionRuntime {
             ctx.globals()
                 .set("__yavin_random", random)
                 .map_err(|e| error("HostFailed", e.to_string()))?;
+            // EXT-32: its workers -- asked for here, done by the host between entries
+            // (`pump_step`); each answers why not, or nothing.
+            let asked = requests.clone();
+            let start_worker = Function::new(
+                ctx.clone(),
+                move |id: u32, source: String, url: String, name: String| -> Option<String> {
+                    asked.borrow_mut().start(id, source, url, name)
+                },
+            )
+            .map_err(|e| error("HostFailed", e.to_string()))?;
+            let asked = requests.clone();
+            let post_worker = Function::new(
+                ctx.clone(),
+                move |id: u32, data: String| -> Option<String> {
+                    asked.borrow_mut().post(id, data)
+                },
+            )
+            .map_err(|e| error("HostFailed", e.to_string()))?;
+            let asked = requests.clone();
+            let end_worker = Function::new(ctx.clone(), move |id: u32| {
+                asked.borrow_mut().end(id);
+            })
+            .map_err(|e| error("HostFailed", e.to_string()))?;
+            for (name, function) in [
+                ("__yavin_worker_start", start_worker),
+                ("__yavin_worker_post", post_worker),
+                ("__yavin_worker_end", end_worker),
+            ] {
+                ctx.globals()
+                    .set(name, function)
+                    .map_err(|e| error("HostFailed", e.to_string()))?;
+            }
             ctx.eval::<(), _>(bootstrap.as_str())
                 .map_err(|e| error("HostFailed", thrown(&ctx, e)))?;
             // Taken now, before the extension's code runs: it cannot replace them.
@@ -269,6 +311,10 @@ impl ExtensionRuntime {
             outbox,
             timers,
             rejected,
+            requests,
+            workers: BTreeMap::new(),
+            notices: VecDeque::new(),
+            turn: 0,
         };
         let sent = runtime.drain(limits);
         Ok((runtime, sent))
@@ -303,9 +349,161 @@ impl ExtensionRuntime {
         sent
     }
 
-    /// When its next timer is due, if it has one waiting.
+    /// When it next has something to do: now, if its workers have (`pump_step`); else its or
+    /// its workers' next timer, if one waits.
     pub fn next_due(&self) -> Option<Instant> {
-        self.timers.borrow().values().map(|t| t.due).min()
+        if self.has_worker_work() {
+            return Some(Instant::now());
+        }
+        let own = self.timers.borrow().values().map(|t| t.due).min();
+        let theirs = self.workers.values().filter_map(Worker::next_due).min();
+        match (own, theirs) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Its workers running now.
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    fn has_worker_work(&self) -> bool {
+        !self.requests.borrow().queue.is_empty()
+            || !self.notices.is_empty()
+            || self
+                .workers
+                .values()
+                .any(|w| !w.inbox.is_empty() || w.has_said())
+    }
+
+    /// Its workers in turn, starting after the one served last.
+    fn in_turn(&self) -> Vec<u32> {
+        let (after, upto): (Vec<u32>, Vec<u32>) =
+            self.workers.keys().copied().partition(|id| *id > self.turn);
+        after.into_iter().chain(upto).collect()
+    }
+
+    /// A worker ends (it failed, or could not start): gone, and its extension told.
+    fn end_worker(&mut self, id: u32, reason: String) {
+        self.workers.remove(&id);
+        self.requests.borrow_mut().forget(id);
+        self.notices.push_back(
+            json!({"type": "worker", "id": id, "kind": "error", "text": reason, "ended": true}),
+        );
+    }
+
+    /// One step of its workers' work (EXT-32), at most one entry into one runtime, so the host's
+    /// watchdog sees each: requests first (in order; a start runs the worker's script), then what
+    /// a worker said (given to the extension), then a message for a worker, then a worker's due
+    /// timer -- each worker in turn. `capacity`: how many more workers the host may run. Returns
+    /// what the extension sent meanwhile, or nothing when there was nothing to do.
+    pub fn pump_step(&mut self, limits: &HostLimits, capacity: usize) -> Option<Vec<Value>> {
+        loop {
+            let request = self.requests.borrow_mut().queue.pop_front();
+            let Some(request) = request else { break };
+            match request {
+                WorkerRequest::Post { id, data } => {
+                    if let Some(worker) = self.workers.get_mut(&id) {
+                        worker.inbox.push_back(data);
+                    }
+                }
+                WorkerRequest::End { id } => {
+                    self.workers.remove(&id);
+                    self.requests.borrow_mut().forget(id);
+                }
+                WorkerRequest::Start {
+                    id,
+                    source,
+                    url,
+                    name,
+                } => {
+                    if !self.requests.borrow().known.contains(&id) {
+                        continue;
+                    }
+                    let started = if capacity == 0 {
+                        Err(format!(
+                            "This host runs at most {} workers at once.",
+                            crate::worker::MAX_HOST_WORKERS
+                        ))
+                    } else {
+                        Worker::start(&source, &url, &name, limits)
+                    };
+                    match started {
+                        Ok(worker) => {
+                            self.workers.insert(id, worker);
+                        }
+                        Err(reason) => self.end_worker(id, reason),
+                    }
+                    return Some(Vec::new());
+                }
+            }
+        }
+        if let Some(notice) = self.notices.pop_front() {
+            return Some(self.deliver(&notice, limits));
+        }
+        for id in self.in_turn() {
+            let Some(worker) = self.workers.get_mut(&id) else {
+                continue;
+            };
+            let name = worker.name.clone();
+            let Some(said) = worker.take_said() else {
+                continue;
+            };
+            self.turn = id;
+            let event = |kind: &str, field: &str, text: String| json!({"type": "worker", "id": id, "kind": kind, field: text});
+            return Some(match said {
+                FromWorker::Message(data) => self.deliver(&event("message", "data", data), limits),
+                FromWorker::Error(text) => self.deliver(&event("error", "text", text), limits),
+                FromWorker::Log(level, text) => {
+                    let level = if level == "warn" || level == "error" {
+                        level
+                    } else {
+                        "info".into()
+                    };
+                    let who = if name.is_empty() {
+                        "a worker".to_string()
+                    } else {
+                        format!("worker {name}")
+                    };
+                    vec![json!({"type": "log", "level": level, "text": format!("[{who}] {text}")})]
+                }
+                FromWorker::Close => {
+                    self.workers.remove(&id);
+                    self.requests.borrow_mut().forget(id);
+                    Vec::new()
+                }
+            });
+        }
+        for id in self.in_turn() {
+            let Some(worker) = self.workers.get_mut(&id) else {
+                continue;
+            };
+            let Some(entered) = worker.take_message(limits) else {
+                continue;
+            };
+            self.turn = id;
+            self.requests.borrow_mut().delivered(id);
+            if let Err(reason) = entered {
+                self.end_worker(id, reason);
+            }
+            return Some(Vec::new());
+        }
+        let now = Instant::now();
+        for id in self.in_turn() {
+            let Some(worker) = self.workers.get_mut(&id) else {
+                continue;
+            };
+            let Some(entered) = worker.fire_due(now, limits) else {
+                continue;
+            };
+            self.turn = id;
+            if let Err(reason) = entered {
+                self.end_worker(id, reason);
+            }
+            return Some(Vec::new());
+        }
+        None
     }
 
     /// Fires its timers due by `now` (earliest first), each an entry of its own: an interval is

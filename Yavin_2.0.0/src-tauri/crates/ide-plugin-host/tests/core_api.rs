@@ -624,3 +624,145 @@ fn console_has_debug_and_trace_as_extensions_call_them() {
     assert!(logs.contains("here") && logs.contains("Trace"), "{logs}");
     assert!(logs.contains("plain"));
 }
+
+// --- EXT-32: what a language client needs of the layer ---------------------------------------------
+
+#[test]
+fn completion_hover_and_symbols_are_given_a_token_cancelled_when_yavin_stops_waiting() {
+    let mut e = Ext::start();
+    e.step(
+        r##"const waits = (kind) => (token) => new Promise((resolve) => token.onCancellationRequested(() => { T[kind] = true; resolve(null); }));
+        vscode.languages.registerCompletionItemProvider("markdown", { provideCompletionItems: (doc, pos, token) => waits("completion")(token) });
+        vscode.languages.registerHoverProvider("markdown", { provideHover: (doc, pos, token) => waits("hover")(token) });
+        vscode.languages.registerDocumentSymbolProvider("markdown", { provideDocumentSymbols: (doc, token) => waits("symbols")(token) });"##,
+    );
+    let registered = e.asked("languages.register");
+    for (n, kind) in ["completion", "hover", "symbols"].iter().enumerate() {
+        let provider =
+            registered.iter().find(|r| r["kind"] == *kind).unwrap()["providerId"].clone();
+        let token = format!("acme.core#token#{}", 20 + n);
+        let position = if *kind == "symbols" {
+            Value::Null
+        } else {
+            json!({"line": 1, "column": 1})
+        };
+        e.host.to(EXT, json!({"type": "request", "requestId": format!("slow{n}"), "method": "provider.invoke", "params": {"providerId": provider, "kind": kind, "document": doc_info(1), "position": position, "extra": {"token": token}}}));
+        e.host.to(EXT, json!({"type": "request", "requestId": format!("cancel{n}"), "method": "provider.cancel", "params": {"token": token}}));
+        let mut answered = false;
+        while !answered {
+            if let Some(answer) = e.pump_one(Some("*")) {
+                answered = answer["requestId"] == json!(format!("slow{n}"));
+            }
+        }
+    }
+    assert_eq!(
+        e.step("return [T.completion, T.hover, T.symbols];"),
+        json!([true, true, true])
+    );
+}
+
+#[test]
+fn providers_yavin_does_not_show_are_registered_inert_and_said_once() {
+    let mut e = Ext::start();
+    let out = e.step(
+        r##"let asked = 0;
+        const lens = { provideCodeLenses() { asked++; return []; } };
+        const a = vscode.languages.registerCodeLensProvider("markdown", lens);
+        const b = vscode.languages.registerCodeLensProvider("markdown", lens);
+        const c = vscode.languages.registerFoldingRangeProvider("markdown", { provideFoldingRanges() { asked++; return []; } });
+        a.dispose(); b.dispose(); c.dispose();
+        return { asked, disposable: typeof a.dispose };"##,
+    );
+    assert_eq!(out, json!({"asked": 0, "disposable": "function"}));
+    // Nothing of them reaches Yavin: no registration, no request.
+    assert!(e.asked("languages.register").is_empty());
+    let said: Vec<&String> = e
+        .window
+        .logs
+        .iter()
+        .filter(|l| l.contains("registerCodeLensProvider") && l.contains("not asked"))
+        .collect();
+    assert_eq!(said.len(), 1, "said once: {:?}", e.window.logs);
+    // What Yavin does not provide still says so (not every languages member is inert).
+    let refused = e.step(r#"try { vscode.languages.setLanguageConfiguration("markdown", {}); return "SET"; } catch (error) { return error.code; }"#);
+    assert_eq!(refused, json!("UnsupportedApi"));
+}
+
+#[test]
+fn a_content_provider_answers_the_extensions_own_virtual_documents_afresh_each_time() {
+    let mut e = Ext::start();
+    let out = e.step(
+        r##"let n = 0;
+        const provider = { provideTextDocumentContent: (uri, token) => `schema ${uri.path} #${++n} ${typeof token.isCancellationRequested}` };
+        const reg = vscode.workspace.registerTextDocumentContentProvider("acme-schema", provider);
+        const first = await vscode.workspace.openTextDocument(vscode.Uri.parse("acme-schema:/one.json"));
+        const second = await vscode.workspace.openTextDocument(vscode.Uri.parse("acme-schema:/one.json"));
+        const refusals = {};
+        for (const scheme of ["file", "untitled", "https", "yavin-storage", "not a scheme"]) {
+          try { vscode.workspace.registerTextDocumentContentProvider(scheme, provider); refusals[scheme] = "REGISTERED"; } catch (error) { refusals[scheme] = "refused"; }
+        }
+        try { vscode.workspace.registerTextDocumentContentProvider("acme-schema", provider); refusals.twice = "REGISTERED"; } catch (error) { refusals.twice = "refused"; }
+        reg.dispose();
+        let after;
+        // Disposed: its documents are no longer its provider's (here the window's own answer).
+        try { const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse("acme-schema:/one.json")); after = doc.getText().startsWith("schema") ? "PROVIDED" : "not provided"; } catch (error) { after = "not provided"; }
+        return { first: first.getText(), second: second.getText(), line: first.lineAt(0).text, uri: first.uri.toString(), refusals, after };"##,
+    );
+    assert_eq!(out["first"], "schema /one.json #1 boolean");
+    assert_eq!(
+        out["second"], "schema /one.json #2 boolean",
+        "asked again on each open"
+    );
+    assert_eq!(out["uri"], "acme-schema:/one.json");
+    assert_eq!(
+        out["refusals"],
+        json!({"file": "refused", "untitled": "refused", "https": "refused", "yavin-storage": "refused", "not a scheme": "refused", "twice": "refused"})
+    );
+    assert_eq!(
+        out["after"], "not provided",
+        "a disposed provider answers nothing"
+    );
+    // While registered, the window was never asked for them: they are the extension's documents.
+    assert_eq!(
+        e.asked("documents.get").len(),
+        1,
+        "only the open after disposing asked the window"
+    );
+}
+
+#[test]
+fn tabs_are_the_open_documents_and_follow_open_and_close() {
+    let mut e = Ext::start();
+    e.step(
+        r##"T.changes = [];
+        T.context.subscriptions.push(vscode.window.tabGroups.onDidChangeTabs((c) => T.changes.push({ opened: c.opened.map((t) => t.label), closed: c.closed.map((t) => t.label) })));
+        return 1;"##,
+    );
+    e.event("documents.open", doc_info(1));
+    let out = e.step(
+        r##"await new Promise((r) => setTimeout(r, 20));
+        const groups = vscode.window.tabGroups.all;
+        const tab = groups[0].tabs.find((t) => t.label === "notes.md");
+        let closing;
+        try { await vscode.window.tabGroups.close(tab); closing = "CLOSED"; } catch (error) { closing = error.code; }
+        const doc = vscode.workspace.textDocuments.find((d) => d.uri.path.endsWith("notes.md"));
+        return { groups: groups.length, labels: groups[0].tabs.map((t) => t.label), text: tab.input instanceof vscode.TabInputText, same: tab.input.uri === doc.uri,
+                 active: vscode.window.tabGroups.activeTabGroup.isActive, changes: T.changes, closing };"##,
+    );
+    assert_eq!(out["groups"], 1);
+    assert_eq!(out["labels"], json!(["notes.md"]));
+    assert_eq!(out["text"], true);
+    assert_eq!(out["same"], true, "the tab is the open document's");
+    assert_eq!(out["active"], true);
+    assert_eq!(
+        out["changes"],
+        json!([{"opened": ["notes.md"], "closed": []}])
+    );
+    assert_eq!(
+        out["closing"], "UnsupportedApi",
+        "closing tabs is the user's"
+    );
+    e.event("documents.close", json!({"uri": DOC_URI}));
+    let closed = e.step(r#"await new Promise((r) => setTimeout(r, 20)); return T.changes.at(-1);"#);
+    assert_eq!(closed, json!({"opened": [], "closed": ["notes.md"]}));
+}
