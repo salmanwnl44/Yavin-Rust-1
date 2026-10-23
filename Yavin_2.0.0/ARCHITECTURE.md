@@ -1388,7 +1388,7 @@ IDE-09 is the user-facing side of extensions: a searchable marketplace, installe
 
 ### Open VSX, browse only (EXT-03)
 
-Open VSX is a second marketplace provider, chosen in Settings › Extensions › Marketplace (`extensions.marketplace.source`: `yavin` | `openvsx`, user scope only) or from the Extensions view's ⋯ menu. Its address is `extensions.marketplace.openVsxUrl` (default `https://open-vsx.org/`; a private mirror is any Open VSX server's base URL). One provider is browsed at a time; the results header, the search box and an extension's Information tab ("Source") name it. Open VSX lists **VS Code extensions**: Yavin can browse them, and installs only their colour themes and snippets (EXT-04, below); none of their code runs.
+Open VSX is a second marketplace provider, chosen in Settings › Extensions › Marketplace (`extensions.marketplace.source`: `yavin` | `openvsx`, user scope only) or from the Extensions view's ⋯ menu. Its address is `extensions.marketplace.openVsxUrl` (default `https://open-vsx.org/`; a private mirror is any Open VSX server's base URL). One provider is browsed at a time; the results header, the search box and an extension's Information tab ("Source") name it. Open VSX lists **VS Code extensions**: Yavin installs what it supports of them -- their themes and snippets (EXT-04), languages, grammars, and their code, run in the sandbox through the VS Code compatibility layer ([EXT-25](#open-vsx-compatibility-vs-code-extensions-code-languages-and-grammars-ext-25)).
 
 | Part                                          | Does                                                                                                                                        |
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1400,7 +1400,7 @@ Open VSX is a second marketplace provider, chosen in Settings › Extensions ›
 
 **Trust boundary.** The renderer sends typed requests, never URLs; the native side encodes each segment and value. A URL that an answer names (a package, its `.sha256`, a readme, an icon) is used only when it is inside the registry's base -- or, for open-vsx.org alone, on its file host `openvsx.eclipsecontent.org`, where its `/file/` links redirect (`302`, verified). A mirror's files must stay on the mirror. Metadata answers are at most 4 MiB and 30 s; a document 512 KiB; an icon 256 KiB and must be a PNG.
 
-**Compatibility.** Every Open VSX version is a VS Code package (`packageFormat: "vsix"`). Its record's categories decide what the view offers: one listed under Themes or Snippets is installable, with the note "A VS Code extension: Yavin installs only its colour themes and snippets; its code never runs."; one listed under neither is Incompatible -- "It is a VS Code extension with no colour themes or snippets …" -- and never downloaded; a search entry (no categories) is installable, and the installer reads its record before downloading anything. The package decides in the end (EXT-04). Recommendations, categories and update checks are empty (Open VSX has no category list endpoint, and an installed extension is updated from where it came only once updates track origin).
+**Compatibility.** _Superseded by EXT-25: a listing is "Not verified" until installed, and categories no longer refuse anything._ As EXT-03 had it: every Open VSX version is a VS Code package (`packageFormat: "vsix"`). Its record's categories decided what the view offered: one listed under Themes or Snippets is installable, with the note "A VS Code extension: Yavin installs only its colour themes and snippets; its code never runs."; one listed under neither is Incompatible -- "It is a VS Code extension with no colour themes or snippets …" -- and never downloaded; a search entry (no categories) is installable, and the installer reads its record before downloading anything. The package decides in the end (EXT-04). Recommendations, categories and update checks are empty (Open VSX has no category list endpoint, and an installed extension is updated from where it came only once updates track origin).
 
 **The install path** exists for the inventory's sake and is tested, though the view never offers it: a package source `openVsx` (registry, namespace, name; the version is the operation's). The native side reads that version's record, requires its namespace, name and version to be the ones asked for, takes `files.download` and `files.sha256` from it (checked as above), downloads the package within the package limit (Open VSX publishes no size), and requires its SHA-256 to equal the published one before the archive is validated and handed to the inventory (EXT-02): the staged manifest must be the requested id and version, and the copy records `source: openvsx <registry>`. The package must be a VS Code package (a Yavin one served by Open VSX is refused), adapted as below.
 
@@ -1408,15 +1408,15 @@ Open VSX is a second marketplace provider, chosen in Settings › Extensions ›
 
 **Errors.** `429` → "The extension marketplace is limiting requests; try again in N s." with the registry's `Retry-After` (open-vsx.org sends `x-ratelimit-limit: 10800`); unreachable or `5xx` → unavailable, with Retry; `404` → not found (a missing readme is no readme); a malformed answer → "sent something unexpected". Offline, browsing Open VSX fails like any marketplace; installed extensions are unaffected.
 
-**Deferred.** Browsing both marketplaces at once with source badges (EXT-01 D2); categories, pre-release filtering and per-platform (`targetPlatform`) packages. Running VS Code extension code (Node.js, the `vscode` API) is not planned here.
+**Deferred.** Browsing both marketplaces at once with source badges (EXT-01 D2); categories, pre-release filtering and per-platform (`targetPlatform`) packages. Running VS Code extension code: done in EXT-25, without Node.js.
 
 ### VS Code packages: colour themes and snippets (EXT-04)
 
-Yavin installs **colour themes and snippets** from VS Code extensions (`.vsix`, from Open VSX or a file) and nothing else of them: no VS Code extension code ever runs. A VS Code package is never taken for a Yavin one: an archive's format comes from what it holds -- `yavin-extension.json` at its root (Yavin), or `extension.vsixmanifest` / `extension/package.json` (VS Code, the layout checked on open-vsx.org packages, 2026-10-18) -- and an archive with the marks of both is refused. Yavin's registry must serve Yavin packages and Open VSX VS Code ones; a file may be either.
+Yavin installs **colour themes and snippets** from VS Code extensions (`.vsix`, from Open VSX or a file). _Since EXT-25 it also installs their languages, language configuration and TextMate grammars, and runs their code in the sandbox ([EXT-25](#open-vsx-compatibility-vs-code-extensions-code-languages-and-grammars-ext-25)); what follows is EXT-04's part._ A VS Code package is never taken for a Yavin one: an archive's format comes from what it holds -- `yavin-extension.json` at its root (Yavin), or `extension.vsixmanifest` / `extension/package.json` (VS Code, the layout checked on open-vsx.org packages, 2026-10-18) -- and an archive with the marks of both is refused. Yavin's registry must serve Yavin packages and Open VSX VS Code ones; a file may be either.
 
 ```text
  package (download or file) → .staging/<op>/package.yvx
-   → unpack (extension_package: names, links, Windows names, 1000 entries, 16/64 MiB, 100:1)
+   → unpack (extension_package: names, links, Windows names, 5000 entries, 48/128 MiB, 100:1, 400-byte names, 120 s; EXT-30: a VS Code package's TargetPlatform)
    → format from contents ─ Yavin: yavin-extension.json as published
                            └ VS Code: vsix::adapt → a generated yavin-extension.json
    → staged → commit → finish (EXT-02: immutable store copy, inventory, rollback, origin)
@@ -1429,7 +1429,8 @@ Yavin installs **colour themes and snippets** from VS Code extensions (`.vsix`, 
 | `publisher.name`, `version`                              | the id, folded to Yavin's rule (must be the one asked for); the version (must be the one asked for)      |
 | `contributes.themes` (`.json`)                           | `contributes.themes`: label, `uiTheme` (vs, vs-dark, hc-black, hc-light), path inside `extension/`       |
 | `contributes.snippets`                                   | `contributes.snippets`: language id, path inside `extension/`                                            |
-| a `.tmTheme` theme, icon and product icon themes         | not supported (listed)                                                                                   |
+| a `.tmTheme` theme, product icon themes                  | not supported (listed)                                                                                   |
+| `contributes.iconThemes` (`.json`, EXT-30)               | `contributes.iconThemes`: id, label, path inside `extension/`                                            |
 | `languages` (language configuration), `grammars`         | not supported: Yavin decides each file's language itself, and its editor has no TextMate engine (listed) |
 | `main`, `browser`, `activationEvents`, every other point | never run, never copied into the manifest; listed as not supported                                       |
 | `extensionDependencies`, `extensionPack`                 | not installed (listed)                                                                                   |
@@ -1445,7 +1446,16 @@ Each path must resolve, by the archive's own name rules, to a plain file inside 
 
 **Signatures** are verified since EXT-09 ([below](#extension-signature-verification-and-package-trust-ext-09)); what this paragraph said before -- that the signed bytes were not specified and no Ed25519 implementation was available -- was settled there from the registry's source.
 
-**Not supported** (and not claimed): VS Code extension code (Node.js, the `vscode` API), commands, settings, keybindings, views, debuggers, tasks, language configuration, new languages, TextMate grammars, icon themes, workbench colours, extension packs and dependencies.
+**Not supported at EXT-04** (code, commands, settings, keybindings, views, language configuration, new languages and TextMate grammars followed in EXT-25; file icon themes in EXT-30): debuggers, tasks, workbench colours, extension packs and dependencies.
+
+**File icon themes (EXT-30)** (`services/extensions/iconThemes.ts`, `components/ui/FileIcons.tsx`). The `explorer.iconTheme` setting (user scope) chooses Yavin's own icons (`yavin`) or an enabled extension's theme (`ext:<extension id>:<theme id>`); a chosen theme whose extension is disabled or uninstalled shows Yavin's icons and stays chosen. The theme file and each icon are read through `extensions_read_resource` (the verified copy, contained, at most 1 MiB), the icon on first use. Invariants:
+
+- **Data only.** No extension code: a theme applies with the extension's code never run.
+- **Inside the package.** An icon's path resolves against the theme file's folder and must stay inside the package: no URL, drive, absolute path or `..` above its root (the native read contains it again).
+- **SVG, as an image.** Only SVG icons are drawn, at most 256 KiB each, as `<img src="data:image/svg+xml,…">` built from the file's own text: an image never runs an SVG's scripts or loads what it links to. The CSP allows `img-src data:` only, as before.
+- **Bounded.** At most 10,000 definitions, 50,000 names, 3,000 icons read at once.
+- **As VS Code chooses.** For a file, its whole name, its extensions longest first, its language, the default; for a folder, its name (expanded or not, root or not), the default. The `light` variant first while the editor's theme is light.
+- **Not shown.** Font-character and PNG icons, the high-contrast variant, `hidesExplorerArrows`; product icon themes.
 
 ### Extension security hardening (EXT-06)
 
@@ -1959,7 +1969,9 @@ A rebuild is idempotent and safe to interrupt: each move is one rename, nothing 
 
 **Known limits.** A folder rename, not a directory flush, makes a publish durable on Windows (the standard library cannot flush a directory there). One previous version is kept as the fallback; older ones are deleted. A copy's folder can exceed `MAX_PATH` with deep packages (the standard library uses long paths). Install origin is recorded from now on; adopted IDE-09 installs are `unknown`. The registry URL is the user's setting, held by the renderer; only what its index says is trusted for a package.
 
-**Package limits** (Yavin's own constraints set them: an entry point is at most 2 MiB, a manifest 64 KiB; the Hello World package is 2.4 KiB): 20 MiB compressed, 1000 entries, 16 MiB per file, 64 MiB unpacked, a 100:1 compression ratio per entry above 1 MiB -- each counted while reading, not taken from the archive's headers.
+**Package limits** (Yavin's own constraints set them: an entry point is at most 2 MiB, a manifest 64 KiB; the Hello World package is 2.4 KiB): 20 MiB compressed, 1000 entries, 16 MiB per file, 64 MiB unpacked, a 100:1 compression ratio per entry above 1 MiB -- each counted while reading, not taken from the archive's headers. _Raised at EXT-30_ from measured Open VSX packages ([audit, Part F](OPEN_VSX_COMPATIBILITY_AUDIT.md)): 32 MiB compressed, 5000 entries, 48 MiB per file, 128 MiB unpacked, the same 100:1 ratio, at most 400 bytes per entry name and 120 s to unpack; a VS Code package's `extension/package.json` at most 2 MiB. The installed-copy digest's own bounds (10,000 files, 256 MiB) stay above them. A refused package still leaves nothing behind.
+
+**Platform packages (EXT-30).** A VS Code package built for one platform names it in `extension.vsixmanifest` (`<Identity TargetPlatform=…>`). It is installed only if that is this Yavin's (`extension_package::HOST_PLATFORM`, `win32-x64` for the MSI) or none (`universal`); anything else, `web` included, is `UnsupportedPlatform`, read before a file is written. From Open VSX, `openvsx::choose_variant` picks this platform's variant, else the universal one, from the version's `downloads`, and fetches its own metadata (`/api/{ns}/{name}/{platform}/{version}`); its checksum and signature are checked as any package's, and the package's own `TargetPlatform` must be the one chosen (`ManifestMismatch`). Choosing a variant decides nothing about trust.
 
 **Enable / disable / uninstall / update.** Disable keeps the installation; the host stops the extension and removes its handlers, views' rows, providers and decorations; enable re-registers its contributions and it activates lazily. Uninstall asks first, and whether to delete its stored state (all workspaces) -- its settings values are kept; only extensions in Yavin's own folder can be uninstalled (a development build's repository samples cannot). Update is install over the running version, with the old one kept until the new one is registered, and then as the fallback (EXT-02).
 
@@ -2041,6 +2053,99 @@ The check order is fixed (`registry_trust::authenticate`): an anchor for this ba
 **Tests.** `registry_trust_tests.rs`: a signed, fresh index of the registry verifies; a changed byte, a changed signature, no domain prefix, another algorithm, a short signature -- each refused; unknown, revoked and expired keys, another registry's id or base, rotation (old and new keys both pinned; old revoked); expiry, replay, equivocation, the highest accepted kept; duplicate keys, malformed signature files and metadata; the pinned anchors bind the official base, and the published registry verifies under them (changed by one byte, it does not). Through the real installer on a loopback registry: a signed install recorded `indexSigned` across restarts, and its record rewritten to the origin or to another registry on it no longer vouching; **the attack** (index and checksum replaced together, the old signature beside them), no signature, a same-size package swapped, a replay, another pinned key, another registry's id -- each refused with the installed version, its grant, trust and signature records unchanged and still running; an unpinned registry installing no code; offline and interrupted updates changing nothing; a file never index-signed. **Each protection proven:** eleven mutations (signature not checked; any anchor for any base; replays accepted; expired indexes accepted; duplicate keys accepted; the registry id not checked; revoked keys accepted; a failed index installing anyway; unpinned code installed; an index-signed record accepted for a file; one bound by origin only) are each caught. `registryTrust.test.ts`: each status's wording. UI on the mock: every notice. The installed application (`tests/real/marketplace.spec.ts`): a package from a signed index installed and shown "Verified registry metadata"; the index altered after signing, said, and its update refused with the installed version kept and running; every other packaged test now runs against a signed registry.
 
 **Residual risks.** Key custody (the private key on one machine: back it up offline, or move signing to CI or a hardware key); the index must be re-signed before it expires (yearly); a fresh install has no replay floor until its first verified index; the same-user boundary (EXT-19); publisher identity is not verified; custom registries cannot install code until a way of pinning their keys is designed.
+
+### Open VSX compatibility: VS Code extensions' code, languages and grammars (EXT-25)
+
+The audit, the benchmark and every number: [OPEN_VSX_COMPATIBILITY_AUDIT.md](OPEN_VSX_COMPATIBILITY_AUDIT.md). The API inventory: [`src/services/extensions/vscodeApi.json`](src/services/extensions/vscodeApi.json). Benchmark records: [`benchmark/openvsx/`](benchmark/openvsx/). This section supersedes what EXT-03 and EXT-04 say about VS Code extensions' code, languages and grammars.
+
+```text
+ .vsix ─ unpack (EXT-02 limits, unchanged) ─ vsix::adapt ─┬ themes, snippets (EXT-04)
+                                                          ├ languages, language configuration, TextMate grammars ── window (declarative.ts)
+                                                          └ code: browser before main ── manifest main + vsix.runtime
+ load: extension_host.rs ── read_vscode_main + read_modules (verified copy) + vsix.runtime ──► host
+ host: bootstrap.js + vscode.js ── CommonJS loader, require("vscode"), Node built-ins policy, timers
+       every vscode.* call = the extension protocol's requests, checked natively and in the window
+```
+
+**The adapter** (`vsix.rs`) keeps what Yavin supports, under ids the extension owns, and lists the rest:
+
+- **Code.** The entry point is `browser` before `main`: a web extension is written for a runtime without Node.js. An ES module does not run, and the adapter says so.
+- **Commands, views and view containers.** VS Code ids become `<id>.<slug>-<tag>`; the original ids are kept in `vsix.runtime` for the layer.
+- **Settings.** Boolean, number, string and enum settings become Yavin settings. Others keep their defaults, readable by the code.
+- **Keybindings.** One chord, a key Yavin binds, and a `when` clause that is absent or an editor focus.
+- **Menus.** commandPalette, editor/context, explorer/context and view/title, with Yavin's two `when` conditions.
+- **Activation events.** The ones Yavin raises, plus the implicit ones. `workspaceContains` becomes "in every folder".
+- **Text.** `%key%` texts resolve from `package.nls.json`.
+- **Permissions.** The manifest asks for `documents.read`, `documents.edit`, `editor.control`, `workspace.fs.read` and `secrets`; the user grants each, or not (EXT-07).
+- **Size.** The generated manifest stays within Yavin's 64 KiB, shortening descriptions and then leaving out settings, keybindings and menus if it must.
+
+Copies installed before EXT-25 keep the manifest they were installed with, which has no `main`: their code still never runs.
+
+**The compatibility layer** (`crates/ide-plugin-host/src/vscode.js`, inside the bootstrap) runs only for such an extension.
+
+- **Loading.** It loads the package's `.js`, `.cjs` and `.json` files as CommonJS modules. The native side sends them all at load: at most 2000 files and 24 MiB, from the copy the inventory verified (`extensions::read_modules`). _As Node.js since EXT-28:_ one `require.cache` for the extension, keyed by file name (deleting an entry loads the file again); a module whose code throws is not kept, so requiring it again runs it again (before, it returned its half-built exports); circular requires see the exports as they were; `module.parent`, `children`, `require` and `require.main`. An absolute path is found only inside the extension's package, and climbing out of it is `MODULE_NOT_FOUND`. ES modules are still refused (deferred: OPEN_VSX_COMPATIBILITY_AUDIT.md, §D3).
+- **`require("vscode")`.** This is the API mapped onto the protocol (`vscodeApi.json`). _Corrected at EXT-26:_ graded by evidence, 5 entries are FULL, 31 PARTIAL, 2 STUB (`window.state`, `onDidChangeWindowState`), 63 NOT VERIFIED (implemented, but no test exercises their behaviour) and 83 UNSUPPORTED. EXT-25's "FULL 24, PARTIAL 77, no stubs" counted members that exist, not members that work. The EXT-26 roadmap is in [OPEN_VSX_COMPATIBILITY_AUDIT.md](OPEN_VSX_COMPATIBILITY_AUDIT.md), Part A. _Corrected again at EXT-27,_ from behavioural tests (Part C there): 21 FULL, 80 PARTIAL, no STUB, no NOT VERIFIED, 83 UNSUPPORTED. Every provided entry has at least one test of what it does; most are PARTIAL because they do a documented subset of VS Code's behaviour. _At EXT-28_ the runtime part was graded again (Part D there): 22 FULL, 88 PARTIAL, 83 UNSUPPORTED, of 193 entries. _At EXT-29_ nine entries moved from UNSUPPORTED to PARTIAL (Part E there): 22 FULL, 97 PARTIAL, 74 UNSUPPORTED.
+- **Synchronous reads.** What VS Code gives synchronously (the active editor, documents' text) is fetched before each entry: activation, a command, a provider, an event.
+- **Edits.** Editor and workspace edits are `documents.edit` requests. _Fixed at EXT-27:_ the application's window proxy (`workspaces.ts`) did not forward `documents.edit`, so no edit reached a document in the application; `createWindowProxy` (`extensions/window.ts`) now forwards every member, and a test checks each one. The window applies an edit through `extensions/documentEdit.ts`.
+- **Window state (EXT-27).** `window.state.focused` is the window's real focus (`services/windowFocus.ts`): in the application, whether Windows has the window as its foreground window, not minimized (`src-tauri/src/window_focus.rs`: the `window_focused` command, and `yavin://window-focus` events from WinEvent hooks on the UI thread for foreground and minimize changes); in a browser window, the DOM's focus and blur. Measured in the packaged application, neither the DOM nor Tauri's focus API follows the OS: `document.hasFocus()` stays true when another application takes the foreground or the window is minimized; Tauri's focus events follow WebView2's keyboard focus, and `is_focused` answered false while the window was in front. The host sends `window.state` events on a change only, and answers a `window.state` request; neither needs a permission. `active` is the same as `focused`: Yavin does not track recent interaction. In a window that does not report its focus, reading `window.state` is an `UnsupportedApi`.
+- **Startup activation (fixed at EXT-27).** An extension installed or enabled after the window started still activates on `onStartupFinished` (or `*`) and on the folder opening, as in VS Code, once per registry entry and never while extensions are held (`manager.ts`). Before, it waited for the next window.
+- **Unsupported APIs.** Anything not provided fails with `UnsupportedApi: <api> is not supported by Yavin`, logged once. The host records it per extension, and the extension's page lists it.
+- **Node.js built-ins.** Pure ones are provided: path, events, util, assert, url (EXT-28: `URL`, `URLSearchParams`, and file URLs with Node.js's Windows rules), crypto's random part (EXT-28), Buffer, os (platform only), http status codes, tty, console, `perf_hooks.performance`. Any other built-in loads, but its members fail when used. `process.env` is empty.
+- **Runtime globals (EXT-28).** What QuickJS lacks and VS Code extensions use, installed only where the engine has none:
+  - `URL` and `URLSearchParams` (the WHATWG URL Standard), in `ide-plugin-host/src/web.js`;
+  - `crypto.getRandomValues` and `randomUUID`;
+  - `EventTarget`, `Event`, `AbortController` and `AbortSignal`;
+  - `structuredClone`;
+  - a `navigator` that says it is Yavin's host on Windows;
+  - and, in `intl.js`, the part of `Intl` the benchmark's extensions use: `Collator` (also behind `localeCompare`), `Segmenter` by graphemes, `ListFormat` and `DateTimeFormat`, in English. The rest of `Intl` fails with `UnsupportedApi`.
+
+  The host inserts both files before `vscode.js`. Their behaviour is checked against Node.js's own answers (`tests/runtime.rs`, with vectors from `scripts/runtime-vectors.mjs`).
+
+- **Random values (EXT-28).** The host has one more native function, `__yavin_random(n)`: at most 65,536 bytes from the operating system (`getrandom`; ProcessPrng, which an AppContainer allows). The bootstrap captures it and removes it from `globalThis` before any extension code runs. `Math.random` is never a source.
+- **Unhandled promise rejections (EXT-28).** They are said in the extension's log once an entry's jobs have run, as Node.js says them, at most ten per entry (`runtime.rs`, QuickJS's rejection tracker). Before, they were lost.
+- **Core API (EXT-29).** Pickers, file watchers, save and selection events, formatting and code-action providers, and diagnostics in the Problems view. Each goes through the protocol and both permission checks (`extension_permissions.rs`, `permissions.ts`, the shared `permissions.cases.json`; 30 bridge methods). Nothing gives an extension a file system or a process.
+  - **Prompts.** `showQuickPick` and `showInputBox` are `window.quickPick` / `window.inputBox` requests with an id the extension owns (`<id>#prompt#n`, checked by both sides). The window shows them in Yavin's dialog style, naming the extension (`components/extensions/ExtensionPrompt.tsx`, queued by `extensions/prompts.ts`, at most 8 waiting). `host.ts` keeps an `AbortController` per prompt: an extension's new prompt replaces its open one, and `window.cancelPrompt`, a stop, a crash, a disable and the window closing all answer the prompt with null. A cancelled token settles the extension's promise at once and tells the window to close the prompt; a late answer is dropped. `validateInput` is asked back (`prompt.validate`, the extension's own boxes only, 150 ms after typing stops and again on accept; an error blocks accepting).
+  - **File watchers.** The native watcher's `resource-changes` batches (`App.tsx`) reach the host through `ExtensionWindow.files`. `host.ts` keeps only paths inside the workspace, turns a rename from outside into a create, and sends `files.change` events of at most 500 changes, to extensions that follow it and hold `workspace.fs.read`. The layer matches each watcher's glob or `RelativePattern`, honours its ignore flags, and delivers a rename as a delete, then a create.
+  - **Save and selection events.** `documents.save` (after a save) and `editor.selection` (the active editor's selections, from `cursorStatus`) need `documents.read`. Before a save, `DocumentService.save` awaits one hook (`setBeforeSave`; it does not re-enter for the same document). In the application the hook asks the host's `willSave`: each active extension that follows `documents.willSave`, within one shared 1.5 s budget per save. Its `waitUntil` edits are applied through `DocumentService` (undoable, the document stays dirty) only with `documents.edit`; without it, the edits are refused and logged. A failing hook never stops the save.
+  - **Formatting and code actions.** They are provider kinds (`formatting`, `rangeFormatting`, `codeActions`) on `provider.invoke`, with a 5 s limit for formatting. When Yavin stops waiting, it sends `provider.cancel` and the provider's token is cancelled. `editor/extensionMonaco.ts` applies edits only to the model version they were asked for, and refuses out-of-range or overlapping edits. A code action's edits are kept only for the document asked about; one that edits other files is shown disabled. Its command runs in the extension (`codeAction.run`, offered handles only) through one Monaco command, `yavin.extensions.codeAction`.
+  - **Diagnostics.** `createDiagnosticCollection` sends batched `diagnostics.set` requests (200 files each) and `diagnostics.clear`, for a collection the extension owns (`<id>#diagnostics#n`). `host.ts` validates each file (inside the workspace; untitled documents skipped), range, severity, code, tags and related places. It publishes them to the Problems store (`panel/problems.ts`, which also gives the editor its markers), as owner `ext:<generation>:<collection>:<resource>`. An extension clears only its own problems, and all of them when it stops. Before EXT-29, diagnostics were editor decorations.
+
+**New in the extension API (2.1.0, additive)**:
+
+| Addition                                                                | Where                                                                                             | Bounds                                                                                                                                               |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `setTimeout`, `setInterval`, `setImmediate`, `clear*`                   | `runtime.rs` keeps them; each fires as an entry under the call deadline and the watchdog          | At most 1000 waiting, intervals of at least 10 ms                                                                                                    |
+| `documents.edit` (capability `documents.edit`, granted by the user)     | `host.ts` → `ExtensionWindow.documents.edit` → `DocumentService.edit`                             | Open documents only; one unsaved, undoable change; refused on a stale version, a proposal or a read-only document; at most 1000 edits, 1 MiB of text |
+| `statusBar.set` / `statusBar.remove` (mandatory, owned `<id>#status#n`) | `host.ts` → `StatusBarStore` → `StatusBar.tsx`; a click asks the extension (`statusBar.activate`) | 20 per extension, 100 characters, plain text in Yavin's style, the tooltip names the extension                                                       |
+| A `load` of up to 32 MiB (`protocol.rs`)                                | Only a load: every other message is still at most 1 MiB                                           | —                                                                                                                                                    |
+
+**The host's stack** (fixed by EXT-25): extensions run on a thread with a 32 MiB stack, with QuickJS limited to 8 MiB. Deep recursion is a `RangeError`. Before, it overflowed the native stack and ended the host, because QuickJS's default limit is a Windows main thread's whole stack.
+
+**Languages and grammars in the window.**
+
+- **Associations.** `services/language.ts` adds contributed file extensions and names for files Yavin does not know itself; Yavin's own languages are never re-labelled.
+- **Monaco languages.** `editor/declarativeMonaco.ts` registers a Monaco language for each contributed language that Yavin has no tokenizer of its own for (unknown ones, and the INI stand-ins for TOML and similar), and sets its configuration (`languageConfiguration.ts`; patterns with nested unbounded repetition are refused).
+- **Grammars.** A grammar becomes semantic tokens from a Web Worker (`editor/textmate.worker.ts`, `services/extensions/textmate.ts`). The engine is `@shikijs/vscode-textmate` with Shiki's JavaScript regular-expression engine, because the CSP allows no WebAssembly. The worker is ended after 4 s; budgets are 50 ms a line and 1.5 s a document. Tokens use the theme scope table, so extension themes colour grammar tokens.
+- **Not applied.** Injection grammars.
+
+**Compatibility UX.**
+
+- An Open VSX listing is "Not verified" until installed (`marketplace/versions.ts`); its categories no longer refuse it.
+- An installed extension's page shows the verdict, the installed parts, the activation state and the APIs it used that Yavin lacks (`vscodeCompatibility.ts`).
+- `engines.vscode` is shown and never enforced: Yavin implements APIs, not a VS Code version.
+
+**Install path fix.** Open VSX's file host serves many checksums as `application/octet-stream`. Those packages could not be installed; now a checksum is accepted as text or an octet stream and then checked strictly (`Kind::Checksum`).
+
+**Not supported, and not claimed.**
+
+- Webviews and custom editors.
+- Source control, testing, debug, tasks, notebooks, authentication and terminals.
+- Language servers started by extensions: they need a process or a worker, and an extension may start neither.
+- `createQuickPick` and `createInputBox`, `languages.getDiagnostics` and `onDidChangeDiagnostics`, file-operation events (EXT-29 provides the simple pickers, file watchers, save events, formatting and code actions).
+- ES modules, native modules and Node.js's system modules.
+- Product icon themes; file icon themes drawn with a font or PNG (EXT-30 shows file icon themes' SVG icons).
+
+A Node.js extension worker was investigated and not introduced; the reasons are in the audit, §5.
 
 ### Release hardening and production readiness (EXT-24)
 

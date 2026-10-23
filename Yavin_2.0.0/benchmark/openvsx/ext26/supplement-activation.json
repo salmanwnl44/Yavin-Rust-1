@@ -1,0 +1,34 @@
+{
+  "results": [
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: window.registerWebviewPanelSerializer is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "vscode.simple-browser",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 25,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: window.registerWebviewPanelSerializer is not supported by Yavin."
+      ],
+      "version": "1.95.3"
+    }
+  ]
+}

@@ -63,7 +63,7 @@
 use crate::extension_diagnostics::{code_of, Event};
 use crate::extension_permissions::{need_of_event, need_of_request, Denial, Need};
 use crate::extension_service::{ExtensionService, HostCopy};
-use crate::extensions::read_main;
+use crate::extensions::{read_main, read_modules, read_vscode_main};
 use crate::trust::{require_trust, Trust};
 use crate::Workspace;
 use ide_workspace::lsp_process::{ServerEvents, ServerProcess};
@@ -1236,9 +1236,24 @@ fn prepare(shared: &Shared, message: &str) -> Result<String, String> {
                     ));
                 }
             }
-            let code = read_main(Path::new(&copy.folder), &copy.main)?;
+            let folder = Path::new(&copy.folder);
             let object = value.as_object_mut().ok_or("MalformedMessage")?;
-            object.insert("code".into(), Value::String(code));
+            if let Some(runtime) = &copy.runtime {
+                // A VS Code extension (EXT-25): its entry point and the modules it may
+                // `require`, all from its verified copy, and what the compatibility layer maps.
+                let main = copy.main.replace('\\', "/");
+                let mut modules = read_modules(folder)?;
+                modules.remove(&main); // sent once, as the code
+                object.insert(
+                    "code".into(),
+                    Value::String(read_vscode_main(folder, &copy.main)?),
+                );
+                object.insert("modules".into(), json!(modules));
+                object.insert("main".into(), Value::String(main));
+                object.insert("vscode".into(), runtime.clone());
+            } else {
+                object.insert("code".into(), Value::String(read_main(folder, &copy.main)?));
+            }
             object.insert("extensionPath".into(), Value::String(copy.folder.clone()));
             // What it is once the host says it loaded it (`Shared::screen`): a load that fails
             // leaves the host, and this, as they were.

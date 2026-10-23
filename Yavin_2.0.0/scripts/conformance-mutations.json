@@ -1,0 +1,764 @@
+{
+  "note": "EXT-27: behaviours of the VS Code compatibility layer and its window side, each broken in turn; the tests named must catch it (scripts/conformance-mutations.mjs). Paths are relative to Yavin_2.0.0. EXT-28 adds R1-R21: the runtime (web.js, intl.js, the loader, the random source, rejection reports), each caught by tests/runtime.rs. EXT-29 adds C1-C9 (the window side: prompts, problems, will-save, file events, ownership) and S1-S7 (the layer: watchers, prompts, tokens, validation, code actions, diagnostics batches). EXT-30 adds I1-I8: file icon themes (paths kept inside the package, SVG only and bounded, VS Code's choice of icon, a disabled extension's theme, the manifest's check).",
+  "mutations": [
+    {
+      "id": "EXT-27 B1",
+      "what": "window.state fires on an event that changes nothing",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "if (focused === null || focused === windowFocused) return;",
+          "to": "if (focused === null) return;"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "conformance", "--", "window_state"]
+    },
+    {
+      "id": "EXT-27 B2",
+      "what": "window.state invented when the window does not report it",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "windowFocused = state && typeof state.focused === \"boolean\" ? state.focused : null;",
+          "to": "windowFocused = state && typeof state.focused === \"boolean\" ? state.focused : true;"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "conformance", "--", "window_state"]
+    },
+    {
+      "id": "EXT-27 B3",
+      "what": "provider positions passed 1-based",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "const pos = position ? new Position(position.line - 1, position.column - 1) : null;",
+          "to": "const pos = position ? new Position(position.line, position.column) : null;"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "conformance", "--", "language_providers"]
+    },
+    {
+      "id": "EXT-27 B4",
+      "what": "a disposed provider stays registered",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/bootstrap.js",
+          "from": "        () => call(\"languages.unregister\", { providerId }).catch(() => {}),",
+          "to": "        () => undefined,"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "conformance", "--", "language_providers"]
+    },
+    {
+      "id": "EXT-27 B5",
+      "what": "status bar changes in one turn sent once each",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "        if (pending) return;\n        pending = true;",
+          "to": "        pending = true;"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "conformance", "--", "status_bar"]
+    },
+    {
+      "id": "EXT-27 B6",
+      "what": "warnings shown as errors",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "    const SEVERITY_NAMES = [\"error\", \"warning\", \"info\", \"hint\"];",
+          "to": "    const SEVERITY_NAMES = [\"error\", \"error\", \"info\", \"hint\"];"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "conformance", "--", "diagnostics"]
+    },
+    {
+      "id": "EXT-27 B7",
+      "what": "a tree row runs a command that needs arguments it will not get",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "if (command && !(item.command.arguments && item.command.arguments.length)) row.command = command;",
+          "to": "if (command) row.command = command;"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "conformance", "--", "tree_views"]
+    },
+    {
+      "id": "EXT-27 B8",
+      "what": "an edit names no version (a stale edit would land)",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "        version: entry.info.version,\n        edits: edits.map(",
+          "to": "        version: null,\n        edits: edits.map("
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "conformance", "--", "the_active_editor"]
+    },
+    {
+      "id": "EXT-27 B9",
+      "what": "a closed document stays listed",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "          entry.closed = true;\n          docs.delete(info.uri);",
+          "to": "          entry.closed = true;"
+        }
+      ],
+      "cargo": [
+        "-p",
+        "ide-plugin-host",
+        "--test",
+        "conformance",
+        "--",
+        "document_and_editor_events"
+      ]
+    },
+    {
+      "id": "EXT-27 W1",
+      "what": "the window proxy does not pass edits on (the EXT-25 defect)",
+      "edits": [
+        {
+          "file": "src/services/extensions/window.ts",
+          "from": "        const edit = window().documents.edit;",
+          "to": "        const edit = undefined as ExtensionWindow[\"documents\"][\"edit\"];"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeConformance.test.ts"]
+    },
+    {
+      "id": "EXT-27 W2",
+      "what": "the window proxy does not pass the focus on",
+      "edits": [
+        {
+          "file": "src/services/extensions/window.ts",
+          "from": "      return current()?.focus;",
+          "to": "      return undefined;"
+        }
+      ],
+      "playwright": [
+        "tests/ui/terminal.spec.ts",
+        "-g",
+        "EXT-27 a VS Code extension in the window",
+        "--workers=1"
+      ]
+    },
+    {
+      "id": "EXT-27 W3",
+      "what": "an edit made on an old version lands",
+      "edits": [
+        {
+          "file": "src/services/extensions/documentEdit.ts",
+          "from": "  if (version !== null && doc.version !== version) return false;",
+          "to": ""
+        }
+      ],
+      "node": ["src/services/windowFocus.test.ts"]
+    },
+    {
+      "id": "EXT-27 W4",
+      "what": "the window's focus heard on every event, not on a change",
+      "edits": [
+        {
+          "file": "src/services/windowFocus.ts",
+          "from": "    if (now === focused) return;",
+          "to": ""
+        }
+      ],
+      "node": ["src/services/windowFocus.test.ts"]
+    },
+    {
+      "id": "EXT-27 W5",
+      "what": "a stopped extension's status bar items stay",
+      "edits": [
+        {
+          "file": "src/services/extensions/host.ts",
+          "from": "    options.statusBar?.clearExtension(extensionId, options.generation);",
+          "to": ""
+        }
+      ],
+      "node": ["src/services/extensions/vscodeConformance.test.ts"]
+    },
+    {
+      "id": "EXT-27 W6",
+      "what": "another extension's status bar id accepted (the permission rule that decides)",
+      "edits": [
+        {
+          "file": "src/services/extensions/permissions.ts",
+          "from": "    case \"statusBar.set\":\n    case \"statusBar.remove\":\n      return owned(params, \"id\", caller, \"#\");",
+          "to": "    case \"statusBar.set\":\n    case \"statusBar.remove\":\n      return none;"
+        }
+      ],
+      "node": [
+        "src/services/extensions/permissions.test.ts",
+        "src/services/extensions/vscodeConformance.test.ts"
+      ]
+    },
+    {
+      "id": "EXT-27 W7",
+      "what": "an extension installed after the window started waits for the next window (onStartupFinished not delivered late)",
+      "edits": [
+        {
+          "file": "src/services/extensions/manager.ts",
+          "from": "  const stopFollowing = options.registry.subscribe(startLate);",
+          "to": "  const stopFollowing = () => undefined;"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeConformance.test.ts"]
+    },
+    {
+      "id": "EXT-27 W8",
+      "what": "a late isFocused answer overrides a newer native focus event",
+      "edits": [
+        {
+          "file": "src/services/windowFocus.ts",
+          "from": "      if (!heard && !disposed) state.set(focused);",
+          "to": "      if (!disposed) state.set(focused);"
+        }
+      ],
+      "node": ["src/services/windowFocus.test.ts"]
+    },
+    {
+      "id": "EXT-28 R1",
+      "what": "crypto's random values from Math.random",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/web.js",
+          "from": "      const hex = random(n);",
+          "to": "      const hex = Array.from({ length: n }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, \"0\")).join(\"\");"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "crypto_gives"]
+    },
+    {
+      "id": "EXT-28 R2",
+      "what": "getRandomValues' 65536-byte quota not enforced",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/web.js",
+          "from": "      if (array.byteLength > QUOTA)\n",
+          "to": "      if (false)\n"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "crypto_gives"]
+    },
+    {
+      "id": "EXT-28 R3",
+      "what": "the host's random function left reachable by extensions",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/bootstrap.js",
+          "from": "  delete globalThis.__yavin_random;\n",
+          "to": "\n"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "crypto_gives"]
+    },
+    {
+      "id": "EXT-28 R4",
+      "what": "a module whose code threw kept in require.cache",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "        delete requireCache[filename];\n",
+          "to": "\n"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "commonjs_caches"]
+    },
+    {
+      "id": "EXT-28 R5",
+      "what": "require.cache inert (a new object for each require)",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "      require.cache = requireCache;",
+          "to": "      require.cache = {};"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "commonjs_caches"]
+    },
+    {
+      "id": "EXT-28 R6",
+      "what": "an absolute path outside the package not refused as such",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "      if (!full.toLowerCase().startsWith(`${root.toLowerCase()}/`)) return null;\n",
+          "to": "\n"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "commonjs_caches"]
+    },
+    {
+      "id": "EXT-28 R7",
+      "what": "a special URL's query does not encode the apostrophe",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/web.js",
+          "from": "    const SPECIAL_QUERY = (c) => QUERY(c) || c === 0x27;",
+          "to": "    const SPECIAL_QUERY = QUERY;"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "url_parsing"]
+    },
+    {
+      "id": "EXT-28 R8",
+      "what": "IPv4 hexadecimal parts not parsed",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/web.js",
+          "from": "      if (/^0[xX]/.test(text)) (text = text.slice(2)), (radix = 16);\n",
+          "to": "\n"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "url_parsing"]
+    },
+    {
+      "id": "EXT-28 R9",
+      "what": "percent-encoded dot segments (%2e) not removed",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/web.js",
+          "from": "    const doubleDot = (s) => [\"..\", \".%2e\", \"%2e.\", \"%2e%2e\"].includes(s.toLowerCase());",
+          "to": "    const doubleDot = (s) => s === \"..\";"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "url_parsing"]
+    },
+    {
+      "id": "EXT-28 R10",
+      "what": "Collator's numeric option ignored",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/intl.js",
+          "from": "        const numeric = pick(o, \"numeric\", [true, false], false);",
+          "to": "        const numeric = false;"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "the_collator"]
+    },
+    {
+      "id": "EXT-28 R11",
+      "what": "accents ignored at accent sensitivity",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/intl.js",
+          "from": "        const accents = sensitivity === \"accent\" || sensitivity === \"variant\";",
+          "to": "        const accents = sensitivity === \"variant\";"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "the_collator"]
+    },
+    {
+      "id": "EXT-28 R12",
+      "what": "an emoji ZWJ sequence split into graphemes",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/intl.js",
+          "from": "          else if (emoji === 2 && cls === \"ExtPict\") join = true;\n",
+          "to": "\n"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "list_formats_graphemes"]
+    },
+    {
+      "id": "EXT-28 R13",
+      "what": "a rejection handled later still said unhandled",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/runtime.rs",
+          "from": "                if handled {",
+          "to": "                if handled && false {"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "unhandled_rejections"]
+    },
+    {
+      "id": "EXT-28 R14",
+      "what": "a once listener runs every time",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/web.js",
+          "from": "          if (entry.once) this.removeEventListener(state.type, entry.listener, { capture: entry.capture });\n",
+          "to": "\n"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "events_and_abort"]
+    },
+    {
+      "id": "EXT-28 R15",
+      "what": "an AbortSignal aborts (and dispatches) twice",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/web.js",
+          "from": "      if (state.aborted) return;\n      state.aborted = true;",
+          "to": "      state.aborted = true;"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "events_and_abort"]
+    },
+    {
+      "id": "EXT-28 R16",
+      "what": "structuredClone loses shared references and cycles",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/web.js",
+          "from": "        if (seen.has(v)) return seen.get(v);\n",
+          "to": "\n"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "structured_clone"]
+    },
+    {
+      "id": "EXT-28 R17",
+      "what": "a 24-hour hour not resolved as two digits",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/intl.js",
+          "from": "        if (fields.hour !== undefined && (cycle === \"h23\" || cycle === \"h24\")) fields.hour = \"2-digit\";\n",
+          "to": "\n"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "list_formats_graphemes"]
+    },
+    {
+      "id": "EXT-28 R18",
+      "what": "localeCompare by code units (not the collator)",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/intl.js",
+          "from": "Object.defineProperty(String.prototype, \"localeCompare\", {",
+          "to": "Object.defineProperty({}, \"localeCompare\", {"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "locales_and"]
+    },
+    {
+      "id": "EXT-28 R19",
+      "what": "Intl.DateTimeFormat not callable without new",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/intl.js",
+          "from": "      DateTimeFormat: callable(DateTimeFormat, \"DateTimeFormat\"),",
+          "to": "      DateTimeFormat,"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "locales_and"]
+    },
+    {
+      "id": "EXT-28 R20",
+      "what": "a URL's host setter rolls back on a bad port",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/web.js",
+          "from": "        parse(usv(value), null, url, \"host\");",
+          "to": "        const copy = Object.assign({}, url);\n        if (parse(usv(value), null, copy, \"host\") !== FAILURE) Object.assign(url, copy);"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "url_setters"]
+    },
+    {
+      "id": "EXT-28 R21",
+      "what": "unhandled rejections not said at all",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/runtime.rs",
+          "from": "        for reason in unhandled.iter().take(MAX_REJECTIONS) {",
+          "to": "        for reason in unhandled.iter().take(0) {"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "runtime", "--", "unhandled_rejections"]
+    },
+    {
+      "id": "EXT-29 C1",
+      "what": "a stopped extension's open prompt is not cancelled",
+      "edits": [
+        {
+          "file": "src/services/extensions/host.ts",
+          "from": "      if (prompt.extensionId === extensionId) {",
+          "to": "      if (prompt.extensionId === extensionId && false) {"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeCoreApi.test.ts"]
+    },
+    {
+      "id": "EXT-29 C2",
+      "what": "a stopped extension's problems stay in the Problems view",
+      "edits": [
+        {
+          "file": "src/services/extensions/host.ts",
+          "from": "    for (const owner of problemOwners.get(extensionId) ?? []) options.problems?.clear(owner);",
+          "to": "    for (const owner of [] as string[]) options.problems?.clear(owner);"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeCoreApi.test.ts"]
+    },
+    {
+      "id": "EXT-29 C3",
+      "what": "an extension's new prompt does not replace its open one",
+      "edits": [
+        {
+          "file": "src/services/extensions/host.ts",
+          "from": "      if (prompt.extensionId === one.entry.id) {\n        prompts.delete(other);",
+          "to": "      if (false) {\n        prompts.delete(other);"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeCoreApi.test.ts"]
+    },
+    {
+      "id": "EXT-29 C4",
+      "what": "will-save edits are taken without documents.edit",
+      "edits": [
+        {
+          "file": "src/services/extensions/host.ts",
+          "from": "            if (!allowed(one, DOCUMENTS_EDIT)) {",
+          "to": "            if (false) {"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeCoreApi.test.ts"]
+    },
+    {
+      "id": "EXT-29 C5",
+      "what": "a save waits for its will-save listeners far past the budget",
+      "edits": [
+        {
+          "file": "src/services/extensions/host.ts",
+          "from": "      const deadline = Date.now() + WILL_SAVE_MS;",
+          "to": "      const deadline = Date.now() + 60 * WILL_SAVE_MS;"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeCoreApi.test.ts"]
+    },
+    {
+      "id": "EXT-29 C6",
+      "what": "diagnostics.clear clears every collection of the extension",
+      "edits": [
+        {
+          "file": "src/services/extensions/host.ts",
+          "from": "        if (owner.startsWith(prefix)) {",
+          "to": "        if (owner.length > 0) {"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeCoreApi.test.ts"]
+    },
+    {
+      "id": "EXT-29 C7",
+      "what": "file events are not forwarded to extensions",
+      "edits": [
+        {
+          "file": "src/services/extensions/host.ts",
+          "from": "      emit(\"files.change\", { changes: out.slice(i, i + FILE_EVENT_CHANGES) });",
+          "to": "      void emit;"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeCoreApi.test.ts"]
+    },
+    {
+      "id": "EXT-29 S1",
+      "what": "a watcher's ignore flags are ignored",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "            if (watcher.ignore[kind] || !watcher.test(target)) continue;",
+          "to": "            if (!watcher.test(target)) continue;"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "core_api", "--", "file_watchers"]
+    },
+    {
+      "id": "EXT-29 S2",
+      "what": "a rename's create comes before its delete",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "[...(from ? [[\"delete\", from]] : []), [\"create\", uri]]",
+          "to": "[[\"create\", uri], ...(from ? [[\"delete\", from]] : [])]"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "core_api", "--", "file_watchers"]
+    },
+    {
+      "id": "EXT-29 S3",
+      "what": "a cancelled prompt waits for the window instead of settling",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "          resolve(null);\n",
+          "to": "          void 0;\n"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "core_api", "--", "quick_pick"]
+    },
+    {
+      "id": "EXT-29 S4",
+      "what": "a listener added to a cancelled token is never called",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "          const timer = setTimeout(() => listener.call(thisArg, undefined), 0);",
+          "to": "          const timer = 0;"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "core_api", "--", "formatting"]
+    },
+    {
+      "id": "EXT-29 S5",
+      "what": "an input box's validator answers for another prompt id",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "      const validate = validators.get(id);",
+          "to": "      const validate = validators.get(id) || [...validators.values()][0];"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "core_api", "--", "input_validation"]
+    },
+    {
+      "id": "EXT-29 S6",
+      "what": "a code action never offered can be run",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "        const command = offeredActions.get(params && params.handle);",
+          "to": "        const command = offeredActions.get(params && params.handle) || { command: \"core.fix\", arguments: [] };"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "core_api", "--", "formatting"]
+    },
+    {
+      "id": "EXT-29 S7",
+      "what": "diagnostics are sent in unbounded requests",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "        for (let i = 0; i < entries.length; i += 200)",
+          "to": "        for (let i = 0; i < entries.length; i += 5000)"
+        }
+      ],
+      "cargo": ["-p", "ide-plugin-host", "--test", "core_api", "--", "diagnostics"]
+    },
+    {
+      "id": "EXT-29 C8",
+      "what": "diagnostic collections need not be the extension's own (window)",
+      "edits": [
+        {
+          "file": "src/services/extensions/permissions.ts",
+          "from": "    case \"diagnostics.clear\":\n      return owned(params, \"collection\", caller, \"#\");",
+          "to": "    case \"diagnostics.clear\":\n      return { kind: \"none\" };"
+        }
+      ],
+      "node": ["src/services/extensions/permissions.test.ts"]
+    },
+    {
+      "id": "EXT-29 C9",
+      "what": "prompts need not be the extension's own (window)",
+      "edits": [
+        {
+          "file": "src/services/extensions/permissions.ts",
+          "from": "    case \"window.cancelPrompt\":\n      return owned(params, \"id\", caller, \"#\");",
+          "to": "    case \"window.cancelPrompt\":\n      return { kind: \"none\" };"
+        }
+      ],
+      "node": ["src/services/extensions/permissions.test.ts"]
+    },
+    {
+      "id": "EXT-30 I1",
+      "what": "an icon path may climb out of the package",
+      "edits": [
+        {
+          "file": "src/services/extensions/iconThemes.ts",
+          "from": "      if (!parts.length) return null;",
+          "to": "      if (!parts.length) continue;"
+        }
+      ],
+      "node": ["src/services/extensions/iconThemes.test.ts"]
+    },
+    {
+      "id": "EXT-30 I2",
+      "what": "an icon path may be a URL or absolute",
+      "edits": [
+        {
+          "file": "src/services/extensions/iconThemes.ts",
+          "from": "  if (/^[a-z][a-z0-9+.-]*:/i.test(relative) || relative.startsWith(\"/\") || relative.includes(\"\\\\\"))",
+          "to": "  if (false)"
+        }
+      ],
+      "node": ["src/services/extensions/iconThemes.test.ts"]
+    },
+    {
+      "id": "EXT-30 I3",
+      "what": "an icon is drawn whatever its size",
+      "edits": [
+        {
+          "file": "src/services/extensions/iconThemes.ts",
+          "from": "text.length > MAX_ICON_BYTES) return null;",
+          "to": "text.length > Infinity) return null;"
+        }
+      ],
+      "node": ["src/services/extensions/iconThemes.test.ts"]
+    },
+    {
+      "id": "EXT-30 I4",
+      "what": "anything is drawn as an SVG",
+      "edits": [
+        {
+          "file": "src/services/extensions/iconThemes.ts",
+          "from": "  if (!/^(<\\?xml[^>]*>\\s*)?(<!--[\\s\\S]*?-->\\s*|<!DOCTYPE[^>]*>\\s*)*<svg[\\s>]/i.test(start))",
+          "to": "  if (false)"
+        }
+      ],
+      "node": ["src/services/extensions/iconThemes.test.ts"]
+    },
+    {
+      "id": "EXT-30 I5",
+      "what": "icon definitions are not bounded",
+      "edits": [
+        {
+          "file": "src/services/extensions/iconThemes.ts",
+          "from": "    if (icons.size >= MAX_DEFINITIONS) {",
+          "to": "    if (false) {"
+        }
+      ],
+      "node": ["src/services/extensions/iconThemes.test.ts"]
+    },
+    {
+      "id": "EXT-30 I6",
+      "what": "the shortest extension wins",
+      "edits": [
+        {
+          "file": "src/services/extensions/iconThemes.ts",
+          "from": "  for (let i = 1; i < parts.length; i++) {",
+          "to": "  for (let i = parts.length - 1; i >= 1; i--) {"
+        }
+      ],
+      "node": ["src/services/extensions/iconThemes.test.ts"]
+    },
+    {
+      "id": "EXT-30 I7",
+      "what": "a theme whose extension is disabled stays shown",
+      "edits": [
+        {
+          "file": "src/services/extensions/iconThemes.ts",
+          "from": "      if (loaded) {\n        loaded = null;",
+          "to": "      if (false) {\n        loaded = null;"
+        }
+      ],
+      "node": ["src/services/extensions/iconThemes.test.ts"]
+    },
+    {
+      "id": "EXT-30 I8",
+      "what": "a manifest's icon theme path is not checked",
+      "edits": [
+        {
+          "file": "src/services/extensions/manifest.ts",
+          "from": "      if (!insidePath(theme.path) || !theme.path.toLowerCase().endsWith(\".json\"))",
+          "to": "      if (false)"
+        }
+      ],
+      "node": ["src/services/extensions/iconThemes.test.ts"]
+    }
+  ]
+}

@@ -17,7 +17,36 @@ export interface CursorStatus {
   /** The document's indentation, as Monaco detected or was told it. */
   insertSpaces: boolean;
   tabSize: number;
+  /**
+   * The selections (EXT-29, for extensions' selection events): 1-based ranges, the primary
+   * first, each noting whether it runs backwards; at most 100.
+   */
+  selections?: readonly CursorSelection[];
+  /** What moved them last: typing, the mouse, or a command (null: an edit or the editor itself). */
+  source?: "keyboard" | "mouse" | "command" | null;
 }
+
+export interface CursorSelection {
+  startLine: number;
+  startColumn: number;
+  endLine: number;
+  endColumn: number;
+  reversed: boolean;
+}
+
+const sameSelections = (a?: readonly CursorSelection[], b?: readonly CursorSelection[]) =>
+  a === b ||
+  (!!a &&
+    !!b &&
+    a.length === b.length &&
+    a.every(
+      (one, i) =>
+        one.startLine === b[i].startLine &&
+        one.startColumn === b[i].startColumn &&
+        one.endLine === b[i].endLine &&
+        one.endColumn === b[i].endColumn &&
+        one.reversed === b[i].reversed,
+    ));
 
 export function createCursorStatus() {
   let current: CursorStatus | null = null;
@@ -31,7 +60,8 @@ export function createCursorStatus() {
       a.selected === b.selected &&
       a.cursors === b.cursors &&
       a.insertSpaces === b.insertSpaces &&
-      a.tabSize === b.tabSize);
+      a.tabSize === b.tabSize &&
+      sameSelections(a.selections, b.selections));
   return {
     /** Null while no editor is showing a document. */
     get: (): CursorStatus | null => current,

@@ -103,6 +103,10 @@ import { createOutlineStore, toOutline } from "./services/lsp/outline";
 import { OutlineSection, SymbolCrumbs } from "./components/layout/Outline";
 import type { DocumentSymbol, SymbolInformation } from "./services/lsp/protocol";
 import { LineIndex } from "./services/lsp/positions";
+import { applyExtensionEdit } from "./services/extensions/documentEdit";
+import { browserWindowFocus, tauriWindowFocus } from "./services/windowFocus";
+import { createPromptService } from "./services/extensions/prompts";
+import { ExtensionPrompt } from "./components/extensions/ExtensionPrompt";
 import type { LanguageFeaturesHost } from "./editor/lspMonaco";
 import type { EditorRange } from "./editor/editorTypes";
 import type { PaletteSymbol, SymbolScope } from "./components/command-palette/CommandPalette";
@@ -112,6 +116,7 @@ import {
   currentGit,
   declarativeContributions,
   extensionDecorations,
+  extensionStatusBar,
   extensionProviders,
   extensionInstaller,
   extensionRegistry,
@@ -147,11 +152,13 @@ import { ExtensionError } from "./services/extensions/errors";
 import { registryRefusal, registryTrust } from "./services/extensions/marketplace/registryTrust";
 import { discoverInstalledOnce } from "./services/extensions/discovery";
 import { followContributedThemes } from "./editor/themes";
+import { iconThemes } from "./services/extensions/iconThemes";
 import { documentInfoOf } from "./services/extensions/documentInfo";
 import { describeCapability } from "./services/extensions/permissions";
 import type {
   DocumentEvent as ExtensionDocumentEvent,
   DocumentInfo,
+  FileChange,
 } from "./services/extensions/window";
 import { commandRegistry } from "./services/commandRegistry";
 import { DebugError } from "./services/debug/errors";
@@ -866,6 +873,14 @@ export default function App() {
   }, [reportError]);
 
   const watchTracker = useRef(createWatchTracker());
+  /** Extensions following the workspace's file changes (EXT-29: VS Code's file watchers). */
+  const extensionFileListeners = useRef(
+    new Set<(changes: readonly FileChange[]) => void>(),
+  ).current;
+  /** Extensions' pickers and input boxes (EXT-29), one shown at a time. */
+  const extensionPrompts = useRef(createPromptService()).current;
+  // When the window closes, every prompt still waiting is answered (cancelled), never left open.
+  useEffect(() => () => extensionPrompts.cancelAll(), [extensionPrompts]);
   /** The language servers (set once they exist, below); the watcher tells them about files. */
   const lspRef = useRef<ReturnType<typeof createLspManager> | null>(null);
   useEffect(() => {
@@ -879,6 +894,15 @@ export default function App() {
       void documents.applyResourceChanges(batch.changes, batch.rescan).catch(reportError);
       // Language servers hear about the files they registered for, whoever changed them.
       lspRef.current?.filesChanged(batch.changes);
+      // So do extensions' file watchers (EXT-29), through their host (inside the workspace only).
+      if (extensionFileListeners.size && batch.changes.length) {
+        const changes: FileChange[] = batch.changes.map((change) => ({
+          kind: change.kind,
+          path: change.path,
+          ...(change.kind === "renamed" ? { from: change.from } : {}),
+        }));
+        for (const listener of [...extensionFileListeners]) listener(changes);
+      }
       const external = batch.changes.filter((change) => change.operation === undefined);
       void explorer
         .applyResourceChanges(external, batch.rescan)
@@ -904,7 +928,7 @@ export default function App() {
       stopChanges();
       stopStatus();
     };
-  }, [documents, explorer, reportError, rootPath]);
+  }, [documents, explorer, reportError, rootPath, extensionFileListeners]);
 
   // What the Document Model decides, the editors follow: a document that became another file
   // (Save As, or a rename) takes its tab and undo history with it; a conflict is said once.
@@ -1332,6 +1356,14 @@ export default function App() {
   // included, so there is one store for each, not window state beside a setting.
   const settingsWorkspace = workspace.folders.length ? workspace.id : null;
   const editorView = useEditorSettings(settings, settingsWorkspace, minimap);
+  // A file icon theme's light variant (EXT-30) applies while the editor's theme is light.
+  useEffect(() => {
+    const id = editorView.settings.theme;
+    const contributed = declarativeContributions.getSnapshot().themes.find((one) => one.id === id);
+    iconThemes.setLight(
+      id === "yavin-light" || contributed?.base === "vs" || contributed?.base === "hc-light",
+    );
+  }, [editorView.settings.theme]);
   const { wordWrap, zoom } = editorView;
   /** A View-menu toggle writes where the value comes from: this workspace if it set one. */
   const changeSetting = <T,>(definition: SettingDefinition<T>, value: T) => {
@@ -1422,6 +1454,9 @@ export default function App() {
   }, [taskSnapshot.revealRequest, revealTerminals]);
   // --- Extensions (IDE-07/08): the registry's contributions, run by the workspace's host manager --
   const extensionHost = workspace.services.extensions;
+  /** The workspace in front's extensions, for the save step set once (EXT-29). */
+  const extensionHostRef = useRef(extensionHost);
+  extensionHostRef.current = extensionHost;
   const extensionSnapshot = useSyncExternalStore(
     extensionRegistry.subscribe,
     extensionRegistry.getSnapshot,
@@ -1450,6 +1485,15 @@ export default function App() {
   const runExtensionCommand = (command: string) => {
     void extensionHost.executeCommand(command).catch(reportExtensionError);
   };
+  // Extensions' status bar items (EXT-25): clicking one runs what its extension gave it.
+  const extensionStatusItems = useMemo(
+    () => ({
+      store: extensionStatusBar,
+      onActivate: (id: string) =>
+        void extensionHost.activateStatusItem(id).catch(reportExtensionError),
+    }),
+    [extensionHost],
+  );
   // Workspace Trust changing: revoked, the extension host ends at once; granted, it may run.
   useEffect(() => {
     void extensionHost.setTrusted(trust.trusted);
@@ -2015,6 +2059,9 @@ export default function App() {
     });
     const inEditor = () =>
       !!editorRef.current && !!activeTabRef.current && activeTabRef.current.id !== "welcome";
+    // The OS's foreground window in the application (EXT-27: neither the DOM nor Tauri's focus
+    // API follows it there), else the DOM.
+    const focus = isTauri() ? tauriWindowFocus() : browserWindowFocus();
     provideExtensionWindow({
       documents: {
         all: () => documents.all().map(documentInfoOf),
@@ -2023,6 +2070,12 @@ export default function App() {
           return doc ? documentInfoOf(doc) : null;
         },
         text: (resource) => findDoc(resource)?.text ?? null,
+        // EXT-25: an extension's edit, as one unsaved change of the document (undoable in its
+        // editor), on the document model -- the same way a language server's edit lands.
+        edit: (resource, version, edits) =>
+          applyExtensionEdit(documents, findDoc(resource), version, edits, (doc) =>
+            latestForLsp.current.editAnyway.has(doc.id),
+          ),
         subscribe: (listener) =>
           documents.subscribe((event) => {
             const kind: ExtensionDocumentEvent | null =
@@ -2032,7 +2085,10 @@ export default function App() {
                   ? "change"
                   : event.type === "closed"
                     ? "close"
-                    : null;
+                    : // EXT-29: a save that succeeded (VS Code's onDidSaveTextDocument).
+                      event.type === "saved"
+                      ? "save"
+                      : null;
             if (!kind) return;
             const doc = documents.all().find((one) => one.id === event.id);
             const info = doc ? documentInfoOf(doc) : lastInfo.get(event.id);
@@ -2051,8 +2107,30 @@ export default function App() {
           const column = cursor?.column ?? 1;
           return {
             document: documentInfoOf(doc),
-            selection: { startLine: line, startColumn: column, endLine: line, endColumn: column },
+            // EXT-29: the primary selection itself (and its direction), not only the cursor.
+            selection: cursor?.selections?.[0] ?? {
+              startLine: line,
+              startColumn: column,
+              endLine: line,
+              endColumn: column,
+            },
           };
+        },
+        // EXT-29: the active editor's selections changing (each change once).
+        onSelection(listener) {
+          let last = cursorStatus.get()?.selections;
+          return cursorStatus.subscribe(() => {
+            const cursor = cursorStatus.get();
+            const tab = activeTabRef.current;
+            const doc = tab && tab.id !== "welcome" ? documents.get(tab.path) : undefined;
+            if (!cursor?.selections?.length || !doc || cursor.selections === last) return;
+            last = cursor.selections;
+            listener({
+              resource: documentInfoOf(doc).resourceId,
+              selections: cursor.selections,
+              kind: cursor.source ?? null,
+            });
+          });
         },
         onActive(listener) {
           activeEditorListeners.add(listener);
@@ -2072,9 +2150,39 @@ export default function App() {
         },
       },
       readFile: (path) => native("read_file_content", { path }),
+      // EXT-27: the window's real focus (its focus and blur events), for window.state.
+      focus: focus ?? undefined,
+      // EXT-29: the native watcher's batches, and Yavin's picker and input box.
+      files: {
+        subscribe(listener) {
+          extensionFileListeners.add(listener);
+          return () => extensionFileListeners.delete(listener);
+        },
+      },
+      prompts: {
+        quickPick: (request, signal) => extensionPrompts.quickPick(request, signal),
+        inputBox: (request, signal) => extensionPrompts.inputBox(request, signal),
+      },
     });
-    return () => provideExtensionWindow(null);
-  }, [documents, cursorStatus, activeEditorListeners]);
+    // EXT-29: before a save, the extensions following will-save may edit the document (their
+    // waitUntil edits, within 1.5 s in all): applied as one undoable change at the version they
+    // were made for -- all together, or, if they overlap, the first extension's only.
+    documents.setBeforeSave(async (doc) => {
+      const info = documentInfoOf(doc);
+      const answers = await extensionHostRef.current?.willSave(info, "manual");
+      if (!answers?.length) return;
+      const unlocked = (one: TextDocument) => latestForLsp.current.editAnyway.has(one.id);
+      const current = () => findDoc(info.resourceId);
+      const all = answers.flatMap((answer) => answer.edits);
+      if (!applyExtensionEdit(documents, current(), info.version, all, unlocked))
+        applyExtensionEdit(documents, current(), info.version, answers[0].edits, unlocked);
+    });
+    return () => {
+      documents.setBeforeSave(null);
+      provideExtensionWindow(null);
+      focus?.dispose();
+    };
+  }, [documents, cursorStatus, activeEditorListeners, extensionFileListeners, extensionPrompts]);
   // Extensions in the editor (IDE-08): providers, decorations, editor/context items.
   const editorContextCommands = useMemo(
     () =>
@@ -4059,6 +4167,7 @@ export default function App() {
           onManageTrust={() => setTrustDialog("manage")}
           cursorStatus={cursorStatus}
           languageStatus={languageStatus}
+          extensionItems={extensionStatusItems}
           onGoToLine={() => {
             const goToLine = commands.find((command) => command.id === "go.line");
             if (goToLine && !goToLine.disabled) void run(async () => goToLine.run());
@@ -4077,6 +4186,8 @@ export default function App() {
             onClose={() => setTrustDialog(null)}
           />
         )}
+        {/* EXT-29: an extension's picker or input box, one at a time. */}
+        <ExtensionPrompt prompts={extensionPrompts} />
         {dialog && (
           <AppDialog
             key={dialogKey(dialog)}

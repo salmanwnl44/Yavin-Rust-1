@@ -462,6 +462,9 @@ pub struct HostCopy {
     /// its code to act. `installed`: it was an installed copy (not a development one) when
     /// loaded.
     pub requires: Vec<HostRequirement>,
+    /// A VS Code extension's code (EXT-25): its generated manifest's `vsix.runtime` -- what the
+    /// compatibility layer maps (commands, settings, views); none for a Yavin extension.
+    pub runtime: Option<serde_json::Value>,
 }
 
 /// A profile switch (EXT-13): the profiles now, and which enabled extensions it leaves unable
@@ -2595,12 +2598,21 @@ impl ExtensionService {
             .find(|one| one.id.as_deref() == Some(id.as_str()) && one.error.is_none())
             .cloned()
             .ok_or_else(|| format!("UnknownExtension: {id} is not installed."))?;
-        let main = chosen
+        let manifest = chosen
             .manifest
             .as_deref()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
+        let main = manifest
+            .as_ref()
             .and_then(|value| value.get("main")?.as_str().map(str::to_string))
             .ok_or_else(|| format!("UnsupportedRuntime: {id} has no code (no \"main\")."))?;
+        let runtime = manifest
+            .as_ref()
+            .and_then(|value| value.get("vsix")?.get("runtime"))
+            .filter(|runtime| {
+                runtime.get("api").and_then(serde_json::Value::as_str) == Some("vscode")
+            })
+            .cloned();
         // Only a copy whose files are bound and whose trust record verifies runs (EXT-17,
         // EXT-19); every other is refused, saying why, with the way out.
         if let Some(integrity) = chosen.integrity.as_ref().filter(|i| !i.runs) {
@@ -2646,6 +2658,7 @@ impl ExtensionService {
             requested: state.requested.into_iter().collect(),
             origin,
             requires,
+            runtime,
         })
     }
 

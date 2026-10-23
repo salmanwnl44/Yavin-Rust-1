@@ -52,7 +52,9 @@ test("permissions: every bridge method the host serves has a decision", () => {
   const methods = [...host.slice(start, end).matchAll(/^\s+(?:async )?"([a-zA-Z.]+)"\(/gm)].map(
     (match) => match[1],
   );
-  assert.equal(methods.length, 21, methods.join(", "));
+  // EXT-25: documents.edit, statusBar.set, statusBar.remove; EXT-27: window.state; EXT-29:
+  // window.quickPick, window.inputBox, window.cancelPrompt, diagnostics.set, diagnostics.clear.
+  assert.equal(methods.length, 30, methods.join(", "));
   for (const method of methods)
     assert.notEqual(needOfRequest("acme.hello", method, {}).kind, "unknown", method);
 });

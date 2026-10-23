@@ -6,11 +6,12 @@
  * is shown: an entry whose id is not a Yavin id, or whose fields are not what Open VSX
  * documents, is dropped or left out -- nothing is invented.
  *
- * Open VSX serves VS Code extensions (`.vsix`, the `vscode` API, Node.js). Yavin runs none of
- * their code; it installs only their colour themes and snippets (EXT-04, `src-tauri/src/vsix.rs`).
- * Every version is marked `packageFormat: "vsix"`; one whose categories name neither Themes nor
- * Snippets is shown as incompatible and never downloaded. The package decides in the end: the
- * native adapter refuses one with nothing Yavin can use (`UnsupportedPackage`).
+ * Open VSX serves VS Code extensions (`.vsix`, the `vscode` API, Node.js). Yavin installs what it
+ * supports of them -- themes, snippets, languages, grammars, and code run in its sandbox through
+ * the VS Code compatibility layer (EXT-04, EXT-25, `src-tauri/src/vsix.rs`). Every version is
+ * marked `packageFormat: "vsix"` and is "Not verified" until installed; `declarative` (its
+ * categories name Themes or Snippets) is informational. The package decides: the native adapter
+ * refuses one with nothing Yavin can use (`UnsupportedPackage`).
  */
 import { native } from "../../native.ts";
 import { canonicalId } from "../identity.ts";

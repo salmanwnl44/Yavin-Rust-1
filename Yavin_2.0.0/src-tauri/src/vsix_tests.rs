@@ -161,9 +161,34 @@ fn the_adapter_keeps_themes_and_snippets_and_reports_everything_else() {
     assert_eq!(generated["publisher"], "dracula-theme");
     assert_eq!(generated["vsix"]["publisher"], "Dracula-Theme");
     assert_eq!(generated["displayName"], "Dracula Theme", "one line");
-    // No code: nothing of it can ever be loaded.
-    assert!(generated.get("main").is_none());
-    assert!(generated.get("activationEvents").is_none());
+    // EXT-25: its code is the manifest's entry point, run by the compatibility layer -- never
+    // here: adapting it runs nothing.
+    assert_eq!(generated["main"], "extension/out/extension.js");
+    assert_eq!(generated["engines"]["yavin"], VSCODE_RUNTIME_API);
+    let mapped = format!("dracula-theme.theme-dracula.{}", part("dracula.hello"));
+    assert_eq!(
+        generated["contributes"]["commands"][0]["command"],
+        json!(mapped)
+    );
+    assert_eq!(
+        generated["activationEvents"],
+        json!(["*", format!("onCommand:{mapped}")])
+    );
+    let runtime = &generated["vsix"]["runtime"];
+    assert_eq!(runtime["api"], "vscode");
+    assert_eq!(runtime["entry"], "main");
+    assert_eq!(runtime["commands"][&mapped], "dracula.hello");
+    // It asks; the user grants (EXT-07). Nothing is granted by being a VS Code extension.
+    assert_eq!(
+        generated["permissions"]["request"],
+        json!([
+            "documents.edit",
+            "documents.read",
+            "editor.control",
+            "secrets",
+            "workspace.fs.read"
+        ])
+    );
     assert_eq!(
         generated["contributes"]["themes"][0]["path"],
         "extension/theme/dracula.json"
@@ -173,27 +198,33 @@ fn the_adapter_keeps_themes_and_snippets_and_reports_everything_else() {
         "javascript"
     );
     assert_eq!(
+        generated["contributes"]["languages"][0],
+        json!({"id": "x", "extensions": [".x"], "filenames": [], "aliases": []})
+    );
+    assert_eq!(
         generated["contributes"]
             .as_object()
             .unwrap()
             .keys()
             .collect::<Vec<_>>(),
-        ["snippets", "themes"]
+        ["commands", "languages", "snippets", "themes"]
     );
     let report = &generated["vsix"];
     assert_eq!(report["code"], true);
     assert_eq!(report["signature"], "not verified");
-    let ignored = report["ignored"].to_string();
-    for expected in [
-        "does not run",
-        "commands",
-        "TextMate grammars",
-        "Languages",
-        "extensionDependencies",
-    ] {
-        assert!(ignored.contains(expected), "{expected}: {ignored}");
-    }
-    assert_eq!(report["supported"].as_array().unwrap().len(), 2);
+    let supported = report["supported"].to_string();
+    assert!(supported.contains("compatibility layer"), "{supported}");
+    // Its grammar has no scope name: refused, and said.
+    assert!(
+        report["rejected"].to_string().contains("not a scope name"),
+        "{report}"
+    );
+    assert!(
+        report["ignored"]
+            .to_string()
+            .contains("extensionDependencies"),
+        "{report}"
+    );
     assert!(
         !dir.join("ran").exists() && !out.join("ran").exists(),
         "nothing ran"
@@ -431,5 +462,300 @@ fn a_vsix_installs_through_the_inventory_and_its_files_are_read_only_from_its_co
         .resource_of(id, "extension/theme/dracula.json")
         .is_err());
     assert!(inventory(&root).extensions.is_empty());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// EXT-25: what a VS Code extension's code needs is mapped to Yavin's own -- under ids it owns,
+/// in the forms Yavin's manifest accepts -- and what has no Yavin equivalent is said.
+#[test]
+fn code_contributions_are_mapped_to_yavin_ids_or_reported() {
+    let dir = temp("vsix-code");
+    let grammar = br#"{"scopeName": "source.x", "patterns": []}"#;
+    let manifest = package_json(
+        json!({
+            "commands": [
+                {"command": "x.sort", "title": "%sort.title%", "category": "X"},
+                {"command": "x.Upper Case!", "title": {"value": "Upper", "original": "Upper"}},
+            ],
+            "keybindings": [
+                {"command": "x.sort", "key": "ctrl+alt+s"},
+                {"command": "x.sort", "key": "ctrl+k ctrl+s"},
+                {"command": "x.sort", "key": "s"},
+                {"command": "x.sort", "key": "cmd+s"},
+                {"command": "x.sort", "key": "ctrl+shift+u", "when": "editorLangId == markdown"},
+            ],
+            "configuration": {"properties": {
+                "x.enabled": {"type": "boolean", "default": true, "description": "On"},
+                "x.mode": {"type": "string", "enum": ["a", "b"], "default": "b", "markdownDescription": "The *mode*"},
+                "x.size": {"type": "integer", "minimum": 1, "maximum": 9, "default": 4},
+                "x.list": {"type": "array", "default": ["q"]},
+            }},
+            "viewsContainers": {"activitybar": [{"id": "xBar", "title": "X Bar", "icon": "i.svg"}]},
+            "views": {
+                "xBar": [{"id": "x.tree", "name": "Tree"}, {"id": "x.web", "name": "Web", "type": "webview"}],
+                "explorer": [{"id": "x.files", "name": "Files"}],
+            },
+            "menus": {
+                "editor/context": [
+                    {"command": "x.sort", "when": "editorLangId == markdown"},
+                    {"command": "x.sort", "when": "editorHasSelection"},
+                ],
+                "view/title": [{"command": "x.sort", "when": "view == x.tree"}],
+                "commandPalette": [{"command": "x.Upper Case!", "when": "false"}],
+                "scm/title": [{"command": "x.sort"}],
+            },
+            "grammars": [
+                {"language": "x", "scopeName": "source.x", "path": "./syntaxes/x.tmLanguage.json"},
+                {"scopeName": "inject.x", "path": "./syntaxes/x.tmLanguage.json", "injectTo": ["source.js"]},
+            ],
+            "debuggers": [{"type": "x"}],
+        }),
+        json!({"main": "./out/node.js", "browser": "./dist/web", "activationEvents": ["onLanguage:x", "workspaceContains:**/x.json", "onUri"]}),
+    );
+    let pkg = vsix(
+        &dir.join("p"),
+        &manifest,
+        &[
+            (
+                "extension/package.nls.json",
+                br#"{"sort.title": "Sort Lines"}"#,
+            ),
+            ("extension/out/node.js", b"exports.activate = () => {};"),
+            ("extension/dist/web.js", b"exports.activate = () => {};"),
+            ("extension/syntaxes/x.tmLanguage.json", grammar),
+        ],
+    );
+    let (out, found) = unpacked(&dir.join("p"), &pkg);
+    let generated: Value = serde_json::from_str(
+        &adapt(
+            &out,
+            &found.manifest,
+            "dracula-theme.theme-dracula",
+            "2.25.1",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let id = |original: &str| format!("dracula-theme.theme-dracula.{}", part(original));
+    // The web entry point (written for a runtime without Node.js) comes first.
+    assert_eq!(generated["main"], "extension/dist/web.js");
+    assert_eq!(generated["vsix"]["runtime"]["entry"], "browser");
+    let c = &generated["contributes"];
+    assert_eq!(
+        c["commands"][0],
+        json!({"command": id("x.sort"), "title": "Sort Lines", "category": "X"})
+    );
+    assert_eq!(c["commands"][1]["title"], "Upper");
+    assert!(
+        part("x.Upper Case!").starts_with("x-upper-case-"),
+        "{}",
+        part("x.Upper Case!")
+    );
+    assert_ne!(part("a.b"), part("a-b"), "distinct ids stay distinct");
+    assert_eq!(
+        c["keybindings"],
+        json!([{"command": id("x.sort"), "key": "Mod+Alt+s"}])
+    );
+    let settings = c["configuration"]["properties"].as_object().unwrap();
+    assert_eq!(settings.len(), 3);
+    assert_eq!(settings[&id("x.mode")]["enum"], json!(["a", "b"]));
+    assert_eq!(settings[&id("x.mode")]["description"], "The *mode*");
+    assert_eq!(settings[&id("x.size")]["maximum"], 9.0);
+    assert_eq!(
+        generated["vsix"]["runtime"]["defaults"]["x.list"],
+        json!(["q"])
+    );
+    assert_eq!(
+        generated["vsix"]["runtime"]["settings"][&id("x.enabled")],
+        "x.enabled"
+    );
+    assert_eq!(
+        c["viewsContainers"]["activitybar"][0]["id"],
+        json!(id("xBar"))
+    );
+    assert_eq!(
+        c["views"].as_array().unwrap().len(),
+        2,
+        "the webview view is left out"
+    );
+    let tree = c["views"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == json!(id("x.tree")))
+        .unwrap();
+    assert_eq!(tree["container"], json!(id("xBar")));
+    assert_eq!(
+        c["menus"]["editor/context"],
+        json!([{"command": id("x.sort"), "when": "resourceLangId == markdown"}])
+    );
+    assert_eq!(c["menus"]["view/title"][0]["view"], json!(id("x.tree")));
+    assert_eq!(c["menus"]["commandPalette"][0]["when"], "false");
+    assert!(c["menus"].get("scm/title").is_none());
+    assert_eq!(
+        c["grammars"],
+        json!([{"scopeName": "source.x", "path": "extension/syntaxes/x.tmLanguage.json", "language": "x"}])
+    );
+    let events = generated["activationEvents"].to_string();
+    for event in [
+        "onLanguage:x",
+        "onWorkspace",
+        &format!("onCommand:{}", id("x.sort")),
+        &format!("onView:{}", id("x.tree")),
+    ] {
+        assert!(events.contains(event), "{event}: {events}");
+    }
+    let ignored = generated["vsix"]["ignored"].to_string();
+    for said in [
+        "injection grammars",
+        "debuggers",
+        "webview views",
+        "keybindings",
+        "menu items",
+        "onUri",
+        "workspaceContains",
+        "lists, objects",
+    ] {
+        assert!(ignored.contains(said), "{said}: {ignored}");
+    }
+    // An ES module does not run; the package still installs for what else it has.
+    let esm = package_json(
+        json!({"grammars": [{"language": "x", "scopeName": "source.x", "path": "./g.json"}]}),
+        json!({"main": "./out/a.js", "type": "module"}),
+    );
+    let pkg = vsix(
+        &dir.join("esm"),
+        &esm,
+        &[
+            ("extension/out/a.js", b"export {}"),
+            ("extension/g.json", grammar),
+        ],
+    );
+    let (out, found) = unpacked(&dir.join("esm"), &pkg);
+    let generated: Value = serde_json::from_str(
+        &adapt(
+            &out,
+            &found.manifest,
+            "dracula-theme.theme-dracula",
+            "2.25.1",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(generated.get("main").is_none());
+    assert!(generated["vsix"]["ignored"]
+        .to_string()
+        .contains("ES module"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// --- EXT-30: file icon themes ------------------------------------------------------------------
+
+#[test]
+fn file_icon_themes_are_kept_with_their_file_and_checked() {
+    let dir = temp("vsix-icon-themes");
+    let theme = br#"{"iconDefinitions":{"f":{"iconPath":"./../icons/f.svg"}},"file":"f"}"#;
+    let manifest = |icon_themes: Value| {
+        package_json(
+            json!({
+                "iconThemes": icon_themes,
+                "productIconThemes": [{"id": "p", "label": "P", "path": "./p.json"}],
+            }),
+            json!({}),
+        )
+    };
+    let adapted = |name: &str, icon_themes: Value| {
+        let pkg = vsix(
+            &dir.join(name),
+            &manifest(icon_themes),
+            &[
+                ("extension/dist/icons.json", theme),
+                ("extension/icons/f.svg", b"<svg/>"),
+                ("extension/dist/icons.svg", b"<svg/>"),
+            ],
+        );
+        let (out, found) = unpacked(&dir.join(name), &pkg);
+        adapt(
+            &out,
+            &found.manifest,
+            "dracula-theme.theme-dracula",
+            "2.25.1",
+        )
+    };
+    // Material Icon Theme's contribution, as published (its `_watch` is VS Code's own).
+    let text = adapted(
+        "ok",
+        json!([{"id": "material-icon-theme", "label": "Material Icon Theme", "path": "./dist/icons.json", "_watch": true}]),
+    )
+    .unwrap();
+    let generated: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        generated["contributes"]["iconThemes"],
+        json!([{"id": "material-icon-theme", "label": "Material Icon Theme", "path": "extension/dist/icons.json"}])
+    );
+    let supported = generated["vsix"]["supported"].to_string();
+    assert!(
+        supported.contains("File icon theme \\\"Material Icon Theme\\\""),
+        "{supported}"
+    );
+    let ignored = generated["vsix"]["ignored"].to_string();
+    assert!(
+        ignored.contains("productIconThemes: product icon themes"),
+        "{ignored}"
+    );
+    assert!(!ignored.contains("iconThemes: icon themes are not supported"));
+
+    // Refused one by one, said why: the rest of the package still adapts if it has anything.
+    for (name, entry, why) in [
+        (
+            "bad-id",
+            json!({"id": "a b", "label": "A", "path": "./dist/icons.json"}),
+            "is not an icon theme id",
+        ),
+        (
+            "not-json",
+            json!({"id": "a", "label": "A", "path": "./dist/icons.svg"}),
+            "is not a JSON icon theme",
+        ),
+        (
+            "missing",
+            json!({"id": "a", "label": "A", "path": "./dist/gone.json"}),
+            "is not in the package",
+        ),
+        (
+            "escape",
+            json!({"id": "a", "label": "A", "path": "../../outside.json"}),
+            "leaves the extension",
+        ),
+        (
+            "no-label",
+            json!({"id": "", "label": "", "path": "./dist/icons.json"}),
+            "is not an icon theme id",
+        ),
+    ] {
+        let error = adapted(name, json!([entry])).unwrap_err();
+        // Nothing else in it is usable: the refusal names the icon theme's reason.
+        assert!(
+            error.starts_with("UnsupportedPackage")
+                && error.contains("file icon themes")
+                && error.contains(why),
+            "{name}: {error}"
+        );
+    }
+    // At most 50 kept from one package.
+    let many: Vec<Value> = (0..55)
+        .map(|i| json!({"id": format!("t{i}"), "label": format!("T{i}"), "path": "./dist/icons.json"}))
+        .collect();
+    let generated: Value = serde_json::from_str(&adapted("many", json!(many)).unwrap()).unwrap();
+    assert_eq!(
+        generated["contributes"]["iconThemes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        50
+    );
+    assert!(generated["vsix"]["ignored"]
+        .to_string()
+        .contains("more than 50 icon themes"));
     let _ = fs::remove_dir_all(&dir);
 }

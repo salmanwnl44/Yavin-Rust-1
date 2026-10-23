@@ -325,6 +325,13 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
   const listeners = new Set<(event: DocumentEvent) => void>();
   /** Bumped by `reset`: work started before it must not bring its documents back. */
   let epoch = 0;
+  /**
+   * What must see a save first (EXT-29: extensions' onWillSaveTextDocument) -- awaited before the
+   * text is taken, so its edits are saved too; it never fails a save, and bounds its own time.
+   */
+  let beforeSave: ((doc: TextDocument) => Promise<void>) | null = null;
+  /** Documents whose before-save step is running: a save asked meanwhile does not run it again. */
+  const preparing = new Set<DocumentId>();
   let revision = 0;
   /** Like `revision`, but not moved by an edit that leaves everything but the text as it was. */
   let stateRevision = 0;
@@ -726,6 +733,11 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
      * one. Fails -- leaving the document dirty -- if the write fails; if that was because the
      * file changed on disk, the document is in conflict and nothing was overwritten.
      */
+    /** Sets (or, with null, removes) the step every save runs first (EXT-29). */
+    setBeforeSave(hook: ((doc: TextDocument) => Promise<void>) | null) {
+      beforeSave = hook;
+    },
+
     async save(key: string): Promise<TextDocument> {
       const doc = required(key);
       if (doc.source.kind === "untitled")
@@ -745,6 +757,20 @@ export function createDocumentService(io: DocumentIO, options: DocumentServiceOp
         );
       const recreate = doc.external?.kind === "deleted" || !doc.base;
       if (!doc.dirty && !recreate) return doc;
+      if (beforeSave && !preparing.has(doc.id)) {
+        preparing.add(doc.id);
+        try {
+          await beforeSave(doc);
+        } catch {
+          // A step before saving never stops the save.
+        } finally {
+          preparing.delete(doc.id);
+        }
+        // Meanwhile it may have been closed, or another save may have begun.
+        if (!live(doc)) return doc;
+        // (Narrowed above, but the await let another save start: read it again.)
+        if ((doc.save as { kind: string }).kind === "saving") return doc;
+      }
       const path = doc.path!;
       const version = doc.version;
       const text = doc.text;

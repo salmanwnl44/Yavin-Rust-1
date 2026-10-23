@@ -1,0 +1,1592 @@
+{
+  "registry": "https://open-vsx.org/",
+  "results": [
+    {
+      "adapt": {
+        "manifest": {
+          "contributes": {
+            "themes": [
+              {
+                "label": "Dracula Theme",
+                "path": "extension/theme/dracula.json",
+                "uiTheme": "vs-dark"
+              },
+              {
+                "label": "Dracula Theme Soft",
+                "path": "extension/theme/dracula-soft.json",
+                "uiTheme": "vs-dark"
+              }
+            ]
+          },
+          "description": "The official Dracula Theme: a dark theme for many editors, shells, and more. 🦇",
+          "displayName": "Dracula Theme Official",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "manifestVersion": 1,
+          "name": "theme-dracula",
+          "publisher": "dracula-theme",
+          "version": "2.25.1",
+          "vsix": {
+            "code": false,
+            "ignored": [],
+            "name": "theme-dracula",
+            "publisher": "dracula-theme",
+            "rejected": [],
+            "signature": "not verified",
+            "supported": ["Colour theme \"Dracula Theme\"", "Colour theme \"Dracula Theme Soft\""],
+            "vscode": "^1.13.0"
+          }
+        },
+        "ok": true
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "f4d8c28fc64874b1b959cc90dbd39c84d5d35c9cf203e32b7a758dc9abf5b1cb",
+        "signature": "registrySigned",
+        "size": 483084
+      },
+      "id": "dracula-theme.theme-dracula",
+      "installMs": 39625,
+      "name": "theme-dracula",
+      "namespace": "dracula-theme",
+      "unpack": {
+        "bytes": 572161,
+        "files": 13,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "2.25.1"
+    },
+    {
+      "adapt": {
+        "manifest": {
+          "contributes": {
+            "themes": [
+              {
+                "label": "One Dark Pro",
+                "path": "extension/themes/OneDark-Pro.json",
+                "uiTheme": "vs-dark"
+              },
+              {
+                "label": "One Dark Pro Flat",
+                "path": "extension/themes/OneDark-Pro-flat.json",
+                "uiTheme": "vs-dark"
+              },
+              {
+                "label": "One Dark Pro Darker",
+                "path": "extension/themes/OneDark-Pro-darker.json",
+                "uiTheme": "vs-dark"
+              },
+              {
+                "label": "One Dark Pro Mix",
+                "path": "extension/themes/OneDark-Pro-mix.json",
+                "uiTheme": "vs-dark"
+              },
+              {
+                "label": "One Dark Pro Night Flat",
+                "path": "extension/themes/OneDark-Pro-night-flat.json",
+                "uiTheme": "vs-dark"
+              }
+            ]
+          },
+          "description": "Atom's iconic One Dark theme for Visual Studio Code",
+          "displayName": "One Dark Pro",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "manifestVersion": 1,
+          "name": "material-theme",
+          "publisher": "zhuangtongfa",
+          "version": "3.20.3",
+          "vsix": {
+            "code": true,
+            "ignored": [
+              "Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+              "commands: needs the VS Code extension API, which Yavin does not provide.",
+              "configuration: needs the VS Code extension API, which Yavin does not provide.",
+              "markdown.previewStyles: needs the VS Code extension API, which Yavin does not provide."
+            ],
+            "name": "material-theme",
+            "publisher": "zhuangtongfa",
+            "rejected": [],
+            "signature": "not verified",
+            "supported": [
+              "Colour theme \"One Dark Pro\"",
+              "Colour theme \"One Dark Pro Flat\"",
+              "Colour theme \"One Dark Pro Darker\"",
+              "Colour theme \"One Dark Pro Mix\"",
+              "Colour theme \"One Dark Pro Night Flat\""
+            ],
+            "vscode": "^1.76.0"
+          }
+        },
+        "ok": true
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "fac19c53133cab9d4236bee87838d81992c8c3627795b7caeb519a009e4e74eb",
+        "signature": "registrySigned",
+        "size": 342632
+      },
+      "id": "zhuangtongfa.material-theme",
+      "installMs": 25461,
+      "name": "material-theme",
+      "namespace": "zhuangtongfa",
+      "unpack": {
+        "bytes": 1571165,
+        "files": 102,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "3.20.3"
+    },
+    {
+      "adapt": {
+        "manifest": {
+          "contributes": {
+            "themes": [
+              {
+                "label": "GitHub Light Default",
+                "path": "extension/themes/light-default.json",
+                "uiTheme": "vs"
+              },
+              {
+                "label": "GitHub Light High Contrast",
+                "path": "extension/themes/light-high-contrast.json",
+                "uiTheme": "hc-light"
+              },
+              {
+                "label": "GitHub Light Colorblind (Beta)",
+                "path": "extension/themes/light-colorblind.json",
+                "uiTheme": "vs"
+              },
+              {
+                "label": "GitHub Dark Default",
+                "path": "extension/themes/dark-default.json",
+                "uiTheme": "vs-dark"
+              },
+              {
+                "label": "GitHub Dark High Contrast",
+                "path": "extension/themes/dark-high-contrast.json",
+                "uiTheme": "hc-black"
+              },
+              {
+                "label": "GitHub Dark Colorblind (Beta)",
+                "path": "extension/themes/dark-colorblind.json",
+                "uiTheme": "vs-dark"
+              },
+              {
+                "label": "GitHub Dark Dimmed",
+                "path": "extension/themes/dark-dimmed.json",
+                "uiTheme": "vs-dark"
+              },
+              {
+                "label": "GitHub Light",
+                "path": "extension/themes/light.json",
+                "uiTheme": "vs"
+              },
+              {
+                "label": "GitHub Dark",
+                "path": "extension/themes/dark.json",
+                "uiTheme": "vs-dark"
+              }
+            ]
+          },
+          "description": "GitHub theme for VS Code",
+          "displayName": "GitHub Theme",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "manifestVersion": 1,
+          "name": "github-vscode-theme",
+          "publisher": "github",
+          "version": "6.3.5",
+          "vsix": {
+            "code": false,
+            "ignored": [],
+            "name": "github-vscode-theme",
+            "publisher": "GitHub",
+            "rejected": [],
+            "signature": "not verified",
+            "supported": [
+              "Colour theme \"GitHub Light Default\"",
+              "Colour theme \"GitHub Light High Contrast\"",
+              "Colour theme \"GitHub Light Colorblind (Beta)\"",
+              "Colour theme \"GitHub Dark Default\"",
+              "Colour theme \"GitHub Dark High Contrast\"",
+              "Colour theme \"GitHub Dark Colorblind (Beta)\"",
+              "Colour theme \"GitHub Dark Dimmed\"",
+              "Colour theme \"GitHub Light\"",
+              "Colour theme \"GitHub Dark\""
+            ],
+            "vscode": "^1.43.0"
+          }
+        },
+        "ok": true
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "a85236a58ad490b1600ec5a0fd0cea7eec56fb9d33660a1ac82c6da639ad3af4",
+        "signature": "registrySigned",
+        "size": 91023
+      },
+      "id": "github.github-vscode-theme",
+      "installMs": 8866,
+      "name": "github-vscode-theme",
+      "namespace": "GitHub",
+      "unpack": {
+        "bytes": 287159,
+        "files": 24,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "6.3.5"
+    },
+    {
+      "download": {
+        "error": "UnexpectedContent: The package's checksum came back as application/octet-stream, not what was asked for.",
+        "ok": false
+      },
+      "id": "jdinhlife.gruvbox",
+      "installMs": 1689,
+      "name": "gruvbox",
+      "namespace": "jdinhlife",
+      "version": "1.29.1"
+    },
+    {
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "f3fda4e1d6095d942c92467c1ad6f322a74c62160f7d29741058e4d726922fbd",
+        "signature": "registrySigned",
+        "size": 890312
+      },
+      "id": "pkief.material-icon-theme",
+      "installMs": 14975,
+      "name": "material-icon-theme",
+      "namespace": "PKief",
+      "unpack": {
+        "error": "UnsafePackage: it has 1278 entries (the limit is 1000)",
+        "ok": false
+      },
+      "version": "5.39.0"
+    },
+    {
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "89aa767f87f09dc966efe2e70bed20321d5cb5b2f43fd413598fb6913a9f99c5",
+        "signature": "registrySigned",
+        "size": 2505900
+      },
+      "id": "vscode-icons-team.vscode-icons",
+      "installMs": 47698,
+      "name": "vscode-icons",
+      "namespace": "vscode-icons-team",
+      "unpack": {
+        "error": "UnsafePackage: it has 1695 entries (the limit is 1000)",
+        "ok": false
+      },
+      "version": "13.0.0"
+    },
+    {
+      "download": {
+        "error": "UnexpectedContent: The package's checksum came back as application/octet-stream, not what was asked for.",
+        "ok": false
+      },
+      "id": "catppuccin.catppuccin-vsc",
+      "installMs": 1609,
+      "name": "catppuccin-vsc",
+      "namespace": "Catppuccin",
+      "version": "3.19.0"
+    },
+    {
+      "download": {
+        "error": "UnexpectedContent: The package's checksum came back as application/octet-stream, not what was asked for.",
+        "ok": false
+      },
+      "id": "scala-lang.scala",
+      "installMs": 1219,
+      "name": "scala",
+      "namespace": "scala-lang",
+      "version": "0.5.10"
+    },
+    {
+      "adapt": {
+        "manifest": {
+          "contributes": {
+            "snippets": [
+              {
+                "language": "kotlin",
+                "path": "extension/snippets/kotlin.json"
+              },
+              {
+                "language": "kotlinscript",
+                "path": "extension/snippets/kotlin.json"
+              }
+            ]
+          },
+          "description": "Kotlin language support for VS Code",
+          "displayName": "Kotlin Language",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "manifestVersion": 1,
+          "name": "kotlin",
+          "publisher": "mathiasfrohlich",
+          "version": "1.7.1",
+          "vsix": {
+            "code": false,
+            "ignored": [
+              "TextMate grammars are not supported: Yavin's editor has no TextMate engine.",
+              "Languages and language configuration are not supported: Yavin decides each file's language itself."
+            ],
+            "name": "Kotlin",
+            "publisher": "mathiasfrohlich",
+            "rejected": [],
+            "signature": "not verified",
+            "supported": ["Snippets for kotlin", "Snippets for kotlinscript"],
+            "vscode": "^1.8.0"
+          }
+        },
+        "ok": true
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "23bbabe7265168a60c0825c4025589e510fad6b41b2b5bc55fc3e1936ec9e20c",
+        "signature": "registrySigned",
+        "size": 24037
+      },
+      "id": "mathiasfrohlich.kotlin",
+      "installMs": 2233,
+      "name": "Kotlin",
+      "namespace": "mathiasfrohlich",
+      "unpack": {
+        "bytes": 76328,
+        "files": 17,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "1.7.1"
+    },
+    {
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "433a90ff91f4f2724f2c6c1764a59d09452a6e501ed2e9984906d4b443993728",
+        "signature": "registrySigned",
+        "size": 4929413
+      },
+      "id": "slevesque.shader",
+      "installMs": 7223,
+      "name": "shader",
+      "namespace": "slevesque",
+      "unpack": {
+        "error": "UnsafePackage: it has 2599 entries (the limit is 1000)",
+        "ok": false
+      },
+      "version": "1.1.5"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: bungcip.better-toml 0.3.2 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "8dde304d2250660534287fa2b996304f0c4446e7dd06550ae281e85587de9f22",
+        "signature": "registrySigned",
+        "size": 263127
+      },
+      "id": "bungcip.better-toml",
+      "installMs": 3645,
+      "name": "better-toml",
+      "namespace": "bungcip",
+      "unpack": {
+        "bytes": 719349,
+        "files": 112,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "0.3.2"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: jeff-hykin.better-cpp-syntax 1.27.1 has nothing Yavin can use from a VS Code extension (colour themes, snippets): TextMate grammars are not supported: Yavin's editor has no TextMate engine.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "c5763d1260109d26448103637e2cce06a2713cc4546b03a5ae09fc0b2e02fbe3",
+        "signature": "registrySigned",
+        "size": 397581
+      },
+      "id": "jeff-hykin.better-cpp-syntax",
+      "installMs": 3130,
+      "name": "better-cpp-syntax",
+      "namespace": "jeff-hykin",
+      "unpack": {
+        "bytes": 1501835,
+        "files": 10,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "1.27.1"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: 13xforever.language-x86-64-assembly 3.1.5 has nothing Yavin can use from a VS Code extension (colour themes, snippets): TextMate grammars are not supported: Yavin's editor has no TextMate engine.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "9e954831ace362711c555ba2bc87ec3284b73a61bd4047d3c96fcef5d50b43d5",
+        "signature": "registrySigned",
+        "size": 21262
+      },
+      "id": "13xforever.language-x86-64-assembly",
+      "installMs": 3729,
+      "name": "language-x86-64-assembly",
+      "namespace": "13xforever",
+      "unpack": {
+        "bytes": 93361,
+        "files": 10,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "3.1.5"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: mrmlnc.vscode-apache 1.2.0 has nothing Yavin can use from a VS Code extension (colour themes, snippets): TextMate grammars are not supported: Yavin's editor has no TextMate engine.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "8249f70fc9e7cd9063d88c93689e8d5a6f196f3b44d8a603be44ae4f4fb10914",
+        "signature": "registrySigned",
+        "size": 9858
+      },
+      "id": "mrmlnc.vscode-apache",
+      "installMs": 3134,
+      "name": "vscode-apache",
+      "namespace": "mrmlnc",
+      "unpack": {
+        "bytes": 40380,
+        "files": 9,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "1.2.0"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: coolbear.systemd-unit-file 1.0.6 has nothing Yavin can use from a VS Code extension (colour themes, snippets): TextMate grammars are not supported: Yavin's editor has no TextMate engine.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "b707f0152c9f00274a88163586a07e4e062065f8edee3a1dda9c1f925f283319",
+        "signature": "registrySigned",
+        "size": 9487
+      },
+      "id": "coolbear.systemd-unit-file",
+      "installMs": 3158,
+      "name": "systemd-unit-file",
+      "namespace": "coolbear",
+      "unpack": {
+        "bytes": 26010,
+        "files": 9,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "1.0.6"
+    },
+    {
+      "adapt": {
+        "manifest": {
+          "contributes": {
+            "snippets": [
+              {
+                "language": "purescript",
+                "path": "extension/snippets/purescript.json"
+              }
+            ]
+          },
+          "description": "Syntax Highlighting for the PureScript programming language",
+          "displayName": "PureScript Language Support",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "manifestVersion": 1,
+          "name": "language-purescript",
+          "publisher": "nwolverson",
+          "version": "0.2.10",
+          "vsix": {
+            "code": false,
+            "ignored": [
+              "TextMate grammars are not supported: Yavin's editor has no TextMate engine.",
+              "Languages and language configuration are not supported: Yavin decides each file's language itself."
+            ],
+            "name": "language-purescript",
+            "publisher": "nwolverson",
+            "rejected": [],
+            "signature": "not verified",
+            "supported": ["Snippets for purescript"],
+            "vscode": "^1.5.0"
+          }
+        },
+        "ok": true
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "2412acc1f42ec5a65eeacb60c05b32c52f6196297a3972b3146575d736ba25b4",
+        "signature": "registrySigned",
+        "size": 13984
+      },
+      "id": "nwolverson.language-purescript",
+      "installMs": 2788,
+      "name": "language-purescript",
+      "namespace": "nwolverson",
+      "unpack": {
+        "bytes": 60422,
+        "files": 10,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "0.2.10"
+    },
+    {
+      "download": {
+        "error": "TooLarge: tamasfe.even-better-toml 0.21.2 is larger than 20971520 bytes; it was not downloaded.",
+        "ok": false
+      },
+      "id": "tamasfe.even-better-toml",
+      "installMs": 16630,
+      "name": "even-better-toml",
+      "namespace": "tamasfe",
+      "version": "0.21.2"
+    },
+    {
+      "download": {
+        "error": "UnexpectedContent: The package's checksum came back as application/octet-stream, not what was asked for.",
+        "ok": false
+      },
+      "id": "esbenp.prettier-vscode",
+      "installMs": 1214,
+      "name": "prettier-vscode",
+      "namespace": "esbenp",
+      "version": "12.4.0"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: foxundermoon.shell-format 7.2.8 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "9a6877b56233cbf9261ced235ab68d601c3afb6bea0673d915720369107cbdc9",
+        "signature": "registrySigned",
+        "size": 101150
+      },
+      "id": "foxundermoon.shell-format",
+      "installMs": 2449,
+      "name": "shell-format",
+      "namespace": "foxundermoon",
+      "unpack": {
+        "bytes": 187151,
+        "files": 14,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "7.2.8"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: ms-python.black-formatter 2025.2.0 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "52a3678d89ef8ba8b10e5eba64ba8ba3e498d2b9a895b7e649e7fa504c9d551e",
+        "signature": "registrySigned",
+        "size": 979097
+      },
+      "id": "ms-python.black-formatter",
+      "installMs": 3376,
+      "name": "black-formatter",
+      "namespace": "ms-python",
+      "unpack": {
+        "bytes": 3670291,
+        "files": 342,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "2025.2.0"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: xaver.clang-format 1.9.0 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "68b9c80f454ef42da2285286e2c742c0268cdc4fb3b02ff4678a84e550ce9d25",
+        "signature": "registrySigned",
+        "size": 45846
+      },
+      "id": "xaver.clang-format",
+      "installMs": 2742,
+      "name": "clang-format",
+      "namespace": "xaver",
+      "unpack": {
+        "bytes": 112377,
+        "files": 17,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "1.9.0"
+    },
+    {
+      "download": {
+        "error": "UnexpectedContent: The package's checksum came back as application/octet-stream, not what was asked for.",
+        "ok": false
+      },
+      "id": "dbaeumer.vscode-eslint",
+      "installMs": 1575,
+      "name": "vscode-eslint",
+      "namespace": "dbaeumer",
+      "version": "3.0.34"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: streetsidesoftware.code-spell-checker 4.10.0 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "0b587a38c4c78887a782158f727bbdaddfab2deae3ce0d80efbab40d56475638",
+        "signature": "registrySigned",
+        "size": 3195172
+      },
+      "id": "streetsidesoftware.code-spell-checker",
+      "installMs": 4934,
+      "name": "code-spell-checker",
+      "namespace": "streetsidesoftware",
+      "unpack": {
+        "bytes": 8956774,
+        "files": 368,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "4.10.0"
+    },
+    {
+      "adapt": {
+        "manifest": {
+          "contributes": {
+            "snippets": [
+              {
+                "language": "shellscript",
+                "path": "extension/snippets/snippets.json"
+              },
+              {
+                "language": "bats",
+                "path": "extension/snippets/snippets.json"
+              }
+            ]
+          },
+          "description": "%description%",
+          "displayName": "%displayName%",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "manifestVersion": 1,
+          "name": "shellcheck",
+          "publisher": "timonwong",
+          "version": "0.48.1",
+          "vsix": {
+            "code": true,
+            "ignored": [
+              "Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+              "commands: needs the VS Code extension API, which Yavin does not provide.",
+              "configuration: needs the VS Code extension API, which Yavin does not provide.",
+              "TextMate grammars are not supported: Yavin's editor has no TextMate engine.",
+              "icons: needs the VS Code extension API, which Yavin does not provide.",
+              "Languages and language configuration are not supported: Yavin decides each file's language itself.",
+              "menus: needs the VS Code extension API, which Yavin does not provide.",
+              "walkthroughs: needs the VS Code extension API, which Yavin does not provide."
+            ],
+            "name": "shellcheck",
+            "publisher": "timonwong",
+            "rejected": [],
+            "signature": "not verified",
+            "supported": ["Snippets for shellscript", "Snippets for bats"],
+            "vscode": "^1.101.0"
+          }
+        },
+        "ok": true
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "7342b9aea6f3f7a3983182fffae2acfde78727722b3df859b7e53f5f8812a034",
+        "signature": "registrySigned",
+        "size": 3603128
+      },
+      "id": "timonwong.shellcheck",
+      "installMs": 6002,
+      "name": "shellcheck",
+      "namespace": "timonwong",
+      "unpack": {
+        "bytes": 15138929,
+        "files": 107,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "0.48.1"
+    },
+    {
+      "download": {
+        "error": "UnexpectedContent: The package's checksum came back as application/octet-stream, not what was asked for.",
+        "ok": false
+      },
+      "id": "davidanson.vscode-markdownlint",
+      "installMs": 1731,
+      "name": "vscode-markdownlint",
+      "namespace": "DavidAnson",
+      "version": "0.62.1"
+    },
+    {
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "c49af2f60fa8348e31b473f75e9c339effe120059992cee38352b111c6b8863b",
+        "signature": "registrySigned",
+        "size": 10547438
+      },
+      "id": "charliermarsh.ruff",
+      "installMs": 11819,
+      "name": "ruff",
+      "namespace": "charliermarsh",
+      "unpack": {
+        "error": "UnsafePackage: \"extension/bundled/libs/bin/ruff\" unpacks to more than 16777216 bytes",
+        "ok": false
+      },
+      "version": "2026.88.0"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: redhat.vscode-yaml 2.1.2026102008 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "a332cadbb27f5fcd85530e230864803ea1771bdf5a22e362faa0c41e4634c734",
+        "signature": "registrySigned",
+        "size": 1106171
+      },
+      "id": "redhat.vscode-yaml",
+      "installMs": 4497,
+      "name": "vscode-yaml",
+      "namespace": "redhat",
+      "unpack": {
+        "bytes": 4246158,
+        "files": 47,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "2.1.2026102008"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: rust-lang.rust-analyzer 0.4.3090 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "f684cb53a568f90c67270d8a620bb4cca11ad3e4a717b920b0fb742e54d227ee",
+        "signature": "registrySigned",
+        "size": 921836
+      },
+      "id": "rust-lang.rust-analyzer",
+      "installMs": 3396,
+      "name": "rust-analyzer",
+      "namespace": "rust-lang",
+      "unpack": {
+        "bytes": 2098798,
+        "files": 14,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "0.4.3090"
+    },
+    {
+      "adapt": {
+        "manifest": {
+          "contributes": {
+            "snippets": [
+              {
+                "language": "go",
+                "path": "extension/snippets/go.json"
+              }
+            ]
+          },
+          "description": "Rich Go language support for Visual Studio Code",
+          "displayName": "Go",
+          "engines": {
+            "yavin": "^2.0.0"
+          },
+          "manifestVersion": 1,
+          "name": "go",
+          "publisher": "golang",
+          "version": "0.56.1",
+          "vsix": {
+            "code": true,
+            "ignored": [
+              "Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+              "breakpoints: needs the VS Code extension API, which Yavin does not provide.",
+              "commands: needs the VS Code extension API, which Yavin does not provide.",
+              "configuration: needs the VS Code extension API, which Yavin does not provide.",
+              "configurationDefaults: needs the VS Code extension API, which Yavin does not provide.",
+              "debuggers: needs the VS Code extension API, which Yavin does not provide.",
+              "TextMate grammars are not supported: Yavin's editor has no TextMate engine.",
+              "Languages and language configuration are not supported: Yavin decides each file's language itself.",
+              "menus: needs the VS Code extension API, which Yavin does not provide.",
+              "taskDefinitions: needs the VS Code extension API, which Yavin does not provide.",
+              "views: needs the VS Code extension API, which Yavin does not provide."
+            ],
+            "name": "go",
+            "publisher": "golang",
+            "rejected": [],
+            "signature": "not verified",
+            "supported": ["Snippets for go"],
+            "vscode": "^1.90.0"
+          }
+        },
+        "ok": true
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "45365da5d1284f3518b2949f218481f1e9ef6221b3d999a2e3082ccbb61e874b",
+        "signature": "registrySigned",
+        "size": 622061
+      },
+      "id": "golang.go",
+      "installMs": 3357,
+      "name": "Go",
+      "namespace": "golang",
+      "unpack": {
+        "bytes": 2999175,
+        "files": 37,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "0.56.1"
+    },
+    {
+      "download": {
+        "error": "UnexpectedContent: The package's checksum came back as application/octet-stream, not what was asked for.",
+        "ok": false
+      },
+      "id": "llvm-vs-code-extensions.vscode-clangd",
+      "installMs": 1197,
+      "name": "vscode-clangd",
+      "namespace": "llvm-vs-code-extensions",
+      "version": "0.6.0"
+    },
+    {
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "d1ae0bb3a2e4d582fb95aea8d16b95715c658f5fd76df2bfaae44e036c09bed9",
+        "signature": "registrySigned",
+        "size": 10188689
+      },
+      "id": "sumneko.lua",
+      "installMs": 11480,
+      "name": "lua",
+      "namespace": "sumneko",
+      "unpack": {
+        "error": "UnsafePackage: it has 2717 entries (the limit is 1000)",
+        "ok": false
+      },
+      "version": "3.19.2"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: christian-kohler.path-intellisense 2.8.0 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "a856e4436f4d9b4b03d581ec10f826fe79eeb6cb34f5eb9d5b013fd817aeb940",
+        "signature": "registrySigned",
+        "size": 222537
+      },
+      "id": "christian-kohler.path-intellisense",
+      "installMs": 4220,
+      "name": "path-intellisense",
+      "namespace": "christian-kohler",
+      "unpack": {
+        "bytes": 523271,
+        "files": 71,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "2.8.0"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: christian-kohler.npm-intellisense 1.4.5 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "962b851a7cafbd51f34afeb4a0b91e985caff3947e46218a12b448533d8f60ab",
+        "signature": "registrySigned",
+        "size": 1221856
+      },
+      "id": "christian-kohler.npm-intellisense",
+      "installMs": 4051,
+      "name": "npm-intellisense",
+      "namespace": "christian-kohler",
+      "unpack": {
+        "bytes": 1822733,
+        "files": 24,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "1.4.5"
+    },
+    {
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "6684f143859ff59143caffc2ea24afdeaea2816d2b702668810131e5d2badf9e",
+        "signature": "registrySigned",
+        "size": 2558120
+      },
+      "id": "zignd.html-css-class-completion",
+      "installMs": 5395,
+      "name": "html-css-class-completion",
+      "namespace": "Zignd",
+      "unpack": {
+        "error": "UnsafePackage: it has 1790 entries (the limit is 1000)",
+        "ok": false
+      },
+      "version": "1.20.0"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: formulahendry.auto-rename-tag 0.1.10 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "7c94f9a7971a1fbb4f74969597612e8a20e871283c930bfa54f333386c86d4d3",
+        "signature": "registrySigned",
+        "size": 684418
+      },
+      "id": "formulahendry.auto-rename-tag",
+      "installMs": 3916,
+      "name": "auto-rename-tag",
+      "namespace": "formulahendry",
+      "unpack": {
+        "bytes": 2709846,
+        "files": 15,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "0.1.10"
+    },
+    {
+      "download": {
+        "error": "UnexpectedContent: The package's checksum came back as application/octet-stream, not what was asked for.",
+        "ok": false
+      },
+      "id": "tyriar.sort-lines",
+      "installMs": 1612,
+      "name": "sort-lines",
+      "namespace": "Tyriar",
+      "version": "1.12.0"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: wmaurer.change-case 1.0.0 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "203d4530ee6af10846c369eb1e44fc1b5cc4c1124164ed679571b36611d49ce3",
+        "signature": "registrySigned",
+        "size": 93290
+      },
+      "id": "wmaurer.change-case",
+      "installMs": 5201,
+      "name": "change-case",
+      "namespace": "wmaurer",
+      "unpack": {
+        "bytes": 193698,
+        "files": 93,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "1.0.0"
+    },
+    {
+      "download": {
+        "error": "UnexpectedContent: The package's checksum came back as application/octet-stream, not what was asked for.",
+        "ok": false
+      },
+      "id": "alefragnani.bookmarks",
+      "installMs": 1481,
+      "name": "Bookmarks",
+      "namespace": "alefragnani",
+      "version": "14.1.1"
+    },
+    {
+      "download": {
+        "error": "UnexpectedContent: The package's checksum came back as application/octet-stream, not what was asked for.",
+        "ok": false
+      },
+      "id": "vscodevim.vim",
+      "installMs": 1421,
+      "name": "vim",
+      "namespace": "vscodevim",
+      "version": "1.32.4"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: stkb.rewrap 1.16.3 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "58778b4cdf7dda5b44670d96ec1dec26b1df005b0e18cab79655780b48572cd0",
+        "signature": "registrySigned",
+        "size": 215199
+      },
+      "id": "stkb.rewrap",
+      "installMs": 3339,
+      "name": "rewrap",
+      "namespace": "stkb",
+      "unpack": {
+        "bytes": 979473,
+        "files": 56,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "1.16.3"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: gruntfuggly.todo-tree 0.0.215 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "326d84bd6372fceb8b40087b4d80be1046e47a4d116f2129e3f3d018b903df00",
+        "signature": "registrySigned",
+        "size": 576886
+      },
+      "id": "gruntfuggly.todo-tree",
+      "installMs": 3551,
+      "name": "todo-tree",
+      "namespace": "Gruntfuggly",
+      "unpack": {
+        "bytes": 1224324,
+        "files": 53,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "0.0.215"
+    },
+    {
+      "download": {
+        "error": "UnexpectedContent: The package's checksum came back as application/octet-stream, not what was asked for.",
+        "ok": false
+      },
+      "id": "alefragnani.project-manager",
+      "installMs": 1277,
+      "name": "project-manager",
+      "namespace": "alefragnani",
+      "version": "13.1.1"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: sleistner.vscode-fileutils 3.10.3 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "bfda32a2aa8171b15238eca13dae1d5178c0d885579424ce46ce27ac51921f31",
+        "signature": "registrySigned",
+        "size": 61885
+      },
+      "id": "sleistner.vscode-fileutils",
+      "installMs": 2743,
+      "name": "vscode-fileutils",
+      "namespace": "sleistner",
+      "unpack": {
+        "bytes": 155764,
+        "files": 8,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "3.10.3"
+    },
+    {
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "fd119b19255fc65d0b9bd0e3ed5c2221456f9a88444c14b90545286132f2bdb4",
+        "signature": "registrySigned",
+        "size": 4814951
+      },
+      "id": "eamodio.gitlens",
+      "installMs": 5838,
+      "name": "gitlens",
+      "namespace": "eamodio",
+      "unpack": {
+        "error": "InvalidPackage: its extension/package.json is larger than 1024 KiB",
+        "ok": false
+      },
+      "version": "2026.10.200514"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: mhutchie.git-graph 1.30.0 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "a6baa3d5b6231035431d6338286e4de7e25ee214b58edee1c7e2c9423bdb552f",
+        "signature": "registrySigned",
+        "size": 354158
+      },
+      "id": "mhutchie.git-graph",
+      "installMs": 3073,
+      "name": "git-graph",
+      "namespace": "mhutchie",
+      "unpack": {
+        "bytes": 999759,
+        "files": 70,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "1.30.0"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: donjayamanne.githistory 0.6.20 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "aaea597276f089922e5b785f5c1ca1f1bef523ee17d6766889b67c0c76c35104",
+        "signature": "registrySigned",
+        "size": 543568
+      },
+      "id": "donjayamanne.githistory",
+      "installMs": 4423,
+      "name": "githistory",
+      "namespace": "donjayamanne",
+      "unpack": {
+        "bytes": 1883677,
+        "files": 46,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "0.6.20"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: waderyan.gitblame 14.0.0 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "f3debf4ea302ea81d941ef74077a1980b889f72f90b5c275141af082ac166d6b",
+        "signature": "registrySigned",
+        "size": 37972
+      },
+      "id": "waderyan.gitblame",
+      "installMs": 2400,
+      "name": "gitblame",
+      "namespace": "waderyan",
+      "unpack": {
+        "bytes": 81947,
+        "files": 30,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "14.0.0"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: hbenl.vscode-test-explorer 2.22.1 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "dc55923cdf09100074189932da5fd0f0fa44822226a047b9b9951cc070740597",
+        "signature": "registrySigned",
+        "size": 82987
+      },
+      "id": "hbenl.vscode-test-explorer",
+      "installMs": 3914,
+      "name": "vscode-test-explorer",
+      "namespace": "hbenl",
+      "unpack": {
+        "bytes": 239017,
+        "files": 82,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "2.22.1"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: vitest.explorer 1.52.2 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "fcae41a6f584b7b0b19b84e52235082f8af12acfe8589930687161733003d331",
+        "signature": "registrySigned",
+        "size": 1326249
+      },
+      "id": "vitest.explorer",
+      "installMs": 4378,
+      "name": "explorer",
+      "namespace": "vitest",
+      "unpack": {
+        "bytes": 1933048,
+        "files": 30,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "1.52.2"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: orta.vscode-jest 6.4.4 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "6804b9da7c00b68331ac5a160f63b0e0b48a802881119bc03fa1f6c585cc5336",
+        "signature": "registrySigned",
+        "size": 394125
+      },
+      "id": "orta.vscode-jest",
+      "installMs": 3556,
+      "name": "vscode-jest",
+      "namespace": "Orta",
+      "unpack": {
+        "bytes": 1604518,
+        "files": 19,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "6.4.4"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: vadimcn.vscode-lldb 1.12.3 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "460ac959094344ebb29b3d01bad94f6093b374d6fff44896ca456ac5b2047cd1",
+        "signature": "registrySigned",
+        "size": 93774
+      },
+      "id": "vadimcn.vscode-lldb",
+      "installMs": 2539,
+      "name": "vscode-lldb",
+      "namespace": "vadimcn",
+      "unpack": {
+        "bytes": 285335,
+        "files": 10,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "1.12.3"
+    },
+    {
+      "download": {
+        "error": "UnexpectedContent: The package's checksum came back as application/octet-stream, not what was asked for.",
+        "ok": false
+      },
+      "id": "ms-python.debugpy",
+      "installMs": 958,
+      "name": "debugpy",
+      "namespace": "ms-python",
+      "version": "2026.6.0"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: firefox-devtools.vscode-firefox-debug 2.15.0 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "f72f7443331fa091bb2a7323828c4de5c70b54cf09de9348c37be164e4c4220f",
+        "signature": "registrySigned",
+        "size": 235453
+      },
+      "id": "firefox-devtools.vscode-firefox-debug",
+      "installMs": 3268,
+      "name": "vscode-firefox-debug",
+      "namespace": "firefox-devtools",
+      "unpack": {
+        "bytes": 718733,
+        "files": 15,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "2.15.0"
+    },
+    {
+      "download": {
+        "error": "TooLarge: hediet.vscode-drawio 1.6.6 is larger than 20971520 bytes; it was not downloaded.",
+        "ok": false
+      },
+      "id": "hediet.vscode-drawio",
+      "installMs": 14391,
+      "name": "vscode-drawio",
+      "namespace": "hediet",
+      "version": "1.6.6"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: tomoki1207.pdf 1.2.2 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "5697cd022caf93fa0fdb8c5b9c3624951394d8126ed09184ad4fdbcad62dadce",
+        "signature": "registrySigned",
+        "size": 3093014
+      },
+      "id": "tomoki1207.pdf",
+      "installMs": 5608,
+      "name": "pdf",
+      "namespace": "tomoki1207",
+      "unpack": {
+        "bytes": 7899489,
+        "files": 380,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "1.2.2"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: jock.svg 1.5.3 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "fc4e8cefd4c2de0af0dcdd66369d290027db10c4e1badbd6d9ad37d85bff2831",
+        "signature": "registrySigned",
+        "size": 1566829
+      },
+      "id": "jock.svg",
+      "installMs": 4718,
+      "name": "svg",
+      "namespace": "jock",
+      "unpack": {
+        "bytes": 6952047,
+        "files": 64,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "1.5.3"
+    },
+    {
+      "download": {
+        "error": "TooLarge: shd101wyy.markdown-preview-enhanced 0.8.40 is larger than 20971520 bytes; it was not downloaded.",
+        "ok": false
+      },
+      "id": "shd101wyy.markdown-preview-enhanced",
+      "installMs": 17812,
+      "name": "markdown-preview-enhanced",
+      "namespace": "shd101wyy",
+      "version": "0.8.40"
+    },
+    {
+      "download": {
+        "error": "UnexpectedContent: The package's checksum came back as application/octet-stream, not what was asked for.",
+        "ok": false
+      },
+      "id": "editorconfig.editorconfig",
+      "installMs": 945,
+      "name": "EditorConfig",
+      "namespace": "EditorConfig",
+      "version": "0.18.2"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: usernamehw.errorlens 3.29.0 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "daf150c4b1ab9faaab1ec6d674ae78e7ee49471ec3fd9719772371020ae1ebd2",
+        "signature": "registrySigned",
+        "size": 62677
+      },
+      "id": "usernamehw.errorlens",
+      "installMs": 3388,
+      "name": "errorlens",
+      "namespace": "usernamehw",
+      "unpack": {
+        "bytes": 198265,
+        "files": 32,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "3.29.0"
+    },
+    {
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "ef9545b7f62f91c69ae79356786e37ca78a20d2ac3e409eace107c8c9a8c8b99",
+        "signature": "registrySigned",
+        "size": 3313175
+      },
+      "id": "oderwat.indent-rainbow",
+      "installMs": 8114,
+      "name": "indent-rainbow",
+      "namespace": "oderwat",
+      "unpack": {
+        "error": "UnsafePackage: it has 1233 entries (the limit is 1000)",
+        "ok": false
+      },
+      "version": "8.3.1"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: yzhang.markdown-all-in-one 3.6.2 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "75037cc2e0f940ead6cb2db25c5e6f139031885f7dc07d56abe1e0bc0781dd1a",
+        "signature": "registrySigned",
+        "size": 1092129
+      },
+      "id": "yzhang.markdown-all-in-one",
+      "installMs": 3980,
+      "name": "markdown-all-in-one",
+      "namespace": "yzhang",
+      "unpack": {
+        "bytes": 3544059,
+        "files": 43,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "3.6.2"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: naumovs.color-highlight 2.8.0 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "f826e88a6a288db08820fd90bde1d962b3cec04fe96ebd126a459dcd5d6f92ea",
+        "signature": "registrySigned",
+        "size": 357480
+      },
+      "id": "naumovs.color-highlight",
+      "installMs": 4238,
+      "name": "color-highlight",
+      "namespace": "naumovs",
+      "unpack": {
+        "bytes": 759225,
+        "files": 359,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "2.8.0"
+    },
+    {
+      "adapt": {
+        "error": "UnsupportedPackage: aaron-bond.better-comments 3.0.2 has nothing Yavin can use from a VS Code extension (colour themes, snippets): Its code (main, browser) does not run: Yavin runs no VS Code extension code, so its commands and features are not available.",
+        "ok": false
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "11eb1ebe69b3d859c9ecd4026d83ab2b7db41069e6dd40dafbe12f54348d7817",
+        "signature": "registrySigned",
+        "size": 104838
+      },
+      "id": "aaron-bond.better-comments",
+      "installMs": 2906,
+      "name": "better-comments",
+      "namespace": "aaron-bond",
+      "unpack": {
+        "bytes": 357787,
+        "files": 34,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "3.0.2"
+    },
+    {
+      "download": {
+        "error": "UnexpectedContent: The package's checksum came back as application/octet-stream, not what was asked for.",
+        "ok": false
+      },
+      "id": "mechatroner.rainbow-csv",
+      "installMs": 918,
+      "name": "rainbow-csv",
+      "namespace": "mechatroner",
+      "version": "3.24.1"
+    }
+  ]
+}

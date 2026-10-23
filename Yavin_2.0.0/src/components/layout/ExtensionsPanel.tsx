@@ -453,7 +453,7 @@ export function ExtensionsPanel({
               onClick: () => onChooseMarketplace("yavin"),
             },
             {
-              label: "Browse Open VSX (VS Code extensions, browse only)",
+              label: "Browse Open VSX (VS Code extensions)",
               checked: market.providerId === "openvsx",
               onClick: () => onChooseMarketplace("openvsx"),
             },

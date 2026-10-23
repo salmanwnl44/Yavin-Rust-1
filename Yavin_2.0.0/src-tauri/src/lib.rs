@@ -42,6 +42,7 @@ mod terminal_shell;
 mod terminal_stream;
 mod trust;
 mod vsix;
+mod window_focus;
 mod workbench;
 use checkers::{available_checkers, cancel_checker, run_checker, Checks};
 use dap::{dap_send, dap_start, dap_stop, dap_stop_all, DapSessions};
@@ -734,6 +735,8 @@ pub fn run() {
         .manage(LocalGit::default())
         .setup(|app| {
             recover_at_startup(app.handle());
+            // The window's focus as the OS says it (EXT-27), followed from the UI thread.
+            window_focus::follow(app.handle());
             // The extension inventory (EXT-02): Yavin's extensions folder, and in development
             // builds the repository's samples.
             if let Ok((root, development)) = extension_service::paths_of(app.handle()) {
@@ -843,6 +846,7 @@ pub fn run() {
             available_checkers,
             workspace_trust,
             set_workspace_trust,
+            window_focus::window_focused,
             trusted_folders,
             forget_trusted_folder,
             read_session,

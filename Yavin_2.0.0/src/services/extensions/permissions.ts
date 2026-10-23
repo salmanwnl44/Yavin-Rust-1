@@ -10,7 +10,8 @@
  * - **Mandatory** (every extension, scoped by ownership): its own commands, views, language
  *   providers, decorations, storage and settings; messages; its configuration events.
  * - **Optional** (declared in `permissions.request`, then allowed by the user, per installed
- *   copy): `workspace.fs.read`, `documents.read`, `editor.control`, `commands.execute:<id>`.
+ *   copy): `workspace.fs.read`, `documents.read`, `documents.edit` (EXT-25), `editor.control`,
+ *   `commands.execute:<id>`, `secrets`.
  * - A manifest without `permissions` (made before EXT-07) is taken to request `LEGACY` when it
  *   has code, nothing when it does not -- and is allowed nothing until the user allows it.
  */
@@ -22,6 +23,8 @@ export const MAX_REQUESTED = 16;
 export const FS_READ = "workspace.fs.read";
 export const DOCUMENTS_READ = "documents.read";
 export const EDITOR_CONTROL = "editor.control";
+/** Editing open documents' text (EXT-25): unsaved, undoable edits through the document service. */
+export const DOCUMENTS_EDIT = "documents.edit";
 export const COMMANDS_EXECUTE = "commands.execute:";
 /** Keeping its own secrets in the OS credential store (EXT-13). */
 export const SECRETS = "secrets";
@@ -30,7 +33,13 @@ export const LEGACY: readonly string[] = [DOCUMENTS_READ, EDITOR_CONTROL, FS_REA
 
 /** `raw` as a capability in its canonical spelling, or null. `owner` is the extension asking. */
 export function capabilityOf(raw: string, owner: string): string | null {
-  if (raw === FS_READ || raw === DOCUMENTS_READ || raw === EDITOR_CONTROL || raw === SECRETS)
+  if (
+    raw === FS_READ ||
+    raw === DOCUMENTS_READ ||
+    raw === DOCUMENTS_EDIT ||
+    raw === EDITOR_CONTROL ||
+    raw === SECRETS
+  )
     return raw;
   if (!raw.startsWith(COMMANDS_EXECUTE)) return null;
   const target = canonicalId(raw.slice(COMMANDS_EXECUTE.length));
@@ -123,12 +132,21 @@ function owned(
 export function needOfEvent(event: string): Need {
   switch (event) {
     case "configuration.changed":
+    // EXT-27: whether the window is focused -- nothing of the user's work.
+    case "window.state":
       return none;
     case "documents.open":
     case "documents.change":
     case "documents.close":
     case "editor.active":
+    // EXT-29: saves (and being asked before one), and the editor's selection.
+    case "documents.save":
+    case "documents.willSave":
+    case "editor.selection":
       return needs(DOCUMENTS_READ);
+    // EXT-29: the workspace's file changes (names of files in it).
+    case "files.change":
+      return needs(FS_READ);
     default:
       return { kind: "invalid", reason: `"${event}" is not an event an extension can follow` };
   }
@@ -150,7 +168,21 @@ export function needOfRequest(
     case "languages.register":
     case "languages.unregister":
       return owned(params, "providerId", caller, "#");
+    // Its own status bar items (EXT-25): `<id>#status#<n>`, shown in Yavin's own style.
+    case "statusBar.set":
+    case "statusBar.remove":
+      return owned(params, "id", caller, "#");
+    // EXT-29: its own prompts (`<id>#prompt#<n>`): Yavin's picker and input box, which the user answers.
+    case "window.quickPick":
+    case "window.inputBox":
+    case "window.cancelPrompt":
+      return owned(params, "id", caller, "#");
+    // EXT-29: its own diagnostic collections (`<id>#diagnostics#<n>`), in the Problems view.
+    case "diagnostics.set":
+    case "diagnostics.clear":
+      return owned(params, "collection", caller, "#");
     case "window.showMessage":
+    case "window.state":
     case "storage.update":
     case "editor.setDecorations":
       return none;
@@ -181,6 +213,8 @@ export function needOfRequest(
     case "fs.readFile":
     case "fs.exists":
       return needs(FS_READ);
+    case "documents.edit":
+      return needs(DOCUMENTS_EDIT);
     case "secrets.get":
     case "secrets.store":
     case "secrets.delete": {
@@ -214,6 +248,12 @@ export function describeCapability(capability: string): { title: string; detail:
         title: "Read your open documents",
         detail:
           "The text of every open document, including unsaved changes, and which documents are open.",
+      };
+    case DOCUMENTS_EDIT:
+      return {
+        title: "Edit your open documents",
+        detail:
+          "Change the text of open documents. Changes are unsaved until you save them, and can be undone.",
       };
     case EDITOR_CONTROL:
       return {

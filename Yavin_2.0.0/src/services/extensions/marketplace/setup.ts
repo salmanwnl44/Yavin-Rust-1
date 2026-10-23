@@ -38,7 +38,7 @@ export const MARKETPLACE_SOURCE = enumSetting<"yavin" | "openvsx">({
   default: "yavin",
   options: [
     { value: "yavin", label: "Yavin Extensions" },
-    { value: "openvsx", label: "Open VSX (browse only)" },
+    { value: "openvsx", label: "Open VSX" },
   ],
   scopes: USER_ONLY,
 });

@@ -4,6 +4,7 @@ import { GitBranchIcon } from "../ui/Icons";
 import { problemCounts, problemsVersion, subscribeProblems } from "../../services/panel/problems";
 import { describeCursor } from "../../services/cursorStatus";
 import type { CursorStatusStore } from "../../services/cursorStatus";
+import type { StatusBarEntry, StatusBarStore } from "../../services/extensions/window";
 
 interface StatusBarProps {
   activeFile: string;
@@ -26,6 +27,48 @@ interface StatusBarProps {
     tone: "normal" | "busy" | "warning" | "error";
     onClick?: () => void;
   };
+  /** Extensions' items (EXT-25), and what clicking one does. */
+  extensionItems?: { store: StatusBarStore; onActivate(id: string): void };
+}
+
+/** Extensions' items on one side (EXT-25): their text in Yavin's style; the tooltip names who. */
+function ExtensionItems({
+  items,
+  side,
+}: {
+  items: NonNullable<StatusBarProps["extensionItems"]>;
+  side: StatusBarEntry["alignment"];
+}) {
+  const entries = useSyncExternalStore(items.store.subscribe, items.store.getSnapshot);
+  return (
+    <>
+      {entries
+        .filter((entry) => entry.alignment === side && entry.text)
+        .map((entry) => {
+          const title = `${entry.tooltip ? entry.tooltip + " — " : ""}${entry.extensionId}`;
+          return entry.clickable ? (
+            <button
+              key={entry.id}
+              data-extension-status={entry.id}
+              title={title}
+              onClick={() => items.onActivate(entry.id)}
+              className="max-w-[16rem] shrink-0 truncate hover:text-zinc-200"
+            >
+              {entry.text}
+            </button>
+          ) : (
+            <span
+              key={entry.id}
+              data-extension-status={entry.id}
+              title={title}
+              className="max-w-[16rem] shrink-0 truncate"
+            >
+              {entry.text}
+            </span>
+          );
+        })}
+    </>
+  );
 }
 
 /**
@@ -65,6 +108,7 @@ export function StatusBar({
   cursorStatus,
   onGoToLine,
   languageStatus,
+  extensionItems,
 }: StatusBarProps) {
   useSyncExternalStore(subscribeProblems, problemsVersion, problemsVersion);
   const branch = useRepoSnapshot(useActiveRepo()?.store)?.branch;
@@ -116,8 +160,10 @@ export function StatusBar({
           </button>
         )}
         <span className="truncate">{activeFile || "Yavin IDE"}</span>
+        {extensionItems && <ExtensionItems items={extensionItems} side="left" />}
       </div>
       <div className="flex shrink-0 items-center gap-4">
+        {extensionItems && <ExtensionItems items={extensionItems} side="right" />}
         {cursorStatus && <CursorItems store={cursorStatus} onGoToLine={onGoToLine} />}
         {languageStatus && (
           <button

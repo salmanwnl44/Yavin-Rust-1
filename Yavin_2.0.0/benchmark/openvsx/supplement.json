@@ -1,0 +1,23 @@
+{
+  "about": "EXT-26 supplement: the two cases reported from the installed app, run through the same native and activation stages; kept apart so that the 64-extension benchmark stays comparable with EXT-25.",
+  "categories": {
+    "lsp": "Language servers",
+    "webviews": "Webviews and custom editors"
+  },
+  "extensions": [
+    {
+      "category": "lsp",
+      "namespace": "ms-python",
+      "name": "python",
+      "version": "2026.4.0",
+      "page": "https://open-vsx.org/extension/ms-python/python"
+    },
+    {
+      "category": "webviews",
+      "namespace": "vscode",
+      "name": "simple-browser",
+      "version": "1.95.3",
+      "page": "https://open-vsx.org/extension/vscode/simple-browser"
+    }
+  ]
+}

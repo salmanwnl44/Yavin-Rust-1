@@ -32,7 +32,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The extension API this Yavin provides (`EXTENSION_API` in `manifest.ts` is the same).
-pub const EXTENSION_API: &str = "2.0.0";
+pub const EXTENSION_API: &str = "2.1.0";
 /// The manifest format this Yavin reads.
 pub const MANIFEST_VERSION: u64 = 1;
 /// The most dependencies and incompatibilities one manifest may name, together.

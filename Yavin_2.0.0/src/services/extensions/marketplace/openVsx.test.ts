@@ -188,7 +188,7 @@ test("Open VSX answers are validated: malformed answers fail, bad entries are le
   assert.equal(items[0].rating, 4.5);
 });
 
-test("Open VSX extensions are VS Code extensions: only themes and snippets install, said plainly", async () => {
+test("Open VSX extensions are VS Code extensions: installable, not verified until installed, said plainly (EXT-25)", async () => {
   const { native } = fakeNative((request) =>
     request.kind === "search"
       ? { offset: 0, totalSize: 1, extensions: [entry()] }
@@ -200,27 +200,27 @@ test("Open VSX extensions are VS Code extensions: only themes and snippets insta
     api: "2.0.0",
     platform: "win32",
   });
-  // A search entry does not say what it contributes: installable, with what that means.
+  // Before it is installed, how well it works is not known: installable, and said so.
   const found = await service.search({ query: "yaml", page: 0, pageSize: 20 });
   const fits = service.compatibility(found.items[0]);
   assert.equal(fits.compatible, true);
+  assert.match(fits.notes?.[0] ?? "", /^Not verified: a VS Code extension./);
   assert.match(
     fits.notes?.[0] ?? "",
-    /installs only its colour themes and snippets; its code never runs/,
+    /runs in Yavin's sandbox with only the permissions you allow/,
   );
-  // Its record does: YAML is a language extension, with no theme or snippets to install.
+  // Its categories no longer decide: the package does (EXT-25, vsix.rs).
   const details = await service.getExtension("redhat.vscode-yaml");
   const why = service.compatibility(details);
-  assert.equal(why.compatible, false);
-  assert.match(why.reasons[0], /VS Code extension with no colour themes or snippets/);
-  assert.equal(service.latestCompatible(details), null);
+  assert.equal(why.compatible, true);
+  assert.equal(service.latestCompatible(details)?.version, "1.15.0");
   // Versions: the aliases are not versions; newest first; each one a VS Code package.
   assert.deepEqual(
     details.versions.map((v) => v.version),
     ["1.15.0", "1.14.2", "1.9.0"],
   );
   assert.ok(details.versions.every((v) => v.packageFormat === "vsix" && v.declarative === false));
-  assert.equal(service.compatibility(details, "1.9.0").compatible, false);
+  assert.equal(service.compatibility(details, "1.9.0").compatible, true);
   // A theme extension is installable, any listed version.
   const theme = await service.getExtension("redhat.theme-dracula");
   assert.equal(service.compatibility(theme).compatible, true);
@@ -308,7 +308,9 @@ test("Open VSX is chosen in Settings, at any registry address (a private mirror)
   assert.deepEqual([...MARKETPLACE_OPEN_VSX.scopes], ["user"]);
 });
 
-test("installing from Open VSX is refused before anything is downloaded: nothing runs, nothing changes", async () => {
+// EXT-25: a VS Code extension's categories no longer refuse it; the native install path reads the
+// package and decides (vsix.rs), and nothing of it runs while installing.
+test("installing from Open VSX goes to the native install path, which decides by the package", async () => {
   const settings = createSettingsRegistry([], memoryStorage());
   const registry = createExtensionRegistry({ settings, storage: memoryStorage() });
   const { native } = fakeNative((request) =>
@@ -317,7 +319,10 @@ test("installing from Open VSX is refused before anything is downloaded: nothing
   const service = createMarketplaceService(createOpenVsxProvider(URL_, { native }));
   const calls: string[] = [];
   const io: InstallerNative = {
-    stage: async () => (calls.push("stage"), { token: "t", manifest: "{}" }),
+    stage: async (source) => (
+      calls.push(`stage ${JSON.stringify(source)}`),
+      { token: "t", manifest: "{}" }
+    ),
     commit: async () => (calls.push("commit"), { folder: "x", replaced: false }),
     finish: async () => void calls.push("finish"),
     discard: async () => void calls.push("discard"),
@@ -331,18 +336,11 @@ test("installing from Open VSX is refused before anything is downloaded: nothing
     rediscover: async () => undefined,
     native: io,
   });
-  for (const version of [undefined, "1.9.0"])
-    await assert.rejects(
-      installer.install("redhat.vscode-yaml", version),
-      (error: MarketplaceError) => {
-        assert.equal(error.code, "Incompatible");
-        assert.match(error.message, /VS Code extension/);
-        return true;
-      },
-    );
-  assert.deepEqual(calls, [], "no package was downloaded or staged");
+  // The fake staged manifest is not a manifest: refused after staging, and discarded.
+  await installer.install("redhat.vscode-yaml").catch(() => undefined);
+  assert.match(calls[0] ?? "", /^stage .*"openVsx"/, calls.join(", "));
+  assert.ok(!calls.includes("finish"), "nothing invalid is registered");
   assert.equal(registry.get("redhat.vscode-yaml"), undefined);
-  assert.match(installer.getSnapshot().failures["redhat.vscode-yaml"].message, /VS Code extension/);
 });
 
 test("search pages never show an extension twice when the registry's order shifts", async () => {

@@ -19,6 +19,7 @@
  * extension lists them.
  */
 import type { ExtensionRegistry, RegistrySnapshot } from "./registry.ts";
+import { languageConfigurationFrom, type LanguageConfig } from "./languageConfiguration.ts";
 
 export interface ThemeRule {
   token: string;
@@ -48,9 +49,30 @@ export interface SnippetDefinition {
   description: string | null;
 }
 
+/** A language an extension contributes (EXT-25), with its configuration read and checked. */
+export interface LanguageDefinition {
+  id: string;
+  extensionId: string;
+  aliases: readonly string[];
+  extensions: readonly string[];
+  filenames: readonly string[];
+  config: LanguageConfig | null;
+}
+
+/** A TextMate grammar an extension contributes (EXT-25), its file read (not yet parsed). */
+export interface GrammarDefinition {
+  extensionId: string;
+  scopeName: string;
+  language: string | null;
+  path: string;
+  text: string;
+}
+
 export interface DeclarativeSnapshot {
   themes: readonly ThemeDefinition[];
   snippets: readonly SnippetDefinition[];
+  languages: readonly LanguageDefinition[];
+  grammars: readonly GrammarDefinition[];
   /** Per extension: what could not be applied, and why. */
   problems: Readonly<Record<string, readonly string[]>>;
   /** Still reading files. */
@@ -130,6 +152,13 @@ const SCOPES: Record<string, string> = {
   "meta.decorator": "decorator",
   invalid: "invalid",
 };
+/**
+ * The editor's token for one TextMate scope (EXT-25: a grammar's tokens, as a theme's scopes
+ * are mapped), or null when the table has none.
+ */
+export const scopeToken = (scope: string): string | null => tokenOf(scope)[0];
+/** Every token `scopeToken` can give: a grammar's semantic-token legend (EXT-25). */
+export const SCOPE_TOKENS: readonly string[] = [...new Set(Object.values(SCOPES))].sort();
 /** Semantic token types the editor colours (a language server's). */
 const SEMANTIC = new Set([
   "function",
@@ -347,14 +376,22 @@ export function snippetsFrom(
 
 // What is applied: every theme and snippet file of every enabled copy (`copy`: EXT-08) -- an
 // update keeping the same paths is another key, so it is read again.
-const keyOf = (snapshot: RegistrySnapshot) => JSON.stringify([snapshot.themes, snapshot.snippets]);
+const keyOf = (snapshot: RegistrySnapshot) =>
+  JSON.stringify([snapshot.themes, snapshot.snippets, snapshot.languages, snapshot.grammars]);
 
 export function createDeclarativeContributions(options: {
   registry: ExtensionRegistry;
   read: ResourceReader;
 }) {
   const listeners = new Set<() => void>();
-  let snapshot: DeclarativeSnapshot = { themes: [], snippets: [], problems: {}, loading: false };
+  let snapshot: DeclarativeSnapshot = {
+    themes: [],
+    snippets: [],
+    languages: [],
+    grammars: [],
+    problems: {},
+    loading: false,
+  };
   let applied = "";
   let sequence = 0;
   /**
@@ -446,11 +483,71 @@ export function createDeclarativeContributions(options: {
         }
       }),
     );
+    // Languages (EXT-25): the first contribution of an id wins (by extension id); a later one
+    // adds only its file associations.
+    const languages: LanguageDefinition[] = [];
+    for (const entry of registry.languages) {
+      let config: LanguageConfig | null = null;
+      if (entry.configuration)
+        try {
+          const read = languageConfigurationFrom(
+            parseJsonc(await readerOf(entry.copy)(entry.extensionId, entry.configuration)),
+          );
+          config = read.config;
+          for (const one of read.problems)
+            problem(entry.extensionId, `Language configuration of ${entry.id}: ${one}`);
+        } catch (error) {
+          problem(
+            entry.extensionId,
+            `${entry.configuration} could not be read: ${(error as Error).message}`,
+          );
+        }
+      const known = languages.find((one) => one.id === entry.id);
+      if (known)
+        languages[languages.indexOf(known)] = {
+          ...known,
+          extensions: [...known.extensions, ...entry.extensions],
+          filenames: [...known.filenames, ...entry.filenames],
+          config: known.config ?? config,
+        };
+      else
+        languages.push({
+          id: entry.id,
+          extensionId: entry.extensionId,
+          aliases: entry.aliases,
+          extensions: entry.extensions,
+          filenames: entry.filenames,
+          config,
+        });
+    }
+    const grammars = (
+      await Promise.all(
+        registry.grammars.map(async (entry): Promise<GrammarDefinition | null> => {
+          try {
+            return {
+              extensionId: entry.extensionId,
+              scopeName: entry.scopeName,
+              language: entry.language,
+              path: entry.path,
+              text: await readerOf(entry.copy)(entry.extensionId, entry.path),
+            };
+          } catch (error) {
+            problem(
+              entry.extensionId,
+              `Grammar ${entry.scopeName} could not be read: ${(error as Error).message}`,
+            );
+            return null;
+          }
+        }),
+      )
+    ).filter((one): one is GrammarDefinition => one !== null);
     if (mine !== sequence) return; // a newer registry state is loading
     files = new Map([...used].filter(([key]) => !failed.has(key)));
     publish({
       themes: themes.filter((one): one is ThemeDefinition => one !== null),
       snippets: snippets.flat(),
+      languages,
+      grammars,
       problems,
       loading: false,
     });

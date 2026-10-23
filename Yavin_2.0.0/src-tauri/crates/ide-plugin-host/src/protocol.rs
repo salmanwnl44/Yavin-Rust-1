@@ -13,6 +13,9 @@ use serde_json::Value;
 
 /// The largest message either way (Yavin enforces the same).
 pub const MAX_MESSAGE: usize = 1024 * 1024;
+/// The largest `load`: Yavin puts the extension's code in it -- a VS Code extension's modules
+/// too (EXT-25: at most 24 MiB of them, `extensions::read_modules`).
+pub const MAX_LOAD: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct HostLimits {
@@ -58,7 +61,9 @@ pub fn valid_extension_id(id: &str) -> bool {
 }
 
 pub fn parse(text: &str) -> Result<Inbound, String> {
-    if text.len() > MAX_MESSAGE {
+    // A load may carry code; nothing else may be larger than a message (checked once its type
+    // is known, below).
+    if text.len() > MAX_LOAD {
         return Err(format!(
             "a message of {} bytes is over the limit",
             text.len()
@@ -70,6 +75,12 @@ pub fn parse(text: &str) -> Result<Inbound, String> {
         .and_then(Value::as_str)
         .ok_or("no type")?
         .to_string();
+    if kind != "load" && text.len() > MAX_MESSAGE {
+        return Err(format!(
+            "a message of {} bytes is over the limit",
+            text.len()
+        ));
+    }
     let string = |name: &str| {
         message
             .get(name)

@@ -23,6 +23,8 @@ import {
   type ExtensionHostOptions,
   type HostSnapshot,
 } from "./host.ts";
+import type { RegisteredExtension } from "./registry.ts";
+import type { DocumentInfo } from "./window.ts";
 
 export const CRASH_LIMIT = 3;
 export const CRASH_WINDOW_MS = 60_000;
@@ -77,6 +79,7 @@ export function createExtensionHostManager(options: ManagerOptions) {
     statuses: {},
     views: {},
     denied: {},
+    unsupported: {},
   });
   let snapshot: ManagerSnapshot = { ...empty(), crashes: 0, held: null, heldBy: null };
   const publish = () => {
@@ -142,9 +145,42 @@ export function createExtensionHostManager(options: ManagerOptions) {
     if (!waiting && !host) return;
     await current().fire(event);
   };
+  /**
+   * EXT-27: an extension installed or enabled after the window's one-shot events (startup, the
+   * folder opening) still activates on them, as in VS Code -- not only at the next window. Once
+   * per registry entry (a new version is a new entry; disabling forgets it), never while held.
+   */
+  const started = new WeakSet<RegisteredExtension>();
+  const waitsForFired = (entry: RegisteredExtension) =>
+    entry.manifest.activationEvents.some((wanted) => events.some((e) => e.kind === wanted.kind));
+  /** What the one-shot events already reach (those fired now, or a new host's replay). */
+  const markStarted = () => {
+    for (const entry of options.registry.getSnapshot().extensions)
+      if (entry.enabled) started.add(entry);
+  };
+  const startLate = () => {
+    if (disposed || held || !events.length) return;
+    for (const entry of options.registry.getSnapshot().extensions) {
+      if (!entry.enabled) {
+        started.delete(entry);
+        continue;
+      }
+      if (started.has(entry)) continue;
+      started.add(entry);
+      if (!entry.manifest.main || !waitsForFired(entry)) continue;
+      void (async () => {
+        const live = current();
+        await live.reconcile(); // a replaced version is retired first
+        await live.activate(entry.id);
+      })().catch(() => undefined);
+    }
+  };
+  const stopFollowing = options.registry.subscribe(startLate);
+
   /** After a restart, a reload or trust granted: views on screen are filled; events, lazily. */
   const resume = () => {
     if (disposed || held) return;
+    markStarted();
     if (shown.size) current();
     for (const event of events) void fireEvent(event).catch(() => undefined);
   };
@@ -185,10 +221,20 @@ export function createExtensionHostManager(options: ManagerOptions) {
         !events.some((e) => e.kind === event.kind)
       )
         events.push(event);
+      if (!held) markStarted();
       await fireEvent(event);
     },
     executeCommand: async (command: string, ...args: unknown[]) =>
       current().executeCommand(command, ...args),
+    /** A status bar item was clicked (EXT-25): only a running host has any. */
+    activateStatusItem: async (id: string) =>
+      host && !host.finished ? host.activateStatusItem(id) : undefined,
+    /**
+     * Before a save (EXT-29): the edits of the extensions following will-save, within their
+     * budget; none without a running host (no extension can be following then).
+     */
+    willSave: async (document: DocumentInfo, reason: "manual" | "afterDelay" | "focusOut") =>
+      host && !host.finished && !held ? host.willSave(document, reason) : [],
     showView: async (view: string) => {
       // Remembered even while held: trust granted or a restart fills it.
       shown.add(view);
@@ -236,6 +282,7 @@ export function createExtensionHostManager(options: ManagerOptions) {
     async dispose(): Promise<void> {
       if (disposed) return;
       disposed = true;
+      stopFollowing();
       await end("The workspace was closed.");
       listeners.clear();
     },

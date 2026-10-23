@@ -1,4 +1,5 @@
-import React from "react";
+import React, { useSyncExternalStore } from "react";
+import { iconThemes } from "../../services/extensions/iconThemes";
 
 // Sleek modern chevron
 export function ChevronIcon({
@@ -714,7 +715,10 @@ const BY_NAME = new Map<string, Icon>([
   ["yarn.lock", LockIcon],
 ]);
 
-/** Picks the icon for a file or folder by name. */
+/**
+ * Picks the icon for a file or folder by name: the chosen file icon theme's (EXT-30, an
+ * extension's SVG drawn as an image), else Yavin's own.
+ */
 export const FileIcon = React.memo(function FileIcon({
   name,
   isDir,
@@ -726,6 +730,19 @@ export const FileIcon = React.memo(function FileIcon({
   isExpanded?: boolean;
   className?: string;
 }) {
+  // Re-rendered when the theme, or an icon it was waiting for, changes.
+  useSyncExternalStore(iconThemes.subscribe, iconThemes.getVersion, iconThemes.getVersion);
+  const themed = iconThemes.image({ name: name || "", isDir: !!isDir, expanded: !!isExpanded });
+  if (themed)
+    return (
+      <img
+        src={themed}
+        alt=""
+        draggable={false}
+        data-icon-theme={iconThemes.shown()?.id}
+        className={`${className} shrink-0 object-contain`}
+      />
+    );
   if (isDir)
     return isExpanded ? (
       <FolderOpenIcon name={name} className={className} />

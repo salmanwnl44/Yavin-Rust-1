@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { setContributedLanguages } from "./language.ts";
 import { Channel, isTauri } from "@tauri-apps/api/core";
 import { GitRegistry } from "./git/registry.ts";
 import { native, onLocalGitProgress } from "./native.ts";
@@ -14,6 +15,7 @@ import type { TerminalUi } from "./terminalUi.ts";
 import { createProfileRegistry } from "./terminalProfiles.ts";
 import { createTerminalSettings } from "./terminalSettings.ts";
 import { createSettingsRegistry } from "./settings/settings.ts";
+import { ICON_THEME_SETTING, iconThemes } from "./extensions/iconThemes.ts";
 import { EDITOR_SETTING_LIST } from "../editor/editorSettings.ts";
 import { TASK_DEFINITIONS } from "./tasks/model.ts";
 import { createTaskService, type TaskService } from "./tasks/service.ts";
@@ -43,6 +45,8 @@ import {
 } from "./extensions/marketplace/setup.ts";
 import {
   createDecorationStore,
+  createStatusBarStore,
+  createWindowProxy,
   createProviderRegistry,
   type ExtensionWindow,
 } from "./extensions/window.ts";
@@ -133,6 +137,7 @@ export const settings = createSettingsRegistry([
   ...DEBUG_SETTING_LIST,
   ...MARKETPLACE_SETTING_LIST,
   ...HOST_RESOURCE_SETTING_LIST,
+  ICON_THEME_SETTING,
 ]);
 
 /**
@@ -198,16 +203,31 @@ export const setPermissionReview = (
 /** Extensions' language providers and decorations, for the editor (IDE-08). */
 export const extensionProviders = createProviderRegistry();
 export const extensionDecorations = createDecorationStore();
+/** Extensions' status bar items (EXT-25), for the status bar. */
+export const extensionStatusBar = createStatusBarStore();
 /**
  * Enabled extensions' colour themes and snippets (EXT-04), read from their installed copy by
  * the native side; the editor applies them (`editor/declarativeMonaco.ts`).
  */
+// Which files are written in a language an extension contributes (EXT-25), from the start.
+const followContributedLanguages = () =>
+  setContributedLanguages(extensionRegistry.getSnapshot().languages);
+extensionRegistry.subscribe(followContributedLanguages);
+followContributedLanguages();
+const readExtensionResource = (id: string, path: string): Promise<string> =>
+  isTauri()
+    ? native("extensions_read_resource", { id, path })
+    : Promise.reject(new Error("Open the desktop application to read extensions."));
 export const declarativeContributions = createDeclarativeContributions({
   registry: extensionRegistry,
-  read: (id, path) =>
-    isTauri()
-      ? native("extensions_read_resource", { id, path })
-      : Promise.reject(new Error("Open the desktop application to read extensions.")),
+  read: readExtensionResource,
+});
+// File icon themes (EXT-30): enabled extensions' themes, the one the setting chooses.
+iconThemes.follow(extensionRegistry, readExtensionResource);
+iconThemes.select(settings.get(ICON_THEME_SETTING, null));
+settings.subscribe(null, (change) => {
+  if (change.id === ICON_THEME_SETTING.id)
+    iconThemes.select(settings.get(ICON_THEME_SETTING, null));
 });
 
 /**
@@ -219,26 +239,7 @@ let extensionWindow: ExtensionWindow | null = null;
 export const provideExtensionWindow = (window: ExtensionWindow | null) => {
   extensionWindow = window;
 };
-const unavailable = (): never => {
-  throw Object.assign(new Error("The window is not ready."), { code: "Unavailable" });
-};
-const windowProxy: ExtensionWindow = {
-  documents: {
-    all: () => extensionWindow?.documents.all() ?? [],
-    get: (resource) => extensionWindow?.documents.get(resource) ?? null,
-    text: (resource) => extensionWindow?.documents.text(resource) ?? null,
-    subscribe: (listener) => extensionWindow?.documents.subscribe(listener) ?? (() => {}),
-  },
-  editor: {
-    active: () => extensionWindow?.editor.active() ?? null,
-    onActive: (listener) => extensionWindow?.editor.onActive(listener) ?? (() => {}),
-    openLocation: (path, range) =>
-      (extensionWindow ?? unavailable()).editor.openLocation(path, range),
-    setSelection: (range) => extensionWindow?.editor.setSelection(range) ?? false,
-    revealRange: (range) => extensionWindow?.editor.revealRange(range) ?? false,
-  },
-  readFile: (path) => (extensionWindow ?? unavailable()).readFile(path),
-};
+const windowProxy: ExtensionWindow = createWindowProxy(() => extensionWindow);
 
 /** What extensions say to the user (`window.show*Message`), for the window to show. */
 export type ExtensionMessage = {
@@ -364,7 +365,10 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
           transport: createNativeHostTransport(() => hostResources(settings)),
           window: windowProxy,
           decorations: extensionDecorations,
+          statusBar: extensionStatusBar,
           providers: extensionProviders,
+          // EXT-29: extensions' diagnostics in the Problems view, under owners of their own.
+          problems: { publish: publishProblems, clear: clearProblems },
           rediscover: () => rediscoverExtensions(extensionRegistry),
           // Workspace Trust, asked before any extension code runs.
           trusted: () => readTrust().then((trust) => trust.trusted),

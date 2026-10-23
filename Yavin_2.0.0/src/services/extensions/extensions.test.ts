@@ -278,7 +278,9 @@ test("a v2 manifest: containers, panel and container views, menus with when, dep
     key: "resourceExtname",
     value: ".md",
   });
-  assert.equal(EXTENSION_API, "2.0.0");
+  // EXT-25: 2.1 adds timers, document edits and status bar items; 2.0 extensions still fit.
+  assert.equal(EXTENSION_API, "2.1.0");
+  assert.equal(satisfies(EXTENSION_API, "^2.0.0"), true);
   assert.equal(satisfies("2.0.0", "^1.0.0"), false, "an IDE-07 (API 1) extension is incompatible");
 });
 
@@ -328,10 +330,10 @@ test("invalid manifests are rejected with every reason; unknown fields only warn
         `${JSON.stringify(overrides)} -> ${JSON.stringify(result.problems)}`,
       );
   }
-  const warned = readManifest(manifest({ sponsor: "x", contributes: { grammars: [] } }));
+  const warned = readManifest(manifest({ sponsor: "x", contributes: { debuggers: [] } }));
   assert.ok(warned.ok);
   assert.deepEqual(
-    warned.warnings.filter((w) => w.field === "sponsor" || w.field === "contributes.grammars")
+    warned.warnings.filter((w) => w.field === "sponsor" || w.field === "contributes.debuggers")
       .length,
     2,
   );
@@ -1099,7 +1101,7 @@ test("the sample extension works end to end through the host", async () => {
   await until(() => !!m.getSnapshot().views["yavin-samples.hello-world.about"], "about");
   assert.equal(
     m.getSnapshot().views["yavin-samples.hello-world.about"][0].children?.[0].label,
-    "API 2.0.0",
+    "API 2.1.0",
   );
   assert.ok(t.notes.some(([, , text]) => text === "Hello, world!"));
 });

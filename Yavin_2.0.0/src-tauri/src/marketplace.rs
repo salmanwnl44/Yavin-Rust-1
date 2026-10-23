@@ -288,6 +288,10 @@ pub enum Kind {
     Text,
     Icon,
     Package,
+    /// A package's published SHA-256 (EXT-25): text, which Open VSX's file host serves as
+    /// `text/plain` or -- for many packages, verified 2026-10-20 -- `application/octet-stream`.
+    /// Its contents are checked strictly (64 hex digits, at most 256 bytes) whatever its type.
+    Checksum,
 }
 
 /// Whether a response's content type is acceptable for what was asked.
@@ -308,6 +312,10 @@ pub fn content_type_ok(kind: Kind, content_type: Option<&str>) -> bool {
                 )
         }
         Kind::Icon => matches!(value.as_str(), "image/png" | "application/octet-stream"),
+        Kind::Checksum => matches!(
+            value.as_str(),
+            "" | "text/plain" | "application/octet-stream" | "binary/octet-stream"
+        ),
         Kind::Package => matches!(
             value.as_str(),
             "application/octet-stream"
@@ -724,7 +732,9 @@ fn stage_package(
             sha256: sha256.to_ascii_lowercase(),
             store_revision: 0,
         };
-        let (sha256, size, signature) = match source {
+        // The platform an Open VSX package was chosen for (EXT-30; `None`: universal, or not
+        // from Open VSX): the package's own `TargetPlatform` must agree.
+        let (sha256, size, signature, chosen) = match source {
             PackageSource::Registry {
                 registry_url,
                 path,
@@ -794,7 +804,7 @@ fn stage_package(
                     },
                     _ => unsigned(&registry.origin, &actual),
                 };
-                (actual, read, signature)
+                (actual, read, signature, None)
             }
             PackageSource::File { path } => {
                 let from = PathBuf::from(&path);
@@ -806,7 +816,7 @@ fn stage_package(
                 fs::copy(&from, &archive).map_err(|e| format!("InstallFailed: {e}"))?;
                 let sha256 = extension_package::sha256_file(&archive)?;
                 let signature = unsigned("file", &sha256);
-                (sha256, meta.len(), signature)
+                (sha256, meta.len(), signature, None)
             }
             PackageSource::OpenVsx {
                 registry_url,
@@ -827,7 +837,15 @@ fn stage_package(
             format,
             files,
             bytes,
+            platform,
         } = unpack(&archive, &files_dir, &LIMITS)?;
+        if expected == Some(Format::Vsix) && chosen != platform {
+            return Err(format!(
+                "ManifestMismatch: {expected_id} {expected_version} was chosen as the {} package, but the package says it is built for {}.",
+                chosen.as_deref().unwrap_or("universal"),
+                platform.as_deref().unwrap_or("every platform")
+            ));
+        }
         match (expected, format) {
             (Some(Format::Yavin), Format::Vsix) => {
                 return Err(format!(
@@ -1018,6 +1036,14 @@ pub(crate) mod tests {
         ));
         assert!(!content_type_ok(Kind::Package, None));
         assert!(content_type_ok(Kind::Icon, Some("image/png")));
+        // EXT-25: a checksum as Open VSX's file host serves it; never a page or a document.
+        assert!(content_type_ok(Kind::Checksum, Some("text/plain")));
+        assert!(content_type_ok(
+            Kind::Checksum,
+            Some("application/octet-stream")
+        ));
+        assert!(!content_type_ok(Kind::Checksum, Some("text/html")));
+        assert!(!content_type_ok(Kind::Checksum, Some("application/json")));
         assert!(!content_type_ok(Kind::Icon, Some("image/svg+xml")));
     }
 

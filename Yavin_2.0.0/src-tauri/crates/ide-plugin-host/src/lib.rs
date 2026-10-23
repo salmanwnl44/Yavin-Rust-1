@@ -10,8 +10,9 @@
 //! Isolation, as it is:
 //! - **Process.** One host process per workspace, started by Yavin, in the servers' Job Object:
 //!   a crash or a runaway extension ends this process, not Yavin, and Yavin's exit ends it.
-//! - **Engine.** QuickJS without its `std`/`os` modules: no filesystem, network, process, timers
-//!   or native code exist in the language environment to call. The only way out is one function,
+//! - **Engine.** QuickJS without its `std`/`os` modules: no filesystem, network, process or
+//!   native code exist in the language environment to call. Timers (EXT-25) are kept by this
+//!   process (`runtime.rs`): each fires as an entry of its own, under the same deadline. The only way out is one function,
 //!   `__yavin_send`, captured by the bootstrap before extension code runs; everything an
 //!   extension wants is a message Yavin decides on.
 //! - **Per extension.** Each extension has its own runtime (globals, memory limit) -- one
@@ -36,10 +37,12 @@ pub mod watchdog;
 
 use ide_workspace::lsp_framing::{frame, FrameReader};
 use protocol::{HostLimits, Inbound, MAX_MESSAGE};
-use runtime::ExtensionRuntime;
+use runtime::{ExtensionRuntime, VscodeCode};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::mpsc::{channel, RecvTimeoutError};
+use std::time::Instant;
 
 /// The host's identity, from `init`: every later message must carry the same.
 struct Identity {
@@ -67,22 +70,79 @@ fn write(out: &mut impl Write, message: &Value) {
     let _ = out.flush();
 }
 
+/// Input as it arrives: framed messages, the end of input, or a stream that cannot be read.
+enum Input {
+    Messages(Vec<String>),
+    End,
+    Broken,
+}
+
 /// Runs the host on `input`/`output` until `shutdown` or end of input. Returns the exit code.
-pub fn run(mut input: impl Read, mut output: impl Write) -> i32 {
-    let mut reader = FrameReader::default();
-    let mut buffer = vec![0u8; 64 * 1024];
+pub fn run(mut input: impl Read + Send + 'static, mut output: impl Write) -> i32 {
+    // Input is read on a thread of its own, so the loop can wake for a timer that is due.
+    let (sender, inbox) = channel();
+    std::thread::spawn(move || {
+        let mut reader = FrameReader::default();
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            let next = match input.read(&mut buffer) {
+                Ok(0) | Err(_) => Input::End,
+                Ok(count) => match reader.push(&buffer[..count]) {
+                    Ok(messages) => Input::Messages(messages),
+                    // The stream cannot be resynchronized: the host ends, and Yavin sees it end.
+                    Err(_) => Input::Broken,
+                },
+            };
+            let last = !matches!(next, Input::Messages(_));
+            if sender.send(next).is_err() || last {
+                return;
+            }
+        }
+    });
     let mut identity: Option<Identity> = None;
     let mut extensions: HashMap<String, ExtensionRuntime> = HashMap::new();
     let watchdog = watchdog::Watchdog::start();
     loop {
-        let count = match input.read(&mut buffer) {
-            Ok(0) | Err(_) => return 0,
-            Ok(count) => count,
+        let due = extensions
+            .values()
+            .filter_map(ExtensionRuntime::next_due)
+            .min();
+        let next = match due {
+            Some(due) => inbox.recv_timeout(due.saturating_duration_since(Instant::now())),
+            None => inbox.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
-        let messages = match reader.push(&buffer[..count]) {
-            Ok(messages) => messages,
-            // The stream cannot be resynchronized: the host ends, and Yavin sees it end.
-            Err(_) => return 2,
+        let messages = match next {
+            Ok(Input::Messages(messages)) => messages,
+            Ok(Input::End) | Err(RecvTimeoutError::Disconnected) => return 0,
+            Ok(Input::Broken) => return 2,
+            Err(RecvTimeoutError::Timeout) => {
+                // Timers that are due, each extension's in turn.
+                if let Some(host) = identity.as_ref() {
+                    let now = Instant::now();
+                    let mut ids: Vec<String> = extensions.keys().cloned().collect();
+                    ids.sort();
+                    for id in ids {
+                        let Some(runtime) = extensions.get_mut(&id) else {
+                            continue;
+                        };
+                        if runtime.next_due().is_none_or(|due| due > now) {
+                            continue;
+                        }
+                        watchdog.enter(host.limits.call_ms);
+                        let sent = runtime.fire_due(now, &host.limits);
+                        watchdog.leave();
+                        for mut outgoing in sent {
+                            if let Some(object) = outgoing.as_object_mut() {
+                                object.insert("extensionId".into(), json!(id));
+                                object.insert("workspaceId".into(), json!(host.workspace_id));
+                                object.insert("hostGeneration".into(), json!(host.generation));
+                            }
+                            write(&mut output, &outgoing);
+                        }
+                    }
+                }
+                continue;
+            }
         };
         for text in messages {
             let inbound = match protocol::parse(&text) {
@@ -157,6 +217,22 @@ pub fn run(mut input: impl Read, mut output: impl Write) -> i32 {
                                 .get("extensionPath")
                                 .and_then(Value::as_str)
                                 .map(str::to_string);
+                            let vscode = match (
+                                message.get("modules"),
+                                message.get("vscode"),
+                                message.get("main").and_then(Value::as_str),
+                            ) {
+                                (Some(modules), Some(runtime), Some(main))
+                                    if modules.is_object() && runtime.is_object() =>
+                                {
+                                    Some(VscodeCode {
+                                        modules,
+                                        runtime,
+                                        main,
+                                    })
+                                }
+                                _ => None,
+                            };
                             watchdog.enter(host.limits.load_ms);
                             let created = ExtensionRuntime::load(
                                 &extension_id,
@@ -166,6 +242,7 @@ pub fn run(mut input: impl Read, mut output: impl Write) -> i32 {
                                 extension_path.as_deref(),
                                 &host.api_version,
                                 code,
+                                vscode,
                                 &host.limits,
                             );
                             watchdog.leave();

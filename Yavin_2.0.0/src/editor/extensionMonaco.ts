@@ -19,12 +19,78 @@ import { resourceId, type ResourceId } from "../services/resource";
 import type {
   DecorationStore,
   DocumentInfo,
+  ExtensionRange,
   LanguageProvider,
+  ProviderExtra,
   ProviderKind,
   ProviderRegistry,
 } from "../services/extensions/window";
 
 type Info = (doc: TextDocument) => DocumentInfo;
+
+/**
+ * EXT-29: a chosen extension code action's command, run in its extension (Monaco's command, made
+ * once; the registry is the one the editor attached last).
+ */
+export const EXTENSION_CODE_ACTION = "yavin.extensions.codeAction";
+let actionProviders: ProviderRegistry | null = null;
+let actionCommand: monaco.IDisposable | null = null;
+const registerActionCommand = (providers: ProviderRegistry) => {
+  actionProviders = providers;
+  actionCommand ??= monaco.editor.registerCommand(
+    EXTENSION_CODE_ACTION,
+    (_accessor, providerId: unknown, handle: unknown) => {
+      const provider = actionProviders
+        ?.getSnapshot()
+        .find((one) => one.providerId === providerId && one.kind === "codeActions");
+      if (!provider?.runAction || typeof handle !== "number") return;
+      void provider.runAction(handle).catch(() => undefined);
+    },
+  );
+};
+const fromMonacoRange = (r: monaco.IRange): ExtensionRange => ({
+  startLine: r.startLineNumber,
+  startColumn: r.startColumn,
+  endLine: r.endLineNumber,
+  endColumn: r.endColumn,
+});
+const MARKER_SEVERITY: Record<number, "error" | "warning" | "info" | "hint"> = {
+  8: "error",
+  4: "warning",
+  2: "info",
+  1: "hint",
+};
+/**
+ * A provider's text edits, as Monaco takes them: each in the document, none overlapping (a
+ * result with overlapping or out-of-range edits is refused whole).
+ */
+const editsOf = (
+  model: monaco.editor.ITextModel,
+  raw: unknown,
+): monaco.languages.TextEdit[] | null => {
+  const list = Array.isArray(raw) ? raw : [];
+  const edits: monaco.languages.TextEdit[] = [];
+  for (const one of list.slice(0, 5000)) {
+    const range = toRange(one?.range);
+    if (!range || typeof one?.text !== "string") return null;
+    const valid = model.validateRange(range);
+    if (!monaco.Range.equalsRange(valid, range)) return null;
+    edits.push({ range, text: one.text });
+  }
+  const sorted = [...edits].sort((a, b) =>
+    monaco.Range.compareRangesUsingStarts(a.range as monaco.IRange, b.range as monaco.IRange),
+  );
+  for (let i = 1; i < sorted.length; i++)
+    if (
+      monaco.Range.areIntersecting(
+        sorted[i - 1].range as monaco.IRange,
+        sorted[i].range as monaco.IRange,
+      ) &&
+      !monaco.Range.isEmpty(sorted[i - 1].range as monaco.IRange)
+    )
+      return null;
+  return edits;
+};
 
 const toRange = (raw: unknown): monaco.IRange | null => {
   const r = raw as {
@@ -59,12 +125,15 @@ async function ask(
   document: DocumentInfo,
   position: { line: number; column: number } | null,
   token: monaco.CancellationToken,
+  extra?: ProviderExtra,
 ): Promise<unknown[]> {
   const controller = new AbortController();
   const cancel = token.onCancellationRequested(() => controller.abort());
   try {
     const answers = await Promise.allSettled(
-      providers.map((provider) => provider.invoke({ document, position }, controller.signal)),
+      providers.map((provider) =>
+        provider.invoke({ document, position, ...(extra ? { extra } : {}) }, controller.signal),
+      ),
     );
     return answers.flatMap((answer) =>
       answer.status === "fulfilled" && answer.value != null ? [answer.value] : [],
@@ -190,6 +259,123 @@ export function attachExtensionEditor(
             );
           },
         });
+      // EXT-29: formatting -- one formatter's answer (the first provider, in registration order,
+      // with edits), for the version it was asked about; Monaco applies it as one undoable edit,
+      // which reaches the document service through the editor's model bridge.
+      case "formatting":
+      case "rangeFormatting": {
+        const format = async (
+          model: monaco.editor.ITextModel,
+          options: monaco.languages.FormattingOptions,
+          token: monaco.CancellationToken,
+          range: monaco.IRange | null,
+        ) => {
+          const doc = docOf(model);
+          if (!doc) return [];
+          const version = model.getVersionId();
+          const extra: ProviderExtra = {
+            options: { tabSize: options.tabSize, insertSpaces: options.insertSpaces },
+            ...(range ? { range: fromMonacoRange(range) } : {}),
+          };
+          for (const provider of matching()) {
+            const [answer] = await ask([provider], infoOf(doc), null, token, extra);
+            if (token.isCancellationRequested || model.isDisposed()) return [];
+            // Edits for an older version than the document's now are not applied.
+            if (model.getVersionId() !== version) return [];
+            const edits = answer === undefined ? null : editsOf(model, answer);
+            if (edits && edits.length) return edits;
+          }
+          return [];
+        };
+        return kind === "formatting"
+          ? L.registerDocumentFormattingEditProvider(target, {
+              displayName: "Extension",
+              provideDocumentFormattingEdits: (model, options, token) =>
+                format(model, options, token, null),
+            })
+          : L.registerDocumentRangeFormattingEditProvider(target, {
+              displayName: "Extension",
+              provideDocumentRangeFormattingEdits: (model, range, options, token) =>
+                format(model, options, token, range),
+            });
+      }
+      // EXT-29: code actions -- their text edits to this document (Monaco applies them, at the
+      // version they were made for), and their command, run in their extension when chosen.
+      case "codeActions":
+        return L.registerCodeActionProvider(target, {
+          async provideCodeActions(model, range, context, token) {
+            const doc = docOf(model);
+            const none = { actions: [], dispose() {} };
+            if (!doc) return none;
+            const version = model.getVersionId();
+            const extra: ProviderExtra = {
+              range: fromMonacoRange(range),
+              diagnostics: context.markers.slice(0, 200).map((marker) => ({
+                range: fromMonacoRange(marker),
+                message: marker.message,
+                severity: MARKER_SEVERITY[marker.severity] ?? "info",
+                ...(marker.source ? { source: marker.source } : {}),
+                ...(marker.code
+                  ? { code: typeof marker.code === "string" ? marker.code : marker.code.value }
+                  : {}),
+              })),
+              ...(context.only ? { only: context.only } : {}),
+              trigger:
+                context.trigger === monaco.languages.CodeActionTriggerType.Auto
+                  ? "automatic"
+                  : "invoke",
+            };
+            const actions: monaco.languages.CodeAction[] = [];
+            for (const provider of matching()) {
+              const [answer] = await ask([provider], infoOf(doc), null, token, extra);
+              if (
+                token.isCancellationRequested ||
+                model.isDisposed() ||
+                model.getVersionId() !== version
+              )
+                return none;
+              for (const item of (Array.isArray(answer) ? answer : []).slice(0, 200)) {
+                if (!item || typeof item.title !== "string") continue;
+                const edits = item.edits === undefined ? [] : editsOf(model, item.edits);
+                const disabled =
+                  typeof item.disabled === "string"
+                    ? item.disabled
+                    : typeof item.unsupported === "string"
+                      ? `Yavin applies an extension's edits to this document only (${item.unsupported}).`
+                      : edits === null
+                        ? "Its edits do not fit the document."
+                        : undefined;
+                actions.push({
+                  title: item.title,
+                  ...(typeof item.kind === "string" ? { kind: item.kind } : {}),
+                  ...(item.isPreferred === true ? { isPreferred: true } : {}),
+                  ...(disabled ? { disabled } : {}),
+                  ...(edits && edits.length && !disabled
+                    ? {
+                        edit: {
+                          edits: edits.map((textEdit) => ({
+                            resource: model.uri,
+                            versionId: version,
+                            textEdit,
+                          })),
+                        },
+                      }
+                    : {}),
+                  ...(typeof item.command === "number" && !disabled
+                    ? {
+                        command: {
+                          id: EXTENSION_CODE_ACTION,
+                          title: item.title,
+                          arguments: [provider.providerId, item.command],
+                        },
+                      }
+                    : {}),
+                });
+              }
+            }
+            return { actions, dispose() {} };
+          },
+        });
     }
   };
   const syncProviders = () => {
@@ -205,6 +391,7 @@ export function attachExtensionEditor(
         registered.set(key, make(kind, language));
       }
   };
+  registerActionCommand(providers);
   syncProviders();
   const stopProviders = providers.subscribe(syncProviders);
 

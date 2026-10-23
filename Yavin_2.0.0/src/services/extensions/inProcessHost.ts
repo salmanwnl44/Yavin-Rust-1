@@ -13,6 +13,15 @@ export interface InProcessHostOptions {
   bootstrap: string;
   /** An extension's code by id, as the native side would read it; null when it has none. */
   code(extensionId: string): string | null;
+  /**
+   * EXT-27: the VS Code compatibility layer (`vscode.js`), put where the bootstrap says, and what
+   * a VS Code extension is loaded with -- its modules, its manifest's `vsix.runtime`, its entry
+   * point -- as `extension_host.rs` sends them. Without these, VS Code extensions do not load.
+   */
+  vscodeLayer?: string;
+  vscode?(
+    extensionId: string,
+  ): { modules: Record<string, string>; runtime: unknown; main: string } | null;
   /** Fails `start`, as the native side does (`Code: message`). */
   failStart?: string;
   /**
@@ -46,6 +55,7 @@ export function createInProcessTransport(options: InProcessHostOptions) {
         apiVersion: string;
       } | null = null;
       const extensions = new Map<string, { receive(text: string): void }>();
+      const stops = new Map<string, () => void>();
       let ended = false;
       /** Messages are handled one after another, in the order sent (the real host reads one pipe). */
       let queue = Promise.resolve();
@@ -94,7 +104,41 @@ export function createInProcessTransport(options: InProcessHostOptions) {
             });
             return;
           }
-          const fakeGlobal: Record<string, unknown> = { __yavin_send: stamped(id) };
+          // Timers as the host keeps them (runtime.rs): fired as messages of their own.
+          const timers = new Map<number, ReturnType<typeof setTimeout>>();
+          const vscode = options.vscode?.(id) ?? null;
+          const fakeGlobal: Record<string, unknown> = {
+            __yavin_send: stamped(id),
+            __yavin_timer(timer: number, ms: number, repeat: boolean) {
+              if (timers.size >= 1000 && !timers.has(timer)) return false;
+              const fire = () =>
+                (queue = queue.then(() => {
+                  if (!repeat) timers.delete(timer);
+                  if (!ended)
+                    extensions.get(id)?.receive(JSON.stringify({ type: "timer", id: timer }));
+                }));
+              timers.set(
+                timer,
+                repeat ? setInterval(fire, Math.max(ms, 10)) : setTimeout(fire, ms),
+              );
+              return true;
+            },
+            __yavin_untimer(timer: number) {
+              const handle = timers.get(timer);
+              if (handle !== undefined) {
+                clearTimeout(handle);
+                clearInterval(handle);
+              }
+              timers.delete(timer);
+            },
+          };
+          stops.set(id, () => {
+            for (const handle of timers.values()) {
+              clearTimeout(handle);
+              clearInterval(handle);
+            }
+            timers.clear();
+          });
           const init = JSON.stringify({
             extensionId: id,
             workspaceId: identity.workspaceId,
@@ -102,13 +146,24 @@ export function createInProcessTransport(options: InProcessHostOptions) {
             workspaceFolder: identity.workspaceFolder,
             extensionPath: `/extensions/${id}`,
             apiVersion: identity.apiVersion,
+            runtime: vscode ? "vscode" : "yavin",
           });
           try {
-            new Function("globalThis", options.bootstrap.replaceAll("__YAVIN_INIT__", init))(
-              fakeGlobal,
-            );
+            new Function(
+              "globalThis",
+              // Literally, as runtime.rs does (EXT-29): a replacement string would expand the
+              // layer's own `$&` and `` $` `` (its escaping and its regular expressions).
+              options.bootstrap
+                .replace("/*__YAVIN_VSCODE__*/", () => options.vscodeLayer ?? "")
+                .replaceAll("__YAVIN_INIT__", () => init),
+            )(fakeGlobal);
             const receive = fakeGlobal.__yavin_receive as (text: string) => void;
-            (fakeGlobal.__yavin_load as (source: string) => void)(code);
+            (fakeGlobal.__yavin_load as (...args: string[]) => void)(
+              code,
+              vscode ? JSON.stringify(vscode.modules) : "null",
+              vscode ? JSON.stringify(vscode.runtime) : "null",
+              vscode ? vscode.main : "",
+            );
             extensions.set(id, { receive });
             out({
               type: "loaded",
@@ -129,6 +184,8 @@ export function createInProcessTransport(options: InProcessHostOptions) {
         }
         if (message.type === "unload") {
           extensions.delete(id);
+          stops.get(id)?.();
+          stops.delete(id);
           out({
             type: "unloaded",
             extensionId: id,
@@ -169,6 +226,8 @@ export function createInProcessTransport(options: InProcessHostOptions) {
         exit(crashed, reason) {
           if (ended) return;
           ended = true;
+          for (const stop of stops.values()) stop();
+          stops.clear();
           for (const listener of [...exitListeners]) listener({ reason, crashed });
         },
         deliver(text) {

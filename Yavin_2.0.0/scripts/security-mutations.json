@@ -1556,6 +1556,258 @@
         }
       ],
       "args": ["-p", "yavin-ide", "--lib", "--", "ext12", "extension_dependencies", "dependency"]
+    },
+    {
+      "id": "EXT-25 P1",
+      "what": "document edits need no grant",
+      "edits": [
+        {
+          "file": "src/extension_permissions.rs",
+          "from": "        \"documents.edit\" => need(DOCUMENTS_EDIT),",
+          "to": "        \"documents.edit\" => Need::Nothing,"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_permissions"]
+    },
+    {
+      "id": "EXT-25 P2",
+      "what": "status bar items need not be the extension's own",
+      "edits": [
+        {
+          "file": "src/extension_permissions.rs",
+          "from": "        \"statusBar.set\" | \"statusBar.remove\" => owned(params, \"id\", caller, '#'),",
+          "to": "        \"statusBar.set\" | \"statusBar.remove\" => Need::Nothing,"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_permissions"]
+    },
+    {
+      "id": "EXT-25 T1",
+      "what": "no cap on waiting timers",
+      "edits": [
+        {
+          "file": "crates/ide-plugin-host/src/runtime.rs",
+          "from": "                    if waiting.len() >= MAX_TIMERS && !waiting.contains_key(&id) {",
+          "to": "                    if false && waiting.len() >= MAX_TIMERS {"
+        }
+      ],
+      "args": ["-p", "ide-plugin-host", "--test", "vscode", "--", "timers"]
+    },
+    {
+      "id": "EXT-25 S1",
+      "what": "extensions run on the main thread's stack",
+      "edits": [
+        {
+          "file": "crates/ide-plugin-host/src/main.rs",
+          "from": "const STACK: usize = 32 * 1024 * 1024;",
+          "to": "const STACK: usize = 1024 * 1024;"
+        }
+      ],
+      "args": ["-p", "ide-plugin-host", "--test", "host", "--", "deep_recursion"]
+    },
+    {
+      "id": "EXT-25 C1",
+      "what": "a page accepted as a checksum",
+      "edits": [
+        {
+          "file": "src/marketplace.rs",
+          "from": "            \"\" | \"text/plain\" | \"application/octet-stream\" | \"binary/octet-stream\"",
+          "to": "            \"\" | \"text/plain\" | \"text/html\" | \"application/octet-stream\" | \"binary/octet-stream\""
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "content_types"]
+    },
+    {
+      "id": "EXT-29 P1",
+      "what": "diagnostic collections need not be the extension's own (native)",
+      "edits": [
+        {
+          "file": "src/extension_permissions.rs",
+          "from": "        \"diagnostics.set\" | \"diagnostics.clear\" => owned(params, \"collection\", caller, '#'),",
+          "to": "        \"diagnostics.set\" | \"diagnostics.clear\" => Need::Nothing,"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_permissions"]
+    },
+    {
+      "id": "EXT-29 P2",
+      "what": "prompts need not be the extension's own (native)",
+      "edits": [
+        {
+          "file": "src/extension_permissions.rs",
+          "from": "        \"window.quickPick\" | \"window.inputBox\" | \"window.cancelPrompt\" => {\n            owned(params, \"id\", caller, '#')\n        }",
+          "to": "        \"window.quickPick\" | \"window.inputBox\" | \"window.cancelPrompt\" => Need::Nothing,"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_permissions"]
+    },
+    {
+      "id": "EXT-30 X01",
+      "what": "the entry count is not bounded",
+      "edits": [
+        {
+          "file": "src/extension_package.rs",
+          "from": "if archive.len() > limits.entries {",
+          "to": "if false {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_package"]
+    },
+    {
+      "id": "EXT-30 X02",
+      "what": "an entry's whole name is not bounded",
+      "edits": [
+        {
+          "file": "src/extension_package.rs",
+          "from": "if name.len() > limits.path {",
+          "to": "if false {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_package"]
+    },
+    {
+      "id": "EXT-30 X03",
+      "what": "unpacking is not bounded in time",
+      "edits": [
+        {
+          "file": "src/extension_package.rs",
+          "from": "if started.elapsed() > limits.time {",
+          "to": "if false {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_package"]
+    },
+    {
+      "id": "EXT-30 X04",
+      "what": "the compression ratio is not checked",
+      "edits": [
+        {
+          "file": "src/extension_package.rs",
+          "from": "if written > RATIO_FLOOR && written / compressed > limits.ratio {",
+          "to": "if false {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_package"]
+    },
+    {
+      "id": "EXT-30 X05",
+      "what": "names differing only in case are not the same file",
+      "edits": [
+        {
+          "file": "src/extension_package.rs",
+          "from": "let key = components.join(\"/\").to_lowercase();",
+          "to": "let key = components.join(\"/\");"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_package"]
+    },
+    {
+      "id": "EXT-30 X06",
+      "what": "\"..\" in an entry name is accepted",
+      "edits": [
+        {
+          "file": "src/extension_package.rs",
+          "from": "if component == \"..\" {",
+          "to": "if component == \"....\" {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_package"]
+    },
+    {
+      "id": "EXT-30 X07",
+      "what": "a link in a package is accepted",
+      "edits": [
+        {
+          "file": "src/extension_package.rs",
+          "from": "            return Err(refuse(format!(\"\\\"{name}\\\" is a link\")));",
+          "to": "            let _ = &name;"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_package"]
+    },
+    {
+      "id": "EXT-30 X08",
+      "what": "a package's platform is not checked",
+      "edits": [
+        {
+          "file": "src/extension_package.rs",
+          "from": "platform_check(platform.as_deref())?;",
+          "to": "let _ = platform_check(platform.as_deref());"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_package"]
+    },
+    {
+      "id": "EXT-30 X09",
+      "what": "a package for any platform is this Yavin's",
+      "edits": [
+        {
+          "file": "src/extension_package.rs",
+          "from": "Some(p) if p == HOST_PLATFORM => Ok(()),",
+          "to": "Some(_) => Ok(()),"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_package"]
+    },
+    {
+      "id": "EXT-30 X10",
+      "what": "an unknown TargetPlatform is accepted",
+      "edits": [
+        {
+          "file": "src/extension_package.rs",
+          "from": "Some(platform) if TARGET_PLATFORMS.contains(&platform.as_str()) => Ok(Some(platform)),",
+          "to": "Some(platform) => Ok(Some(platform)),"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_package"]
+    },
+    {
+      "id": "EXT-30 X11",
+      "what": "this platform's variant is not preferred",
+      "edits": [
+        {
+          "file": "src/openvsx.rs",
+          "from": "if let Some(p) = published.iter().find(|p| **p == host) {",
+          "to": "if let Some(p) = published.iter().find(|p| **p == \"none\") {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "openvsx"]
+    },
+    {
+      "id": "EXT-30 X12",
+      "what": "a variant's metadata for another platform is taken",
+      "edits": [
+        {
+          "file": "src/openvsx.rs",
+          "from": "if platform != wanted {",
+          "to": "if false {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "openvsx"]
+    },
+    {
+      "id": "EXT-30 X13",
+      "what": "a package unlike the variant chosen is installed",
+      "edits": [
+        {
+          "file": "src/marketplace.rs",
+          "from": "if expected == Some(Format::Vsix) && chosen != platform {",
+          "to": "if false {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "openvsx"]
+    },
+    {
+      "id": "EXT-30 X14",
+      "what": "an icon theme's id is not checked",
+      "edits": [
+        {
+          "file": "src/vsix.rs",
+          "from": "if !icon_theme_id_ok(id) {",
+          "to": "if false {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "vsix"]
     }
   ]
 }

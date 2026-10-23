@@ -32,6 +32,7 @@
 import { createOutputChannel, type OutputChannel } from "../panel/output.ts";
 import {
   fileUri,
+  formatUri,
   fsPath,
   isEqualOrAncestor,
   parseUri,
@@ -50,14 +51,22 @@ import type { ExtensionStorage } from "./storage.ts";
 import type { HostChannel, HostDenial, HostTransport } from "./transport.ts";
 import {
   DECORATION_STYLES,
+  PROVIDER_KINDS,
   type DecorationStore,
+  type StatusBarStore,
   type DocumentInfo,
   type ExtensionDecoration,
   type ExtensionRange,
+  type ExtensionTextEdit,
   type ExtensionWindow,
+  type FileChange,
+  type PromptItem,
+  type PromptValidation,
   type ProviderKind,
   type ProviderRegistry,
 } from "./window.ts";
+import type { Diagnostic as Problem } from "../panel/problemMatchers.ts";
+import { DOCUMENTS_EDIT, DOCUMENTS_READ } from "./permissions.ts";
 
 export type ExtensionState =
   "registered" | "activating" | "active" | "failed" | "deactivating" | "disposed";
@@ -99,6 +108,11 @@ export interface HostSnapshot {
   views: Readonly<Record<string, readonly ViewRow[]>>;
   /** Each extension's last refused request (EXT-07), until what it needed is allowed. */
   denied: Readonly<Record<string, Omit<HostDenial, "extensionId">>>;
+  /**
+   * EXT-25: the VS Code APIs each extension used that Yavin does not provide (the compatibility
+   * layer's `UnsupportedApi` reports), in the order met; at most 50 per extension.
+   */
+  unsupported?: Readonly<Record<string, readonly string[]>>;
 }
 
 export interface HostTimeouts {
@@ -109,6 +123,8 @@ export interface HostTimeouts {
   command: number;
   view: number;
   provider: number;
+  /** A formatting provider (EXT-29). */
+  format: number;
 }
 
 export const DEFAULT_TIMEOUTS: HostTimeouts = {
@@ -119,6 +135,8 @@ export const DEFAULT_TIMEOUTS: HostTimeouts = {
   command: 30_000,
   view: 5_000,
   provider: 1_500,
+  // EXT-29: formatting a document can take longer than a hover.
+  format: 5_000,
 };
 
 export interface ExtensionHostOptions {
@@ -138,7 +156,17 @@ export interface ExtensionHostOptions {
   trusted(): Promise<boolean>;
   window: ExtensionWindow | null;
   decorations: DecorationStore;
+  /** Extensions' status bar items (EXT-25); without it, an extension cannot add any. */
+  statusBar?: StatusBarStore;
   providers: ProviderRegistry;
+  /**
+   * The Problems view (EXT-29): extensions' diagnostics, under owners of their own (the store
+   * Yavin's language servers and checkers publish to). Without it, no diagnostics are shown.
+   */
+  problems?: {
+    publish(owner: string, label: string, diagnostics: Problem[]): void;
+    clear(owner: string): void;
+  };
   notify(level: "info" | "warning" | "error", extensionId: string, message: string): void;
   channel?(extensionId: string, name: string): Pick<OutputChannel, "appendLine">;
   timeouts?: Partial<HostTimeouts>;
@@ -152,12 +180,28 @@ const MAX_PENDING = 256;
 const MALFORMED_LIMIT = 100;
 const EVENTS = new Set([
   "configuration.changed",
+  "window.state",
   "documents.open",
   "documents.change",
   "documents.close",
   "editor.active",
+  // EXT-29: saves, the selection, file changes; will-save is a request, followed to be asked.
+  "documents.save",
+  "documents.willSave",
+  "editor.selection",
+  "files.change",
 ]);
+/** How long, in all, the extensions following will-save may delay a save (VS Code's budget). */
+const WILL_SAVE_MS = 1500;
+/** Of an extension: diagnostics files in the Problems view, and items in one prompt. */
+const PROBLEM_FILES_LIMIT = 5000;
+const PROMPT_ITEMS_LIMIT = 5000;
+/** File changes sent in one event, and in one batch of the watcher. */
+const FILE_EVENT_CHANGES = 500;
+const FILE_BATCH_LIMIT = 5000;
 const KEY = /^[A-Za-z0-9._-]{1,40}$/;
+/** The most status bar items one extension may show (EXT-25). */
+const STATUS_LIMIT = 20;
 const LANGUAGE = /^[a-z0-9][a-z0-9+#._-]{0,49}$/i;
 
 interface Running {
@@ -193,6 +237,12 @@ export function createExtensionHost(options: ExtensionHostOptions) {
   const viewVersions = new Map<string, number>();
   let views: Record<string, readonly ViewRow[]> = {};
   let denied: Record<string, Omit<HostDenial, "extensionId">> = {};
+  let unsupported: Record<string, readonly string[]> = {};
+  /** Its diagnostics' owners in the Problems view, per extension (EXT-29): cleared when it stops. */
+  const problemOwners = new Map<string, Set<string>>();
+  /** Prompts shown for extensions (EXT-29), by id: cancelled when it stops, crashes or asks. */
+  const prompts = new Map<string, { extensionId: string; controller: AbortController }>();
+  let nextToken = 1;
   let hostState: HostState = "idle";
   let hostReason: string | null = null;
   let channel: HostChannel | null = null;
@@ -217,6 +267,7 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       statuses,
       views,
       denied,
+      unsupported,
     };
   }
   const publish = () => {
@@ -477,6 +528,14 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       case "log": {
         const one = running.get(message.extensionId);
         if (one) log(one, message.level, message.text);
+        const api = /^UnsupportedApi: (.{1,200}?) is not supported by Yavin/.exec(
+          String(message.text),
+        );
+        const known = unsupported[message.extensionId] ?? [];
+        if (one && api && !known.includes(api[1]) && known.length < 50) {
+          unsupported = { ...unsupported, [message.extensionId]: [...known, api[1]] };
+          publish();
+        }
         return;
       }
       case "error": {
@@ -571,6 +630,15 @@ export function createExtensionHost(options: ExtensionHostOptions) {
     // Only this host's: a host that ended never removes what its replacement registered.
     options.providers.clearExtension(extensionId, options.generation);
     options.decorations.clearExtension(extensionId, options.generation);
+    options.statusBar?.clearExtension(extensionId, options.generation);
+    // EXT-29: its problems leave the Problems view; a prompt it showed is cancelled (answered null).
+    for (const owner of problemOwners.get(extensionId) ?? []) options.problems?.clear(owner);
+    problemOwners.delete(extensionId);
+    for (const [id, prompt] of prompts)
+      if (prompt.extensionId === extensionId) {
+        prompts.delete(id);
+        prompt.controller.abort();
+      }
     running.get(extensionId)?.events.clear();
   };
 
@@ -656,6 +724,117 @@ export function createExtensionHost(options: ExtensionHostOptions) {
   };
   const windowOf = () =>
     options.window ?? fail("Unavailable", "This window offers no documents or editor.");
+
+  // --- EXT-29: prompts and diagnostics, checked here before the window sees them -------------
+  const optionalText = (value: unknown, max = 500) =>
+    typeof value === "string" ? value.slice(0, max) : undefined;
+  /** A prompt's id: the extension's own (`<id>#prompt#n`). */
+  const promptId = (one: Running, params: Record<string, unknown>) => {
+    const id = stringParam(params, "id", 200);
+    if (!id.startsWith(`${one.entry.id}#prompt#`))
+      fail("NotOwned", "A prompt's id is the extension's own.");
+    return id;
+  };
+  const promptOrigin = (one: Running, params: Record<string, unknown>) => ({
+    extensionId: one.entry.id,
+    extensionName: one.entry.manifest.displayName ?? one.entry.id,
+    ...(optionalText(params.title) !== undefined ? { title: optionalText(params.title) } : {}),
+    ...(optionalText(params.placeHolder) !== undefined
+      ? { placeHolder: optionalText(params.placeHolder) }
+      : {}),
+    ignoreFocusOut: params.ignoreFocusOut === true,
+  });
+  /**
+   * Shows a prompt of `one`'s: its earlier prompt, if any, is cancelled first (as in VS Code, a new
+   * one replaces it); the prompt is cancelled when the extension stops or asks to.
+   */
+  const showPrompt = async <T>(
+    one: Running,
+    id: string,
+    show: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> => {
+    for (const [other, prompt] of prompts)
+      if (prompt.extensionId === one.entry.id) {
+        prompts.delete(other);
+        prompt.controller.abort();
+      }
+    const controller = new AbortController();
+    prompts.set(id, { extensionId: one.entry.id, controller });
+    try {
+      return await show(controller.signal);
+    } finally {
+      if (prompts.get(id)?.controller === controller) prompts.delete(id);
+    }
+  };
+  const validationOf = (value: unknown): PromptValidation | null => {
+    const raw = (value ?? null) as { message?: unknown; severity?: unknown } | null;
+    if (!raw || typeof raw.message !== "string" || !raw.message) return null;
+    const severity = raw.severity === "warning" || raw.severity === "info" ? raw.severity : "error";
+    return { message: raw.message.slice(0, 500), severity };
+  };
+  /** A diagnostic collection's id: the extension's own (`<id>#diagnostics#n`). */
+  const collectionOf = (one: Running, params: Record<string, unknown>) => {
+    const id = stringParam(params, "collection", 200);
+    if (!id.startsWith(`${one.entry.id}#diagnostics#`))
+      fail("NotOwned", "A diagnostic collection's id is the extension's own.");
+    return id;
+  };
+  /** An extension's diagnostic, as the Problems view holds one; anything malformed is refused. */
+  const problemOf = (path: string, value: unknown): Problem => {
+    const d = (value ?? {}) as Record<string, unknown>;
+    const range = rangeParam(d.range);
+    if (typeof d.message !== "string")
+      fail("InvalidRequest", "A diagnostic's message is a string.");
+    const severity = d.severity;
+    if (
+      severity !== "error" &&
+      severity !== "warning" &&
+      severity !== "info" &&
+      severity !== "hint"
+    )
+      fail("InvalidRequest", "A diagnostic's severity is error, warning, info or hint.");
+    const code = (d.code ?? null) as { value?: unknown } | null;
+    const tags = Array.isArray(d.tags)
+      ? d.tags.filter(
+          (t): t is "unnecessary" | "deprecated" => t === "unnecessary" || t === "deprecated",
+        )
+      : [];
+    // Related places in this workspace only (others are left out).
+    const related = (Array.isArray(d.related) ? d.related : []).slice(0, 20).flatMap((entry) => {
+      const r = (entry ?? {}) as Record<string, unknown>;
+      try {
+        const uri = stringParam(r, "uri", 4000);
+        resourceOf(uri);
+        const at = rangeParam(r.range);
+        return [
+          {
+            file: fsPath(parseUri(uri)),
+            line: at.startLine,
+            column: at.startColumn,
+            message: typeof r.message === "string" ? r.message.slice(0, 500) : "",
+          },
+        ];
+      } catch {
+        return [];
+      }
+    });
+    return {
+      file: path,
+      line: range.startLine,
+      column: range.startColumn,
+      endLine: range.endLine,
+      endColumn: range.endColumn,
+      severity: severity === "hint" ? "info" : (severity as Problem["severity"]),
+      ...(severity === "hint" ? { hint: true } : {}),
+      message: (d.message as string).slice(0, 2000),
+      ...(code && (typeof code.value === "string" || typeof code.value === "number")
+        ? { code: String(code.value).slice(0, 200) }
+        : {}),
+      ...(typeof d.source === "string" ? { origin: d.source.slice(0, 100) } : {}),
+      ...(tags.length ? { tags } : {}),
+      ...(related.length ? { related } : {}),
+    };
+  };
   /**
    * An extension's own settings, as it sees them (EXT-13): a value set for this workspace, else
    * the active profile's (if valid for the setting), else the user's, else the default.
@@ -707,7 +886,31 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         options.window.editor.onActive(() =>
           emit("editor.active", options.window?.editor.active() ?? null),
         ),
+        // EXT-29: the active editor's selections (of the document that editor shows).
+        options.window.editor.onSelection?.((change) => {
+          const now = options.window?.editor.active();
+          if (!now || now.document.resourceId !== change.resource) return;
+          emit("editor.selection", {
+            uri: now.document.uri,
+            selections: change.selections.slice(0, 100),
+            kind: change.kind,
+          });
+        }) ?? (() => {}),
+        // EXT-29: the workspace's file changes, as file URIs inside this workspace only.
+        options.window.files?.subscribe((changes) => emitFileChanges(changes)) ?? (() => {}),
       );
+      // EXT-27: the window's focus, to extensions following it -- a change only.
+      const focus = options.window.focus;
+      if (focus) {
+        let last = focus.focused();
+        windowStops.push(
+          focus.onChange((focused) => {
+            if (focused === last) return;
+            last = focused;
+            emit("window.state", { focused });
+          }),
+        );
+      }
     }
     // EXT-18: a change of the active profile's values reaches the extensions it is theirs, as a
     // user or workspace change does -- for each of their keys whose profile value changed.
@@ -743,6 +946,34 @@ export function createExtensionHost(options: ExtensionHostOptions) {
             );
       }),
     );
+  };
+  /** One watcher batch, to extensions following file changes: bounded, in parts. */
+  const emitFileChanges = (changes: readonly FileChange[]) => {
+    const root = folderUri();
+    if (!root) return;
+    const inside = (path: string) => {
+      try {
+        const uri = fileUri(path);
+        return isEqualOrAncestor(root, uri) ? formatUri(uri) : null;
+      } catch {
+        return null;
+      }
+    };
+    const out: { kind: FileChange["kind"]; uri: string; from?: string }[] = [];
+    for (const change of changes) {
+      if (out.length >= FILE_BATCH_LIMIT) break;
+      const uri = inside(change.path);
+      if (!uri) continue;
+      const from = change.kind === "renamed" && change.from ? inside(change.from) : null;
+      // A rename from outside the workspace is, inside it, a file created.
+      out.push(
+        change.kind === "renamed" && !from
+          ? { kind: "created", uri }
+          : { kind: change.kind, uri, ...(from ? { from } : {}) },
+      );
+    }
+    for (let i = 0; i < out.length; i += FILE_EVENT_CHANGES)
+      emit("files.change", { changes: out.slice(i, i + FILE_EVENT_CHANGES) });
   };
   const endWindowListeners = () => {
     for (const stop of windowStops ?? []) stop();
@@ -844,6 +1075,36 @@ export function createExtensionHost(options: ExtensionHostOptions) {
     "editor.active"() {
       return windowOf().editor.active();
     },
+    // EXT-27: whether the window has the user's focus (null: this window does not say).
+    "window.state"() {
+      const focus = options.window?.focus;
+      return { focused: focus ? focus.focused() : null };
+    },
+    // EXT-25: an open document's text, edited as one unsaved, undoable change.
+    "documents.edit"(_one, params) {
+      const resource = resourceOf(stringParam(params, "uri", 4000));
+      const version =
+        params.version === null || params.version === undefined
+          ? null
+          : typeof params.version === "number" && Number.isInteger(params.version)
+            ? params.version
+            : fail("InvalidRequest", "A version is a whole number, or null.");
+      const raw = Array.isArray(params.edits)
+        ? params.edits
+        : fail("InvalidRequest", "Edits are a list.");
+      if (raw.length > 1000) fail("TooLarge", "At most 1000 edits at once.");
+      let size = 0;
+      const edits = raw.map((entry) => {
+        const item = (entry ?? {}) as Record<string, unknown>;
+        if (typeof item.text !== "string") fail("InvalidRequest", "An edit's text is a string.");
+        size += (item.text as string).length;
+        return { range: rangeParam(item.range), text: item.text as string };
+      });
+      if (size > MAX_MESSAGE) fail("TooLarge", "The edits are too large.");
+      const edit =
+        windowOf().documents.edit ?? fail("Unavailable", "This window cannot edit documents.");
+      return edit(resource, version, edits);
+    },
     async "editor.openLocation"(_one, params) {
       const uri = stringParam(params, "uri", 4000);
       resourceOf(uri);
@@ -887,9 +1148,194 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       });
       return null;
     },
+    // EXT-25: its own status bar items, in Yavin's own style.
+    "statusBar.set"(one, params) {
+      const store = options.statusBar ?? fail("Unavailable", "This window has no status bar.");
+      const id = stringParam(params, "id", 200);
+      if (!id.startsWith(`${one.entry.id}#status#`))
+        fail("NotOwned", "A status bar item's id is the extension's own.");
+      const mine = store.getSnapshot().filter((entry) => entry.extensionId === one.entry.id);
+      if (mine.length >= STATUS_LIMIT && !mine.some((entry) => entry.id === id))
+        fail("TooMany", `At most ${STATUS_LIMIT} status bar items per extension.`);
+      const text = String(params.text ?? "")
+        .replace(/[\u0000-\u001f\u007f]/g, " ")
+        .trim()
+        .slice(0, 100);
+      const tooltip = typeof params.tooltip === "string" ? params.tooltip.slice(0, 500) : null;
+      store.set({
+        id,
+        extensionId: one.entry.id,
+        generation: options.generation,
+        text,
+        tooltip,
+        alignment: params.alignment === "right" ? "right" : "left",
+        priority:
+          typeof params.priority === "number" && Number.isFinite(params.priority)
+            ? params.priority
+            : 0,
+        clickable: params.clickable === true,
+      });
+      return null;
+    },
+    "statusBar.remove"(one, params) {
+      const id = stringParam(params, "id", 200);
+      if (id.startsWith(`${one.entry.id}#status#`))
+        options.statusBar?.remove(id, options.generation);
+      return null;
+    },
+    // EXT-29: Yavin's picker, for this extension (its own prompt id); the chosen index(es), or null.
+    async "window.quickPick"(one, params) {
+      const id = promptId(one, params);
+      const raw = Array.isArray(params.items)
+        ? params.items
+        : fail("InvalidRequest", "A picker's items are a list.");
+      if (raw.length > PROMPT_ITEMS_LIMIT)
+        fail("TooLarge", `At most ${PROMPT_ITEMS_LIMIT} items in a picker.`);
+      const items: PromptItem[] = raw.map((entry) => {
+        const item = (entry ?? {}) as Record<string, unknown>;
+        if (typeof item.label !== "string") fail("InvalidRequest", "An item's label is a string.");
+        return {
+          label: (item.label as string).slice(0, 500),
+          ...(typeof item.description === "string"
+            ? { description: item.description.slice(0, 500) }
+            : {}),
+          ...(typeof item.detail === "string" ? { detail: item.detail.slice(0, 500) } : {}),
+          ...(item.picked === true ? { picked: true } : {}),
+          ...(item.separator === true ? { separator: true } : {}),
+        };
+      });
+      const prompts = windowOf().prompts ?? fail("Unavailable", "This window shows no pickers.");
+      const canPickMany = params.canPickMany === true;
+      const answer = await showPrompt(one, id, (signal) =>
+        prompts.quickPick(
+          {
+            ...promptOrigin(one, params),
+            items,
+            canPickMany,
+            matchOnDescription: params.matchOnDescription === true,
+            matchOnDetail: params.matchOnDetail === true,
+          },
+          signal,
+        ),
+      );
+      // What the window answers is checked too: an index of an item, or a list of them.
+      const valid = (i: unknown) =>
+        typeof i === "number" && Number.isInteger(i) && i >= 0 && i < items.length;
+      if (answer === null) return null;
+      if (canPickMany) return Array.isArray(answer) ? answer.filter(valid) : null;
+      return valid(answer) ? answer : null;
+    },
+    // EXT-29: Yavin's input box; validateInput is asked of the extension as the user types.
+    async "window.inputBox"(one, params) {
+      const id = promptId(one, params);
+      const prompts =
+        windowOf().prompts ?? fail("Unavailable", "This window shows no input boxes.");
+      const value = typeof params.value === "string" ? params.value.slice(0, 10_000) : "";
+      const selection =
+        Array.isArray(params.valueSelection) &&
+        params.valueSelection.length === 2 &&
+        params.valueSelection.every((n) => Number.isInteger(n) && n >= 0 && n <= value.length)
+          ? (params.valueSelection as [number, number])
+          : undefined;
+      const extensionId = one.entry.id;
+      const validate =
+        params.validates === true
+          ? async (text: string): Promise<PromptValidation | null> => {
+              try {
+                return validationOf(
+                  await ask(
+                    extensionId,
+                    "prompt.validate",
+                    { id, value: text.slice(0, 10_000) },
+                    timeouts.provider,
+                  ),
+                );
+              } catch {
+                // An extension that does not answer in time does not block the input.
+                return null;
+              }
+            }
+          : null;
+      const answer = await showPrompt(one, id, (signal) =>
+        prompts.inputBox(
+          {
+            ...promptOrigin(one, params),
+            ...(typeof params.prompt === "string" ? { prompt: params.prompt.slice(0, 500) } : {}),
+            value,
+            ...(selection ? { valueSelection: selection } : {}),
+            password: params.password === true,
+            validate,
+          },
+          signal,
+        ),
+      );
+      return typeof answer === "string" ? answer : null;
+    },
+    "window.cancelPrompt"(one, params) {
+      const id = promptId(one, params);
+      const prompt = prompts.get(id);
+      if (prompt && prompt.extensionId === one.entry.id) {
+        prompts.delete(id);
+        prompt.controller.abort();
+      }
+      return null;
+    },
+    // EXT-29: its diagnostics, in the Problems view (and as the editor's markers), owned by it.
+    "diagnostics.set"(one, params) {
+      const problems = options.problems ?? fail("Unavailable", "This window has no Problems view.");
+      const collection = collectionOf(one, params);
+      const label =
+        typeof params.name === "string" && params.name
+          ? params.name.slice(0, 100)
+          : (one.entry.manifest.displayName ?? one.entry.id);
+      const entries = Array.isArray(params.entries)
+        ? params.entries
+        : fail("InvalidRequest", "Diagnostics are a list of files.");
+      if (entries.length > 200) fail("TooLarge", "At most 200 files at once.");
+      // Every file is checked before any is shown: a request is applied whole, or not at all.
+      const files = entries.map((entry) => {
+        const item = (entry ?? {}) as Record<string, unknown>;
+        const uri = stringParam(item, "uri", 4000);
+        // The Problems view holds files: an untitled document's diagnostics are not shown.
+        if (uri.startsWith("untitled:")) return null;
+        const resource = resourceOf(uri);
+        const path = fsPath(parseUri(uri));
+        const list = Array.isArray(item.diagnostics)
+          ? item.diagnostics
+          : fail("InvalidRequest", "A file's diagnostics are a list.");
+        if (list.length > 1000) fail("TooLarge", "At most 1000 diagnostics per file.");
+        return {
+          owner: `ext:${options.generation}:${collection}:${resource}`,
+          diagnostics: list.map((d) => problemOf(path, d)),
+        };
+      });
+      const owners = problemOwners.get(one.entry.id) ?? new Set<string>();
+      problemOwners.set(one.entry.id, owners);
+      for (const file of files) {
+        if (!file) continue;
+        if (file.diagnostics.length) {
+          if (!owners.has(file.owner) && owners.size >= PROBLEM_FILES_LIMIT)
+            fail("TooMany", `At most ${PROBLEM_FILES_LIMIT} files with diagnostics per extension.`);
+          problems.publish(file.owner, label, file.diagnostics);
+          owners.add(file.owner);
+        } else if (owners.delete(file.owner)) problems.clear(file.owner);
+      }
+      return null;
+    },
+    "diagnostics.clear"(one, params) {
+      const collection = collectionOf(one, params);
+      const prefix = `ext:${options.generation}:${collection}:`;
+      const owners = problemOwners.get(one.entry.id);
+      for (const owner of [...(owners ?? [])])
+        if (owner.startsWith(prefix)) {
+          owners!.delete(owner);
+          options.problems?.clear(owner);
+        }
+      return null;
+    },
     "languages.register"(one, params) {
       const kind = stringParam(params, "kind", 20) as ProviderKind;
-      if (!["completion", "hover", "definition", "references", "symbols"].includes(kind))
+      if (!PROVIDER_KINDS.includes(kind))
         fail("InvalidRequest", `"${kind}" is not a provider kind.`);
       const providerId = stringParam(params, "providerId", 200);
       if (!providerId.startsWith(`${one.entry.id}#${kind}#`))
@@ -909,14 +1355,38 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         generation: options.generation,
         kind,
         language,
-        invoke: (request, signal) =>
-          ask(
+        invoke: (request, signal) => {
+          // EXT-29: when Yavin stops waiting, the provider's cancellation token is cancelled.
+          const token = `${extensionId}#token#${nextToken++}`;
+          signal.addEventListener(
+            "abort",
+            () =>
+              void send({
+                type: "request",
+                extensionId,
+                requestId: `c${nextRequest++}`,
+                method: "provider.cancel",
+                params: { token },
+              }).catch(() => undefined),
+            { once: true },
+          );
+          return ask(
             extensionId,
             "provider.invoke",
-            { providerId, kind, ...request },
-            timeouts.provider,
+            { providerId, kind, ...request, extra: { ...(request.extra ?? {}), token } },
+            kind === "formatting" || kind === "rangeFormatting"
+              ? timeouts.format
+              : timeouts.provider,
             signal,
-          ),
+          );
+        },
+        // EXT-29: a chosen code action's command, run in its own extension.
+        ...(kind === "codeActions"
+          ? {
+              runAction: (handle: number) =>
+                ask(extensionId, "codeAction.run", { providerId, handle }, timeouts.command),
+            }
+          : {}),
       });
       return null;
     },
@@ -1320,6 +1790,62 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         .sort((a, b) => a.id.localeCompare(b.id));
       await Promise.all(waiting.map((entry) => activate(entry.id).catch(() => undefined)));
     },
+    /**
+     * Before Yavin saves `document` (EXT-29): the extensions following will-save are asked, all
+     * within 1.5 s (VS Code's budget), and their waitUntil edits returned -- only from an extension
+     * allowed to edit documents (a refusal is said otherwise). Never fails, never waits longer.
+     */
+    async willSave(
+      document: DocumentInfo,
+      reason: "manual" | "afterDelay" | "focusOut",
+    ): Promise<{ extensionId: string; edits: ExtensionTextEdit[] }[]> {
+      if (finished) return [];
+      const deadline = Date.now() + WILL_SAVE_MS;
+      const asked = [...running.values()].filter(
+        (one) =>
+          one.status.state === "active" &&
+          one.events.has("documents.willSave") &&
+          allowed(one, DOCUMENTS_READ),
+      );
+      const answers = await Promise.all(
+        asked.map(async (one) => {
+          const left = deadline - Date.now();
+          if (left <= 0) return null;
+          try {
+            const answer = (await ask(
+              one.entry.id,
+              "documents.willSave",
+              { document, reason },
+              left,
+            )) as { edits?: unknown } | null;
+            const raw = Array.isArray(answer?.edits) ? answer.edits.slice(0, 1000) : [];
+            if (!raw.length) return null;
+            if (!allowed(one, DOCUMENTS_EDIT)) {
+              refuse(one.entry.id, {
+                method: "documents.willSave",
+                capability: DOCUMENTS_EDIT,
+                code: "PermissionDenied",
+                message: "Its edits before a save need permission to edit documents.",
+              });
+              return null;
+            }
+            const edits = raw.map((entry) => {
+              const item = (entry ?? {}) as Record<string, unknown>;
+              if (typeof item.text !== "string")
+                fail("InvalidRequest", "An edit's text is a string.");
+              return { range: rangeParam(item.range), text: item.text as string };
+            });
+            return { extensionId: one.entry.id, edits };
+          } catch (error) {
+            log(one, "warn", `Before saving: ${(error as Error).message}`);
+            return null;
+          }
+        }),
+      );
+      return answers.filter(
+        (one): one is { extensionId: string; edits: ExtensionTextEdit[] } => !!one,
+      );
+    },
     async executeCommand(command: string, ...args: unknown[]): Promise<unknown> {
       const owner = options.registry.commandOwner(command);
       if (!owner)
@@ -1359,6 +1885,19 @@ export function createExtensionHost(options: ExtensionHostOptions) {
     },
     /** Command ids with a registered handler (the command registry's runtime view). */
     hasHandler: (command: string) => handlers.has(command),
+    /** A status bar item was clicked (EXT-25): its extension runs what it gave the item. */
+    async activateStatusItem(id: string): Promise<void> {
+      const owner = options.statusBar?.getSnapshot().find((entry) => entry.id === id)?.extensionId;
+      if (!owner || !running.has(owner)) return;
+      try {
+        await ask(owner, "statusBar.activate", { id }, timeouts.command);
+      } catch (error) {
+        const one = running.get(owner);
+        const message = `The status bar item failed: ${(error as Error)?.message ?? String(error)}`;
+        if (one) log(one, "error", message);
+        throw new ExtensionError("CommandFailed", owner, message);
+      }
+    },
     /** Ends every extension of this host, then the process. */
     async dispose(): Promise<void> {
       if (finished) return;

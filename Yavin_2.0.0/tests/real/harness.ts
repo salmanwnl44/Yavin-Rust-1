@@ -61,6 +61,56 @@ export function children(pid: number): { id: number; path: string }[] {
       return { id: Number(id), path: path ?? "" };
     });
 }
+/**
+ * EXT-27: the OS foreground, as a user changes it. Gives the foreground to `pid`'s first visible
+ * titled window (restored first if asked), the way Windows lets a background process do so (an
+ * Alt press first); returns whether that window is now the foreground one.
+ */
+export function foreground(pid: number, restore = false): boolean {
+  const script = `
+Add-Type -Namespace Y -Name W -MemberDefinition @"
+[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h);
+[DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow();
+[DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr h, int c);
+[DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(IntPtr h);
+[DllImport(\"user32.dll\")] public static extern int GetWindowTextLength(IntPtr h);
+[DllImport(\"user32.dll\")] public static extern void keybd_event(byte k, byte s, uint f, UIntPtr e);
+[DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
+public delegate bool EnumProc(IntPtr h, IntPtr l);
+[DllImport(\"user32.dll\")] public static extern bool EnumWindows(EnumProc f, IntPtr l);
+"@
+$found = New-Object System.Collections.ArrayList
+[Y.W]::EnumWindows({ param($h, $l) $p = 0; [Y.W]::GetWindowThreadProcessId($h, [ref]$p) | Out-Null
+  if ($p -eq ${pid} -and [Y.W]::IsWindowVisible($h) -and [Y.W]::GetWindowTextLength($h) -gt 0) { [void]$found.Add($h) }; $true }, [IntPtr]::Zero) | Out-Null
+if (-not $found.Count) { "False"; exit }
+$h = $found[0]
+if (${restore ? "$true" : "$false"}) { [Y.W]::ShowWindow($h, 9) | Out-Null }
+[Y.W]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); [Y.W]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+[Y.W]::SetForegroundWindow($h) | Out-Null
+Start-Sleep -Milliseconds 200
+[Y.W]::GetForegroundWindow() -eq $h`;
+  const out = execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8",
+  });
+  return out.trim().endsWith("True");
+}
+
+/** Another application's window (a form of this test's own), to take the foreground from Yavin. */
+export function otherApplication(): ChildProcess {
+  return spawn(
+    "powershell",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-WindowStyle",
+      "Hidden",
+      "-Command",
+      "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object Windows.Forms.Form; $f.Text = 'Yavin e2e: another application'; [void]$f.ShowDialog()",
+    ],
+    { stdio: "ignore" },
+  );
+}
+
 export const hostProcesses = (pid: number) =>
   children(pid).filter((child) => /yavin-extension-host\.exe$/i.test(child.path));
 export function alive(pid: number) {
@@ -224,7 +274,8 @@ export async function emptyRegistry(): Promise<{ url: string; close(): Promise<v
 // --- EXT-19: extensions installed as a user installs them ------------------------------------
 
 /** A stored ZIP of `files` (no compression, no timestamps): an extension package. */
-function storedZip(files: { name: string; data: Buffer }[]): Buffer {
+// Exported for the VS Code package test (EXT-27).
+export function storedZip(files: { name: string; data: Buffer }[]): Buffer {
   const table = Array.from({ length: 256 }, (_, n) => {
     let c = n;
     for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;

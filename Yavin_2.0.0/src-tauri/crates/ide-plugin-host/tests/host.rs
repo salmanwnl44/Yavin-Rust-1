@@ -158,14 +158,16 @@ fn an_extension_is_loaded_activated_and_runs_a_command_through_the_protocol() {
 }
 
 #[test]
-fn extension_code_has_no_filesystem_network_process_or_timers() {
+/// EXT-25: timers exist now, kept by the host (`timers_are_the_hosts_bounded_and_interruptible`);
+/// nothing else does.
+fn extension_code_has_no_filesystem_network_or_process() {
     let mut host = Host::start();
     let probe = r#"
       module.exports.activate = function () {
         return {
           require: typeof require, fetch: typeof fetch, process: typeof process,
           std: typeof std, os: typeof os, xhr: typeof XMLHttpRequest,
-          setTimeout: typeof setTimeout, send: typeof __yavin_send,
+          send: typeof __yavin_send, timer: typeof __yavin_timer, untimer: typeof __yavin_untimer,
           webSocket: typeof WebSocket, importScripts: typeof importScripts,
         };
       };
@@ -465,4 +467,25 @@ fn performance_stays_within_budgets() {
             "{what}: {value:.1} ms is over its {budget} ms budget"
         );
     }
+}
+
+/// EXT-25 (found by the Open VSX benchmark): recursion too deep for the stack is an error the
+/// extension sees -- not a host that overflows its native stack and ends.
+#[test]
+fn deep_recursion_is_an_error_and_the_host_lives() {
+    let mut host = Host::start();
+    let code = r#"
+      const deep = (n) => (n === 0 ? 0 : 1 + deep(n - 1));
+      module.exports.activate = function () {
+        try { return "returned " + deep(10000000); } catch (e) { return "caught " + e.name; }
+      };
+    "#;
+    assert_eq!(host.load("acme.deep", code)["type"], "loaded");
+    let answer = host.ask("acme.deep", "d1", "activate", json!({}), json!(null));
+    assert_eq!(answer["result"], "caught RangeError", "{answer}");
+    host.load("acme.greeter", GREETER);
+    assert_eq!(
+        host.ask("acme.greeter", "g1", "activate", json!({}), json!(null))["ok"],
+        true
+    );
 }

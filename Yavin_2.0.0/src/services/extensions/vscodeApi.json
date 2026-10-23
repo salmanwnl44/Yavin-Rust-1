@@ -1,0 +1,1713 @@
+{
+  "about": "EXT-25, graded by evidence at EXT-26 by behavioural tests at EXT-27, and its runtime part again at EXT-28: what Yavin provides of the VS Code extension API, through the compatibility layer (src-tauri/crates/ide-plugin-host/src/vscode.js) and the VS Code package adapter (src-tauri/src/vsix.rs). FULL: as VS Code documents it, and tested. PARTIAL: provided with the limitation noted, and tested. STUB: present but fabricated or inert. UNSUPPORTED: fails with an UnsupportedApi error naming it (logged once). NOT VERIFIED: implemented (`implemented` says how far) but no test or benchmark run exercises its behaviour. `evidence`: L1 present (the inventory test), L2 behaviour tested, L3 exercised by real extensions in the Open VSX benchmark. 'baseline' is before EXT-25, when no VS Code extension code ran at all. Checked against the layer by crates/ide-plugin-host/tests/vscode.rs (the_inventory_matches_the_layer). EXT-27 adds L4: the window (tests/ui) and the packaged application (tests/real). EXT-29 adds the pickers, file watchers, save and selection events, formatting and code-action providers, and diagnostics in the Problems view. EXT-30 adds file icon themes (their SVG icons).",
+  "level": "1.90.0",
+  "statuses": ["FULL", "PARTIAL", "STUB", "UNSUPPORTED", "NOT VERIFIED"],
+  "api": [
+    {
+      "api": "require(\"vscode\")",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "The object below; members it does not have fail with UnsupportedApi when used.",
+      "evidence": ["L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)"]
+    },
+    {
+      "api": "version",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "\"1.90.0\": the API level the layer was audited against, not a VS Code version that is fully implemented.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (values_and_utilities…)"
+      ]
+    },
+    {
+      "api": "commands.registerCommand",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Contributed commands are Yavin commands (ids mapped by the adapter); others are the extension's own, callable by executeCommand.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (commands_register_run_execute_and_dispose)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (status bar, providers)"
+      ]
+    },
+    {
+      "api": "commands.registerTextEditorCommand",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Runs with the active editor; its edit builder's edits are applied through documents.edit.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (commands_…: the edit builder's edits applied)",
+        "L4: the window, tests/ui/terminal.spec.ts (EXT-27 a VS Code extension in the window)",
+        "L4: the packaged application, tests/real/vscode.spec.ts"
+      ]
+    },
+    {
+      "api": "commands.executeCommand",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "The extension's own commands; setContext (accepted: Yavin evaluates no when clauses) and vscode.open. Other built-in and other extensions' commands fail with UnsupportedApi.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (commands_…: own, internal, setContext, unknown built-in refused)"
+      ]
+    },
+    {
+      "api": "commands.getCommands",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "The extension's own commands only.",
+      "evidence": ["L2: real host, crates/ide-plugin-host/tests/conformance.rs (commands_…)"]
+    },
+    {
+      "api": "commands.registerDiffInformationCommand",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.showInformationMessage",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Shown as a notification; buttons are listed in the text and not offered, so it resolves to undefined (as when dismissed). Modal options are ignored.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (messages_and_output_channels…)",
+        "L4: the window, tests/ui/terminal.spec.ts (EXT-27 a VS Code extension in the window)"
+      ]
+    },
+    {
+      "api": "window.showWarningMessage",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "As showInformationMessage.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (messages_and_output_channels…)"
+      ]
+    },
+    {
+      "api": "window.showErrorMessage",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "As showInformationMessage.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (messages_and_output_channels…)"
+      ]
+    },
+    {
+      "api": "window.createOutputChannel",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Lines go to the extension's log (its page in Extensions); show/hide/clear do not change any view. LogOutputChannel methods are provided.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (messages_and_output_channels…: append, appendLine, replace, LogOutputChannel levels)"
+      ]
+    },
+    {
+      "api": "window.createStatusBarItem",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Text and tooltip in Yavin's own style (codicons $(…) are dropped; colours ignored); a click runs its command with its arguments. At most 20 per extension.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (status_bar_items…: show, coalesced changes, hide, click with arguments)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (store, ownership, limit of 20, cleared on disable)",
+        "L4: the window, tests/ui/terminal.spec.ts (EXT-27 a VS Code extension in the window)",
+        "L4: the packaged application, tests/real/vscode.spec.ts"
+      ]
+    },
+    {
+      "api": "window.setStatusBarMessage",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "A status bar item, removed after the timeout or when the promise settles.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (status_bar_items…: removed after its time)"
+      ]
+    },
+    {
+      "api": "window.activeTextEditor",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Needs documents.read. Refreshed before each command, provider and event; its selection is the cursor (Yavin reports no selection range); visibleRanges is the whole document; options are fixed (tabSize 4, spaces).",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_active_editor…)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (edits, revocation)",
+        "L4: the window, tests/ui/terminal.spec.ts (EXT-27 a VS Code extension in the window)",
+        "L4: the packaged application, tests/real/vscode.spec.ts"
+      ]
+    },
+    {
+      "api": "window.visibleTextEditors",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "The active editor only.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_active_editor…)"
+      ]
+    },
+    {
+      "api": "window.onDidChangeActiveTextEditor",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Needs documents.read.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (document_and_editor_events…)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (documents opened, changed and closed)"
+      ]
+    },
+    {
+      "api": "window.onDidChangeVisibleTextEditors",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Fires with the active editor's changes.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_remaining_members…: follows the active editor)"
+      ]
+    },
+    {
+      "api": "window.showTextDocument",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Needs editor.control; workspace files only; view columns and preview are ignored.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_remaining_members…: opens through the window, 1-based selection, returns its editor)"
+      ]
+    },
+    {
+      "api": "window.createTextEditorDecorationType",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Mapped to one of Yavin's fixed styles (highlight, underline, dimmed); colours, gutter icons and before/after text are not shown.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (decoration_types…: the three styles, hover, dispose clears)"
+      ]
+    },
+    {
+      "api": "window.registerTreeDataProvider",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "A contributed view; rows up to 3 levels and 1000 in all, expanded eagerly; a row runs its command only when it is a contributed command without arguments.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (tree_views…)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (rows in the window, refreshed, disposed)"
+      ]
+    },
+    {
+      "api": "window.createTreeView",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "As registerTreeDataProvider; selection, visibility and expansion events never fire; reveal is unsupported.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (tree_views…: reveal refused, dispose unregisters)"
+      ]
+    },
+    {
+      "api": "window.withProgress",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "The task runs; no progress is shown and it cannot be cancelled.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (values_and_utilities…: the task's result; report and the token)"
+      ]
+    },
+    {
+      "api": "window.state",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "The window's real focus: in the application, whether Windows has it as the foreground window and not minimized (window_focus.rs: a WinEvent hook; neither WebView2's DOM nor Tauri's focus API follows the OS), in a browser window the DOM's focus and blur. `active` is the same as `focused` (Yavin does not track recent interaction). Deterministic UnsupportedApi when a window does not report its focus.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (window_state…: read at activation, followed; unreported is UnsupportedApi)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (the window's focus store)",
+        "L4: the window, tests/ui/terminal.spec.ts (EXT-27 a VS Code extension in the window)",
+        "L4: the packaged application, tests/real/vscode.spec.ts (another application takes the foreground, Yavin gets it back, minimized, restored)"
+      ]
+    },
+    {
+      "api": "window.onDidChangeWindowState",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Fires once per real change of the window's focus.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (window_state…: once per change, no duplicate)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (blur twice, focus)",
+        "L4: the window, tests/ui/terminal.spec.ts (EXT-27 a VS Code extension in the window)",
+        "L4: the packaged application, tests/real/vscode.spec.ts (four real OS transitions)"
+      ]
+    },
+    {
+      "api": "window.showQuickPick",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Yavin's own picker (one prompt at a time per extension, queued across extensions): items or a promise of items (at most 5000), separators, canPickMany, matchOnDescription/matchOnDetail, title, placeHolder, ignoreFocusOut, cancellation token. Not: onDidSelectItem, item buttons, alwaysShow, icons.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (quick_pick_and_input_box…: options, answers, invalid indices, cancelled token)",
+        "L2: window, src/services/extensions/vscodeCoreApi.test.ts (picks, cancellation by token, stop and window close, two extensions)",
+        "L3: Open VSX benchmark, benchmark/openvsx/ext29/activation.json: Change Case runs 17/17 commands (16 at EXT-28), npm IntelliSense's command runs (the benchmark's stand-in window answers prompts as cancelled)",
+        "L4: window, tests/ui/terminal.spec.ts (EXT-29 a VS Code extension's picker and input box…)"
+      ]
+    },
+    {
+      "api": "window.showInputBox",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (input_validation…, quick_pick_and_input_box…)",
+        "L2: window, src/services/extensions/vscodeCoreApi.test.ts (validation while open, cancellation)",
+        "L3: Open VSX benchmark, benchmark/openvsx/ext29/activation.json: Rewrap's rewrapCommentAt runs (answered as cancelled)",
+        "L4: window, tests/ui/terminal.spec.ts (EXT-29 a VS Code extension's picker and input box…)"
+      ],
+      "notes": "Yavin's own input box: value, valueSelection, prompt, placeHolder, title, password, ignoreFocusOut, validateInput (string or InputBoxValidationMessage; an error blocks accepting), cancellation token."
+    },
+    {
+      "api": "window.createQuickPick",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.createInputBox",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.showOpenDialog",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.showSaveDialog",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.showWorkspaceFolderPick",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.onDidChangeTextEditorSelection",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "For the active editor only (Yavin shows one editor): its selections (primary first, at most 100) and kind (keyboard, mouse, command). Needs documents.read.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (save_events_selection_events…)",
+        "L2: window, src/services/extensions/vscodeCoreApi.test.ts (selection events)",
+        "L3: Open VSX benchmark, benchmark/openvsx/ext29/activation.json: markdownlint's and Vim's activation pass it (both failed on it at EXT-28)"
+      ]
+    },
+    {
+      "api": "window.onDidChangeTextEditorVisibleRanges",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.onDidChangeTextEditorOptions",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.onDidChangeActiveColorTheme",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.activeColorTheme",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.createWebviewPanel",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "notes": "Webviews need an isolated HTML surface Yavin does not have; see the audit.",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.registerWebviewViewProvider",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.registerCustomEditorProvider",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.registerWebviewPanelSerializer",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.createTerminal",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "notes": "Would start a process for the extension.",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.terminals",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.tabGroups",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.registerUriHandler",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "window.registerFileDecorationProvider",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "workspace.workspaceFolders",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "The one folder of the window, or undefined.",
+      "evidence": ["L2: real host, crates/ide-plugin-host/tests/conformance.rs (workspace_edits…)"]
+    },
+    {
+      "api": "workspace.rootPath",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Deprecated in VS Code; the folder.",
+      "evidence": ["L2: real host, crates/ide-plugin-host/tests/conformance.rs (workspace_edits…)"]
+    },
+    {
+      "api": "workspace.name",
+      "tier": 1,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: real host, crates/ide-plugin-host/tests/conformance.rs (workspace_edits…)"]
+    },
+    {
+      "api": "workspace.isTrusted",
+      "tier": 1,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "notes": "True: VS Code extensions' code runs only in trusted folders.",
+      "evidence": ["L2: real host, crates/ide-plugin-host/tests/conformance.rs (workspace_edits…)"]
+    },
+    {
+      "api": "workspace.onDidGrantWorkspaceTrust",
+      "tier": 2,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Never fires: the code runs only once the folder is trusted.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_remaining_members…: registers, disposes, never fires (the code runs only once trusted))"
+      ]
+    },
+    {
+      "api": "workspace.onDidChangeWorkspaceFolders",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Never fires: a host belongs to one folder.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_remaining_members…: never fires (a host belongs to one folder))"
+      ]
+    },
+    {
+      "api": "workspace.getWorkspaceFolder",
+      "tier": 1,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (workspace_edits…: inside and outside)"
+      ]
+    },
+    {
+      "api": "workspace.asRelativePath",
+      "tier": 1,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (workspace_edits…: with and without the folder, outside it)"
+      ]
+    },
+    {
+      "api": "workspace.getConfiguration",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Its own contributed settings (boolean, number, string, enum: changed in Yavin's Settings); list and object settings return their defaults; any other key returns the caller's default (logged once). update() is unsupported.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (configuration…: mapped, defaults, sections, missing keys said once, update refused)"
+      ]
+    },
+    {
+      "api": "workspace.onDidChangeConfiguration",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Its own settings.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (configuration…: affectsConfiguration)"
+      ]
+    },
+    {
+      "api": "workspace.textDocuments",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Needs documents.read; the open documents Yavin has sent it (up to 50 at activation).",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (workspace_edits…, document_and_editor_events…)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (revocation)"
+      ]
+    },
+    {
+      "api": "workspace.onDidOpenTextDocument",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Needs documents.read.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (document_and_editor_events…: reopened as a document of its own)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (documents opened…)"
+      ]
+    },
+    {
+      "api": "workspace.onDidChangeTextDocument",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Needs documents.read; each change is reported as one whole-document replacement.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (document_and_editor_events…: one whole-document change; none when the text is unchanged)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (documents …changed)"
+      ]
+    },
+    {
+      "api": "workspace.onDidCloseTextDocument",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Needs documents.read.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (document_and_editor_events…)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (documents …closed)"
+      ]
+    },
+    {
+      "api": "workspace.openTextDocument",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "An open document; or a workspace file read through workspace.fs.read as a read-only snapshot. {content, language} is unsupported.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (workspace_edits…: open, a file snapshot, outside refused, untitled unsupported)"
+      ]
+    },
+    {
+      "api": "workspace.applyEdit",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Needs documents.edit; text edits to open documents, each one undoable change (not atomic across documents). File operations are unsupported.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (workspace_edits…: two documents; file operations refused before any edit)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (lands in the document service)"
+      ]
+    },
+    {
+      "api": "workspace.fs.readFile",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Needs workspace.fs.read; workspace files only, read as UTF-8 text (binary content is not preserved).",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (workspace_edits…: Uint8Array; outside: NoPermissions)"
+      ]
+    },
+    {
+      "api": "workspace.fs.isWritableFileSystem",
+      "tier": 3,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "false for file: extensions cannot write files.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_remaining_members…)"
+      ]
+    },
+    {
+      "api": "workspace.findFiles",
+      "tier": 1,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "workspace.createFileSystemWatcher",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (file_watchers…: globs, RelativePattern, ignore flags, renames, malformed events)",
+        "L2: window, src/services/extensions/vscodeCoreApi.test.ts (file watchers; watchers need workspace.fs.read)",
+        "L3: Open VSX benchmark, benchmark/openvsx/ext29/activation.json: Better TOML and SVG activate (both failed on it at EXT-28)"
+      ],
+      "notes": "Yavin's workspace watcher (files inside the opened folder only): glob strings and RelativePattern, create/change/delete, the three ignore flags, dispose; a rename is a delete then a create. At most 500 watchers per extension. Needs workspace.fs.read."
+    },
+    {
+      "api": "workspace.onDidSaveTextDocument",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "After Yavin saves a document. Needs documents.read.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (save_events_selection_events…)",
+        "L2: window, src/services/extensions/vscodeCoreApi.test.ts (save and will-save)"
+      ]
+    },
+    {
+      "api": "workspace.onWillSaveTextDocument",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (save_events_selection_events…: edits, a throwing listener)",
+        "L2: window, src/services/extensions/vscodeCoreApi.test.ts (will-save without documents.edit, the budget)"
+      ],
+      "notes": "Before a save: waitUntil (synchronously, as VS Code) with TextEdits applied to the document before it is written, only with documents.edit; all extensions share a 1.5 s budget per save, after which the save goes on without them; a promise of anything but edits is ignored."
+    },
+    {
+      "api": "workspace.saveAll",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "workspace.registerTextDocumentContentProvider",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "workspace.registerFileSystemProvider",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "workspace.registerTaskProvider",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "workspace.onDidCreateFiles",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "workspace.onDidDeleteFiles",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "workspace.onDidRenameFiles",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "workspace.notebookDocuments",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "workspace.fs.writeFile",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "notes": "No extension may write files (EXT-07).",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "workspace.fs.stat",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "workspace.fs.readDirectory",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.registerCompletionItemProvider",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Selectors with a language; label, insert text (snippets as plain text) and detail; trigger characters, resolve and documentation are not used.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (language_providers…: two languages, 0-based positions, CompletionList, snippets as text, dispose)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (in Yavin's provider registry)"
+      ]
+    },
+    {
+      "api": "languages.registerHoverProvider",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Markdown text; the range is not used.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (language_providers…: MarkdownString and code)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (hover through the registry)"
+      ]
+    },
+    {
+      "api": "languages.registerDefinitionProvider",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Locations and location links inside the workspace.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (language_providers…: Location and LocationLink)"
+      ]
+    },
+    {
+      "api": "languages.registerReferenceProvider",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "includeDeclaration is always true.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (language_providers…: includeDeclaration)"
+      ]
+    },
+    {
+      "api": "languages.registerDocumentSymbolProvider",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Flattened; kinds are not shown.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (language_providers…: children flattened)"
+      ]
+    },
+    {
+      "api": "languages.createDiagnosticCollection",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "In Yavin's Problems view and as editor markers (EXT-29), owned by the collection (one extension cannot clear another's): severity, source, code (value and target), tags, related information inside the workspace. At most 200 files per request and 1000 diagnostics per file; files outside the workspace and untitled documents are not shown.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (diagnostics_go_to_the_problems_store…: severities, both set forms, get/has/forEach, delete, dispose)",
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (diagnostics_go_to_the_window_in_batches…: batches, codes, tags, related information)",
+        "L2: window, src/services/extensions/vscodeCoreApi.test.ts (diagnostics in the Problems store, ownership)",
+        "L2: window, src/services/extensions/vscodeConformance.test.ts (diagnostics are in Yavin's Problems store…)",
+        "L4: window, tests/ui/terminal.spec.ts (EXT-29 a VS Code extension's picker and input box…: its diagnostic in Problems)"
+      ]
+    },
+    {
+      "api": "languages.match",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "By language only.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_remaining_members…: 10, 5 and 0)"
+      ]
+    },
+    {
+      "api": "languages.registerDocumentFormattingEditProvider",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (formatting_and_code_actions…)",
+        "L2: window, src/services/extensions/vscodeCoreApi.test.ts (formatting with cancellation)"
+      ],
+      "notes": "Format Document in the editor: the edits apply only if the document did not change meanwhile (undoable, dirty as any edit); 5 s limit, then the provider's token is cancelled. At most 5000 edits, 4 MB."
+    },
+    {
+      "api": "languages.registerDocumentRangeFormattingEditProvider",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (formatting_and_code_actions…: a cancelled range formatting)"
+      ],
+      "notes": "Format Selection in the editor; as registerDocumentFormattingEditProvider."
+    },
+    {
+      "api": "languages.registerCodeActionsProvider",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (formatting_and_code_actions…)",
+        "L2: window, src/services/extensions/vscodeCoreApi.test.ts (code actions)",
+        "L3: Open VSX benchmark, benchmark/openvsx/ext29/activation.json: shellcheck's activation passes it (failed on it at EXT-28)"
+      ],
+      "notes": "The editor's quick fixes (light bulb): title, kind, isPreferred, disabled, diagnostics (the extension's own objects), edits to the document asked about, and a command run in the extension. An action that edits other files is shown disabled. Not: resolveCodeAction, CodeActionProviderMetadata."
+    },
+    {
+      "api": "languages.registerSignatureHelpProvider",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.registerCodeLensProvider",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.registerRenameProvider",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.registerDocumentHighlightProvider",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.registerDocumentLinkProvider",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.registerColorProvider",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.registerFoldingRangeProvider",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.registerDocumentSemanticTokensProvider",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.registerInlayHintsProvider",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.registerOnTypeFormattingEditProvider",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.registerWorkspaceSymbolProvider",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.registerInlineCompletionItemProvider",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.setLanguageConfiguration",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "notes": "The declarative contributes.languages configuration is supported instead.",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.getLanguages",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.getDiagnostics",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "languages.createLanguageStatusItem",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "env.appName",
+      "tier": 1,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "notes": "\"Yavin IDE\".",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (values_and_utilities…)"
+      ]
+    },
+    {
+      "api": "env.language",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "\"en\" (Yavin is English only).",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (values_and_utilities…)"
+      ]
+    },
+    {
+      "api": "env.uiKind",
+      "tier": 2,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (values_and_utilities…)"
+      ]
+    },
+    {
+      "api": "env.uriScheme",
+      "tier": 3,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "\"yavin\"; no URI handler exists.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_remaining_members…)"
+      ]
+    },
+    {
+      "api": "env.isTelemetryEnabled",
+      "tier": 2,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "notes": "false: nothing an extension records leaves the machine.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (values_and_utilities…)"
+      ]
+    },
+    {
+      "api": "env.onDidChangeTelemetryEnabled",
+      "tier": 2,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Never fires.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_remaining_members…: never fires (telemetry is off and stays off))"
+      ]
+    },
+    {
+      "api": "env.clipboard",
+      "tier": 1,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "notes": "No clipboard capability exists for extensions.",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "env.openExternal",
+      "tier": 1,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "env.machineId",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "notes": "Not given: an identifier of the machine.",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "env.sessionId",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "env.appRoot",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "env.shell",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "env.createTelemetryLogger",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "extensions.getExtension",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Its own only; another extension is undefined.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (context_state_secrets…: own; another is undefined)"
+      ]
+    },
+    {
+      "api": "extensions.all",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Its own only.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_remaining_members…: its own, by its published id)"
+      ]
+    },
+    {
+      "api": "l10n.t",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "The message with its arguments; no translations (English).",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (values_and_utilities…: positional, named, the message object)"
+      ]
+    },
+    {
+      "api": "ExtensionContext.subscriptions",
+      "tier": 1,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (context_state_secrets…: disposed at deactivation)"
+      ]
+    },
+    {
+      "api": "ExtensionContext.globalState",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "JSON values, 64 KiB per extension; setKeysForSync has no effect (nothing syncs).",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (context_state_secrets…: update, remove, default, keys)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (persists across a host restart)"
+      ]
+    },
+    {
+      "api": "ExtensionContext.workspaceState",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "As globalState; without a folder it is the global state.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (context_state_secrets…)"
+      ]
+    },
+    {
+      "api": "ExtensionContext.secrets",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Needs secrets; the OS credential store (EXT-13); onDidChange never fires.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (context_state_secrets…: store, get, delete, installation scope)"
+      ]
+    },
+    {
+      "api": "ExtensionContext.extensionUri",
+      "tier": 1,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (context_state_secrets…)"
+      ]
+    },
+    {
+      "api": "ExtensionContext.extensionPath",
+      "tier": 1,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (context_state_secrets…)"
+      ]
+    },
+    {
+      "api": "ExtensionContext.asAbsolutePath",
+      "tier": 1,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (context_state_secrets…)"
+      ]
+    },
+    {
+      "api": "ExtensionContext.extensionMode",
+      "tier": 2,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (context_state_secrets…)"
+      ]
+    },
+    {
+      "api": "ExtensionContext.storageUri",
+      "tier": 1,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "notes": "Also storagePath, globalStorageUri, globalStoragePath, logUri, logPath: extensions have no folder to write to.",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "ExtensionContext.environmentVariableCollection",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "TextDocument",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "getText, lineAt, offsetAt, positionAt, getWordRangeAtPosition, validateRange/Position, lineCount, eol, languageId, version, isDirty; save() is unsupported.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_active_editor…: text, lines, offsets, positions, words, validation)"
+      ]
+    },
+    {
+      "api": "TextEditor.edit",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Needs documents.edit; one undoable change; false when the document changed meanwhile; setEndOfLine is unsupported.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_active_editor…: one documents.edit at its version; stale: false)",
+        "L2: window side, src/services/extensions/vscodeConformance.test.ts (stale, read-only, overlapping, permission)",
+        "L4: the window, tests/ui/terminal.spec.ts (EXT-27 a VS Code extension in the window)",
+        "L4: the packaged application, tests/real/vscode.spec.ts"
+      ]
+    },
+    {
+      "api": "TextEditor.selection",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Set: needs editor.control; read: the cursor.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_active_editor…: read and set, 1-based to the window)"
+      ]
+    },
+    {
+      "api": "TextEditor.setDecorations",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Yavin's fixed styles; hover messages shown.",
+      "evidence": ["L2: real host, crates/ide-plugin-host/tests/conformance.rs (decoration_types…)"]
+    },
+    {
+      "api": "TextEditor.revealRange",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Needs editor.control.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_active_editor…)"
+      ]
+    },
+    {
+      "api": "TextEditor.insertSnippet",
+      "tier": 2,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "Position, Range, Selection, Location",
+      "tier": 1,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (values_and_utilities…, the_active_editor…)"
+      ]
+    },
+    {
+      "api": "Uri",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "parse, file, joinPath, from, with, fsPath; toString() keeps a drive's colon (file:///C:/a), as Yavin names files.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (values_and_utilities…: parse, file, fsPath, toString, joinPath, with)"
+      ]
+    },
+    {
+      "api": "Disposable, EventEmitter, CancellationTokenSource, CancellationError",
+      "tier": 1,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (values_and_utilities…)"
+      ]
+    },
+    {
+      "api": "MarkdownString, SnippetString, ThemeColor, ThemeIcon",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "ThemeColor and ThemeIcon are data, not exercised.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (values_and_utilities…: MarkdownString, SnippetString)"
+      ]
+    },
+    {
+      "api": "CompletionItem, CompletionList, Hover, TextEdit, WorkspaceEdit, Diagnostic, DocumentSymbol, SymbolInformation, TreeItem, RelativePattern, FileSystemError",
+      "tier": 1,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "SymbolInformation and RelativePattern are data, not exercised.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (providers, diagnostics, trees, workspace edits)"
+      ]
+    },
+    {
+      "api": "CodeAction, CodeActionKind, CodeLens, DocumentLink, Color, FoldingRange, SelectionRange, SignatureHelp, InlayHint, DocumentHighlight, SemanticTokensLegend, CallHierarchyItem, TypeHierarchyItem, InlayHintLabelPart, InlineValue*, InlineCompletionItem, LinkedEditingRanges, SemanticTokens, SemanticTokensBuilder, DocumentDropEdit, SnippetTextEdit",
+      "tier": 2,
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Data classes only: their providers are unsupported.",
+      "evidence": [
+        "L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs) (subclassing CallHierarchyItem through __importStar)"
+      ]
+    },
+    {
+      "api": "enums (CompletionItemKind, DiagnosticSeverity, SymbolKind, StatusBarAlignment, ViewColumn, …)",
+      "tier": 1,
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (used across the suite)"
+      ]
+    },
+    {
+      "api": "debug",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "notes": "Debug adapters are processes; Yavin starts none for an extension.",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "scm",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "tasks",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "tests",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "notebooks",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "comments",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "authentication",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    },
+    {
+      "api": "chat, lm",
+      "tier": 3,
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+    }
+  ],
+  "runtime": [
+    {
+      "api": "CommonJS modules (require, module.exports, relative files, JSON, node_modules)",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "From the package's own .js, .cjs and .json files (at most 2000 files, 24 MiB). As Node.js (EXT-28): one require.cache for the extension, keyed by file name (deleting an entry loads the file again); a module whose code throws is not kept (requiring it again runs it again); circular requires see the exports as they were; module.parent, children, require, path, paths and require.main; require.resolve of a built-in is its name. An absolute path is found only inside the extension's package; climbing out of it is MODULE_NOT_FOUND. Not provided: package.json `exports` maps, require.extensions, require() of an ES module.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/runtime.rs (commonjs_caches_fails_and_cycles_as_node_does_within_the_package)",
+        "L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)",
+        "L3: exercised by real extensions in the benchmark (30 of 42 packages load)"
+      ]
+    },
+    {
+      "api": "ES modules (type: module, .mjs)",
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "notes": "Refused by the adapter: its code does not run. Deferred at EXT-28 on evidence: of the 64 benchmark extensions one is an ES module (waderyan.gitblame), and its main feature runs git (a process, roadmap P6), so loading it would gain nothing; doing it properly needs QuickJS's module loader with a resolver held to the package (rquickjs's `loader` feature).",
+      "evidence": ["L2: the adapter's tests (src-tauri/src/vsix_tests.rs)"]
+    },
+    {
+      "api": "Native modules (.node)",
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "notes": "Never loaded: native code would run outside QuickJS.",
+      "evidence": ["L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)"]
+    },
+    {
+      "api": "Node.js path",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "win32 semantics (and path.posix); resolve() has no working directory (the root).",
+      "evidence": ["L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)"]
+    },
+    {
+      "api": "Node.js events",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "EventEmitter, also as an old-style constructor (EventEmitter.call(this)); no captureRejections, no async iterators.",
+      "evidence": ["L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)"]
+    },
+    {
+      "api": "Node.js util",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "format, inspect (basic; inspect.custom), promisify, callbackify, inherits, deprecate, debuglog (silent: no NODE_DEBUG reaches an extension), TextEncoder/TextDecoder.",
+      "evidence": ["L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)"]
+    },
+    {
+      "api": "Node.js assert",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "ok, equal, strictEqual, deepStrictEqual (by JSON), fail.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_remaining_members…: ok, strictEqual, deepStrictEqual, equal and fail)"
+      ]
+    },
+    {
+      "api": "Node.js url",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "URL and URLSearchParams (the globals); fileURLToPath and pathToFileURL with Node.js's Windows rules (drive case kept, UNC paths, encoded separators refused; a rooted path without a drive is on the extension folder's drive, a relative one fails with UnsupportedApi: no working directory); domainToASCII. The legacy url.parse, format and resolve fail with UnsupportedApi.",
+      "evidence": [
+        "L2: real host, against Node.js's answers (tests/fixtures/runtime-vectors.json), crates/ide-plugin-host/tests/runtime.rs (nodes_url_module_matches_node_on_windows)",
+        "L2: real host, crates/ide-plugin-host/tests/runtime.rs (navigator_and_rooted_paths_say_where_code_runs)",
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_remaining_members…: fileURLToPath, pathToFileURL)"
+      ]
+    },
+    {
+      "api": "Node.js crypto (random values)",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "randomBytes (sync and with a callback; filled in 64 KiB parts), randomInt (unbiased), randomUUID, getRandomValues, randomFillSync, webcrypto: the operating system's random source. Hashes, HMACs, ciphers, keys and signing fail with UnsupportedApi.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/runtime.rs (nodes_random_crypto_and_its_limits)"
+      ]
+    },
+    {
+      "api": "Node.js perf_hooks",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "performance (QuickJS's own performance.now()); the rest fails with UnsupportedApi.",
+      "evidence": ["L1: present (vscode.js builtins)"]
+    },
+    {
+      "api": "Node.js os",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "platform, type, arch, endianness, EOL (Yavin runs on Windows x64); the machine's own facts (homedir, tmpdir, hostname, userInfo, cpus, network) fail with UnsupportedApi.",
+      "evidence": ["L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)"]
+    },
+    {
+      "api": "Node.js http",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "STATUS_CODES and METHODS (data); requests and servers fail with UnsupportedApi: no network.",
+      "evidence": ["L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)"]
+    },
+    {
+      "api": "Node.js tty",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "isatty() is false: no terminal is attached to an extension.",
+      "evidence": ["L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)"]
+    },
+    {
+      "api": "Node.js console",
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "notes": "The global console: lines go to the extension's log.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/conformance.rs (the_remaining_members…: a line in the extension's log)"
+      ]
+    },
+    {
+      "api": "Node.js fs, child_process, net, https, zlib, stream, worker_threads and every other built-in",
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "notes": "Loadable (every Node.js built-in name is); each member fails with UnsupportedApi when used. Reaching the system is not something the sandbox allows.",
+      "evidence": ["L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)"]
+    },
+    {
+      "api": "process",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "platform, env ({}: no environment reaches an extension), nextTick, hrtime; cwd, exit, pid and the like fail with UnsupportedApi.",
+      "evidence": ["L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)"]
+    },
+    {
+      "api": "Buffer",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "A Uint8Array: from/alloc/concat/byteLength/isBuffer, toString and from in utf8, hex, base64, base64url, latin1, utf16le; equals, compare, slice, write, a few reads. Also require(\"buffer\").",
+      "evidence": ["L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)"]
+    },
+    {
+      "api": "setTimeout, setInterval, setImmediate, clear*",
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Kept by the host: at most 1000 waiting, intervals at least 10 ms, each run under the call deadline.",
+      "evidence": [
+        "L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)",
+        "L2: real host, crates/ide-plugin-host/tests/runtime.rs (timers_promises_and_cleanup: a throwing interval goes on, order of microtasks and timers, nothing runs after unload)"
+      ]
+    },
+    {
+      "api": "TextEncoder, TextDecoder",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "UTF-8 only.",
+      "evidence": [
+        "L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs) (through Buffer)"
+      ]
+    },
+    {
+      "api": "atob, btoa, queueMicrotask",
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "evidence": [
+        "L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs) (through Buffer's base64)"
+      ]
+    },
+    {
+      "api": "fetch, XMLHttpRequest, WebSocket",
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "notes": "Not defined: no network.",
+      "evidence": ["L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)"]
+    },
+    {
+      "api": "URL, URLSearchParams",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "The WHATWG URL Standard's parser, serializers and setters, and application/x-www-form-urlencoded; URL.canParse, URL.parse; searchParams linked to its URL. Checked against Node.js on 121 inputs and 36 setters. Known difference: a host name with non-ASCII letters is mapped by lower-casing, NFC and Punycode, not by UTS #46's full mapping table (a few inputs a browser maps or refuses are kept). URL.createObjectURL fails with UnsupportedApi (no blobs).",
+      "evidence": [
+        "L2: real host, against Node.js's answers (tests/fixtures/runtime-vectors.json), crates/ide-plugin-host/tests/runtime.rs (url_parsing_matches_node, url_setters_and_search_params_match_node)",
+        "L2: real host, crates/ide-plugin-host/tests/runtime.rs (url_semantics_and_failures)",
+        "L3: benchmark (EXT-28): Code Spell Checker loads (it failed at load with `URL is not defined`)"
+      ]
+    },
+    {
+      "api": "Intl (Collator, DateTimeFormat, ListFormat, Segmenter), String.prototype.localeCompare",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "English only (\"en\", \"en-US\"; any other locale resolves to en-US). Collator: the root collation for Latin letters, accents, case, expansions (ß, æ), digits and numeric runs, spaces, ASCII punctuation and symbols, with every option (usage, sensitivity, numeric, caseFirst, ignorePunctuation); other scripts sort by code point after Latin. localeCompare uses it, as with ICU. Segmenter: extended grapheme clusters (UAX #29); word and sentence granularity fail with UnsupportedApi. ListFormat: every type and style. DateTimeFormat: the en-US patterns of dateStyle, timeStyle and the date and time fields, in UTC and the host's own zone (named by its offset, \"UTC\" or such as \"+05:30\": no IANA names); other zones, era, dayPeriod and timeZoneName fail with UnsupportedApi. NumberFormat, PluralRules, RelativeTimeFormat, DisplayNames, Locale and DurationFormat fail with UnsupportedApi. Checked against Node.js's ICU (9 collations of 79 words, 16 texts, 23 date formats).",
+      "evidence": [
+        "L2: real host, against Node.js's answers (tests/fixtures/runtime-vectors.json), crates/ide-plugin-host/tests/runtime.rs (the_collator_matches_icus, list_formats_graphemes_and_dates_match_icus)",
+        "L2: real host, crates/ide-plugin-host/tests/runtime.rs (locales_and_what_intl_does_not_provide, collation_sorts_thousands_of_lines_within_the_call_deadline)",
+        "L3: benchmark (EXT-28): Sort Lines' natural sort works (it failed with `Intl is not defined`); markdownlint and Go load (both failed at load); YAML loads"
+      ]
+    },
+    {
+      "api": "crypto (getRandomValues, randomUUID)",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "From the operating system's random source (ProcessPrng, through the host; the native function is not reachable by extensions, and Math.random is never used). Integer typed arrays only (TypeMismatchError), at most 65536 bytes (QuotaExceededError). crypto.subtle fails with UnsupportedApi; CryptoKey cannot be constructed.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/runtime.rs (crypto_gives_the_systems_random_values_within_its_limits)",
+        "L3: benchmark (EXT-28): YAML loads (it failed at load with `crypto is not defined`)"
+      ]
+    },
+    {
+      "api": "EventTarget, Event, AbortController, AbortSignal",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Listeners (functions and handleEvent objects), once, signal, capture flag, preventDefault on cancelable events, stopImmediatePropagation; a listener's failure is logged and the dispatch goes on. AbortSignal: aborted, reason (an AbortError DOMException by default), onabort, throwIfAborted, abort(), timeout() (a TimeoutError), any(). No propagation through a tree (there is none).",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/runtime.rs (events_and_abort_signals)"
+      ]
+    },
+    {
+      "api": "structuredClone",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Primitives, wrappers, Date, RegExp, ArrayBuffer, typed arrays, DataView, Map, Set, arrays (holes kept), plain objects and errors, with shared references and cycles; functions, symbols and other objects are a DataCloneError. The transfer option fails with UnsupportedApi.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/runtime.rs (structured_clone_copies_what_can_be_copied_and_refuses_the_rest)"
+      ]
+    },
+    {
+      "api": "navigator",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "As Node.js 21+ has one, said as it is: userAgent \"Yavin-Extension-Host (Windows NT 10.0; Win64; x64)\" (no browser or Node.js claimed), language en-US, platform win32, hardwareConcurrency 1.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/runtime.rs (navigator_and_rooted_paths_say_where_code_runs)",
+        "L3: benchmark (EXT-28): YAML loads (it read navigator at load)"
+      ]
+    },
+    {
+      "api": "Unhandled promise rejections",
+      "status": "FULL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Said in the extension's log once the entry's jobs have run (as Node.js says them): a rejection handled later in the same entry is not; at most ten per entry, the rest counted. Before EXT-28 they were lost.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/runtime.rs (unhandled_rejections_are_said_and_handled_ones_are_not)"
+      ]
+    },
+    {
+      "api": "location, importScripts (web bundles)",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "location is the entry point's file URL; importScripts (loading further chunks) fails with UnsupportedApi.",
+      "evidence": ["L2: behaviour tested in the real host (crates/ide-plugin-host/tests/vscode.rs)"]
+    },
+    {
+      "api": "Deep recursion",
+      "status": "FULL",
+      "baseline": "FULL",
+      "notes": "A RangeError at 8 MiB of script stack (the host's thread has 32 MiB); before EXT-25 it overflowed the native stack and ended the host.",
+      "evidence": ["L2: crates/ide-plugin-host/tests/host.rs"]
+    }
+  ],
+  "contributions": [
+    {
+      "api": "themes (JSON colour themes)",
+      "status": "PARTIAL",
+      "baseline": "PARTIAL",
+      "notes": "EXT-04: editor colours and mapped token scopes; workbench colours and .tmTheme are not applied.",
+      "evidence": ["L2: declarative.test.ts, a UI test; L3: themes of 6 benchmark packages read"]
+    },
+    {
+      "api": "snippets",
+      "status": "PARTIAL",
+      "baseline": "PARTIAL",
+      "notes": "EXT-04: completion items for their own language.",
+      "evidence": ["L2: declarative.test.ts; L3: snippets of benchmark packages read"]
+    },
+    {
+      "api": "languages",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Ids, file extensions and names, aliases, language configuration; never for a language Yavin knows itself; file name patterns and first-line detection are not supported.",
+      "evidence": [
+        "L4: the window, tests/ui/terminal.spec.ts (EXT-27 a VS Code extension in the window)",
+        "L4: the packaged application, tests/real/vscode.spec.ts",
+        "Adapter: vsix_tests.rs"
+      ]
+    },
+    {
+      "api": "language configuration",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "Comments, brackets, auto-closing and surrounding pairs, folding markers, word pattern, indentation and on-Enter rules; patterns that could backtrack exponentially are left out.",
+      "evidence": [
+        "L4: the window, tests/ui/terminal.spec.ts (EXT-27 a VS Code extension in the window) (comment toggle)",
+        "Conversion: textmate.test.ts"
+      ]
+    },
+    {
+      "api": "grammars (TextMate)",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "JSON and property-list grammars, in a worker, for languages without a tokenizer of Yavin's own; injection grammars are not applied; patterns JavaScript cannot express are skipped; tokens coloured by the theme table.",
+      "evidence": [
+        "L4: the window, tests/ui/terminal.spec.ts (EXT-27 a VS Code extension in the window) (the worker colours a file)",
+        "L4: the packaged application, tests/real/vscode.spec.ts (under the application's CSP)",
+        "Engine: textmate.test.ts"
+      ]
+    },
+    {
+      "api": "commands, keybindings, configuration, views, viewsContainers, menus",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "With code that runs: mapped to Yavin ids; keybindings with one chord and an editor or no when clause; settings of four kinds; tree views; four menus with Yavin's two when conditions.",
+      "evidence": [
+        "L2: the adapter's tests (src-tauri/src/vsix_tests.rs)",
+        "L3: exercised by real extensions in the benchmark (52/52 generated manifests valid in the window)"
+      ]
+    },
+    {
+      "api": "activationEvents",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "*, onStartupFinished, onCommand, onLanguage, onView and the implicit ones; workspaceContains activates in every folder; others are not raised.",
+      "evidence": ["L2: the adapter's tests (src-tauri/src/vsix_tests.rs)"]
+    },
+    {
+      "api": "iconThemes (file icon themes)",
+      "status": "PARTIAL",
+      "baseline": "UNSUPPORTED",
+      "notes": "EXT-30: the explorer and the editor's tabs show a chosen theme's SVG icons (explorer.iconTheme setting), by file name, extension, language and folder name, with its light variant; drawn only as images from the package's own files. Not shown: icons by font character, PNG icons, the high-contrast variant, hidesExplorerArrows.",
+      "evidence": [
+        "L2: the adapter's tests (src-tauri/src/vsix_tests.rs, file_icon_themes…)",
+        "L2: window, src/services/extensions/iconThemes.test.ts",
+        "L4: window, tests/ui/terminal.spec.ts (EXT-30 a file icon theme…)",
+        "L3: Open VSX benchmark, benchmark/openvsx/ext30/results.json: Material Icon Theme (1251 SVG icons, all drawn) and VSCode Icons (1504, all drawn) install and their themes read"
+      ]
+    },
+    {
+      "api": "productIconThemes",
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "notes": "The workbench's own icons are not themable.",
+      "evidence": ["L2: the adapter's tests (src-tauri/src/vsix_tests.rs)"]
+    },
+    {
+      "api": "debuggers, breakpoints, taskDefinitions, problemMatchers",
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the adapter's tests (src-tauri/src/vsix_tests.rs)"]
+    },
+    {
+      "api": "customEditors, notebooks, webview views",
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the adapter's tests (src-tauri/src/vsix_tests.rs)"]
+    },
+    {
+      "api": "jsonValidation, colors, walkthroughs, submenus, semanticTokenScopes",
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "evidence": ["L2: the adapter's tests (src-tauri/src/vsix_tests.rs)"]
+    },
+    {
+      "api": "extensionDependencies, extensionPack",
+      "status": "UNSUPPORTED",
+      "baseline": "UNSUPPORTED",
+      "notes": "Not installed with it.",
+      "evidence": ["L2: the adapter's tests (src-tauri/src/vsix_tests.rs)"]
+    }
+  ]
+}

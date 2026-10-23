@@ -213,18 +213,22 @@ fn the_api_is_this_yavins_and_a_code_extension_must_say_which_it_supports() {
     };
     assert!(api_of(json!({"yavin": "^2.0.0"}), true).is_ok());
     assert!(api_of(json!({"yavin": ">=2.0.0, <3.0.0"}), true).is_ok());
-    assert!(api_of(json!({"yavin": "2.0.0"}), true).is_ok());
+    // An exact version is that version only: 2.0.0 is not this API (2.1.0).
+    assert!(api_of(json!({"yavin": "2.0.0"}), true).is_err());
+    // EXT-25: the API is 2.1.0 (additive): 2.0 ranges and 2.1 ones fit.
+    assert!(api_of(json!({"yavin": "^2.1.0"}), true).is_ok());
+    assert!(api_of(json!({"yavin": "2.1.0"}), true).is_ok());
     // A future API, an older major, a pre-release of a later one: refused.
     for refused in [
         "^3.0.0",
         "^1.0.0",
         "2.0.1",
-        "^2.1.0",
-        ">=2.1.0-beta.1, <3.0.0",
+        "^2.2.0",
+        ">=2.2.0-beta.1, <3.0.0",
     ] {
         let error = api_of(json!({"yavin": refused}), true).unwrap_err();
         assert!(
-            error.contains("this Yavin provides 2.0.0"),
+            error.contains(&format!("this Yavin provides {EXTENSION_API}")),
             "{refused}: {error}"
         );
     }

@@ -1,0 +1,1619 @@
+{
+  "results": [
+    {
+      "activate": {
+        "ms": 3,
+        "ok": true
+      },
+      "commands": [
+        {
+          "command": "zhuangtongfa.material-theme.onedarkpro-showchangelog-51bf98e5",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "oneDarkPro.showChangelog"
+        },
+        {
+          "command": "zhuangtongfa.material-theme.onedarkpro-setvivid-edefa7f0",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "oneDarkPro.setVivid"
+        },
+        {
+          "command": "zhuangtongfa.material-theme.onedarkpro-cancelvivid-69095c9e",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "oneDarkPro.cancelVivid"
+        },
+        {
+          "command": "zhuangtongfa.material-theme.onedarkpro-setitalic-2ac08810",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "oneDarkPro.setItalic"
+        },
+        {
+          "command": "zhuangtongfa.material-theme.onedarkpro-cancelitalic-15345a7e",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "oneDarkPro.cancelItalic"
+        },
+        {
+          "command": "zhuangtongfa.material-theme.onedarkpro-setbold-196e8303",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "oneDarkPro.setBold"
+        },
+        {
+          "command": "zhuangtongfa.material-theme.onedarkpro-cancelbold-db89d79d",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "oneDarkPro.cancelBold"
+        }
+      ],
+      "exited": false,
+      "id": "zhuangtongfa.material-theme",
+      "install": {
+        "ok": true,
+        "retries": 1
+      },
+      "load": {
+        "ms": 142,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "commands.register": 7,
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 8,
+        "events.subscribe": 2,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: workspace.fs.stat is not supported by Yavin.",
+        "UnsupportedApi: UnsupportedApi: workspace.fs.stat is not supported by Yavin.",
+        "UnsupportedApi: WorkspaceConfiguration.update is not supported by Yavin (settings are changed in Yavin's Settings)."
+      ],
+      "version": "3.20.3"
+    },
+    {
+      "activate": {
+        "ms": 3,
+        "ok": true
+      },
+      "commands": [],
+      "exited": false,
+      "id": "catppuccin.catppuccin-vsc",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 60,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 2,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "3.19.0"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: workspace.createFileSystemWatcher is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "bungcip.better-toml",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 95,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: workspace.createFileSystemWatcher is not supported by Yavin."
+      ],
+      "version": "0.3.2"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: languages.createLanguageStatusItem is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "esbenp.prettier-vscode",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 1689,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: languages.createLanguageStatusItem is not supported by Yavin."
+      ],
+      "version": "12.4.0"
+    },
+    {
+      "exited": false,
+      "id": "foxundermoon.shell-format",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "error": {
+          "code": "LoadFailed",
+          "message": "UnsupportedApi: Node.js fs.readFileSync is not supported by Yavin (Yavin's extension host has no Node.js).",
+          "stack": "    at unsupported (eval_script:491:31)\n    at <anonymous> (eval_script:501:33)\n    at 7959 (<input>:3:3891)\n    at call (native)\n    at n (<input>:3:99252)\n    at 7753 (<input>:3:26623)"
+        },
+        "ok": false
+      },
+      "messages": [],
+      "requests": {},
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "7.2.8"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: Node.js fs.readFileSync is not supported by Yavin (Yavin's extension host has no Node.js)."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "ms-python.black-formatter",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 230,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: Node.js fs.readFileSync is not supported by Yavin (Yavin's extension host has no Node.js)."
+      ],
+      "version": "2025.2.0"
+    },
+    {
+      "activate": {
+        "ms": 3,
+        "ok": true
+      },
+      "commands": [],
+      "exited": false,
+      "id": "xaver.clang-format",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 121,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "1.9.0"
+    },
+    {
+      "activate": {
+        "ms": 6,
+        "ok": true
+      },
+      "commands": [
+        {
+          "command": "dbaeumer.vscode-eslint.eslint-executeautofix-e96d6395",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "eslint.executeAutofix"
+        },
+        {
+          "command": "dbaeumer.vscode-eslint.eslint-createconfig-55f24718",
+          "edited": false,
+          "error": {
+            "code": "UnsupportedApi",
+            "message": "UnsupportedApi: Node.js fs.existsSync is not supported by Yavin (Yavin's extension host has no Node.js)."
+          },
+          "ok": false,
+          "vscode": "eslint.createConfig"
+        },
+        {
+          "command": "dbaeumer.vscode-eslint.eslint-showoutputchannel-61831da5",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "eslint.showOutputChannel"
+        },
+        {
+          "command": "dbaeumer.vscode-eslint.eslint-migratesettings-385d2ca6",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "eslint.migrateSettings"
+        },
+        {
+          "command": "dbaeumer.vscode-eslint.eslint-restart-acfd844d",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "eslint.restart"
+        },
+        {
+          "command": "dbaeumer.vscode-eslint.eslint-revalidate-858bbec9",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "eslint.revalidate"
+        }
+      ],
+      "exited": false,
+      "id": "dbaeumer.vscode-eslint",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 264,
+        "ok": true
+      },
+      "messages": [
+        "ESLint is not running. By default only TypeScript and JavaScript files are validated. If you want to validate other file types please specify them in the 'eslint.probe' setting.",
+        "ESLint is not running. By default only TypeScript and JavaScript files are validated. If you want to validate other file types please specify them in the 'eslint.probe' setting.",
+        "ESLint is not running. By default only TypeScript and JavaScript files are validated. If you want to validate other file types please specify them in the 'eslint.probe' setting.",
+        "ESLint is not running. By default only TypeScript and JavaScript files are validated. If you want to validate other file types please specify them in the 'eslint.probe' setting.",
+        "ESLint is not running. By default only TypeScript and JavaScript files are validated. If you want to validate other file types please specify them in the 'eslint.probe' setting."
+      ],
+      "requests": {
+        "commands.register": 6,
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 7,
+        "events.subscribe": 3,
+        "window.showMessage": 5,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: Node.js fs.existsSync is not supported by Yavin (Yavin's extension host has no Node.js)."
+      ],
+      "version": "3.0.34"
+    },
+    {
+      "exited": false,
+      "id": "streetsidesoftware.code-spell-checker",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "error": {
+          "code": "LoadFailed",
+          "message": "URL is not defined",
+          "stack": "    at rootFileURL (<input>:4:5402)\n    at <anonymous> (<input>:4:3010)\n    at anonymous (<input>:4:2774)\n    at call (native)\n    at loadModule (eval_script:1767:101)\n    at load (eval_script:2735:31)"
+        },
+        "ok": false
+      },
+      "messages": [],
+      "requests": {},
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "4.10.0"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: languages.registerCodeActionsProvider is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "timonwong.shellcheck",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 568,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 2,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: languages.registerCodeActionsProvider is not supported by Yavin."
+      ],
+      "version": "0.48.1"
+    },
+    {
+      "exited": false,
+      "id": "davidanson.vscode-markdownlint",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "error": {
+          "code": "LoadFailed",
+          "message": "Intl is not defined",
+          "stack": "    at 9722 (<input>:47:196823)\n    at n (<input>:272:70084)\n    at <anonymous> (<input>:272:71332)\n    at anonymous (<input>:272:71433)\n    at call (native)\n    at loadModule (eval_script:1767:101)"
+        },
+        "ok": false
+      },
+      "messages": [],
+      "requests": {},
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "0.62.1"
+    },
+    {
+      "exited": false,
+      "id": "redhat.vscode-yaml",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "error": {
+          "code": "LoadFailed",
+          "message": "crypto is not defined",
+          "stack": "    at 7897 (<input>:3:31008)\n    at call (native)\n    at n (<input>:3:648802)\n    at 7562 (<input>:3:18498)\n    at call (native)\n    at n (<input>:3:648802)"
+        },
+        "ok": false
+      },
+      "messages": [],
+      "requests": {},
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "2.1.2026102008"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: languages.setLanguageConfiguration is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "rust-lang.rust-analyzer",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 479,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 2,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: languages.setLanguageConfiguration is not supported by Yavin."
+      ],
+      "version": "0.4.3090"
+    },
+    {
+      "exited": false,
+      "id": "golang.go",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "error": {
+          "code": "LoadFailed",
+          "message": "Intl is not defined",
+          "stack": "    at anonymous (<input>:40217:20)\n    at call (native)\n    at loadModule (eval_script:1767:101)\n    at load (eval_script:2735:31)\n    at <anonymous> (eval_script:2781:18)"
+        },
+        "ok": false
+      },
+      "messages": [],
+      "requests": {},
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "0.56.1"
+    },
+    {
+      "exited": false,
+      "id": "llvm-vs-code-extensions.vscode-clangd",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "error": {
+          "code": "LoadFailed",
+          "message": "not a function",
+          "stack": "    at <anonymous> (<input>:44:480430)\n    at <anonymous> (<input>:3:301)\n    at <anonymous> (<input>:228:18197)\n    at <anonymous> (<input>:3:301)\n    at <anonymous> (<input>:228:24641)\n    at <anonymous> (<input>:3:301)"
+        },
+        "ok": false
+      },
+      "messages": [],
+      "requests": {},
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "0.6.0"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: a document selector without a language is not supported by Yavin (Yavin registers providers per language)."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "christian-kohler.path-intellisense",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 261,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 1,
+        "languages.register": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: workspace.findFiles is not supported by Yavin.",
+        "UnsupportedApi: a document selector without a language is not supported by Yavin (Yavin registers providers per language)."
+      ],
+      "version": "2.8.0"
+    },
+    {
+      "activate": {
+        "ms": 5,
+        "ok": true
+      },
+      "commands": [
+        {
+          "command": "christian-kohler.npm-intellisense.npm-intellisense-import-971eaaad",
+          "edited": false,
+          "error": {
+            "code": "UnsupportedApi",
+            "message": "UnsupportedApi: window.showQuickPick is not supported by Yavin."
+          },
+          "ok": false,
+          "vscode": "npm-intellisense.import"
+        }
+      ],
+      "exited": false,
+      "id": "christian-kohler.npm-intellisense",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 243,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "commands.register": 1,
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 2,
+        "events.subscribe": 1,
+        "languages.register": 4,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: Node.js fs.readFile is not supported by Yavin (Yavin's extension host has no Node.js).",
+        "UnsupportedApi: window.showQuickPick is not supported by Yavin."
+      ],
+      "version": "1.4.5"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: Node.js fs.lstat is not supported by Yavin (Yavin's extension host has no Node.js)."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "formulahendry.auto-rename-tag",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 451,
+        "ok": true
+      },
+      "messages": [
+        "A request has failed. See the output for more information. [Go to output: buttons are not supported]",
+        "Couldn't start client Auto Rename Tag"
+      ],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 2,
+        "window.showMessage": 2,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: Node.js fs.lstat is not supported by Yavin (Yavin's extension host has no Node.js)."
+      ],
+      "version": "0.1.10"
+    },
+    {
+      "activate": {
+        "ms": 5,
+        "ok": true
+      },
+      "commands": [
+        {
+          "command": "tyriar.sort-lines.sortlines-sortlines-409f1f69",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "sortLines.sortLines"
+        },
+        {
+          "command": "tyriar.sort-lines.sortlines-sortlinescaseinsensitive-da11258a",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "sortLines.sortLinesCaseInsensitive"
+        },
+        {
+          "command": "tyriar.sort-lines.sortlines-sortlinescaseinsensitiveunique-808d0b75",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "sortLines.sortLinesCaseInsensitiveUnique"
+        },
+        {
+          "command": "tyriar.sort-lines.sortlines-sortlinesreverse-5aeec7c1",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "sortLines.sortLinesReverse"
+        },
+        {
+          "command": "tyriar.sort-lines.sortlines-sortlineslinelength-3674501b",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "sortLines.sortLinesLineLength"
+        },
+        {
+          "command": "tyriar.sort-lines.sortlines-sortlineslinelengthreverse-66bb8c4f",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "sortLines.sortLinesLineLengthReverse"
+        },
+        {
+          "command": "tyriar.sort-lines.sortlines-sortlinesvariablelength-7d64ebc9",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "sortLines.sortLinesVariableLength"
+        },
+        {
+          "command": "tyriar.sort-lines.sortlines-sortlinesvariablelengthreverse-75f786e1",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "sortLines.sortLinesVariableLengthReverse"
+        },
+        {
+          "command": "tyriar.sort-lines.sortlines-sortlinesnatural-57b33832",
+          "edited": false,
+          "error": {
+            "code": "ExtensionError",
+            "message": "Intl is not defined"
+          },
+          "ok": false,
+          "vscode": "sortLines.sortLinesNatural"
+        },
+        {
+          "command": "tyriar.sort-lines.sortlines-sortlinesunique-4ffe0c6a",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "sortLines.sortLinesUnique"
+        },
+        {
+          "command": "tyriar.sort-lines.sortlines-removeduplicatelines-9dd12aa2",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "sortLines.removeDuplicateLines"
+        },
+        {
+          "command": "tyriar.sort-lines.sortlines-keeponlyduplicatelines-73984f41",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "sortLines.keepOnlyDuplicateLines"
+        },
+        {
+          "command": "tyriar.sort-lines.sortlines-keeponlynotduplicatelines-67863ffa",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "sortLines.keepOnlyNotDuplicateLines"
+        },
+        {
+          "command": "tyriar.sort-lines.sortlines-sortlinesshuffle-a7158362",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "sortLines.sortLinesShuffle"
+        }
+      ],
+      "exited": false,
+      "id": "tyriar.sort-lines",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 207,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "commands.register": 14,
+        "documents.all": 1,
+        "documents.edit": 13,
+        "documents.get": 13,
+        "documents.getText": 1,
+        "editor.active": 15,
+        "events.subscribe": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "1.12.0"
+    },
+    {
+      "activate": {
+        "ms": 5,
+        "ok": true
+      },
+      "commands": [
+        {
+          "command": "wmaurer.change-case.extension-changecase-commands-4bc93998",
+          "edited": false,
+          "error": {
+            "code": "UnsupportedApi",
+            "message": "UnsupportedApi: window.showQuickPick is not supported by Yavin."
+          },
+          "ok": false,
+          "vscode": "extension.changeCase.commands"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-camel-a25468f8",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.camel"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-constant-ce7a367a",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.constant"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-dot-ac278d31",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.dot"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-kebab-ea5f97c3",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.kebab"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-lower-edb64527",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.lower"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-lowerfirst-e91d8a43",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.lowerFirst"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-no-ec377bf9",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.no"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-param-117be71b",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.param"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-pascal-40339bf6",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.pascal"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-path-bfcccaf9",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.path"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-sentence-55843d67",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.sentence"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-snake-1c235742",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.snake"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-swap-9253c13d",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.swap"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-title-03500abc",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.title"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-upper-e3c75ba6",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.upper"
+        },
+        {
+          "command": "wmaurer.change-case.extension-changecase-upperfirst-ad27ba64",
+          "edited": true,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.changeCase.upperFirst"
+        }
+      ],
+      "exited": false,
+      "id": "wmaurer.change-case",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 368,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "commands.register": 17,
+        "documents.all": 1,
+        "documents.edit": 14,
+        "documents.get": 13,
+        "documents.getText": 1,
+        "editor.active": 18,
+        "editor.setSelection": 15,
+        "events.subscribe": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": ["UnsupportedApi: window.showQuickPick is not supported by Yavin."],
+      "version": "1.0.0"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: window.createWebviewPanel is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "alefragnani.bookmarks",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 349,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 1,
+        "storage.update": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": ["UnsupportedApi: window.createWebviewPanel is not supported by Yavin."],
+      "version": "14.1.1"
+    },
+    {
+      "activate": {
+        "ms": 41,
+        "ok": true
+      },
+      "commands": [
+        {
+          "command": "vscodevim.vim.togglevim-83aab8d7",
+          "edited": false,
+          "error": {
+            "code": "UnknownCommand",
+            "message": "\"vscodevim.vim.togglevim-83aab8d7\" has no handler."
+          },
+          "ok": false,
+          "vscode": "toggleVim"
+        },
+        {
+          "command": "vscodevim.vim.vim-showquickpickcmdline-cd8540a6",
+          "edited": false,
+          "error": {
+            "code": "UnknownCommand",
+            "message": "\"vscodevim.vim.vim-showquickpickcmdline-cd8540a6\" has no handler."
+          },
+          "ok": false,
+          "vscode": "vim.showQuickpickCmdLine"
+        },
+        {
+          "command": "vscodevim.vim.vim-editvimrc-540e8966",
+          "edited": false,
+          "error": {
+            "code": "UnknownCommand",
+            "message": "\"vscodevim.vim.vim-editvimrc-540e8966\" has no handler."
+          },
+          "ok": false,
+          "vscode": "vim.editVimrc"
+        }
+      ],
+      "exited": false,
+      "id": "vscodevim.vim",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 1071,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 5,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: window.onDidChangeTextEditorSelection is not supported by Yavin."
+      ],
+      "version": "1.32.4"
+    },
+    {
+      "activate": {
+        "ms": 4,
+        "ok": true
+      },
+      "commands": [
+        {
+          "command": "stkb.rewrap.rewrap-rewrapcomment-d88b1a64",
+          "edited": false,
+          "error": {
+            "code": "ExtensionError",
+            "message": "cannot read property 'then' of undefined"
+          },
+          "ok": false,
+          "vscode": "rewrap.rewrapComment"
+        },
+        {
+          "command": "stkb.rewrap.rewrap-rewrapcommentat-d9cd6e11",
+          "edited": false,
+          "error": {
+            "code": "UnsupportedApi",
+            "message": "UnsupportedApi: window.showInputBox is not supported by Yavin."
+          },
+          "ok": false,
+          "vscode": "rewrap.rewrapCommentAt"
+        },
+        {
+          "command": "stkb.rewrap.rewrap-toggleautowrap-a32a75e1",
+          "edited": false,
+          "error": {
+            "code": "ExtensionError",
+            "message": "cannot read property 'workspaceFolderLanguageValue' of undefined"
+          },
+          "ok": false,
+          "vscode": "rewrap.toggleAutoWrap"
+        }
+      ],
+      "exited": false,
+      "id": "stkb.rewrap",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 446,
+        "ok": true
+      },
+      "messages": [
+        "Sorry, there was an error in Rewrap. Go to: Help -> Toggle Developer Tools -> Console for more information."
+      ],
+      "requests": {
+        "commands.register": 3,
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 4,
+        "events.subscribe": 3,
+        "window.showMessage": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": ["UnsupportedApi: window.showInputBox is not supported by Yavin."],
+      "version": "1.16.3"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: workspace.registerTextDocumentContentProvider is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "gruntfuggly.todo-tree",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 541,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 1,
+        "storage.update": 1,
+        "views.register": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: workspace.registerTextDocumentContentProvider is not supported by Yavin."
+      ],
+      "version": "0.0.215"
+    },
+    {
+      "exited": false,
+      "id": "alefragnani.project-manager",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "error": {
+          "code": "LoadFailed",
+          "message": "UnsupportedApi: Node.js os.homedir is not supported by Yavin (Yavin's extension host has no Node.js).",
+          "stack": "    at unsupported (eval_script:491:31)\n    at <anonymous> (eval_script:501:33)\n    at 4495 (<input>:3:68934)\n    at call (native)\n    at s (<input>:3:247069)\n    at 9950 (<input>:3:34372)"
+        },
+        "ok": false
+      },
+      "messages": [],
+      "requests": {},
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "13.1.1"
+    },
+    {
+      "exited": false,
+      "id": "sleistner.vscode-fileutils",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "error": {
+          "code": "LoadFailed",
+          "message": "cannot read property 'split' of undefined",
+          "stack": "    at <anonymous> (<input>:4:36715)\n    at <anonymous> (<input>:3:249)\n    at <anonymous> (<input>:4:37982)\n    at <anonymous> (<input>:3:249)\n    at <anonymous> (<input>:4:41304)\n    at <anonymous> (<input>:3:249)"
+        },
+        "ok": false
+      },
+      "messages": [],
+      "requests": {},
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "3.10.3"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: ExtensionContext.globalStoragePath is not supported by Yavin (extensions have no folder of their own to write to in Yavin)."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "mhutchie.git-graph",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 462,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: ExtensionContext.globalStoragePath is not supported by Yavin (extensions have no folder of their own to write to in Yavin)."
+      ],
+      "version": "1.30.0"
+    },
+    {
+      "exited": false,
+      "id": "donjayamanne.githistory",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "error": {
+          "code": "LoadFailed",
+          "message": "cannot read property 'split' of undefined",
+          "stack": "    at <anonymous> (<input>:3:37944)\n    at call (native)\n    at n (<input>:3:151)\n    at <anonymous> (<input>:18:51653)\n    at call (native)\n    at n (<input>:3:151)"
+        },
+        "ok": false
+      },
+      "messages": [],
+      "requests": {},
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "0.6.20"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: languages.registerCodeLensProvider is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "hbenl.vscode-test-explorer",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 376,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "editor.setDecorations": 18,
+        "events.subscribe": 3,
+        "views.register": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: languages.registerCodeLensProvider is not supported by Yavin."
+      ],
+      "version": "2.22.1"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: tests.createTestController is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "vitest.explorer",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 445,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": ["UnsupportedApi: tests.createTestController is not supported by Yavin."],
+      "version": "1.52.2"
+    },
+    {
+      "exited": false,
+      "id": "orta.vscode-jest",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "error": {
+          "code": "LoadFailed",
+          "message": "UnsupportedApi: Node.js process.cwd is not supported by Yavin (Yavin's extension host has no Node.js).",
+          "stack": "    at unsupported (eval_script:491:31)\n    at <anonymous> (eval_script:475:46)\n    at call (native)\n    at <anonymous> (<input>:4:85972)\n    at 2919 (<input>:4:307375)\n    at call (native)"
+        },
+        "ok": false
+      },
+      "messages": [],
+      "requests": {},
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "6.4.4"
+    },
+    {
+      "exited": false,
+      "id": "vadimcn.vscode-lldb",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "error": {
+          "code": "LoadFailed",
+          "message": "UnsupportedApi: debug.onDidStartDebugSession is not supported by Yavin.",
+          "stack": "    at unsupported (eval_script:491:31)\n    at <anonymous> (eval_script:501:33)\n    at 6468 (<input>:3:136620)\n    at call (native)\n    at n (<input>:3:176999)\n    at 614 (<input>:3:1167)"
+        },
+        "ok": false
+      },
+      "messages": [],
+      "requests": {},
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "1.12.3"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: debug.onDidReceiveDebugSessionCustomEvent is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "ms-python.debugpy",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 718,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "commands.register": 1,
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: debug.onDidReceiveDebugSessionCustomEvent is not supported by Yavin."
+      ],
+      "version": "2026.6.0"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: debug.registerDebugConfigurationProvider is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "firefox-devtools.vscode-firefox-debug",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 372,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 1,
+        "views.register": 2,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: debug.registerDebugConfigurationProvider is not supported by Yavin."
+      ],
+      "version": "2.15.0"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: window.registerCustomEditorProvider is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "tomoki1207.pdf",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 833,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: window.registerCustomEditorProvider is not supported by Yavin."
+      ],
+      "version": "1.2.2"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: workspace.createFileSystemWatcher is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "jock.svg",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 1163,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "commands.register": 6,
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 4,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: workspace.createFileSystemWatcher is not supported by Yavin."
+      ],
+      "version": "1.5.3"
+    },
+    {
+      "exited": false,
+      "id": "editorconfig.editorconfig",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "error": {
+          "code": "LoadFailed",
+          "message": "UnsupportedApi: Node.js fs.readFileSync is not supported by Yavin (Yavin's extension host has no Node.js).",
+          "stack": "    at unsupported (eval_script:491:31)\n    at <anonymous> (eval_script:501:33)\n    at anonymous (<input>:305:46)\n    at call (native)\n    at loadModule (eval_script:1767:101)\n    at require (eval_script:1793:27)"
+        },
+        "ok": false
+      },
+      "messages": [],
+      "requests": {},
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "0.18.2"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: languages.getDiagnostics is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "usernamehw.errorlens",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 420,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 1,
+        "statusBar.remove": 3,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": ["UnsupportedApi: languages.getDiagnostics is not supported by Yavin."],
+      "version": "3.29.0"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: Node.js fs.readdirSync is not supported by Yavin (Yavin's extension host has no Node.js)."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "yzhang.markdown-all-in-one",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 1349,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 1,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: Node.js fs.readdirSync is not supported by Yavin (Yavin's extension host has no Node.js)."
+      ],
+      "version": "3.6.2"
+    },
+    {
+      "activate": {
+        "ms": 4,
+        "ok": true
+      },
+      "commands": [
+        {
+          "command": "naumovs.color-highlight.extension-colorhighlight-6ab60549",
+          "edited": false,
+          "error": null,
+          "ok": true,
+          "vscode": "extension.colorHighlight"
+        }
+      ],
+      "exited": false,
+      "id": "naumovs.color-highlight",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 666,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "commands.register": 1,
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 2,
+        "events.subscribe": 4,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "2.8.0"
+    },
+    {
+      "activate": {
+        "ms": 3,
+        "ok": true
+      },
+      "commands": [],
+      "exited": false,
+      "id": "aaron-bond.better-comments",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 489,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 3,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [],
+      "version": "3.0.2"
+    },
+    {
+      "activate": {
+        "error": {
+          "code": "UnsupportedApi",
+          "message": "UnsupportedApi: languages.registerDocumentRangeSemanticTokensProvider is not supported by Yavin."
+        },
+        "ok": false
+      },
+      "exited": false,
+      "id": "mechatroner.rainbow-csv",
+      "install": {
+        "ok": true,
+        "retries": 0
+      },
+      "load": {
+        "ms": 570,
+        "ok": true
+      },
+      "messages": [],
+      "requests": {
+        "commands.register": 24,
+        "documents.all": 1,
+        "documents.getText": 1,
+        "editor.active": 1,
+        "events.subscribe": 5,
+        "languages.register": 12,
+        "window.state": 1
+      },
+      "sandboxed": true,
+      "unsupported": [
+        "UnsupportedApi: languages.registerDocumentRangeSemanticTokensProvider is not supported by Yavin."
+      ],
+      "version": "3.24.1"
+    }
+  ]
+}

@@ -1,13 +1,23 @@
 // The extension API inside the host (IDE-08): what one extension's QuickJS context is given.
 // Everything it can do is a message to Yavin through `send`; everything Yavin tells it arrives
 // through `globalThis.__yavin_receive`. There is nothing else: no require, no fs, no network,
-// no process, no timers that outlive a call. `__YAVIN_INIT__` is replaced by the host with the
-// extension's identity before this runs.
+// no process. Timers (EXT-25) are the host's (`__yavin_timer`): each fires as an entry of its
+// own. `__YAVIN_INIT__` is replaced by the host with the extension's identity before this runs.
+// A VS Code extension's code runs through the compatibility layer (`vscode.js`, EXT-25), which
+// the host puts where this file says `__YAVIN_VSCODE__`, after the Web globals (`web.js`) and
+// the Intl subset (`intl.js`) it installs (EXT-28).
 (function () {
   "use strict";
   const init = __YAVIN_INIT__;
   const send = globalThis.__yavin_send;
   delete globalThis.__yavin_send;
+  const setTimer = globalThis.__yavin_timer;
+  const clearTimer = globalThis.__yavin_untimer;
+  delete globalThis.__yavin_timer;
+  delete globalThis.__yavin_untimer;
+  // The operating system's random bytes (EXT-28), for the layer's `crypto`: hex, or nothing.
+  const random = globalThis.__yavin_random;
+  delete globalThis.__yavin_random;
   const ids = {
     extensionId: init.extensionId,
     workspaceId: init.workspaceId,
@@ -83,6 +93,136 @@
       );
     });
   };
+
+  // --- Timers and text (EXT-25) ------------------------------------------------------------------
+  const timers = new Map();
+  let nextTimer = 1;
+  /** A timer's handle: a number to the code that adds it, a Node.js `Timeout` to the code that asks. */
+  const handle = (id) => ({
+    _id: id,
+    ref() {
+      return this;
+    },
+    unref() {
+      return this;
+    },
+    hasRef: () => true,
+    refresh() {
+      return this;
+    },
+    [Symbol.toPrimitive]: () => id,
+  });
+  const schedule = (repeat) => (callback, ms, ...args) => {
+    if (typeof callback !== "function") throw new TypeError("A timer's callback is a function.");
+    const id = nextTimer++;
+    if (!setTimer(id, Number(ms) || 0, repeat))
+      throw Object.assign(new Error("Too many timers are waiting (the limit is 1000)."), { code: "TooManyTimers" });
+    timers.set(id, { callback, args, repeat });
+    return handle(id);
+  };
+  const cancel = (timer) => {
+    const id = timer && typeof timer === "object" ? timer._id : Number(timer);
+    if (timers.delete(id)) clearTimer(id);
+  };
+  globalThis.setTimeout = schedule(false);
+  globalThis.setInterval = schedule(true);
+  globalThis.clearTimeout = cancel;
+  globalThis.clearInterval = cancel;
+  globalThis.setImmediate = (callback, ...args) => globalThis.setTimeout(callback, 0, ...args);
+  globalThis.clearImmediate = cancel;
+  if (typeof globalThis.queueMicrotask !== "function")
+    globalThis.queueMicrotask = (callback) => {
+      Promise.resolve().then(callback);
+    };
+  class TextEncoder {
+    get encoding() {
+      return "utf-8";
+    }
+    encode(text) {
+      const bytes = [];
+      for (const char of String(text === undefined ? "" : text)) {
+        let code = char.codePointAt(0);
+        if (code >= 0xd800 && code <= 0xdfff) code = 0xfffd;
+        if (code < 0x80) bytes.push(code);
+        else if (code < 0x800) bytes.push(0xc0 | (code >> 6), 0x80 | (code & 63));
+        else if (code < 0x10000) bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 63), 0x80 | (code & 63));
+        else bytes.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 63), 0x80 | ((code >> 6) & 63), 0x80 | (code & 63));
+      }
+      return new Uint8Array(bytes);
+    }
+  }
+  class TextDecoder {
+    constructor(label) {
+      const name = String(label || "utf-8").toLowerCase();
+      if (name !== "utf-8" && name !== "utf8") throw new RangeError(`The encoding "${label}" is not supported.`);
+    }
+    get encoding() {
+      return "utf-8";
+    }
+    decode(input) {
+      if (input === undefined) return "";
+      const bytes = input instanceof Uint8Array ? input : new Uint8Array(input.buffer ? input.buffer : input);
+      let out = "";
+      for (let i = 0; i < bytes.length; ) {
+        const b = bytes[i];
+        const need = b < 0x80 ? 0 : b >= 0xf0 && b < 0xf8 ? 3 : b >= 0xe0 ? 2 : b >= 0xc0 ? 1 : -1;
+        if (need < 0 || i + need >= bytes.length + (need ? 0 : 1)) {
+          out += need === 0 ? String.fromCharCode(b) : "\ufffd";
+          i++;
+          continue;
+        }
+        let code = need === 0 ? b : b & (0x3f >> need);
+        let ok = true;
+        for (let k = 1; k <= need; k++) {
+          const next = bytes[i + k];
+          if ((next & 0xc0) !== 0x80) ok = false;
+          code = (code << 6) | (next & 63);
+        }
+        if (!ok) {
+          out += "\ufffd";
+          i++;
+          continue;
+        }
+        out += String.fromCodePoint(code);
+        i += need + 1;
+      }
+      return out;
+    }
+  }
+  if (typeof globalThis.TextEncoder !== "function") globalThis.TextEncoder = TextEncoder;
+  if (typeof globalThis.TextDecoder !== "function") globalThis.TextDecoder = TextDecoder;
+  const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  if (typeof globalThis.btoa !== "function")
+    globalThis.btoa = (text) => {
+      const s = String(text);
+      let out = "";
+      for (let i = 0; i < s.length; i += 3) {
+        const [a, b, c] = [s.charCodeAt(i), s.charCodeAt(i + 1), s.charCodeAt(i + 2)];
+        if (a > 255 || b > 255 || c > 255) throw new Error("btoa: characters outside Latin-1");
+        out += BASE64[a >> 2] + BASE64[((a & 3) << 4) | ((b || 0) >> 4)];
+        out += i + 1 < s.length ? BASE64[((b & 15) << 2) | ((c || 0) >> 6)] : "=";
+        out += i + 2 < s.length ? BASE64[c & 63] : "=";
+      }
+      return out;
+    };
+  if (typeof globalThis.atob !== "function")
+    globalThis.atob = (text) => {
+      const s = String(text).replace(/[\s=]+/g, "");
+      let out = "";
+      let bits = 0;
+      let value = 0;
+      for (const char of s) {
+        const n = BASE64.indexOf(char);
+        if (n < 0) throw new Error("atob: not base64");
+        value = (value << 6) | n;
+        bits += 6;
+        if (bits >= 8) {
+          bits -= 8;
+          out += String.fromCharCode((value >> bits) & 255);
+        }
+      }
+      return out;
+    };
 
   const yavin = Object.freeze({
     version: init.apiVersion,
@@ -213,10 +353,12 @@
         subscriptions,
         log: Object.freeze({ info: log("info"), warn: log("warn"), error: log("error") }),
       });
+      if (vscodeShim) return vscodeShim.activate();
       if (typeof module.exports.activate !== "function") throw new Error("The extension exports no activate function.");
       return module.exports.activate(context, yavin);
     },
     deactivate() {
+      if (vscodeShim) return vscodeShim.deactivate();
       const done = typeof module.exports.deactivate === "function" ? module.exports.deactivate() : undefined;
       return Promise.resolve(done).then(() => {
         const subscriptions = context ? context.subscriptions : [];
@@ -236,6 +378,10 @@
       if (!handler) throw Object.assign(new Error(`"${params.id}" has no handler.`), { code: "UnknownCommand" });
       return handler(...(params.args || []));
     },
+    // A status bar item of a VS Code extension was clicked (EXT-25): its command, with its arguments.
+    "statusBar.activate"(params) {
+      return vscodeShim ? vscodeShim.statusClicked(params.id) : null;
+    },
     "view.items"(params) {
       const view = views.get(params.id);
       if (!view) throw new Error(`"${params.id}" has no provider.`);
@@ -250,14 +396,40 @@
         definition: "provideDefinition",
         references: "provideReferences",
         symbols: "provideDocumentSymbols",
+        // EXT-29 (VS Code extensions' providers, through the layer).
+        formatting: "provideDocumentFormattingEdits",
+        rangeFormatting: "provideDocumentRangeFormattingEdits",
+        codeActions: "provideCodeActions",
       }[params.kind];
       if (typeof implementation[method] !== "function") return null;
-      return implementation[method](params.document, params.position || null);
+      return implementation[method](params.document, params.position || null, params.extra || null);
+    },
+    // EXT-29: Yavin stopped waiting for a provider: its cancellation token is cancelled.
+    "provider.cancel"(params) {
+      return vscodeShim ? vscodeShim.cancelProvider(params) : null;
+    },
+    // EXT-29: an input box's validation, a save's waitUntil edits, a chosen code action's command.
+    "prompt.validate"(params) {
+      return vscodeShim ? vscodeShim.validate(params) : null;
+    },
+    "documents.willSave"(params) {
+      return vscodeShim ? vscodeShim.willSave(params) : { edits: [] };
+    },
+    "codeAction.run"(params) {
+      return vscodeShim ? vscodeShim.runCodeAction(params) : null;
     },
   };
 
-  globalThis.__yavin_load = function (source) {
+/*__YAVIN_VSCODE__*/
+
+  let vscodeShim = null;
+  globalThis.__yavin_load = function (source, modules, vscode, main) {
     module = { exports: {} };
+    if (init.runtime === "vscode") {
+      vscodeShim = vscodeRuntime(JSON.parse(vscode), JSON.parse(modules), main, source);
+      vscodeShim.load();
+      return;
+    }
     const factory = new Function("module", "exports", "yavin", source);
     factory(module, module.exports, yavin);
   };
@@ -273,6 +445,17 @@
         const error = new Error((message.error && message.error.message) || "Request failed.");
         error.code = message.error && message.error.code;
         waiting.reject(error);
+      }
+      return;
+    }
+    if (message.type === "timer") {
+      const timer = timers.get(message.id);
+      if (!timer) return;
+      if (!timer.repeat) timers.delete(message.id);
+      try {
+        timer.callback(...timer.args);
+      } catch (error) {
+        log("error")(`A timer threw: ${error && error.message}`);
       }
       return;
     }

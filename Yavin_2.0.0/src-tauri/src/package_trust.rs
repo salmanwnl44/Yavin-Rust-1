@@ -338,13 +338,40 @@ pub fn with_store<R>(store: Result<TrustStore, String>, f: impl FnOnce() -> R) -
     result
 }
 
-/// The trust store checks use: the pinned one (tests may set their own).
+/// The trust store checks use: the pinned one (tests may set their own). A `test-registry`
+/// build (the end-to-end test's, never shipped) also pins the loopback Open VSX mirror
+/// `YAVIN_TEST_OPENVSX` under the key `YAVIN_TEST_OPENVSX_KEY` (base64, 32 bytes) as key id
+/// `yavin-test` (EXT-27: a packaged test installs a signed VS Code package through the real
+/// path) -- as `registry_trust::anchors` does for `YAVIN_TEST_REGISTRY`; no other build reads either.
 pub fn store() -> Result<TrustStore, String> {
     #[cfg(test)]
     if let Some(store) = TEST_STORE.with(|cell| cell.borrow().clone()) {
         return store;
     }
-    TrustStore::builtin().clone()
+    let mut store = TrustStore::builtin().clone()?;
+    if cfg!(feature = "test-registry") {
+        if let (Ok(origin), Ok(key)) = (
+            std::env::var("YAVIN_TEST_OPENVSX"),
+            std::env::var("YAVIN_TEST_OPENVSX_KEY"),
+        ) {
+            let raw: [u8; 32] = base64::engine::general_purpose::STANDARD
+                .decode(key.trim())
+                .ok()
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or("YAVIN_TEST_OPENVSX_KEY is not a base64 Ed25519 key")?;
+            store.anchors.push(Anchor {
+                registry: crate::openvsx::registry(&origin)?.origin,
+                key_id: "yavin-test".into(),
+                key: VerifyingKey::from_bytes(&raw)
+                    .map_err(|_| "YAVIN_TEST_OPENVSX_KEY is not an Ed25519 key")?,
+                publisher: false,
+                namespaces: Vec::new(),
+                revoked: false,
+                not_after: None,
+            });
+        }
+    }
+    Ok(store)
 }
 
 /// The 64-byte signature in a `.sigzip`, or why it cannot be read.
@@ -440,3 +467,27 @@ pub fn refusal(status: SignatureStatus, label: &str, registry: &str) -> String {
 #[cfg(test)]
 #[path = "package_trust_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod ext27_test_mirror {
+    use super::*;
+
+    /// EXT-27: only a `test-registry` build pins the loopback Open VSX mirror its environment
+    /// names; the default build (every release) ignores the variables entirely.
+    #[test]
+    fn only_a_test_registry_build_pins_the_environments_mirror() {
+        let public = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        let key = base64::engine::general_purpose::STANDARD.encode(public.as_bytes());
+        std::env::set_var("YAVIN_TEST_OPENVSX", "http://127.0.0.1:9/");
+        std::env::set_var("YAVIN_TEST_OPENVSX_KEY", key);
+        let pinned = store().unwrap().of("http://127.0.0.1:9").count();
+        std::env::remove_var("YAVIN_TEST_OPENVSX");
+        std::env::remove_var("YAVIN_TEST_OPENVSX_KEY");
+        assert_eq!(pinned, usize::from(cfg!(feature = "test-registry")));
+        // Without the variables, every build has exactly the built-in anchors.
+        assert_eq!(
+            store().unwrap().anchors.len(),
+            TrustStore::builtin().clone().unwrap().anchors.len()
+        );
+    }
+}

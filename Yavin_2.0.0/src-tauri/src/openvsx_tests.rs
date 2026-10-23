@@ -604,7 +604,7 @@ fn live_open_vsx_search_record_and_checksum() {
         first["name"].as_str().unwrap(),
         first["version"].as_str().unwrap(),
     );
-    let meta = version_metadata(&r, namespace, name, version).unwrap();
+    let meta = version_metadata(&r, namespace, name, None, version).unwrap();
     let checksum = get_text(&r, &file_url(&meta, "sha256", &r).unwrap(), "checksum", 256).unwrap();
     assert_eq!(checksum.trim().len(), 64, "{checksum}");
 }
@@ -818,4 +818,327 @@ fn an_installed_copy_whose_files_change_is_not_listed_signed_or_used() {
     std::fs::remove_file(folder.join("extra.js")).unwrap();
     assert!(entry(&service).signature.is_some());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- EXT-30: a version built per platform ------------------------------------------------------
+
+use crate::extension_package::tests::{elsewhere, vsixmanifest};
+use crate::extension_package::HOST_PLATFORM;
+
+#[test]
+fn the_variant_chosen_is_this_platforms_then_universal_else_refused() {
+    let label = "acme.hello 1.0.0";
+    let meta = |answered: Value, downloads: Value| {
+        let mut m = json!({"namespace": "acme", "name": "hello", "version": "1.0.0"});
+        if !answered.is_null() {
+            m["targetPlatform"] = answered;
+        }
+        if !downloads.is_null() {
+            m["downloads"] = downloads;
+        }
+        m
+    };
+    let downloads = |platforms: &[&str]| {
+        Value::Object(
+            platforms
+                .iter()
+                .map(|p| (p.to_string(), json!(format!("https://x/{p}.vsix"))))
+                .collect(),
+        )
+    };
+    let other = elsewhere();
+    let host = HOST_PLATFORM;
+    // Open VSX answered with this platform's, or with the universal package: that one.
+    assert_eq!(
+        choose_variant(&meta(json!(host), downloads(&[host, other])), host, label),
+        Ok(None)
+    );
+    assert_eq!(
+        choose_variant(
+            &meta(json!("universal"), downloads(&["universal"])),
+            host,
+            label
+        ),
+        Ok(None)
+    );
+    // No platforms at all (an older registry): universal.
+    assert_eq!(
+        choose_variant(&meta(Value::Null, Value::Null), host, label),
+        Ok(None)
+    );
+    // Answered with another platform's (as open-vsx.org did for sumneko.lua): this one's fetched.
+    assert_eq!(
+        choose_variant(
+            &meta(json!(other), downloads(&[other, host, "linux-x64"])),
+            host,
+            label
+        ),
+        Ok(Some(host))
+    );
+    // This platform's preferred over the universal package when both are published.
+    assert_eq!(
+        choose_variant(
+            &meta(json!("universal"), downloads(&["universal", host])),
+            host,
+            label
+        ),
+        Ok(Some(host))
+    );
+    // Another platform's answered, a universal one published: that.
+    assert_eq!(
+        choose_variant(
+            &meta(json!(other), downloads(&[other, "universal"])),
+            host,
+            label
+        ),
+        Ok(Some("universal"))
+    );
+    // Published only for others (or for VS Code in a browser): refused, naming them.
+    for only in [vec![other], vec!["web"], vec![other, "linux-arm64"]] {
+        let error =
+            choose_variant(&meta(json!(only[0]), downloads(&only)), host, label).unwrap_err();
+        assert!(error.starts_with("UnsupportedPlatform"), "{error}");
+        for p in &only {
+            assert!(error.contains(p), "{error}");
+        }
+        assert!(error.contains(host), "{error}");
+    }
+    // Malformed metadata: refused, never guessed.
+    for (bad, why) in [
+        (meta(json!("win32-x65"), Value::Null), "not a platform"),
+        (meta(json!(7), Value::Null), "not text"),
+        (meta(json!(other), json!(["win32-x64"])), "not a map"),
+        (meta(json!(other), json!("win32-x64")), "not a map"),
+    ] {
+        let error = choose_variant(&bad, host, label).unwrap_err();
+        assert!(
+            error.starts_with("UnexpectedContent") && error.contains(why),
+            "{error}"
+        );
+    }
+    // A platform Yavin does not know, or one whose download is not a URL, is not offered.
+    let error = choose_variant(
+        &meta(
+            json!(other),
+            json!({"riscv-64": "https://x/r.vsix", host: 7}),
+        ),
+        host,
+        label,
+    )
+    .unwrap_err();
+    assert!(error.starts_with("UnsupportedPlatform"), "{error}");
+}
+
+/// A VS Code package of `acme.hello` 1.0.0 built for `platform` (`None`: every one).
+fn platform_vsix(dir: &Path, platform: Option<&str>) -> Vec<u8> {
+    let at = dir.join(format!("p-{}", platform.unwrap_or("universal")));
+    fs::create_dir_all(&at).unwrap();
+    let manifest = r#"{"publisher":"Acme","name":"hello","version":"1.0.0","engines":{"vscode":"^1.80.0"},"contributes":{"themes":[{"label":"Acme Dark","uiTheme":"vs-dark","path":"./theme.json"}]}}"#;
+    fs::read(package(
+        &at,
+        &[
+            ("extension.vsixmanifest", vsixmanifest(platform).as_bytes()),
+            ("extension/package.json", manifest.as_bytes()),
+            (
+                "extension/theme.json",
+                br##"{"colors":{"editor.background":"#101010"}}"##,
+            ),
+        ],
+    ))
+    .unwrap()
+}
+
+/// A fake Open VSX that answers `/api/acme/hello/1.0.0` with `answered`'s metadata, and each
+/// platform's own at `/api/acme/hello/<platform>/1.0.0`; `packages` are what each serves (and
+/// what its metadata claims, by `claims`).
+fn platform_registry(
+    answered: &'static str,
+    packages: Vec<(&'static str, &'static str, Vec<u8>)>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    fake(move |base, target| {
+        let downloads: serde_json::Map<String, Value> = packages
+            .iter()
+            .map(|(p, _, _)| {
+                (
+                    p.to_string(),
+                    json!(format!("{base}api/acme/hello/{p}/1.0.0/file/hello.vsix")),
+                )
+            })
+            .collect();
+        let meta_of = |p: &str, claims: &str| {
+            let file = |name: &str| format!("{base}api/acme/hello/{p}/1.0.0/file/{name}");
+            json_answer(json!({
+                "namespace": "acme", "name": "hello", "version": "1.0.0",
+                "targetPlatform": claims,
+                "downloads": downloads,
+                "files": {
+                    "download": file("hello.vsix"),
+                    "sha256": file("hello.sha256"),
+                    "signature": file("hello.sigzip"),
+                    "publicKey": format!("{base}api/-/public-key/test-key"),
+                },
+            }))
+        };
+        if target == "/registry/api/acme/hello/1.0.0" {
+            let (p, claims, _) = packages.iter().find(|(p, _, _)| *p == answered).unwrap();
+            return meta_of(p, claims);
+        }
+        for (p, claims, bytes) in &packages {
+            let prefix = format!("/registry/api/acme/hello/{p}/1.0.0");
+            if target == prefix {
+                return meta_of(p, claims);
+            }
+            if target == format!("{prefix}/file/hello.vsix") {
+                return (
+                    200,
+                    vec![("Content-Type", "application/octet-stream".into())],
+                    bytes.clone(),
+                );
+            }
+            if target == format!("{prefix}/file/hello.sha256") {
+                return (
+                    200,
+                    vec![("Content-Type", "text/plain".into())],
+                    sha(bytes).into_bytes(),
+                );
+            }
+            if target == format!("{prefix}/file/hello.sigzip") {
+                return (
+                    200,
+                    vec![("Content-Type", "application/octet-stream".into())],
+                    trust::signed(trust::SEED_A, bytes),
+                );
+            }
+        }
+        (404, vec![], b"{}".to_vec())
+    })
+}
+
+#[test]
+fn a_package_built_per_platform_is_installed_as_this_platforms_signed_and_checked() {
+    let dir = temp("openvsx-platform");
+    let other = elsewhere();
+    let host = HOST_PLATFORM;
+    let try_install = |name: &str,
+                       answered: &'static str,
+                       packages: Vec<(&'static str, &'static str, Vec<u8>)>| {
+        let (base, seen) = platform_registry(answered, packages);
+        let root = dir.join(name);
+        let service = ExtensionService::new(root.clone(), Vec::new());
+        let source = PackageSource::OpenVsx {
+            registry_url: base.clone(),
+            namespace: "acme".into(),
+            name: "hello".into(),
+        };
+        let result = crate::package_trust::with_store(pinned(&base), || {
+            let staged = stage(&service, source, "acme.hello", "1.0.0")?;
+            service.commit(&staged.token, "acme.hello")?;
+            service.finish(&staged.token, "acme.hello", true)?;
+            Ok::<_, String>(())
+        });
+        let installed =
+            root.join(INVENTORY).exists() && inventory(&root).extensions.contains_key("acme.hello");
+        let requests = seen.lock().unwrap().clone();
+        (result, installed, requests, root)
+    };
+
+    // Open VSX answers with another platform's: this platform's is fetched, verified, installed.
+    let (result, installed, seen, root) = try_install(
+        "chosen",
+        other,
+        vec![
+            (other, other, platform_vsix(&dir, Some(other))),
+            (host, host, platform_vsix(&dir, Some(host))),
+        ],
+    );
+    result.unwrap();
+    assert!(installed);
+    let record = inventory(&root).extensions["acme.hello"].clone();
+    let signature = record.active.signature.clone().expect("signed");
+    assert_eq!(
+        signature.status,
+        crate::package_trust::SignatureStatus::RegistrySigned
+    );
+    assert_eq!(Some(&signature.sha256), record.active.sha256.as_ref());
+    assert_eq!(
+        record.active.sha256.as_deref(),
+        Some(sha(&platform_vsix(&dir, Some(host))).as_str()),
+        "the installed bytes are this platform's package"
+    );
+    assert!(seen
+        .iter()
+        .any(|t| t == &format!("/registry/api/acme/hello/{host}/1.0.0/file/hello.vsix")));
+    assert!(
+        !seen
+            .iter()
+            .any(|t| t.contains(&format!("/{other}/1.0.0/file/"))),
+        "{seen:?}"
+    );
+
+    // Published only for another platform: refused before any package is fetched.
+    let (result, installed, seen, _) = try_install(
+        "none",
+        other,
+        vec![(other, other, platform_vsix(&dir, Some(other)))],
+    );
+    let error = result.unwrap_err();
+    assert!(
+        error.starts_with("UnsupportedPlatform") && error.contains(other),
+        "{error}"
+    );
+    assert!(!installed);
+    assert!(!seen.iter().any(|t| t.contains("/file/")), "{seen:?}");
+
+    // The platform's metadata describes another platform: refused at once, from the metadata --
+    // no package is fetched on its word.
+    let (result, installed, seen, _) = try_install(
+        "lying-metadata",
+        other,
+        vec![
+            (other, other, platform_vsix(&dir, Some(other))),
+            (host, other, platform_vsix(&dir, Some(host))),
+        ],
+    );
+    let error = result.unwrap_err();
+    assert!(
+        error.starts_with("ManifestMismatch")
+            && error.contains(&format!("asked for acme.hello 1.0.0's {host} package")),
+        "{error}"
+    );
+    assert!(!installed);
+    assert!(!seen.iter().any(|t| t.contains("/file/")), "{seen:?}");
+
+    // The package chosen as this platform's says it is another's: refused by its own manifest
+    // (signed and checksummed as served -- integrity does not make it the right package).
+    let (result, installed, _, _) = try_install(
+        "lying-package",
+        other,
+        vec![
+            (other, other, platform_vsix(&dir, Some(other))),
+            (host, host, platform_vsix(&dir, Some(other))),
+        ],
+    );
+    let error = result.unwrap_err();
+    assert!(error.starts_with("UnsupportedPlatform"), "{error}");
+    assert!(!installed);
+
+    // Chosen as universal, built for this platform: the package and its metadata disagree.
+    let (result, installed, _, _) = try_install(
+        "universal-mismatch",
+        "universal",
+        vec![("universal", "universal", platform_vsix(&dir, Some(host)))],
+    );
+    let error = result.unwrap_err();
+    assert!(error.starts_with("ManifestMismatch"), "{error}");
+    assert!(!installed);
+
+    // A universal package: installed as before.
+    let (result, installed, _, _) = try_install(
+        "universal",
+        "universal",
+        vec![("universal", "universal", platform_vsix(&dir, None))],
+    );
+    result.unwrap();
+    assert!(installed);
+    let _ = fs::remove_dir_all(&dir);
 }

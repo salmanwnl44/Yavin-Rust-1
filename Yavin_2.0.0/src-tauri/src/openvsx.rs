@@ -24,6 +24,15 @@
 //! pins for this registry -- `files.publicKey` only names which -- or the package is refused
 //! before anything is staged. It proves the package is the one the registry published; Open VSX
 //! has no publisher keys, so it does not prove who made it either.
+//!
+//! **A version built per platform** (EXT-30): Open VSX answers `/api/{ns}/{name}/{version}`
+//! with one of its variants, not necessarily this machine's (measured 2026-10-22: `sumneko.lua`
+//! answered with darwin-arm64, `charliermarsh.ruff` with alpine-arm64). Its `downloads` names
+//! every variant published. Yavin takes this platform's (`extension_package::HOST_PLATFORM`)
+//! from `/api/{ns}/{name}/{targetPlatform}/{version}`, else the universal one, else refuses
+//! (`choose_variant`). Choosing a variant decides nothing about trust: the variant's own
+//! checksum and signature are checked exactly as any package's, and the package's own
+//! `TargetPlatform` must agree (`extension_package::unpack`).
 
 use crate::extension_package;
 use crate::marketplace::{fetch_url, registry as registry_at, url_on, Kind, Registry};
@@ -142,18 +151,22 @@ fn version_metadata(
     registry: &Registry,
     namespace: &str,
     name: &str,
+    platform: Option<&str>,
     version: &str,
 ) -> Result<Value, String> {
-    let url = api_url(
-        registry,
-        &[
-            segment("namespace", namespace)?,
-            segment("extension name", name)?,
-            segment("version", version)?,
-        ],
-        &[],
-    );
-    let label = format!("{namespace}.{name} {version}");
+    let mut segments = vec![
+        segment("namespace", namespace)?,
+        segment("extension name", name)?,
+    ];
+    if let Some(platform) = platform {
+        segments.push(segment("platform", platform)?);
+    }
+    segments.push(segment("version", version)?);
+    let url = api_url(registry, &segments, &[]);
+    let label = match platform {
+        Some(platform) => format!("{namespace}.{name} {version} ({platform})"),
+        None => format!("{namespace}.{name} {version}"),
+    };
     serde_json::from_str(&get_text(registry, &url, &label, MAX_JSON)?)
         .map_err(|_| format!("UnexpectedContent: {label}'s metadata is not JSON."))
 }
@@ -283,7 +296,7 @@ pub fn answer(registry: &Registry, request: Request) -> Result<String, String> {
             version,
             document,
         } => {
-            let meta = version_metadata(registry, &namespace, &name, &version)?;
+            let meta = version_metadata(registry, &namespace, &name, None, &version)?;
             let key = match document {
                 Document::Readme => "readme",
                 Document::Changelog => "changelog",
@@ -306,7 +319,7 @@ pub fn icon(
     name: &str,
     version: &str,
 ) -> Result<Vec<u8>, String> {
-    let meta = version_metadata(registry, namespace, name, version)?;
+    let meta = version_metadata(registry, namespace, name, None, version)?;
     let url = file_url(&meta, "icon", registry)?;
     let bytes = get(&metadata(registry), &url, "The icon", Kind::Icon, MAX_ICON)?;
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -318,8 +331,8 @@ pub fn icon(
 /// Downloads `namespace.name` at `version` into `archive`, for the installer: the version's
 /// metadata must be that extension (`expected_id`, case-insensitively) and version; its
 /// package and checksum come from the files it names, checked to be the registry's; the
-/// package is bounded while it arrives and must match the checksum. Returns the SHA-256 and
-/// the size.
+/// package is bounded while it arrives and must match the checksum. Returns the SHA-256, the
+/// size, the signature, and the platform the package was chosen for (EXT-30; `None`: universal).
 pub fn download(
     registry: &Registry,
     namespace: &str,
@@ -327,8 +340,25 @@ pub fn download(
     expected_id: &str,
     expected_version: &str,
     archive: &Path,
-) -> Result<(String, u64, SignatureRecord), String> {
-    let meta = version_metadata(registry, namespace, name, expected_version)?;
+) -> Result<(String, u64, SignatureRecord, Option<String>), String> {
+    let first = version_metadata(registry, namespace, name, None, expected_version)?;
+    let label = format!("{expected_id} {expected_version}");
+    let (meta, platform) = match choose_variant(&first, extension_package::HOST_PLATFORM, &label)? {
+        None => {
+            let platform = platform_of(&first, &label)?;
+            (first, platform)
+        }
+        Some(wanted) => {
+            let meta = version_metadata(registry, namespace, name, Some(wanted), expected_version)?;
+            let platform = platform_of(&meta, &label)?;
+            if platform != wanted {
+                return Err(format!(
+                    "ManifestMismatch: the registry was asked for {label}'s {wanted} package and described its {platform} one."
+                ));
+            }
+            (meta, platform)
+        }
+    };
     let id = match (meta["namespace"].as_str(), meta["name"].as_str()) {
         (Some(ns), Some(n)) => canonical_id(&format!("{ns}.{n}")),
         _ => None,
@@ -342,7 +372,14 @@ pub fn download(
     }
     let checksum_url = file_url(&meta, "sha256", registry)?;
     let package_url = file_url(&meta, "download", registry)?;
-    let published = get_text(registry, &checksum_url, "The package's checksum", 256)?;
+    let published = String::from_utf8(get(
+        &metadata(registry),
+        &checksum_url,
+        "The package's checksum",
+        Kind::Checksum,
+        256,
+    )?)
+    .map_err(|_| "IntegrityFailed: the registry's checksum is not text.".to_string())?;
     let published = published
         .split_whitespace()
         .next()
@@ -354,7 +391,6 @@ pub fn download(
     let limit = extension_package::LIMITS.package;
     let mut file = fs::File::create(archive).map_err(|e| format!("InstallFailed: {e}"))?;
     let mut hasher = Sha256::new();
-    let label = format!("{expected_id} {expected_version}");
     let size = fetch_url(
         registry,
         &package_url,
@@ -396,6 +432,73 @@ pub fn download(
             sha256: actual,
             store_revision: package_trust::store().map(|s| s.revision).unwrap_or(0),
         },
+        (platform != "universal").then(|| platform.to_string()),
+    ))
+}
+
+/// A version's `targetPlatform`: one VS Code knows; absent (a registry without platforms) is
+/// `universal`.
+fn platform_of(meta: &Value, label: &str) -> Result<&'static str, String> {
+    match meta.get("targetPlatform") {
+        None | Some(Value::Null) => Ok("universal"),
+        Some(Value::String(p)) => extension_package::TARGET_PLATFORMS
+            .iter()
+            .copied()
+            .find(|known| known == p)
+            .ok_or_else(|| {
+                format!(
+                    "UnexpectedContent: {label}'s targetPlatform \"{}\" is not a platform VS Code packages are built for.",
+                    p.chars().take(40).collect::<String>()
+                )
+            }),
+        Some(_) => Err(format!(
+            "UnexpectedContent: {label}'s targetPlatform is not text."
+        )),
+    }
+}
+
+/// Which variant of a version to install on `host`, from its metadata (`meta`, the one Open
+/// VSX answered with): `None` for that one, or the platform whose own metadata to fetch.
+/// This platform's first, then the universal one; anything else is refused, naming what is
+/// published. `downloads` must be a map; platforms in it Yavin does not know are not offered.
+pub fn choose_variant(
+    meta: &Value,
+    host: &str,
+    label: &str,
+) -> Result<Option<&'static str>, String> {
+    let answered = platform_of(meta, label)?;
+    let published: Vec<&'static str> = match meta.get("downloads") {
+        None | Some(Value::Null) => vec![answered],
+        Some(Value::Object(map)) => extension_package::TARGET_PLATFORMS
+            .iter()
+            .copied()
+            .filter(|p| map.get(*p).is_some_and(Value::is_string))
+            .collect(),
+        Some(_) => {
+            return Err(format!(
+                "UnexpectedContent: {label}'s downloads is not a map of platforms."
+            ))
+        }
+    };
+    if answered == host {
+        return Ok(None);
+    }
+    if let Some(p) = published.iter().find(|p| **p == host) {
+        return Ok(Some(p));
+    }
+    if answered == "universal" {
+        return Ok(None);
+    }
+    if published.contains(&"universal") {
+        return Ok(Some("universal"));
+    }
+    let list = if published.is_empty() {
+        answered.to_string()
+    } else {
+        published.join(", ")
+    };
+    Err(format!(
+        "UnsupportedPlatform: {label} is published for {list}, not for {host} (this Yavin's platform)."
     ))
 }
 
@@ -486,3 +589,7 @@ pub fn marketplace_openvsx_icon(
 #[cfg(test)]
 #[path = "openvsx_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "openvsx_benchmark_tests.rs"]
+mod benchmark;

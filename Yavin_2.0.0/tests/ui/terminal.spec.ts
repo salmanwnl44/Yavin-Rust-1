@@ -27,6 +27,18 @@ const EXTENSION_HOST = {
     new URL("../../extensions/samples/hello-world/extension.js", import.meta.url),
     "utf8",
   ),
+  /**
+   * EXT-27: the VS Code compatibility layer, for extensions installed from VS Code packages; as
+   * runtime.rs puts it in the bootstrap, after the Web globals and Intl it installs (EXT-28).
+   */
+  vscodeLayer: ["web.js", "intl.js", "vscode.js"]
+    .map((name) =>
+      readFileSync(
+        new URL(`../../src-tauri/crates/ide-plugin-host/src/${name}`, import.meta.url),
+        "utf8",
+      ),
+    )
+    .join("\n"),
 };
 const SAMPLE_FOLDER = "/repo/extensions/samples/hello-world";
 
@@ -103,6 +115,10 @@ async function desktop(
     sampleShadowed?: { folder: string; version: string | null; reason: string }[];
     /** Installed extensions' code, by extension id, as the native side reads it (IDE-08). */
     extensionCode?: Record<string, string>;
+    /** EXT-27: what the native inventory has granted, by extension id. */
+    grants?: Record<string, string[]>;
+    /** EXT-27: more files in the workspace's root, by name, with their text. */
+    workspaceFiles?: Record<string, string>;
     /** The marketplace (IDE-09): unreachable, slow to answer its index. */
     marketplace?: { down?: boolean; indexDelayMs?: number };
     /** EXT-07: what a marketplace package's manifest requests, by extension id. */
@@ -258,7 +274,7 @@ async function desktop(
       let nextToken = 1;
       // --- Permissions (EXT-07), as the native inventory keeps them ----------------------------
       /** Granted, per id, for the copy listed now (a new copy has none). */
-      const grants: Record<string, string[]> = {};
+      const grants: Record<string, string[]> = { ...(setup.grants ?? {}) };
       const previousGrants: Record<string, { version: string; granted: string[] }> = {};
       const manifestOf = (id: string): string | null =>
         installedExtensions[id]?.manifest ??
@@ -342,22 +358,52 @@ async function desktop(
               ...ids,
               error: { code: "LoadFailed", message: `${id} has no code.` },
             });
+          // EXT-27: a VS Code package's code runs through the compatibility layer, with what
+          // extension_host.rs sends for it (its manifest's vsix.runtime).
+          const runtime = (() => {
+            try {
+              return JSON.parse(manifestOf(id) ?? "null")?.vsix?.runtime ?? null;
+            } catch {
+              return null;
+            }
+          })();
           const realm: Record<string, unknown> = {
             // Everything the extension sends carries its real identity, as the native host stamps it.
             __yavin_send: (out: string) => hostOut(session, { ...JSON.parse(out), ...ids }),
+            // Timers as the host keeps them: each fires as a message of its own.
+            __yavin_timer: (timer: number, ms: number, repeat: boolean) => {
+              const fire = () => {
+                if (one.ended) return;
+                one.extensions.get(id)?.(JSON.stringify({ type: "timer", id: timer }));
+              };
+              (repeat ? setInterval : setTimeout)(fire, repeat ? Math.max(ms, 10) : ms);
+              return true;
+            },
+            __yavin_untimer: () => undefined,
           };
           const init = JSON.stringify({
             ...ids,
             workspaceFolder: identity.workspaceFolder,
             extensionPath: `/extensions/${id}`,
             apiVersion: identity.apiVersion,
+            runtime: runtime ? "vscode" : "yavin",
           });
           try {
-            new Function("globalThis", setup.host.bootstrap.replaceAll("__YAVIN_INIT__", init))(
-              realm,
-            );
+            new Function(
+              "globalThis",
+              // Literally, as runtime.rs does (EXT-29): a replacement string would expand the
+              // layer's own `$&` and `` $` ``.
+              setup.host.bootstrap
+                .replace("/*__YAVIN_VSCODE__*/", () => setup.host.vscodeLayer)
+                .replaceAll("__YAVIN_INIT__", () => init),
+            )(realm);
             const receive = realm.__yavin_receive as (text: string) => void;
-            (realm.__yavin_load as (source: string) => void)(code);
+            (realm.__yavin_load as (...args: string[]) => void)(
+              code,
+              runtime ? "{}" : "null",
+              runtime ? JSON.stringify({ api: "vscode", ...runtime }) : "null",
+              runtime ? "extension/out/main.js" : "",
+            );
             one.extensions.set(id, receive);
             hostOut(session, { type: "loaded", ...ids });
           } catch (error) {
@@ -489,6 +535,9 @@ async function desktop(
               (listeners[event] ??= []).push(args.handler as number);
               return nextId++;
             }
+            // The native window's focus (EXT-27), as the test sets it.
+            if (command === "window_focused")
+              return (window as unknown as { __focused?: boolean }).__focused ?? true;
             if (command === "get_default_workspace") return "/work";
             // One folder, for a reveal to show, and one file.
             if (command === "list_workspace_files" && args.path === "/work/src")
@@ -501,8 +550,20 @@ async function desktop(
                 children: [
                   { path: "/work/src", name: "src", is_dir: true, children: null },
                   { path: "/work/file.ts", name: "file.ts", is_dir: false, children: null },
+                  ...Object.keys(setup.workspaceFiles ?? {}).map((name) => ({
+                    path: `/work/${name}`,
+                    name,
+                    is_dir: false,
+                    children: null,
+                  })),
                 ],
               };
+            // A workspace file of the test's reads as given (EXT-27).
+            if (command === "read_file_content") {
+              const name = String(args.path).replace(/^.*[\\/]/, "");
+              const given = setup.workspaceFiles?.[name];
+              if (given !== undefined) return given;
+            }
             // Any file reads as 30 numbered lines, so a jump to a line can be checked.
             if (command === "read_file_content")
               return Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n");
@@ -3914,7 +3975,7 @@ test("an extension's Activity Bar container shows its views", async ({ page }) =
   const container = page.getByRole("complementary", { name: "Hello World" });
   const about = container.getByRole("region", { name: "About" });
   await expect(about).toContainText("A sample extension");
-  await expect(about).toContainText("API 2.0.0");
+  await expect(about).toContainText("API 2.1.0"); // EXT-25: the extension API this Yavin provides
 });
 
 test("extension menus: a view's title action and the Explorer's context menu run its commands", async ({
@@ -4548,7 +4609,7 @@ test("a duplicate extension is one card; its shadowed copy is named on the card 
   );
 });
 
-test("Open VSX: browsed from the view, attributed; only themes and snippets install, and a language extension says so", async ({
+test("Open VSX: browsed from the view, attributed; a VS Code extension is installable and not verified until installed (EXT-25)", async ({
   page,
 }) => {
   await desktop(page);
@@ -4561,17 +4622,17 @@ test("Open VSX: browsed from the view, attributed; only themes and snippets inst
   await expect(results).toContainText("Open VSX");
   const yaml = card(results, "YAML");
   const install = yaml.getByRole("button", { name: "Install YAML" });
-  // A search entry does not say what it contributes: installable, saying what that means.
+  // Installable, saying what that means: how well it works is known once it is installed.
   await expect(install).toBeEnabled();
-  await expect(install).toHaveAttribute(
-    "title",
-    /installs only its colour themes and snippets; its code never runs/,
-  );
+  await expect(install).toHaveAttribute("title", /Not verified: a VS Code extension./);
   await yaml.click();
   const details = page.getByRole("region", { name: "Extension: YAML" });
-  // Its record does: a language extension, with nothing Yavin can install.
+  // Its categories no longer refuse it: the package decides.
   await details.getByRole("tab", { name: "Requirements" }).click();
-  await expect(details).toContainText("VS Code extension with no colour themes or snippets");
+  await expect(details).toContainText("A VS Code extension (not verified until installed).");
+  await expect(details).toContainText(
+    "runs in Yavin's sandbox with only the permissions you allow",
+  );
   await details.getByRole("tab", { name: "Information" }).click();
   await expect(details.getByTestId("extension-source")).toHaveText("Open VSX");
   await expect(details).toContainText("8,613,164");
@@ -4648,6 +4709,10 @@ test("a VS Code extension adapted by Yavin: one card, what was installed and not
   const report = details.getByTestId("vsix-report");
   await expect(report).toContainText("VS Code ^1.13.0");
   await expect(report).toContainText("Yavin runs no VS Code extension code");
+  // EXT-25: its verdict, and install and activation as separate facts (its code does not run:
+  // installed before EXT-25, its manifest has none).
+  await expect(details.getByTestId("vsix-verdict")).toHaveText("Compatible with limitations");
+  await expect(details.getByTestId("vsix-activation")).toHaveText("its code does not run");
   // Its signature as the inventory recorded it (EXT-09): the registry's, and only that.
   const signature = details.getByTestId("extension-signature");
   await expect(signature).toHaveAttribute("data-signed", "true");
@@ -4668,6 +4733,438 @@ test("a VS Code extension adapted by Yavin: one card, what was installed and not
   // Nothing of it was ever sent to an extension host (the sample's host runs the sample).
   const sent = (await calls(page, "ext_host_send")).map((call) => String(call.args.message));
   expect(sent.some((message) => message.includes(id))).toBe(false);
+});
+
+// --- EXT-27: a VS Code extension in the window ---------------------------------------------------
+
+const UI_PROBE = "acme.uiprobe";
+const UI_PROBE_CODE = `
+const vscode = require("vscode");
+exports.activate = (context) => {
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  item.text = "$(beaker) Probe ready";
+  item.tooltip = "Probe status";
+  item.command = { command: "uiprobe.say", title: "Say", arguments: ["from the status bar"] };
+  item.show();
+  context.subscriptions.push(
+    item,
+    vscode.commands.registerCommand("uiprobe.say", (where) =>
+      vscode.window.showInformationMessage("clicked " + where + ", focused " + vscode.window.state.focused)),
+    vscode.window.onDidChangeWindowState((s) => vscode.window.showInformationMessage("focus " + s.focused)),
+  );
+  // An edit through the window (documents.edit), from a second item.
+  const edit = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
+  edit.text = "Probe upper";
+  edit.command = "uiprobe.upper";
+  edit.show();
+  context.subscriptions.push(
+    edit,
+    vscode.commands.registerTextEditorCommand("uiprobe.upper", (editor, builder) => {
+      const line = editor.document.lineAt(0);
+      builder.replace(line.range, line.text.toUpperCase());
+    }),
+  );
+};
+`;
+const UI_PROBE_MANIFEST = JSON.stringify({
+  manifestVersion: 1,
+  publisher: "acme",
+  name: "uiprobe",
+  version: "1.0.0",
+  displayName: "UI Probe",
+  engines: { yavin: "^2.1.0" },
+  main: "extension/out/main.js",
+  activationEvents: ["*"],
+  permissions: { version: 1, request: ["documents.edit", "documents.read"] },
+  contributes: {
+    languages: [
+      {
+        id: "probelang",
+        extensions: [".probe"],
+        filenames: [],
+        aliases: ["Probe Lang"],
+        configuration: "extension/probe.configuration.json",
+      },
+    ],
+    grammars: [
+      { scopeName: "source.probe", path: "extension/probe.tmLanguage.json", language: "probelang" },
+    ],
+  },
+  vsix: {
+    publisher: "Acme",
+    name: "uiprobe",
+    vscode: "^1.80.0",
+    code: true,
+    runtime: {
+      api: "vscode",
+      level: "1.90.0",
+      entry: "main",
+      commands: {},
+      settings: {},
+      views: {},
+      defaults: {},
+    },
+    supported: [
+      "Its code (main: out/main.js) runs in Yavin's extension sandbox",
+      "Language probelang (.probe)",
+      "TextMate grammar source.probe (probelang)",
+    ],
+    ignored: [],
+    rejected: [],
+    signature: "not verified",
+  },
+});
+
+test("EXT-27 a VS Code extension in the window: its status bar item shows and runs, window focus reaches it, its language and grammar apply", async ({
+  page,
+}) => {
+  // The native window's focus, as the test sets it (the packaged test uses the OS's).
+  await page.addInitScript(() => {
+    const state = window as unknown as { __focused: boolean };
+    state.__focused = true;
+    Document.prototype.hasFocus = () => state.__focused;
+  });
+  await desktop(page, {
+    extensions: [
+      {
+        folder: `/data/extensions/.store/${UI_PROBE}/1.0.0-abcd1234`,
+        error: null,
+        manifest: UI_PROBE_MANIFEST,
+      },
+    ],
+    extensionCode: { [UI_PROBE]: UI_PROBE_CODE },
+    grants: { [UI_PROBE]: ["documents.edit", "documents.read"] },
+    extensionResources: {
+      [`${UI_PROBE}:extension/probe.tmLanguage.json`]: JSON.stringify({
+        scopeName: "source.probe",
+        patterns: [
+          { match: "#.*$", name: "comment.line.number-sign.probe" },
+          { match: "\\bline\\b", name: "keyword.control.probe" },
+          { match: "\\b\\d+\\b", name: "constant.numeric.probe" },
+        ],
+      }),
+      [`${UI_PROBE}:extension/probe.configuration.json`]: JSON.stringify({
+        comments: { lineComment: "#" },
+        brackets: [["(", ")"]],
+      }),
+    },
+    workspaceFiles: { "demo.probe": "line 1 # note\nplain words\n" },
+  });
+  // The status bar item: in Yavin's status bar, named for its extension; a click runs its command.
+  const item = page.locator(`[data-extension-status^="${UI_PROBE}#status#"]`, {
+    hasText: "Probe ready",
+  });
+  await expect(item).toHaveText("Probe ready");
+  await expect(item).toHaveAttribute("title", `Probe status — ${UI_PROBE}`);
+  await item.click();
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
+    "clicked from the status bar, focused true",
+  );
+  // The window loses the focus, then gets it back: the extension hears each change once.
+  // As the native side says it: `yavin://window-focus` with the new state.
+  const native = (focused: boolean) =>
+    page.evaluate((now) => {
+      const w = window as unknown as {
+        __focused: boolean;
+        __emit: (event: string, payload: unknown) => void;
+      };
+      w.__focused = now;
+      w.__emit("yavin://window-focus", now);
+    }, focused);
+  await native(false);
+  await native(false);
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
+    "focus false",
+  );
+  await native(true);
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText("focus true");
+  // Its language: the file is written in it (the status bar says so), its grammar colours it,
+  // its configuration comments a line.
+  await page.getByRole("treeitem", { name: "demo.probe" }).dblclick();
+  await expect(page.getByRole("tab", { name: /demo.probe/ })).toBeVisible();
+  await expect(page.locator("footer")).toContainText("Probe Lang");
+  const spans = () =>
+    page.evaluate(() =>
+      [...document.querySelectorAll(".view-line")].map((line) =>
+        // Monaco draws spaces as no-break spaces.
+        [...line.querySelectorAll(":scope > span > span")].map((span) => [
+          (span.textContent ?? "").replace(/ /g, " "),
+          span.className,
+        ]),
+      ),
+    );
+  await expect
+    .poll(async () => {
+      const lines = await spans();
+      const first = lines.find((line) => line.some(([text]) => text?.includes("line")));
+      if (!first) return "not rendered";
+      const keyword = first.find(([text]) => text === "line")?.[1];
+      const comment = first.find(([text]) => text?.includes("# note"))?.[1];
+      const plain = lines.find((line) => line.some(([text]) => text?.includes("plain")))?.[0]?.[1];
+      return keyword &&
+        comment &&
+        plain &&
+        keyword !== plain &&
+        comment !== plain &&
+        keyword !== comment
+        ? "coloured"
+        : JSON.stringify(lines);
+    })
+    .toBe("coloured");
+  await page.getByText("plain words", { exact: true }).click();
+  await page.keyboard.press("Control+/");
+  await expect(page.locator(".view-lines")).toContainText("# plain words");
+  // The extension edits the document through the application's own window (EXT-27 found the
+  // window proxy had never passed edits on): one change, in the editor, unsaved.
+  await page
+    .locator(`[data-extension-status^="${UI_PROBE}#status#"]`, { hasText: "Probe upper" })
+    .click();
+  await expect(page.locator(".view-lines")).toContainText("LINE 1 # NOTE");
+  await expect(page.getByTitle("Unsaved changes (Ctrl+S to save)")).toBeVisible();
+  // One undo takes back the extension's edit, and only it.
+  await page.locator(".view-lines").click();
+  await page.keyboard.press("Control+z");
+  await expect(page.locator(".view-lines")).toContainText("line 1 # note");
+  await expect(page.locator(".view-lines")).toContainText("# plain words");
+});
+
+// --- EXT-29: VS Code's pickers and diagnostics in the window --------------------------------------
+
+const CORE_PROBE = "acme.coreprobe";
+const CORE_PROBE_CODE = `
+const vscode = require("vscode");
+exports.activate = (context) => {
+  const lint = vscode.languages.createDiagnosticCollection("core-lint");
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  item.text = "Core ask";
+  item.command = "coreprobe.ask";
+  item.show();
+  context.subscriptions.push(
+    lint,
+    item,
+    vscode.commands.registerCommand("coreprobe.ask", async () => {
+      const fruit = await vscode.window.showQuickPick(
+        ["apple", { label: "Citrus", kind: vscode.QuickPickItemKind.Separator }, { label: "orange", description: "a citrus" }, "lemon"],
+        { title: "Pick a fruit", placeHolder: "Fruit" },
+      );
+      if (!fruit) return vscode.window.showInformationMessage("picker cancelled");
+      const label = typeof fruit === "string" ? fruit : fruit.label;
+      const count = await vscode.window.showInputBox({
+        title: "How many?",
+        prompt: "A number",
+        validateInput: (v) => (/^[0-9]+$/.test(v) ? undefined : "digits only"),
+      });
+      if (count === undefined) return vscode.window.showInformationMessage("input cancelled");
+      const doc = vscode.window.activeTextEditor.document;
+      const problem = new vscode.Diagnostic(new vscode.Range(0, 0, 0, 4), label + " x" + count, vscode.DiagnosticSeverity.Warning);
+      problem.source = "core";
+      lint.set(doc.uri, [problem]);
+      return vscode.window.showInformationMessage("chose " + count + " " + label);
+    }),
+  );
+};
+`;
+const CORE_PROBE_MANIFEST = JSON.stringify({
+  manifestVersion: 1,
+  publisher: "acme",
+  name: "coreprobe",
+  version: "1.0.0",
+  displayName: "Core Probe",
+  engines: { yavin: "^2.1.0" },
+  main: "extension/out/main.js",
+  activationEvents: ["*"],
+  permissions: { version: 1, request: ["documents.read"] },
+  contributes: {},
+  vsix: {
+    publisher: "Acme",
+    name: "coreprobe",
+    vscode: "^1.80.0",
+    code: true,
+    runtime: {
+      api: "vscode",
+      level: "1.90.0",
+      entry: "main",
+      commands: {},
+      settings: {},
+      views: {},
+      defaults: {},
+    },
+    supported: ["Its code (main: out/main.js) runs in Yavin's extension sandbox"],
+    ignored: [],
+    rejected: [],
+    signature: "not verified",
+  },
+});
+
+test("EXT-29 a VS Code extension's picker and input box are Yavin's dialogs naming it; validation blocks a bad value; Escape cancels; its diagnostics are in Problems", async ({
+  page,
+}) => {
+  await desktop(page, {
+    extensions: [
+      {
+        folder: `/data/extensions/.store/${CORE_PROBE}/1.0.0-abcd1234`,
+        error: null,
+        manifest: CORE_PROBE_MANIFEST,
+      },
+    ],
+    extensionCode: { [CORE_PROBE]: CORE_PROBE_CODE },
+    grants: { [CORE_PROBE]: ["documents.read"] },
+    workspaceFiles: { "notes.txt": "fruit basket\n" },
+  });
+  await page.getByRole("treeitem", { name: "notes.txt" }).dblclick();
+  await expect(page.getByRole("tab", { name: /notes.txt/ })).toBeVisible();
+  const ask = page.locator(`[data-extension-status^="${CORE_PROBE}#status#"]`, {
+    hasText: "Core ask",
+  });
+  const message = page.getByRole("status", { name: "Extension message" });
+  const prompt = page.locator(`dialog[data-extension-prompt="${CORE_PROBE}"]`);
+
+  // Escape closes the picker: the extension gets no item.
+  await ask.click();
+  await expect(prompt).toBeVisible();
+  await expect(prompt).toContainText("Core Probe asks");
+  await page.keyboard.press("Escape");
+  await expect(prompt).toHaveCount(0);
+  await expect(message).toContainText("picker cancelled");
+
+  // The picker: its title, its items and separator; the filter narrows by label.
+  await ask.click();
+  await expect(prompt.getByRole("heading", { name: "Pick a fruit" })).toBeVisible();
+  const options = prompt.getByRole("option");
+  await expect(options).toHaveText(["apple", /orange/, "lemon"]);
+  await expect(prompt.getByRole("separator")).toContainText("Citrus");
+  await prompt.getByRole("combobox", { name: "Pick a fruit" }).fill("ora");
+  await expect(options).toHaveText([/orange/]);
+  await page.keyboard.press("Enter");
+
+  // The input box: a value that fails validation is refused, with the extension's message.
+  await expect(prompt.getByRole("heading", { name: "How many?" })).toBeVisible();
+  const box = prompt.getByRole("textbox", { name: "A number" });
+  await box.fill("lots");
+  await expect(prompt.getByRole("alert")).toHaveText("digits only");
+  await page.keyboard.press("Enter");
+  await expect(prompt).toBeVisible();
+  await box.fill("3");
+  await expect(prompt.getByRole("alert")).toHaveCount(0);
+  await page.keyboard.press("Enter");
+  await expect(prompt).toHaveCount(0);
+  await expect(message).toContainText("chose 3 orange");
+
+  // Its diagnostic: in Yavin's Problems view, under the collection's name.
+  await showView(page, "PROBLEMS");
+  const problems = page.getByRole("region", { name: "Problems" });
+  await expect(problems).toContainText("orange x3");
+  await expect(problems).toContainText("core-lint");
+});
+
+// --- EXT-30: a file icon theme in the window ---------------------------------------------------
+
+const ICONS = "acme.icons";
+const ICONS_MANIFEST = JSON.stringify({
+  manifestVersion: 1,
+  publisher: "acme",
+  name: "icons",
+  version: "1.0.0",
+  displayName: "Acme Icons",
+  engines: { yavin: "^2.1.0" },
+  contributes: {
+    iconThemes: [{ id: "acme-icons", label: "Acme Icons", path: "extension/dist/icons.json" }],
+  },
+});
+const svg = (fill: string) =>
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" fill="${fill}"/></svg>`;
+
+test("EXT-30 a file icon theme: chosen in Settings, its SVG icons are the explorer's, drawn as images; an icon it lacks is Yavin's; Yavin's icons again when switched back", async ({
+  page,
+}) => {
+  await desktop(page, {
+    extensions: [
+      {
+        folder: `/data/extensions/.store/${ICONS}/1.0.0-abcd1234`,
+        error: null,
+        manifest: ICONS_MANIFEST,
+      },
+    ],
+    grants: { [ICONS]: [] },
+    extensionResources: {
+      [`${ICONS}:extension/dist/icons.json`]: JSON.stringify({
+        iconDefinitions: {
+          file: { iconPath: "./../icons/file.svg" },
+          ts: { iconPath: "./../icons/ts.svg" },
+          readme: { iconPath: "./../icons/readme.svg" },
+          folder: { iconPath: "./../icons/folder.svg" },
+          "folder-src": { iconPath: "./../icons/folder-src.svg" },
+          lost: { iconPath: "./../icons/not-in-the-package.svg" },
+          away: { iconPath: "../../../../outside.svg" },
+        },
+        file: "file",
+        folder: "folder",
+        folderExpanded: "folder",
+        fileExtensions: { ts: "ts", lost: "lost", away: "away" },
+        fileNames: { "readme.md": "readme" },
+        folderNames: { src: "folder-src" },
+      }),
+      [`${ICONS}:extension/icons/file.svg`]: svg("#888"),
+      [`${ICONS}:extension/icons/ts.svg`]: svg("#3178c6"),
+      // Script in an SVG never runs: it is only ever an image.
+      [`${ICONS}:extension/icons/readme.svg`]: `<svg xmlns="http://www.w3.org/2000/svg"><script>window.__ran = true</script><rect width="16" height="16"/></svg>`,
+      [`${ICONS}:extension/icons/folder.svg`]: svg("#dcb67a"),
+      [`${ICONS}:extension/icons/folder-src.svg`]: svg("#4caf50"),
+    },
+    workspaceFiles: {
+      "notes.ts": "export {};\n",
+      "README.md": "# hi\n",
+      "plain.txt": "x\n",
+      "data.lost": "x\n",
+    },
+  });
+  const tree = page.getByRole("tree");
+  const row = (name: string) => page.getByRole("treeitem", { name, exact: true });
+  const themed = (name: string) => row(name).locator("img[data-icon-theme]");
+  await expect(row("notes.ts")).toBeVisible();
+  // Yavin's own icons until a theme is chosen.
+  await expect(tree.locator("img[data-icon-theme]")).toHaveCount(0);
+
+  await page.keyboard.press("Control+,");
+  const setting = page
+    .getByRole("region", { name: "Settings" })
+    .getByRole("group", { name: "File Icon Theme", exact: true });
+  const choice = setting.getByRole("combobox", { name: "File Icon Theme" });
+  await expect(choice.locator("option")).toHaveText(["Yavin", "Acme Icons"]);
+  await choice.selectOption(`ext:${ICONS}:acme-icons`);
+  await page.keyboard.press("Escape");
+
+  // The theme's icons: by extension, by whole name, by folder name, and the defaults.
+  const src = (name: string) => themed(name).getAttribute("src");
+  await expect(themed("notes.ts")).toHaveAttribute("data-icon-theme", `ext:${ICONS}:acme-icons`);
+  expect(decodeURIComponent((await src("notes.ts"))!)).toContain("#3178c6");
+  expect(decodeURIComponent((await src("README.md"))!)).toContain("<script>");
+  expect(await src("README.md")).toMatch(/^data:image\/svg\+xml;charset=utf-8,/);
+  expect(decodeURIComponent((await src("plain.txt"))!)).toContain("#888");
+  expect(decodeURIComponent((await src("src"))!)).toContain("#4caf50");
+  // An icon the package does not have, or one outside it: Yavin's own icon.
+  await expect(row("data.lost").locator("svg")).toHaveCount(1);
+  await expect(themed("data.lost")).toHaveCount(0);
+  // Nothing in an icon ran.
+  expect(
+    await page.evaluate(() => (window as unknown as { __ran?: boolean }).__ran),
+  ).toBeUndefined();
+  // The open editor's tab shows the theme's icon too.
+  await row("notes.ts").dblclick();
+  await expect(
+    page.getByRole("tab", { name: /notes\.ts/ }).locator("img[data-icon-theme]"),
+  ).toHaveCount(1);
+
+  // Back to Yavin's icons.
+  await page.keyboard.press("Control+,");
+  await choice.selectOption("yavin");
+  await page.keyboard.press("Escape");
+  await expect(tree.locator("img[data-icon-theme]")).toHaveCount(0);
+  // The choice is a user setting, kept across a reload.
+  await page.keyboard.press("Control+,");
+  await choice.selectOption(`ext:${ICONS}:acme-icons`);
+  await page.reload();
+  await expect(themed("notes.ts")).toHaveCount(1);
 });
 
 test("an incompatible extension says why and cannot be installed", async ({ page }) => {

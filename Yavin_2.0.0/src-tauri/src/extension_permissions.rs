@@ -5,16 +5,19 @@
 //! **Mandatory** -- every extension, scoped by ownership, no consent: registering its own
 //! commands, views and language providers (their ids carry its id), decorating through Yavin's
 //! fixed styles, its own storage (`extension.storage`), its own contributed settings
-//! (`settings.read` of its own section), messages, and its configuration events.
+//! (`settings.read` of its own section), messages, its configuration events, and whether the
+//! window is focused (`window.state`, EXT-27), its own prompts (Yavin's picker and input box,
+//! which the user answers) and its own diagnostic collections in the Problems view (EXT-29).
 //!
 //! **Optional** -- declared in the manifest (`permissions.request`), then granted by the user,
 //! per installed copy (`ExtensionService::set_grants`); none by default:
 //!
 //! | Capability | Requests |
 //! |---|---|
-//! | `workspace.fs.read` | `fs.readFile`, `fs.exists` (inside the workspace folder) |
-//! | `documents.read` | `documents.all/get/getText`, `editor.active`; receiving the `documents.*` and `editor.active` events |
+//! | `workspace.fs.read` | `fs.readFile`, `fs.exists` (inside the workspace folder); receiving `files.change` (EXT-29) |
+//! | `documents.read` | `documents.all/get/getText`, `editor.active`; receiving the `documents.*` (saves and will-save too, EXT-29), `editor.active` and `editor.selection` events |
 //! | `editor.control` | `editor.openLocation`, `editor.setSelection`, `editor.revealRange` |
+//! | `documents.edit` | `documents.edit`: text edits to an open document, as unsaved and undoable edits (EXT-25) |
 //! | `commands.execute:<id>` | `commands.execute` of a command `<id>` contributes (another extension's) |
 //! | `secrets` | `secrets.get`, `secrets.store`, `secrets.delete` -- its own, kept by Yavin in the OS credential store (EXT-13) |
 //!
@@ -36,6 +39,8 @@ pub const MAX_REQUESTED: usize = 16;
 pub const FS_READ: &str = "workspace.fs.read";
 pub const DOCUMENTS_READ: &str = "documents.read";
 pub const EDITOR_CONTROL: &str = "editor.control";
+/// Editing open documents' text (EXT-25): unsaved, undoable edits through the document service.
+pub const DOCUMENTS_EDIT: &str = "documents.edit";
 /// `commands.execute:<extension id>`: the other extension's commands.
 pub const COMMANDS_EXECUTE: &str = "commands.execute:";
 /// Keeping its own secrets in the OS credential store (EXT-13).
@@ -47,7 +52,9 @@ pub const LEGACY: [&str; 3] = [DOCUMENTS_READ, EDITOR_CONTROL, FS_READ];
 /// asking: its own commands need no capability, so naming them is not one.
 pub fn capability(raw: &str, owner: &str) -> Option<String> {
     match raw {
-        FS_READ | DOCUMENTS_READ | EDITOR_CONTROL | SECRETS => Some(raw.to_string()),
+        FS_READ | DOCUMENTS_READ | DOCUMENTS_EDIT | EDITOR_CONTROL | SECRETS => {
+            Some(raw.to_string())
+        }
         _ => {
             let target = canonical_id(raw.strip_prefix(COMMANDS_EXECUTE)?)?;
             (target != owner).then(|| format!("{COMMANDS_EXECUTE}{target}"))
@@ -185,10 +192,17 @@ fn owned(params: &Value, name: &str, caller: &str, separator: char) -> Need {
 /// An event Yavin may send an extension, and what receiving it needs.
 pub fn need_of_event(event: &str) -> Need {
     match event {
-        "configuration.changed" => Need::Nothing,
+        // EXT-27: whether the window is focused -- nothing of the user's work.
+        "configuration.changed" | "window.state" => Need::Nothing,
         "documents.open" | "documents.change" | "documents.close" | "editor.active" => {
             Need::Capability(DOCUMENTS_READ.into())
         }
+        // EXT-29: saves (and being asked before one), and the editor's selection.
+        "documents.save" | "documents.willSave" | "editor.selection" => {
+            Need::Capability(DOCUMENTS_READ.into())
+        }
+        // EXT-29: the workspace's file changes (names of files in it).
+        "files.change" => Need::Capability(FS_READ.into()),
         other => Need::Invalid(format!(
             "\"{other}\" is not an event an extension can follow"
         )),
@@ -203,7 +217,17 @@ pub fn need_of_request(caller: &str, method: &str, params: &Value) -> Need {
         "commands.register" | "commands.unregister" => owned(params, "id", caller, '.'),
         "views.register" | "views.refresh" | "views.unregister" => owned(params, "id", caller, '.'),
         "languages.register" | "languages.unregister" => owned(params, "providerId", caller, '#'),
-        "window.showMessage" | "storage.update" | "editor.setDecorations" => Need::Nothing,
+        // Its own status bar items (EXT-25): `<id>#status#<n>`, shown in Yavin's own style.
+        "statusBar.set" | "statusBar.remove" => owned(params, "id", caller, '#'),
+        // EXT-29: its own prompts (`<id>#prompt#<n>`): Yavin's picker and input box, which the
+        // user answers; its own diagnostic collections (`<id>#diagnostics#<n>`), in Problems.
+        "window.quickPick" | "window.inputBox" | "window.cancelPrompt" => {
+            owned(params, "id", caller, '#')
+        }
+        "diagnostics.set" | "diagnostics.clear" => owned(params, "collection", caller, '#'),
+        "window.showMessage" | "window.state" | "storage.update" | "editor.setDecorations" => {
+            Need::Nothing
+        }
         // Following an event is mandatory; receiving one is checked when it is sent
         // (`need_of_event`): a grant given later applies at once, a revocation too.
         "events.subscribe" => match string(params, "event").map(need_of_event) {
@@ -224,6 +248,7 @@ pub fn need_of_request(caller: &str, method: &str, params: &Value) -> Need {
             need(EDITOR_CONTROL)
         }
         "fs.readFile" | "fs.exists" => need(FS_READ),
+        "documents.edit" => need(DOCUMENTS_EDIT),
         // Its own secrets (EXT-13): handled natively, never passed to the window.
         "secrets.get" | "secrets.store" | "secrets.delete" => {
             let scope_ok = params.get("scope").is_none_or(|s| {
@@ -326,7 +351,9 @@ mod tests {
                 rest.starts_with('(').then_some(name)
             })
             .collect();
-        assert_eq!(methods.len(), 21, "{methods:?}");
+        // EXT-25: documents.edit, statusBar.set, statusBar.remove; EXT-27: window.state; EXT-29:
+        // window.quickPick, window.inputBox, window.cancelPrompt, diagnostics.set, diagnostics.clear.
+        assert_eq!(methods.len(), 30, "{methods:?}");
         for method in methods {
             assert_ne!(
                 need_of_request("acme.hello", method, &json!({})),

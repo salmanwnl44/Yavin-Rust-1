@@ -2464,3 +2464,306 @@ fn a_revocation_while_a_request_is_in_flight_withholds_the_answer() {
     let again = yavin.read_while(session, 27_001, || {});
     assert_eq!(again["text"], "THE DOCUMENT TEXT", "{again}");
 }
+
+/// The Open VSX benchmark's activation stage (EXT-25): every catalogue package the native stage
+/// installed that has code is installed again here, from its downloaded file, through the
+/// inventory (staged, verified, committed), loaded into the real host in its AppContainer, and
+/// activated -- with every capability it requests granted, in a disposable workspace whose only
+/// document is a scratch text (no user data). Then each command it contributes is run once.
+/// What happened is recorded, not judged: `<out>/activation.json`.
+///
+/// Ignored (it runs third-party code, sandboxed): after `openvsx_benchmark_tests`,
+/// `YAVIN_BENCH_OUT=<its folder> cargo test open_vsx_benchmark_activation -- --ignored`.
+#[test]
+#[ignore = "runs downloaded VS Code extensions in the sandboxed host"]
+fn open_vsx_benchmark_activation() {
+    let out = PathBuf::from(std::env::var("YAVIN_BENCH_OUT").expect("the benchmark folder"));
+    let native: Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("native.json")).unwrap()).unwrap();
+    let yavin = Yavin::new("openvsx-benchmark", &[]);
+    let doc = json!({"uri": "file:///C:/work/scratch.txt", "resourceId": "r", "languageId": "plaintext", "version": 1, "source": "disk", "dirty": false});
+    let text = "pear\napple\nfig";
+    let mut results = Vec::new();
+    let mut generation = 30_000;
+    for entry in native["results"].as_array().unwrap() {
+        let id = entry["id"].as_str().unwrap();
+        let manifest = &entry["adapt"]["manifest"];
+        if manifest.get("main").is_none() {
+            continue;
+        }
+        let version = entry["version"].as_str().unwrap();
+        let archive = out.join(id).join("package.vsix");
+        let mut record = json!({"id": id, "version": version});
+        let staged = crate::marketplace::stage(
+            &yavin.extensions,
+            crate::marketplace::PackageSource::File {
+                path: archive.to_string_lossy().into(),
+            },
+            id,
+            version,
+        );
+        let staged = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                record["install"] = json!({"ok": false, "error": error});
+                results.push(record);
+                continue;
+            }
+        };
+        // A commit can meet a file another process holds a moment (os error 5): tried again,
+        // and recorded.
+        let mut committed = yavin.extensions.commit(&staged.token, id);
+        let mut retries = 0;
+        while committed.as_ref().is_err_and(|e| e.contains("os error 5")) && retries < 5 {
+            retries += 1;
+            std::thread::sleep(Duration::from_millis(500));
+            committed = yavin.extensions.commit(&staged.token, id);
+        }
+        if let Err(error) = committed {
+            eprintln!("{id}: commit failed: {error}");
+            record["install"] = json!({"ok": false, "error": error, "retries": retries});
+            yavin.extensions.abort(&staged.token);
+            results.push(record);
+            continue;
+        }
+        yavin.extensions.finish(&staged.token, id, true).unwrap();
+        record["install"] = json!({"ok": true, "retries": retries});
+        let requested: Vec<String> = manifest["permissions"]["request"]
+            .as_array()
+            .map(|l| {
+                l.iter()
+                    .filter_map(|c| c.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        yavin.extensions.set_grants(id, None, &requested).unwrap();
+        // Its settings as the window gives them: here, the defaults.
+        let mut configuration = serde_json::Map::new();
+        for (key, setting) in manifest["contributes"]["configuration"]["properties"]
+            .as_object()
+            .into_iter()
+            .flatten()
+        {
+            configuration.insert(key.clone(), setting["default"].clone());
+        }
+        generation += 1;
+        let session = yavin.start();
+        record["sandboxed"] = json!(yavin.sessions.process_id(session).is_some_and(sandboxed));
+        yavin
+            .send(session, json!({"type": "init", "workspaceId": WS, "hostGeneration": generation, "workspaceFolder": "C:/work", "apiVersion": "2.1.0", "limits": {"memoryBytes": 128 * 1024 * 1024, "loadMs": 10_000, "callMs": 3000}}))
+            .unwrap();
+        let ready = yavin.next_message(session);
+        assert_eq!(ready["type"], "ready");
+        let started = Instant::now();
+        let mut seen = Seen::default();
+        let loaded = yavin.load_seeing(session, generation, id, &mut seen);
+        record["load"] = if loaded["type"] == "loaded" {
+            json!({"ok": true, "ms": started.elapsed().as_millis() as u64})
+        } else {
+            json!({"ok": false, "error": loaded["error"]})
+        };
+        let _ = &loaded["error"]["stack"];
+        if loaded["type"] == "loaded" {
+            let started = Instant::now();
+            let activated = yavin.drive(
+                session,
+                generation,
+                id,
+                "activate",
+                json!({"globalState": {}, "workspaceState": {}, "configuration": configuration}),
+                &doc,
+                text,
+                &mut seen,
+            );
+            record["activate"] = match activated {
+                Some(r) if r["ok"] == json!(true) => {
+                    json!({"ok": true, "ms": started.elapsed().as_millis() as u64})
+                }
+                Some(r) => json!({"ok": false, "error": r["error"]}),
+                None => {
+                    json!({"ok": false, "error": {"code": "NoAnswer", "message": "activation did not finish within 20 s"}})
+                }
+            };
+            if record["activate"]["ok"] == json!(true) {
+                let mut commands = Vec::new();
+                for command in manifest["contributes"]["commands"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(30)
+                {
+                    let name = command["command"].as_str().unwrap();
+                    let before = seen.edits;
+                    let ran = yavin.drive(
+                        session,
+                        generation,
+                        id,
+                        "command.run",
+                        json!({"id": name, "args": []}),
+                        &doc,
+                        text,
+                        &mut seen,
+                    );
+                    commands.push(json!({
+                        "command": name,
+                        "vscode": manifest["vsix"]["runtime"]["commands"][name],
+                        "ok": ran.as_ref().map(|r| r["ok"].clone()).unwrap_or(json!(false)),
+                        "error": ran.as_ref().map(|r| r["error"].clone()).unwrap_or(json!({"code": "NoAnswer"})),
+                        "edited": seen.edits > before,
+                    }));
+                }
+                record["commands"] = json!(commands);
+            }
+        }
+        record["unsupported"] = json!(seen.unsupported);
+        record["requests"] = json!(seen.methods);
+        record["messages"] = json!(seen.messages);
+        record["exited"] = json!(seen.exited);
+        yavin.sessions.stop(session);
+        eprintln!(
+            "{id}: load {} activate {}",
+            record["load"]["ok"], record["activate"]["ok"]
+        );
+        results.push(record);
+    }
+    std::fs::write(
+        out.join("activation.json"),
+        serde_json::to_string_pretty(&json!({"results": results})).unwrap(),
+    )
+    .unwrap();
+}
+
+/// What the window saw while a benchmark extension ran.
+#[derive(Default)]
+struct Seen {
+    unsupported: Vec<String>,
+    methods: std::collections::BTreeMap<String, u64>,
+    messages: Vec<String>,
+    edits: u64,
+    asked: u64,
+    exited: bool,
+}
+
+impl Yavin {
+    /// Loads a benchmark extension; a host that ends meanwhile is recorded, not a panic.
+    fn load_seeing(
+        &self,
+        session: u32,
+        generation: u64,
+        extension: &str,
+        seen: &mut Seen,
+    ) -> Value {
+        // A load refused natively (EXT-30: packages now install whose code is past what is
+        // read, `extensions::read_modules`) is that extension's result, as in the application.
+        let message = json!({"type": "load", "extensionId": extension, "workspaceId": WS, "hostGeneration": generation});
+        if let Err(error) = self.send(session, message) {
+            let code = error.split(':').next().unwrap_or("LoadFailed").to_string();
+            return json!({"type": "error", "error": {"code": code, "message": error}});
+        }
+        let until = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < until {
+            match self.events.recv_timeout(Duration::from_millis(500)) {
+                Ok((s, Event::Exit(code, error))) if s == session => {
+                    seen.exited = true;
+                    return json!({"type": "error", "error": {"code": "HostEnded", "message": format!("the host ended: {code:?} {error:?}")}});
+                }
+                Ok((s, Event::Message(m)))
+                    if s == session && (m["type"] == "loaded" || m["type"] == "error") =>
+                {
+                    return m
+                }
+                _ => {}
+            }
+        }
+        json!({"type": "error", "error": {"code": "NoAnswer", "message": "the load did not finish within 30 s"}})
+    }
+
+    /// Asks the extension `method`; its requests are answered as a window with one scratch
+    /// document would. None when it gives no answer within 20 s (or its host ended).
+    #[allow(clippy::too_many_arguments)]
+    fn drive(
+        &self,
+        session: u32,
+        generation: u64,
+        extension: &str,
+        method: &str,
+        params: Value,
+        doc: &Value,
+        text: &str,
+        seen: &mut Seen,
+    ) -> Option<Value> {
+        seen.asked += 1;
+        let request = format!("bench{}", seen.asked);
+        self.to(
+            session,
+            generation,
+            extension,
+            json!({"type": "request", "requestId": request, "method": method, "params": params}),
+        );
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until {
+            let Ok((s, event)) = self.events.recv_timeout(Duration::from_millis(500)) else {
+                continue;
+            };
+            if s != session {
+                continue;
+            }
+            match event {
+                Event::Exit(..) => {
+                    seen.exited = true;
+                    return None;
+                }
+                Event::Denied(_) => {}
+                Event::Message(message) => match message["type"].as_str() {
+                    Some("log") => {
+                        let line = message["text"].as_str().unwrap_or("");
+                        if line.starts_with("UnsupportedApi:")
+                            && !seen.unsupported.iter().any(|u| u == line)
+                        {
+                            seen.unsupported.push(line.chars().take(300).collect());
+                        }
+                    }
+                    Some("request") => {
+                        let asked = message["method"].as_str().unwrap_or("").to_string();
+                        *seen.methods.entry(asked.clone()).or_default() += 1;
+                        let result = match asked.as_str() {
+                            "documents.all" => json!([doc]),
+                            "documents.get" => doc.clone(),
+                            "documents.getText" => json!(text),
+                            "editor.active" => {
+                                json!({"document": doc, "selection": {"startLine": 1, "startColumn": 1, "endLine": 3, "endColumn": 4}})
+                            }
+                            "documents.edit" => {
+                                seen.edits += 1;
+                                json!(true)
+                            }
+                            // As the application's window answers (EXT-27): it always reports
+                            // its focus; here, a window in the foreground.
+                            "window.state" => json!({"focused": true}),
+                            "window.showMessage" => {
+                                if seen.messages.len() < 20 {
+                                    seen.messages.push(
+                                        message["params"]["message"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .chars()
+                                            .take(200)
+                                            .collect(),
+                                    );
+                                }
+                                Value::Null
+                            }
+                            _ => Value::Null,
+                        };
+                        self.to(session, generation, extension, json!({"type": "response", "requestId": message["requestId"], "ok": true, "result": result}));
+                    }
+                    Some("response") if message["requestId"] == json!(request) => {
+                        return Some(message)
+                    }
+                    _ => {}
+                },
+            }
+        }
+        None
+    }
+}

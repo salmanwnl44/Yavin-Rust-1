@@ -48,8 +48,28 @@ const MONACO_LANGUAGE: Record<string, string> = {
   dockerfile: "dockerfile",
 };
 
+/** Yavin languages shown with another language's tokenizer, for want of their own. */
+const STAND_INS = new Set(["toml", "ignore", "properties", "dotenv"]);
+/**
+ * Languages extensions colour (EXT-25): a Monaco language of their own id, for languages Yavin
+ * has no tokenizer of its own for (unknown ones, and the stand-ins above). Never one of Yavin's.
+ */
+const contributed = new Set<string>();
+
+export const isStandIn = (languageId: string): boolean => STAND_INS.has(languageId);
+
+/** Whether an extension may give `languageId` its configuration and grammar (EXT-25). */
+export const extensionMayColour = (languageId: string): boolean =>
+  !(languageId in MONACO_LANGUAGE) || STAND_INS.has(languageId);
+
+/** Uses the extension-contributed Monaco language `languageId` (registered by the caller). */
+export function useContributedLanguage(languageId: string, used: boolean): void {
+  if (used && extensionMayColour(languageId)) contributed.add(languageId);
+  else contributed.delete(languageId);
+}
+
 export const monacoLanguage = (languageId: string): string =>
-  MONACO_LANGUAGE[languageId] ?? "plaintext";
+  contributed.has(languageId) ? languageId : (MONACO_LANGUAGE[languageId] ?? "plaintext");
 
 /**
  * A document's Monaco URI, from Yavin's `ResourceUri` -- scheme, authority and path as Module 01

@@ -15,7 +15,11 @@ import { addReferencesAction, installLanguageFeatures } from "../../editor/lspMo
 import { createDiffView } from "../../editor/diff";
 import { attachDebugDecorations } from "../../editor/debugMonaco";
 import { attachExtensionEditor } from "../../editor/extensionMonaco";
-import { attachDeclarativeSnippets, defineDeclarativeThemes } from "../../editor/declarativeMonaco";
+import {
+  attachDeclarativeLanguages,
+  attachDeclarativeSnippets,
+  defineDeclarativeThemes,
+} from "../../editor/declarativeMonaco";
 import type { DeclarativeContributions } from "../../services/extensions/declarative";
 import type {
   DecorationStore,
@@ -185,7 +189,7 @@ export default function CodeEditor({
   };
 
   /** The cursor and indentation for the status bar; none while no document is shown. */
-  const publishCursor = () => {
+  const publishCursor = (event?: { source?: string }) => {
     const instance = editor.current;
     const model = instance?.getModel();
     const selections = instance?.getSelections();
@@ -209,6 +213,24 @@ export default function CodeEditor({
       cursors: selections.length,
       insertSpaces: options.insertSpaces,
       tabSize: options.tabSize,
+      // EXT-29: the selections themselves, and what moved them, for extensions.
+      selections: [primary, ...selections.filter((s) => !s.equalsSelection(primary))]
+        .slice(0, 100)
+        .map((s) => ({
+          startLine: s.startLineNumber,
+          startColumn: s.startColumn,
+          endLine: s.endLineNumber,
+          endColumn: s.endColumn,
+          reversed: s.getDirection() === monaco.SelectionDirection.RTL,
+        })),
+      source:
+        event?.source === "keyboard"
+          ? "keyboard"
+          : event?.source === "mouse"
+            ? "mouse"
+            : event?.source === "api"
+              ? "command"
+              : null,
     });
   };
 
@@ -272,6 +294,11 @@ export default function CodeEditor({
     if (!declarativeStore) return;
     return attachDeclarativeSnippets(bridge, declarativeStore);
   }, [bridge, declarativeStore]);
+  // Extensions' languages: configuration and TextMate grammars (EXT-25).
+  useEffect(() => {
+    if (!declarativeStore) return;
+    return attachDeclarativeLanguages(bridge, declarativeStore);
+  }, [bridge, declarativeStore]);
 
   // Extensions' colour themes (EXT-04), defined before the editor is made so one it is set to
   // exists when it starts.
@@ -311,7 +338,7 @@ export default function CodeEditor({
     const subscriptions = [
       instance.onDidChangeCursorSelection(publish),
       instance.onDidChangeCursorSelection(publishCursor),
-      instance.onDidChangeModelOptions(publishCursor),
+      instance.onDidChangeModelOptions(() => publishCursor()),
       instance.onDidChangeModelContent(publish),
       instance.onDidFocusEditorText(() => {
         if (shown.current) views.setFocused(shown.current.key, true);

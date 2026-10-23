@@ -11,6 +11,7 @@
 //! (`src/services/extensions`).
 
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -106,12 +107,88 @@ pub fn read_main(folder: &Path, main: &str) -> Result<String, String> {
     read_inside(folder, main, MAX_MAIN)
 }
 
+/// A VS Code extension's entry point (EXT-25): as `read_main`, at most `vsix::MAX_CODE` (VS Code
+/// extensions are usually one bundle of everything they use).
+pub fn read_vscode_main(folder: &Path, main: &str) -> Result<String, String> {
+    read_inside(folder, main, crate::vsix::MAX_CODE)
+}
+
 /// The largest file of an extension's own read for the window (a theme, snippets: EXT-04).
 const MAX_RESOURCE: u64 = 1024 * 1024;
 
 /// One of an extension's files, as `read_main` reads its entry point, at most 1 MiB.
 pub fn read_resource(folder: &Path, path: &str) -> Result<String, String> {
     read_inside(folder, path, MAX_RESOURCE)
+}
+
+/// The most code a VS Code extension's modules may be, in all (EXT-25).
+pub const MAX_MODULES_TOTAL: u64 = 24 * 1024 * 1024;
+/// The most module files read for one VS Code extension.
+pub const MAX_MODULE_FILES: usize = 2000;
+
+/// A VS Code extension's code (EXT-25): every `.js`, `.cjs` and `.json` file of the package
+/// (`extension/…`, where its `require`s resolve), by its `/`-separated path in the copy -- each
+/// a plain file inside the copy (no link), a `.js` at most `vsix::MAX_CODE`, a `.json` at most
+/// 1 MiB, UTF-8; at most `MAX_MODULE_FILES` and `MAX_MODULES_TOTAL` in all, or none is loaded.
+/// The copy's files are the ones its integrity record binds (EXT-17): this reads the folder the
+/// inventory verified, as `read_main` does.
+pub fn read_modules(folder: &Path) -> Result<BTreeMap<String, String>, String> {
+    let base = folder
+        .canonicalize()
+        .map_err(|e| format!("LoadFailed: {e}"))?;
+    let mut modules = BTreeMap::new();
+    let mut total = 0u64;
+    let mut pending = vec![base.join("extension")];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).map_err(|e| format!("LoadFailed: {e}"))?;
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let lower = name.to_ascii_lowercase();
+            let max = if lower.ends_with(".js") || lower.ends_with(".cjs") {
+                crate::vsix::MAX_CODE
+            } else if lower.ends_with(".json") {
+                MAX_RESOURCE
+            } else {
+                continue;
+            };
+            if meta.len() > max {
+                continue;
+            }
+            total += meta.len();
+            if modules.len() >= MAX_MODULE_FILES || total > MAX_MODULES_TOTAL {
+                return Err(format!(
+                    "LoadFailed: its code is more than {MAX_MODULE_FILES} files or {} MiB.",
+                    MAX_MODULES_TOTAL >> 20
+                ));
+            }
+            let real = path
+                .canonicalize()
+                .map_err(|e| format!("LoadFailed: {e}"))?;
+            let relative = real
+                .strip_prefix(&base)
+                .map_err(|_| "LoadFailed: a module is outside the extension.".to_string())?;
+            let key = relative
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            if let Ok(text) = fs::read_to_string(&real) {
+                modules.insert(key, text);
+            }
+        }
+    }
+    Ok(modules)
 }
 
 fn read_inside(folder: &Path, main: &str, max: u64) -> Result<String, String> {
@@ -220,12 +297,13 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Discovery returns manifests; code is read only by `read_main`, and nothing here runs.
+    /// Discovery returns manifests; code is read only by `read_main` (and, for a VS Code
+    /// extension's modules, `read_modules`: EXT-25), and nothing here runs.
     #[test]
     fn discovery_reads_manifests_and_only_read_main_reads_code() {
         let source = include_str!("extensions.rs");
         let code = source.split("#[cfg(test)]").next().unwrap();
-        assert_eq!(code.matches("fs::read_to_string(").count(), 2);
+        assert_eq!(code.matches("fs::read_to_string(").count(), 3);
         assert!(!code.contains("Command::new"));
     }
 

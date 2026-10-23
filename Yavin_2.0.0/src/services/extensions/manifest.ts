@@ -12,7 +12,7 @@ import { ID_PART, MAX_ID_PART } from "./identity.ts";
 import { declaredPermissions, type DeclaredPermissions } from "./permissions.ts";
 
 /** The extension API this Yavin provides. Bumped on a breaking change to `api.ts`. */
-export const EXTENSION_API = "2.0.0";
+export const EXTENSION_API = "2.1.0";
 /** The manifest formats this Yavin reads. */
 export const MANIFEST_VERSION = 1;
 /** The manifest's file name in an extension's folder. */
@@ -101,10 +101,45 @@ export interface ThemeContribution {
   path: string;
 }
 
+/**
+ * A file icon theme (EXT-30): a VS Code icon theme file, whose SVG icons the explorer and the
+ * editor's tabs show (`services/extensions/iconThemes.ts`).
+ */
+export interface IconThemeContribution {
+  /** Its VS Code id: what the `explorer.iconTheme` setting names, with its extension. */
+  id: string;
+  label: string;
+  /** The theme file, relative to the extension's folder. */
+  path: string;
+}
+
 /** Snippets for one language (EXT-04): a VS Code snippets file. */
 export interface SnippetContribution {
   language: string;
   path: string;
+}
+
+/**
+ * A language (EXT-25): an id, the files that are written in it (by extension or whole name),
+ * and its language configuration file (comments, brackets, auto-closing pairs, indentation).
+ */
+export interface LanguageContribution {
+  id: string;
+  extensions: string[];
+  filenames: string[];
+  aliases: string[];
+  /** A VS Code `language-configuration.json`, relative to the extension's folder. */
+  configuration: string | null;
+}
+
+/** A TextMate grammar (EXT-25): tokens for its language, from a `.tmLanguage(.json)` file. */
+export interface GrammarContribution {
+  scopeName: string;
+  path: string;
+  /** The language it colours; null for a grammar only others embed. */
+  language: string | null;
+  /** Scopes inside it that are other languages. */
+  embeddedLanguages: Record<string, string>;
 }
 
 export interface Contributions {
@@ -115,20 +150,39 @@ export interface Contributions {
   viewContainers: ViewContainerContribution[];
   menus: MenuContribution[];
   themes: ThemeContribution[];
+  iconThemes: IconThemeContribution[];
   snippets: SnippetContribution[];
+  languages: LanguageContribution[];
+  grammars: GrammarContribution[];
 }
 
 /**
  * A VS Code package this manifest was made from (EXT-04, `src-tauri/src/vsix.rs`): its
  * published spelling, and what of it Yavin uses, leaves out and refused.
  */
+/**
+ * A VS Code extension's code, as the compatibility layer runs it (EXT-25): the entry point it
+ * chose, the API level, and the Yavin ids the adapter gave its commands, settings and views
+ * (Yavin id → VS Code id), with the defaults of settings Yavin cannot show.
+ */
+export interface VscodeRuntime {
+  entry: "main" | "browser";
+  level: string;
+  commands: Record<string, string>;
+  settings: Record<string, string>;
+  views: Record<string, string>;
+  defaults: Record<string, unknown>;
+}
+
 export interface VsixOrigin {
   publisher: string | null;
   name: string | null;
   /** Its `engines.vscode` range. */
   vscode: string | null;
-  /** It has code (`main`, `browser`), which never runs in Yavin. */
+  /** It has code (`main`, `browser`); it runs only when `runtime` says how (EXT-25). */
   code: boolean;
+  /** Its code runs through the VS Code compatibility layer (EXT-25); null: it does not run. */
+  runtime: VscodeRuntime | null;
   supported: string[];
   ignored: string[];
   rejected: string[];
@@ -183,6 +237,7 @@ const SEMVER =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-.]+)?$/;
 const KEY = /^((Mod|Shift|Alt)\+){0,3}([a-z0-9]|F([1-9]|1[0-2])|[`\-=[\]\\;',./])$/i;
 const LANGUAGE = /^[a-z0-9][a-z0-9+#._-]{0,49}$/i;
+const SCOPE = /^[A-Za-z0-9][A-Za-z0-9_.+-]{0,99}$/;
 
 const oneLine = (value: unknown, max: number): value is string =>
   typeof value === "string" &&
@@ -230,8 +285,13 @@ const CONTRIBUTION_POINTS = new Set([
   "viewsContainers",
   "menus",
   "themes",
+  "iconThemes",
   "snippets",
+  "languages",
+  "grammars",
 ]);
+/** A file icon theme's id (EXT-30): as the VS Code package adapter keeps them. */
+const ICON_THEME_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 const UI_THEMES = new Set(["vs", "vs-dark", "hc-black", "hc-light"]);
 /** A path inside the extension's folder: no `..`, no drive, not absolute. */
 const insidePath = (value: unknown): value is string =>
@@ -440,7 +500,10 @@ export function readManifest(value: unknown): ManifestResult {
     viewContainers: [],
     menus: [],
     themes: [],
+    iconThemes: [],
     snippets: [],
+    languages: [],
+    grammars: [],
   };
   const rawContributes = (raw.contributes ?? {}) as Record<string, unknown>;
   if (typeof rawContributes !== "object" || Array.isArray(rawContributes))
@@ -706,6 +769,20 @@ export function readManifest(value: unknown): ManifestResult {
         path: theme.path,
       });
     });
+    // File icon themes (EXT-30): data files, read and checked when applied.
+    list("iconThemes").forEach((entry, index) => {
+      const field = `contributes.iconThemes[${index}]`;
+      const theme = entry as Record<string, unknown>;
+      if (!theme || typeof theme !== "object") return error(field, "Must be an object.");
+      if (typeof theme.id !== "string" || !ICON_THEME_ID.test(theme.id))
+        return error(`${field}.id`, "Must be an id: letters, digits, '.', '_' and '-'.");
+      if (!oneLine(theme.label, 100)) return error(`${field}.label`, "Needs a label (one line).");
+      if (!insidePath(theme.path) || !theme.path.toLowerCase().endsWith(".json"))
+        return error(`${field}.path`, "Must be a JSON file inside the extension's folder.");
+      if (contributes.iconThemes.some((existing) => existing.id === theme.id))
+        return error(field, `The icon theme "${theme.id}" is contributed twice.`);
+      contributes.iconThemes.push({ id: theme.id, label: theme.label as string, path: theme.path });
+    });
     list("snippets").forEach((entry, index) => {
       const field = `contributes.snippets[${index}]`;
       const snippet = entry as Record<string, unknown>;
@@ -715,6 +792,71 @@ export function readManifest(value: unknown): ManifestResult {
       if (!insidePath(snippet.path))
         return error(`${field}.path`, "Must be a path inside the extension's folder.");
       contributes.snippets.push({ language: snippet.language, path: snippet.path });
+    });
+
+    // Languages and TextMate grammars (EXT-25): data files, read and checked when applied.
+    const strings = (value: unknown, ok: (one: string) => boolean) =>
+      Array.isArray(value) &&
+      value.length <= 50 &&
+      value.every((one) => typeof one === "string" && ok(one))
+        ? (value as string[])
+        : null;
+    list("languages").forEach((entry, index) => {
+      const field = `contributes.languages[${index}]`;
+      const language = entry as Record<string, unknown>;
+      if (!language || typeof language !== "object") return error(field, "Must be an object.");
+      if (typeof language.id !== "string" || !LANGUAGE.test(language.id))
+        return error(`${field}.id`, "Must be a language id.");
+      const extensions = strings(language.extensions ?? [], (one) =>
+        /^\.[A-Za-z0-9._+-]{1,30}$/.test(one),
+      );
+      const filenames = strings(
+        language.filenames ?? [],
+        (one) => oneLine(one, 100) && !/[\\/]/.test(one),
+      );
+      const aliases = strings(language.aliases ?? [], (one) => oneLine(one, 50));
+      if (!extensions)
+        return error(`${field}.extensions`, 'Must be a list of extensions, like ".x".');
+      if (!filenames) return error(`${field}.filenames`, "Must be a list of file names.");
+      if (!aliases) return error(`${field}.aliases`, "Must be a list of names.");
+      const configuration = language.configuration ?? null;
+      if (configuration !== null && !insidePath(configuration))
+        return error(`${field}.configuration`, "Must be a path inside the extension's folder.");
+      contributes.languages.push({
+        id: language.id,
+        extensions,
+        filenames,
+        aliases,
+        configuration: configuration as string | null,
+      });
+    });
+    list("grammars").forEach((entry, index) => {
+      const field = `contributes.grammars[${index}]`;
+      const grammar = entry as Record<string, unknown>;
+      if (!grammar || typeof grammar !== "object") return error(field, "Must be an object.");
+      if (typeof grammar.scopeName !== "string" || !SCOPE.test(grammar.scopeName))
+        return error(`${field}.scopeName`, "Must be a TextMate scope name, like source.x.");
+      if (!insidePath(grammar.path))
+        return error(`${field}.path`, "Must be a path inside the extension's folder.");
+      const language = grammar.language ?? null;
+      if (language !== null && (typeof language !== "string" || !LANGUAGE.test(language)))
+        return error(`${field}.language`, "Must be a language id.");
+      const embedded = (grammar.embeddedLanguages ?? {}) as Record<string, unknown>;
+      if (
+        !embedded ||
+        typeof embedded !== "object" ||
+        Array.isArray(embedded) ||
+        Object.entries(embedded).some(
+          ([scope, id]) => !SCOPE.test(scope) || typeof id !== "string" || !LANGUAGE.test(id),
+        )
+      )
+        return error(`${field}.embeddedLanguages`, "Must map scope names to language ids.");
+      contributes.grammars.push({
+        scopeName: grammar.scopeName,
+        path: grammar.path,
+        language: language as string | null,
+        embeddedLanguages: embedded as Record<string, string>,
+      });
     });
   }
 
@@ -749,18 +891,26 @@ export function readManifest(value: unknown): ManifestResult {
       origin.signature !== "not verified"
     )
       error("vsix", "Must be the report of a VS Code package Yavin adapted.");
-    else
+    else {
+      const runtime = vscodeRuntimeOf(origin.runtime);
+      if (runtime === undefined)
+        error("vsix.runtime", "Must be how the VS Code compatibility layer runs its code.");
       vsix = {
         publisher,
         name,
         vscode,
         code: origin.code,
+        runtime: runtime ?? null,
         supported,
         ignored,
         rejected,
         signature: "not verified",
       };
-    if (main !== null) error("main", "A manifest made from a VS Code package has no code.");
+      // Its code is loaded only when the adapter said how it runs (EXT-25).
+      if (main !== null && !runtime)
+        error("main", "A manifest made from a VS Code package has code only with a runtime.");
+      if (runtime && main === null) error("main", "A VS Code runtime needs the code it runs.");
+    }
   }
 
   for (const event of activationEvents)
@@ -818,6 +968,46 @@ export function readManifest(value: unknown): ManifestResult {
       vsix,
       permissions,
     },
+  };
+}
+
+/** `vsix.runtime` as the compatibility layer reads it: null when absent, undefined when invalid. */
+function vscodeRuntimeOf(raw: unknown): VscodeRuntime | null | undefined {
+  if (raw === undefined || raw === null) return null;
+  const runtime = raw as Record<string, unknown>;
+  const map = (value: unknown) =>
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).length <= 500 &&
+    Object.entries(value).every(([key, one]) => oneLine(key, 300) && oneLine(one, 300))
+      ? (value as Record<string, string>)
+      : null;
+  const [commands, settings, views] = [runtime?.commands, runtime?.settings, runtime?.views].map(
+    map,
+  );
+  const defaults = runtime?.defaults;
+  if (
+    !runtime ||
+    typeof runtime !== "object" ||
+    runtime.api !== "vscode" ||
+    (runtime.entry !== "main" && runtime.entry !== "browser") ||
+    !oneLine(runtime.level, 20) ||
+    !commands ||
+    !settings ||
+    !views ||
+    !defaults ||
+    typeof defaults !== "object" ||
+    Array.isArray(defaults)
+  )
+    return undefined;
+  return {
+    entry: runtime.entry,
+    level: runtime.level as string,
+    commands,
+    settings,
+    views,
+    defaults: defaults as Record<string, unknown>,
   };
 }
 

@@ -27,11 +27,14 @@ import {
   readManifest,
   type CommandContribution,
   type ExtensionManifest,
+  type GrammarContribution,
+  type LanguageContribution,
   type ManifestProblem,
   type MenuContribution,
   type SettingContribution,
   type SnippetContribution,
   type ThemeContribution,
+  type IconThemeContribution,
   type ViewContainerContribution,
   type ViewContribution,
 } from "./manifest.ts";
@@ -117,7 +120,12 @@ export interface RegistrySnapshot {
   /** Enabled extensions' colour themes and snippets (EXT-04), in order of extension id. */
   /** `copy`: which installed copy contributes it (EXT-08) -- its folder and version. */
   themes: readonly (ThemeContribution & { extensionId: string; copy: string })[];
+  /** Enabled extensions' file icon themes (EXT-30), in order of extension id. */
+  iconThemes: readonly (IconThemeContribution & { extensionId: string; copy: string })[];
   snippets: readonly (SnippetContribution & { extensionId: string; copy: string })[];
+  /** Enabled extensions' languages and TextMate grammars (EXT-25), in order of extension id. */
+  languages: readonly (LanguageContribution & { extensionId: string; copy: string })[];
+  grammars: readonly (GrammarContribution & { extensionId: string; copy: string })[];
   /**
    * Enabled extensions that cannot activate because of their dependencies (missing, disabled,
    * themselves unavailable, or in a cycle), with why. Their declarative contributions still apply.
@@ -249,7 +257,10 @@ export function createExtensionRegistry(options: {
     viewContainers: [],
     menus: [],
     themes: [],
+    iconThemes: [],
     snippets: [],
+    languages: [],
+    grammars: [],
     unavailable: {},
   };
 
@@ -284,6 +295,7 @@ export function createExtensionRegistry(options: {
     const menus = enabled.flatMap((one) =>
       one.manifest.contributes.menus.map((menu) => ({ ...menu, extensionId: one.id })),
     );
+    const byId = [...enabled].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     return {
       extensions: all,
       rejected,
@@ -319,24 +331,41 @@ export function createExtensionRegistry(options: {
         })),
       ),
       menus,
-      themes: [...enabled]
-        .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-        .flatMap((one) =>
-          one.manifest.contributes.themes.map((theme) => ({
-            ...theme,
-            extensionId: one.id,
-            copy: copyOf(one),
-          })),
-        ),
-      snippets: [...enabled]
-        .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-        .flatMap((one) =>
-          one.manifest.contributes.snippets.map((snippet) => ({
-            ...snippet,
-            extensionId: one.id,
-            copy: copyOf(one),
-          })),
-        ),
+      themes: byId.flatMap((one) =>
+        one.manifest.contributes.themes.map((theme) => ({
+          ...theme,
+          extensionId: one.id,
+          copy: copyOf(one),
+        })),
+      ),
+      iconThemes: byId.flatMap((one) =>
+        one.manifest.contributes.iconThemes.map((theme) => ({
+          ...theme,
+          extensionId: one.id,
+          copy: copyOf(one),
+        })),
+      ),
+      snippets: byId.flatMap((one) =>
+        one.manifest.contributes.snippets.map((snippet) => ({
+          ...snippet,
+          extensionId: one.id,
+          copy: copyOf(one),
+        })),
+      ),
+      languages: byId.flatMap((one) =>
+        one.manifest.contributes.languages.map((language) => ({
+          ...language,
+          extensionId: one.id,
+          copy: copyOf(one),
+        })),
+      ),
+      grammars: byId.flatMap((one) =>
+        one.manifest.contributes.grammars.map((grammar) => ({
+          ...grammar,
+          extensionId: one.id,
+          copy: copyOf(one),
+        })),
+      ),
       unavailable: dependencyProblems(),
     };
   };

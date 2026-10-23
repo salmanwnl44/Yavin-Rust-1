@@ -256,6 +256,19 @@
       "ok": true,
       "legacy": false,
       "requested": ["secrets"]
+    },
+    {
+      "about": "EXT-25: documents.edit can be requested",
+      "manifest": {
+        "main": "extension.js",
+        "permissions": {
+          "version": 1,
+          "request": ["documents.edit", "documents.read"]
+        }
+      },
+      "ok": true,
+      "legacy": false,
+      "requested": ["documents.edit", "documents.read"]
     }
   ],
   "requests": [
@@ -579,6 +592,111 @@
         "scope": "everywhere"
       },
       "need": "invalid"
+    },
+    {
+      "method": "documents.edit",
+      "params": {
+        "uri": "file:///c:/w/a.ts",
+        "version": 3,
+        "edits": []
+      },
+      "need": "documents.edit"
+    },
+    {
+      "method": "statusBar.set",
+      "params": {
+        "id": "acme.hello#status#1",
+        "text": "hi"
+      },
+      "need": "none"
+    },
+    {
+      "method": "statusBar.set",
+      "params": {
+        "id": "acme.other#status#1",
+        "text": "hi"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "statusBar.set",
+      "params": {
+        "text": "hi"
+      },
+      "need": "invalid"
+    },
+    {
+      "method": "statusBar.remove",
+      "params": {
+        "id": "acme.hello#status#1"
+      },
+      "need": "none"
+    },
+    {
+      "method": "statusBar.remove",
+      "params": {
+        "id": "acme.hello.status"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "window.state",
+      "params": {},
+      "need": "none"
+    },
+    {
+      "method": "window.quickPick",
+      "params": {
+        "id": "acme.hello#prompt#1"
+      },
+      "need": "none"
+    },
+    {
+      "method": "window.quickPick",
+      "params": {
+        "id": "acme.other#prompt#1"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "window.inputBox",
+      "params": {
+        "id": "acme.hello#prompt#2"
+      },
+      "need": "none"
+    },
+    {
+      "method": "window.inputBox",
+      "params": {},
+      "need": "invalid"
+    },
+    {
+      "method": "window.cancelPrompt",
+      "params": {
+        "id": "acme.hello#prompt#2"
+      },
+      "need": "none"
+    },
+    {
+      "method": "diagnostics.set",
+      "params": {
+        "collection": "acme.hello#diagnostics#1"
+      },
+      "need": "none"
+    },
+    {
+      "method": "diagnostics.set",
+      "params": {
+        "collection": "acme.other#diagnostics#1"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "diagnostics.clear",
+      "params": {
+        "collection": "acme.hello#diagnostics#1"
+      },
+      "need": "none"
     }
   ],
   "events": [
@@ -605,6 +723,26 @@
     {
       "event": "documents.opened",
       "need": "invalid"
+    },
+    {
+      "event": "window.state",
+      "need": "none"
+    },
+    {
+      "event": "documents.save",
+      "need": "documents.read"
+    },
+    {
+      "event": "documents.willSave",
+      "need": "documents.read"
+    },
+    {
+      "event": "editor.selection",
+      "need": "documents.read"
+    },
+    {
+      "event": "files.change",
+      "need": "workspace.fs.read"
     }
   ]
 }

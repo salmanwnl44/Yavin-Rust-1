@@ -56,5 +56,6 @@ semver = "1"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# A Local Git restore recreates Windows junctions (FSCTL_SET_REPARSE_POINT), never by a process.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Threading"] }
+# A Local Git restore recreates Windows junctions (FSCTL_SET_REPARSE_POINT), never by a process;
+# the window's focus is the foreground window (EXT-27, `window_focus.rs`).
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging"] }

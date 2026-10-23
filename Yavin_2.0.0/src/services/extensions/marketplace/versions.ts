@@ -46,18 +46,16 @@ export function compatibilityOf(
   const reasons: string[] = [];
   if (!isSemver(version.version)) reasons.push(`Its version "${version.version}" is not valid.`);
   const range = version.engines.yavin;
-  // A VS Code extension (Open VSX): only its colour themes and snippets install (EXT-04).
+  // A VS Code extension (Open VSX, EXT-25): what it is decides what installs -- its themes,
+  // snippets, languages and grammars, and its code, which runs in Yavin's sandbox through the
+  // VS Code compatibility layer. How well it works is known once it is installed: "Not
+  // verified" until then. Its `engines.vscode` is shown, never enforced (vscodeCompatibility.ts).
   const notes: string[] = [];
-  if (version.packageFormat === "vsix") {
-    if (version.declarative === false)
-      reasons.push(
-        "It is a VS Code extension with no colour themes or snippets: Yavin installs only those from a VS Code extension, and runs none of its code.",
-      );
-    else
-      notes.push(
-        "A VS Code extension: Yavin installs only its colour themes and snippets; its code never runs.",
-      );
-  } else if (!range) reasons.push("It does not say which Yavin extension API it needs.");
+  if (version.packageFormat === "vsix")
+    notes.push(
+      "Not verified: a VS Code extension. Yavin installs what it supports of it -- its themes, snippets, languages and grammars, and its code, which runs in Yavin's sandbox with only the permissions you allow. Its page says how well it works once it is installed.",
+    );
+  else if (!range) reasons.push("It does not say which Yavin extension API it needs.");
   if (range) {
     const fits = satisfies(api, range);
     if (fits === null) reasons.push(`Its required Yavin API ("${range}") cannot be read.`);

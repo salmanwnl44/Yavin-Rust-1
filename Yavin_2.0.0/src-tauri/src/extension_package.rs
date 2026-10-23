@@ -33,10 +33,23 @@ use std::path::Path;
 use crate::extensions::MANIFEST_FILE;
 use ide_workspace::extension_id::is_canonical;
 
-/// Limits on a package. Yavin's own constraints set them: an entry point is at most 2 MiB
-/// (`read_main`) and a manifest 64 KiB, so a package is code plus assets (icon, readme,
-/// changelog, grammars). The Hello World package is 3 KiB; these leave three to four orders of
-/// magnitude of room while keeping a hostile archive from filling a disk or the memory.
+/// Limits on a package: they keep a hostile archive from filling a disk or the memory, or
+/// holding an install for long, and they are set from real packages (EXT-30, measured on the
+/// Open VSX benchmark's packages; `OPEN_VSX_COMPATIBILITY_AUDIT.md`, Part F):
+///
+/// - **Entries** were 1000, which refused six legitimate packages (icon themes, a shader
+///   grammar, the Lua extension: 1233 to 2732 entries) that are small in bytes (1.8 to 42.5
+///   MiB unpacked). 5000 is under the installed-copy digest's `TREE_FILES` (10,000).
+/// - **The archive** was 20 MiB; 32 MiB admits the largest measured within reach (23.6 MiB).
+///   The downloaded archive is held in memory once to verify its signature
+///   (`openvsx::verified_bytes`), so this bounds that too.
+/// - **A file** was 16 MiB; 48 MiB admits the largest measured script (34.1 MiB, a language
+///   server worker) and a platform package's binary (25 MiB). Unpacked is not run: code Yavin
+///   loads is bounded again where it is read (`vsix::MAX_CODE`, `extensions::read_modules`).
+/// - **Everything unpacked** was 64 MiB; 128 MiB is four times the archive, under the
+///   installed-copy digest's `TREE_BYTES` (256 MiB).
+/// - **The ratio** stays 100:1 (the highest measured over 1 MiB is 13.3:1), **a path** is at
+///   most 400 bytes (the longest measured is 116), and **unpacking** at most 120 s.
 pub struct Limits {
     /// The archive itself (compressed).
     pub package: u64,
@@ -48,14 +61,20 @@ pub struct Limits {
     pub total: u64,
     /// Unpacked/compressed size of one entry, beyond `RATIO_FLOOR` bytes.
     pub ratio: u64,
+    /// An entry's whole name, in bytes.
+    pub path: usize,
+    /// Reading and unpacking the whole archive.
+    pub time: std::time::Duration,
 }
 
 pub const LIMITS: Limits = Limits {
-    package: 20 * 1024 * 1024,
-    entries: 1000,
-    file: 16 * 1024 * 1024,
-    total: 64 * 1024 * 1024,
+    package: 32 * 1024 * 1024,
+    entries: 5000,
+    file: 48 * 1024 * 1024,
+    total: 128 * 1024 * 1024,
     ratio: 100,
+    path: 400,
+    time: std::time::Duration::from_secs(120),
 };
 /// Below this, an entry's ratio is not checked (tiny highly-compressible files are normal).
 const RATIO_FLOOR: u64 = 1024 * 1024;
@@ -69,6 +88,116 @@ pub struct Unpacked {
     pub format: Format,
     pub files: usize,
     pub bytes: u64,
+    /// A VS Code package built for one platform (EXT-30): its `extension.vsixmanifest`'s
+    /// `TargetPlatform` -- always this Yavin's (`HOST_PLATFORM`). `None`: built for every one.
+    pub platform: Option<String>,
+}
+
+/// The platforms VS Code packages are built for: Open VSX's `targetPlatform` values (its OpenAPI
+/// document, `/v3/api-docs`, checked 2026-10-22), as `extension.vsixmanifest` spells them.
+pub const TARGET_PLATFORMS: [&str; 12] = [
+    "win32-x64",
+    "win32-ia32",
+    "win32-arm64",
+    "linux-x64",
+    "linux-arm64",
+    "linux-armhf",
+    "alpine-x64",
+    "alpine-arm64",
+    "darwin-x64",
+    "darwin-arm64",
+    "web",
+    "universal",
+];
+
+/// The platform this Yavin runs on, as VS Code packages name it. A package built for another
+/// one (or for `web`, VS Code in a browser) is not this Yavin's to install.
+pub const HOST_PLATFORM: &str = if cfg!(all(windows, target_arch = "aarch64")) {
+    "win32-arm64"
+} else if cfg!(all(windows, target_arch = "x86")) {
+    "win32-ia32"
+} else if cfg!(windows) {
+    "win32-x64"
+} else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    "darwin-arm64"
+} else if cfg!(target_os = "macos") {
+    "darwin-x64"
+} else if cfg!(target_arch = "aarch64") {
+    "linux-arm64"
+} else {
+    "linux-x64"
+};
+
+/// The largest `extension.vsixmanifest` read (Open VSX's are 1 to 3 KiB).
+const MAX_VSIXMANIFEST: u64 = 64 * 1024;
+
+/// The `TargetPlatform` of an `extension.vsixmanifest`'s `<Identity>` element: `None` when it
+/// names none, or there is no `<Identity>` (no claim: a package for every platform). Refused:
+/// two `<Identity>` elements, a `TargetPlatform` named twice, malformed, or one VS Code does
+/// not know.
+pub fn target_platform(vsixmanifest: &str) -> Result<Option<String>, String> {
+    let mut identities = vsixmanifest.match_indices("<Identity").filter(|(at, _)| {
+        // `<Identity ` or `<Identity/`, not `<IdentityFoo`.
+        vsixmanifest[at + 9..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>')
+    });
+    let Some((start, _)) = identities.next() else {
+        return Ok(None);
+    };
+    if identities.next().is_some() {
+        return Err(
+            "InvalidPackage: its extension.vsixmanifest has two <Identity> elements".into(),
+        );
+    }
+    let end = vsixmanifest[start..]
+        .find('>')
+        .ok_or_else(|| "InvalidPackage: its extension.vsixmanifest is malformed".to_string())?;
+    let element = &vsixmanifest[start..start + end];
+    let mut found = None;
+    let mut rest = element;
+    while let Some(at) = rest.find("TargetPlatform") {
+        let before = rest[..at].chars().next_back();
+        let after = &rest[at + "TargetPlatform".len()..];
+        rest = after;
+        if !before.is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let value = after.trim_start().strip_prefix('=').map(str::trim_start);
+        let Some(value) = value else { continue };
+        let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'');
+        let Some(quote) = quote else {
+            return Err("InvalidPackage: its TargetPlatform is not a quoted value".into());
+        };
+        let body = &value[1..];
+        let close = body
+            .find(quote)
+            .ok_or_else(|| "InvalidPackage: its TargetPlatform is not closed".to_string())?;
+        if found.is_some() {
+            return Err("InvalidPackage: its TargetPlatform is named twice".into());
+        }
+        found = Some(body[..close].to_string());
+    }
+    match found {
+        None => Ok(None),
+        Some(platform) if TARGET_PLATFORMS.contains(&platform.as_str()) => Ok(Some(platform)),
+        Some(platform) => Err(format!(
+            "InvalidPackage: \"{}\" is not a platform VS Code packages are built for",
+            platform.chars().take(40).collect::<String>()
+        )),
+    }
+}
+
+/// Whether a package built for `platform` (`None`: every one) is this Yavin's to install.
+pub fn platform_check(platform: Option<&str>) -> Result<(), String> {
+    match platform {
+        None | Some("universal") => Ok(()),
+        Some(p) if p == HOST_PLATFORM => Ok(()),
+        Some(p) => Err(format!(
+            "UnsupportedPlatform: the package is built for {p}; this Yavin runs on {HOST_PLATFORM}"
+        )),
+    }
 }
 
 /// Which kind of package an archive is, from what it holds -- never from where it came from.
@@ -83,8 +212,9 @@ pub enum Format {
 
 /// A VS Code package's manifest, inside the archive.
 pub const VSIX_MANIFEST: &str = "extension/package.json";
-/// The largest `extension/package.json` read (its `contributes` can be long).
-const MAX_VSIX_MANIFEST: u64 = 1024 * 1024;
+/// The largest `extension/package.json` read (its `contributes` can be long). EXT-30: was 1 MiB,
+/// which refused GitLens (1066 KiB); its JSON is parsed once, at install.
+const MAX_VSIX_MANIFEST: u64 = 2 * 1024 * 1024;
 
 fn refuse(message: impl Into<String>) -> String {
     format!("UnsafePackage: {}", message.into())
@@ -283,6 +413,17 @@ fn unpack_inner(package: &Path, destination: &Path, limits: &Limits) -> Result<U
             limits.package
         )));
     }
+    let started = std::time::Instant::now();
+    let in_time = || {
+        if started.elapsed() > limits.time {
+            Err(refuse(format!(
+                "unpacking it took longer than {} s",
+                limits.time.as_secs()
+            )))
+        } else {
+            Ok(())
+        }
+    };
     let file = fs::File::open(package).map_err(|e| format!("PackageUnreadable: {e}"))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| format!("MalformedPackage: not a valid zip archive ({e})"))?;
@@ -303,6 +444,13 @@ fn unpack_inner(package: &Path, destination: &Path, limits: &Limits) -> Result<U
         let name = std::str::from_utf8(entry.name_raw())
             .map_err(|_| refuse(format!("entry {index} has a name that is not UTF-8")))?
             .to_string();
+        if name.len() > limits.path {
+            return Err(refuse(format!(
+                "entry {index}'s name is {} bytes (the limit is {})",
+                name.len(),
+                limits.path
+            )));
+        }
         let components = entry_components(&name)?;
         if entry.is_symlink()
             || entry
@@ -322,6 +470,7 @@ fn unpack_inner(package: &Path, destination: &Path, limits: &Limits) -> Result<U
             )));
         }
         plan.push((index, components, is_dir));
+        in_time()?;
     }
     // A file and a folder of the same name cannot both be.
     let files: HashSet<_> = plan
@@ -359,6 +508,39 @@ fn unpack_inner(package: &Path, destination: &Path, limits: &Limits) -> Result<U
                 "InvalidPackage: it has no {MANIFEST_FILE} at its root"
             ))
         }
+    };
+    // A VS Code package built for one platform (EXT-30): this Yavin's, or refused -- before
+    // anything is written.
+    let platform = match format {
+        Format::Vsix if files.contains("extension.vsixmanifest") => {
+            let index = plan
+                .iter()
+                .find(|(_, c, dir)| !dir && c.join("/").to_lowercase() == "extension.vsixmanifest")
+                .map(|(i, _, _)| *i)
+                .ok_or_else(|| {
+                    "InvalidPackage: its extension.vsixmanifest cannot be read".to_string()
+                })?;
+            let entry = archive
+                .by_index(index)
+                .map_err(|e| format!("MalformedPackage: {e}"))?;
+            let mut text = String::new();
+            entry
+                .take(MAX_VSIXMANIFEST + 1)
+                .read_to_string(&mut text)
+                .map_err(|_| {
+                    "InvalidPackage: its extension.vsixmanifest is not UTF-8 text".to_string()
+                })?;
+            if text.len() as u64 > MAX_VSIXMANIFEST {
+                return Err(format!(
+                    "InvalidPackage: its extension.vsixmanifest is larger than {} KiB",
+                    MAX_VSIXMANIFEST / 1024
+                ));
+            }
+            let platform = target_platform(&text)?;
+            platform_check(platform.as_deref())?;
+            platform.filter(|p| p != "universal")
+        }
+        _ => None,
     };
 
     fs::create_dir(destination).map_err(|e| format!("InstallFailed: {e}"))?;
@@ -418,6 +600,7 @@ fn unpack_inner(package: &Path, destination: &Path, limits: &Limits) -> Result<U
             }
             out.write_all(&buffer[..read])
                 .map_err(|e| format!("InstallFailed: {e}"))?;
+            in_time()?;
         }
         count += 1;
     }
@@ -441,6 +624,7 @@ fn unpack_inner(package: &Path, destination: &Path, limits: &Limits) -> Result<U
         format,
         files: count,
         bytes: total,
+        platform,
     })
 }
 
@@ -620,6 +804,7 @@ pub mod tests {
             file: 1000,
             total: 1500,
             ratio: 100,
+            ..LIMITS
         };
         let many: Vec<(String, Vec<u8>)> =
             (0..5).map(|i| (format!("f{i}.txt"), vec![b'x'])).collect();
@@ -674,5 +859,250 @@ pub mod tests {
             );
         }
         assert!(identity(&MANIFEST.replace("hello", &"h".repeat(50))).is_ok());
+    }
+    // --- EXT-30: limits from real packages, the platform a package is built for ----------------
+
+    /// `n` small files under nested folders, as an icon theme's or a language server's package.
+    fn many(n: usize) -> Vec<(String, Vec<u8>)> {
+        (0..n)
+            .map(|i| {
+                (
+                    format!("icons/{}/i{i}.svg", i % 40),
+                    format!("<svg>{i}</svg>").into_bytes(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_package_over_the_former_1000_entries_is_unpacked_whole() {
+        // pkief.material-icon-theme has 1278 entries, sumneko.lua 2732: legitimate, small.
+        let dir = temp("many");
+        let files = many(2800);
+        let mut entries = vec![(MANIFEST_FILE, MANIFEST.as_bytes())];
+        entries.extend(files.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
+        let path = package(&dir, &entries);
+        let out = dir.join("out");
+        let unpacked = unpack(&path, &out, &LIMITS).unwrap();
+        assert_eq!(unpacked.files, 2801);
+        assert!(out.join("icons/39/i2799.svg").is_file());
+        // Its installed copy's digest covers every file (EXT-15): within its bounds.
+        assert!(tree_digest(&out).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_entry_count_is_still_bounded() {
+        let files = many(LIMITS.entries);
+        let mut entries = vec![(MANIFEST_FILE, MANIFEST.as_bytes())];
+        entries.extend(files.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
+        let error = refused(&entries, &LIMITS);
+        assert!(
+            error.contains(&format!(
+                "{} entries (the limit is 5000)",
+                LIMITS.entries + 1
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn long_names_and_deep_nesting_are_refused() {
+        let m = (MANIFEST_FILE, MANIFEST.as_bytes());
+        let long = format!("{}/x.js", "a".repeat(LIMITS.path));
+        let error = refused(&[m, (long.as_str(), b"x")], &LIMITS);
+        assert!(error.contains("the limit is 400"), "{error}");
+        let deep = format!("{}x.js", "d/".repeat(33));
+        let error = refused(&[m, (deep.as_str(), b"x")], &LIMITS);
+        assert!(error.contains("nested too deeply"), "{error}");
+        // The longest measured (116 bytes, nine deep) is fine.
+        let ok = format!("{}/{}.js", ["n"; 8].join("/"), "f".repeat(100));
+        let dir = temp("longok");
+        let path = package(&dir, &[m, (ok.as_str(), b"x")]);
+        assert!(unpack(&path, &dir.join("out"), &LIMITS).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unpacking_is_bounded_in_time_and_leaves_nothing_when_it_stops() {
+        let files = many(50);
+        let mut entries = vec![(MANIFEST_FILE, MANIFEST.as_bytes())];
+        entries.extend(files.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
+        let none = Limits {
+            time: std::time::Duration::ZERO,
+            ..LIMITS
+        };
+        let error = refused(&entries, &none);
+        assert!(error.contains("took longer than 0 s"), "{error}");
+    }
+
+    #[test]
+    fn a_refusal_after_files_were_written_removes_them_all() {
+        // 200 files are written, then the last entry is a bomb: nothing of the package is left
+        // to be taken for an installed copy (`refused` checks the folder is gone).
+        let files = many(200);
+        let zeros = vec![0u8; 3 * 1024 * 1024];
+        let mut entries = vec![(MANIFEST_FILE, MANIFEST.as_bytes())];
+        entries.extend(files.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
+        entries.push(("zz/bomb.bin", &zeros));
+        let error = refused(&entries, &LIMITS);
+        assert!(error.contains("compressed more than 100:1"), "{error}");
+    }
+
+    const VSIX_JSON: &str =
+        r#"{"publisher":"acme","name":"hello","version":"1.0.0","engines":{"vscode":"^1.80.0"}}"#;
+
+    pub fn vsixmanifest(platform: Option<&str>) -> String {
+        let attribute = platform.map_or(String::new(), |p| format!(r#" TargetPlatform="{p}""#));
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?><PackageManifest Version="2.0.0"><Metadata><Identity Language="en-US" Id="hello" Version="1.0.0" Publisher="acme"{attribute}/></Metadata></PackageManifest>"#
+        )
+    }
+
+    /// A platform other than this Yavin's.
+    pub fn elsewhere() -> &'static str {
+        if HOST_PLATFORM == "darwin-arm64" {
+            "linux-x64"
+        } else {
+            "darwin-arm64"
+        }
+    }
+
+    #[test]
+    fn a_vsixmanifests_target_platform_is_read_strictly() {
+        assert_eq!(target_platform(&vsixmanifest(None)).unwrap(), None);
+        // No <Identity> at all: no claim (the EXT-04 fixtures' bare manifest).
+        assert_eq!(target_platform("<PackageManifest/>").unwrap(), None);
+        for p in TARGET_PLATFORMS {
+            assert_eq!(
+                target_platform(&vsixmanifest(Some(p))).unwrap().as_deref(),
+                Some(p)
+            );
+        }
+        // Single quotes and spacing are XML.
+        assert_eq!(
+            target_platform("<Identity Id='x' TargetPlatform = 'win32-x64' />")
+                .unwrap()
+                .as_deref(),
+            Some("win32-x64")
+        );
+        // Another attribute ending in the name is not it.
+        assert_eq!(
+            target_platform(r#"<Identity XTargetPlatform="linux-x64"/>"#).unwrap(),
+            None
+        );
+        for (text, why) in [
+            (vsixmanifest(Some("win32-x65")), "not a platform"),
+            (vsixmanifest(Some("")), "not a platform"),
+            (
+                format!("{}{}", vsixmanifest(None), vsixmanifest(None)),
+                "two <Identity>",
+            ),
+            (
+                r#"<Identity TargetPlatform="win32-x64" TargetPlatform="linux-x64"/>"#.into(),
+                "named twice",
+            ),
+            (
+                r#"<Identity TargetPlatform=win32-x64/>"#.into(),
+                "not a quoted",
+            ),
+            (
+                r#"<Identity TargetPlatform="win32-x64/>"#.into(),
+                "not closed",
+            ),
+            (r#"<Identity Id="x""#.into(), "malformed"),
+        ] {
+            let error = target_platform(&text).unwrap_err();
+            assert!(
+                error.starts_with("InvalidPackage") && error.contains(why),
+                "{text}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_vs_code_package_for_this_platform_or_every_one_is_unpacked() {
+        let unpack_with = |platform: Option<&str>| {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = temp(&format!("platform-{n}"));
+            let manifest = vsixmanifest(platform);
+            let path = package(
+                &dir,
+                &[
+                    ("extension.vsixmanifest", manifest.as_bytes()),
+                    (VSIX_MANIFEST, VSIX_JSON.as_bytes()),
+                    ("extension/bin/tool.exe", b"MZ"),
+                ],
+            );
+            let out = dir.join("out");
+            let result = unpack(&path, &out, &LIMITS);
+            let left = out.exists();
+            let _ = fs::remove_dir_all(&dir);
+            (result, left)
+        };
+        let (ok, _) = unpack_with(None);
+        assert_eq!(ok.unwrap().platform, None, "built for every platform");
+        let (ok, _) = unpack_with(Some("universal"));
+        assert_eq!(ok.unwrap().platform, None);
+        let (ok, _) = unpack_with(Some(HOST_PLATFORM));
+        assert_eq!(ok.unwrap().platform.as_deref(), Some(HOST_PLATFORM));
+        for other in [elsewhere(), "web"] {
+            let (error, left) = unpack_with(Some(other));
+            let error = error.unwrap_err();
+            assert!(
+                error.starts_with("UnsupportedPlatform") && error.contains(other),
+                "{other}: {error}"
+            );
+            assert!(!left, "{other}: refused before anything was written");
+        }
+        let (error, left) = unpack_with(Some("amiga-68k"));
+        assert!(error.unwrap_err().contains("not a platform"));
+        assert!(!left);
+    }
+
+    /// `n` hex digits that deflate about 2:1.
+    fn noise(n: usize) -> String {
+        let mut out = String::with_capacity(n + 64);
+        let mut block = Sha256::digest(b"noise");
+        while out.len() < n {
+            out.push_str(&hex(&block));
+            block = Sha256::digest(block);
+        }
+        out.truncate(n);
+        out
+    }
+
+    #[test]
+    fn a_vs_code_manifest_up_to_2_mib_is_read() {
+        // GitLens's package.json is 1066 KiB.
+        let padded = |n: usize| {
+            VSIX_JSON.replace(
+                r#""engines""#,
+                // Hex of a running hash: text that does not compress past the 100:1 ratio.
+                &format!(r#""pad":"{}","engines""#, noise(n)),
+            )
+        };
+        let read = |json: &str, name: &str| {
+            let dir = temp(name);
+            let manifest = vsixmanifest(None);
+            let path = package(
+                &dir,
+                &[
+                    ("extension.vsixmanifest", manifest.as_bytes()),
+                    (VSIX_MANIFEST, json.as_bytes()),
+                ],
+            );
+            let out = dir.join("out");
+            let result = unpack(&path, &out, &LIMITS);
+            let left = out.exists();
+            let _ = fs::remove_dir_all(&dir);
+            (result, left)
+        };
+        let json = padded(1100 * 1024);
+        assert_eq!(read(&json, "bigjson").0.unwrap().manifest, json);
+        let (error, left) = read(&padded(2100 * 1024), "hugejson");
+        assert!(error.unwrap_err().contains("larger than 2048 KiB"));
+        assert!(!left);
     }
 }

@@ -1,0 +1,118 @@
+{
+  "registry": "https://open-vsx.org/",
+  "results": [
+    {
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "232aeafb01f069824fdd92d3e628c1c442bbcfa1d3cc945ff97076340bb2b4a6",
+        "signature": "registrySigned",
+        "size": 6826731
+      },
+      "id": "ms-python.python",
+      "installMs": 16581,
+      "name": "python",
+      "namespace": "ms-python",
+      "unpack": {
+        "error": "UnsafePackage: it has 2382 entries (the limit is 1000)",
+        "ok": false
+      },
+      "version": "2026.4.0"
+    },
+    {
+      "adapt": {
+        "manifest": {
+          "activationEvents": ["onCommand:vscode.simple-browser.simplebrowser-show-4f0364f8"],
+          "contributes": {
+            "commands": [
+              {
+                "category": "Simple Browser",
+                "command": "vscode.simple-browser.simplebrowser-show-4f0364f8",
+                "title": "Show"
+              }
+            ],
+            "configuration": {
+              "properties": {
+                "vscode.simple-browser.simplebrowser-focuslockindicator-enabled-a0e99d8e": {
+                  "default": true,
+                  "description": "Enable/disable the floating indicator that shows when focused in the simple browser.",
+                  "scope": "both",
+                  "title": "simpleBrowser.focusLockIndicator.enabled",
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "description": "A very basic built-in webview for displaying web content.",
+          "displayName": "Simple Browser (built-in)",
+          "engines": {
+            "yavin": "^2.1.0"
+          },
+          "main": "extension/dist/browser/extension.js",
+          "manifestVersion": 1,
+          "name": "simple-browser",
+          "permissions": {
+            "request": [
+              "documents.edit",
+              "documents.read",
+              "editor.control",
+              "secrets",
+              "workspace.fs.read"
+            ],
+            "version": 1
+          },
+          "publisher": "vscode",
+          "version": "1.95.3",
+          "vsix": {
+            "code": true,
+            "ignored": [
+              "Activation events Yavin does not raise: onOpenExternalUri:http, onOpenExternalUri:https, onWebviewPanel:simpleBrowser.view"
+            ],
+            "name": "simple-browser",
+            "publisher": "vscode",
+            "rejected": [],
+            "runtime": {
+              "api": "vscode",
+              "commands": {
+                "vscode.simple-browser.simplebrowser-show-4f0364f8": "simpleBrowser.show"
+              },
+              "defaults": {},
+              "entry": "browser",
+              "level": "1.90.0",
+              "settings": {
+                "vscode.simple-browser.simplebrowser-focuslockindicator-enabled-a0e99d8e": "simpleBrowser.focusLockIndicator.enabled"
+              },
+              "views": {}
+            },
+            "signature": "not verified",
+            "supported": [
+              "Its code (browser: dist/browser/extension.js) runs in Yavin's extension sandbox through the VS Code compatibility layer; VS Code APIs Yavin does not provide fail with an error naming them",
+              "1 command (Command Palette)",
+              "1 setting"
+            ],
+            "vscode": "^1.70.0"
+          }
+        },
+        "ok": true
+      },
+      "download": {
+        "keyId": "14ccb407-4e79-41ed-be5a-6d608325c45a",
+        "ok": true,
+        "sha256": "9c3694e2707ce18863d49b7447955e36f9faf9c98ca8035170795d08fa9844cb",
+        "signature": "registrySigned",
+        "size": 80166
+      },
+      "id": "vscode.simple-browser",
+      "installMs": 4560,
+      "name": "simple-browser",
+      "namespace": "vscode",
+      "unpack": {
+        "bytes": 184362,
+        "files": 16,
+        "format": "vsix",
+        "ok": true
+      },
+      "version": "1.95.3"
+    }
+  ]
+}

@@ -18,3 +18,5 @@ rquickjs = { version = "0.14", default-features = false }
 serde_json = { workspace = true }
 # The Content-Length framing shared with the language servers and debug adapters.
 ide-workspace = { path = "../ide-workspace" }
+# crypto.getRandomValues (EXT-28): the operating system's random source (ProcessPrng on Windows).
+getrandom = "0.3"

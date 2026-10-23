@@ -75,16 +75,24 @@ for (const m of chosen) {
     for (const [file, text] of files) writeFileSync(file, text);
     const caught = [];
     let broken = false;
+    let blocked = false;
     for (const args of [m.args, ...(m.also ?? [])]) {
       const { out } = cargo(args);
       if (/^error(\[E\d+\])?: /m.test(out) && !/test result/.test(out)) broken = true;
-      if (out.includes("os error 4551")) broken = true;
+      // Smart App Control refused a test binary or the host it starts (4551): proves nothing.
+      if (/os error 4551|code: 4551|Windows error 4551/.test(out)) blocked = true;
       caught.push(
         ...[...out.matchAll(/^---- (\S+) stdout/gm)].map((x) => x[1].replace(/^.*::/, "")),
       );
     }
-    verdict = caught.length ? "caught" : broken ? "BROKEN" : "NOT CAUGHT";
-    detail = caught.length ? caught.slice(0, 3).join(", ") : broken ? "did not build or run" : "";
+    verdict = blocked ? "BROKEN" : caught.length ? "caught" : broken ? "BROKEN" : "NOT CAUGHT";
+    detail = blocked
+      ? "blocked by Smart App Control (4551)"
+      : caught.length
+        ? caught.slice(0, 3).join(", ")
+        : broken
+          ? "did not build or run"
+          : "";
   } finally {
     const saved = new Map(pending);
     restore();

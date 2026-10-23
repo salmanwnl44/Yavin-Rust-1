@@ -110,8 +110,57 @@ const LABELS: Record<string, string> = {
   plaintext: "Plain Text",
 };
 
+/**
+ * Languages extensions contribute (EXT-25): their file extensions and names, for files Yavin
+ * does not know itself -- an extension adds languages; it never changes one of Yavin's own.
+ */
+let contributedNames = new Map<string, string>();
+let contributedExtensions: [string, string][] = [];
+let contributedLabels = new Map<string, string>();
+
+export interface ContributedLanguage {
+  id: string;
+  extensions: readonly string[];
+  filenames: readonly string[];
+  aliases: readonly string[];
+}
+
+/** Sets the contributed languages (in the order the first claim of a name or extension wins). */
+export function setContributedLanguages(languages: readonly ContributedLanguage[]): void {
+  const names = new Map<string, string>();
+  const extensions = new Map<string, string>();
+  const labels = new Map<string, string>();
+  for (const language of languages) {
+    for (const name of language.filenames)
+      if (!names.has(name.toLowerCase())) names.set(name.toLowerCase(), language.id);
+    for (const extension of language.extensions)
+      if (!extensions.has(extension.toLowerCase()))
+        extensions.set(extension.toLowerCase(), language.id);
+    if (language.aliases[0] && !labels.has(language.id))
+      labels.set(language.id, language.aliases[0]);
+  }
+  contributedNames = names;
+  // Longest first: `.blade.php` before `.php`.
+  contributedExtensions = [...extensions].sort((a, b) => b[0].length - a[0].length);
+  contributedLabels = labels;
+}
+
 /** The language of a file called `name` (a path works too); `plaintext` when unknown. */
 export function languageFor(name: string): string {
+  const own = builtinLanguageFor(name);
+  if (own !== "plaintext") return own;
+  const base = name
+    .slice(Math.max(name.lastIndexOf("/"), name.lastIndexOf("\\")) + 1)
+    .toLowerCase();
+  if (base.endsWith(".txt")) return own;
+  const named = contributedNames.get(base);
+  if (named) return named;
+  for (const [extension, id] of contributedExtensions)
+    if (base.endsWith(extension) && base.length > extension.length) return id;
+  return own;
+}
+
+function builtinLanguageFor(name: string): string {
   const base = name.slice(Math.max(name.lastIndexOf("/"), name.lastIndexOf("\\")) + 1);
   const lower = base.toLowerCase();
   const named = BY_NAME[lower];
@@ -126,4 +175,4 @@ export function languageFor(name: string): string {
 }
 
 /** What the status bar calls a language id. */
-export const languageLabel = (id: string): string => LABELS[id] ?? id;
+export const languageLabel = (id: string): string => LABELS[id] ?? contributedLabels.get(id) ?? id;

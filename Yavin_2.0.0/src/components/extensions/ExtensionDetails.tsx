@@ -1,4 +1,5 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
+import { vscodeCompatibility } from "../../services/extensions/vscodeCompatibility";
 import type { DeclarativeContributions } from "../../services/extensions/declarative";
 import type { ExtensionHostManager } from "../../services/extensions/manager";
 import type { ExtensionRegistry } from "../../services/extensions/registry";
@@ -179,6 +180,16 @@ export function ExtensionDetails({
   const latest = extension ? marketplace.latestCompatible(extension) : null;
   const compatibility = extension ? marketplace.compatibility(extension, latest?.version) : null;
   const runtime = state.runtime.statuses[id];
+  // EXT-25: a VS Code extension's verdict, from its report and what its code did here.
+  const unsupportedApis = state.runtime.unsupported?.[id] ?? [];
+  const vscode = manifest?.vsix
+    ? vscodeCompatibility(
+        manifest.vsix,
+        runtime ?? null,
+        unsupportedApis,
+        applied?.problems[id] ?? [],
+      )
+    : null;
   const report = (promise: Promise<unknown>) => void promise.catch(() => undefined);
 
   const commands = manifest
@@ -380,9 +391,9 @@ export function ExtensionDetails({
             data-testid="vsix-notice"
             className="mx-8 mt-3 rounded border border-amber-900/60 bg-amber-950/30 px-3 py-2 text-[12px] text-amber-200/90"
           >
-            A VS Code extension: Yavin installed only {manifest.vsix.supported.join(", ")}.
-            {manifest.vsix.code &&
-              " Its code does not run in Yavin, so its commands and other features are not available."}{" "}
+            {manifest.vsix.runtime
+              ? `A VS Code extension (${vscode?.verdict ?? "Not verified"}): its code runs in Yavin's sandbox through the VS Code compatibility layer, with only the permissions you allow; VS Code features Yavin does not provide fail with an error naming them.`
+              : `A VS Code extension: Yavin installed only ${manifest.vsix.supported.join(", ")}.${manifest.vsix.code ? " Its code does not run in Yavin, so its commands and other features are not available." : ""}`}{" "}
             Details are under Requirements.
           </p>
         )}
@@ -500,15 +511,19 @@ export function ExtensionDetails({
                 (this Yavin: {EXTENSION_API})
               </Row>
               <Row label="Kind">
-                {manifest?.vsix || latest?.packageFormat === "vsix"
-                  ? "A VS Code extension: its code never runs in Yavin; only its colour themes and snippets install."
-                  : (manifest
-                        ? manifest.main
-                          ? "code"
-                          : "declarative"
-                        : extension?.extensionKind) === "declarative"
-                    ? "Declarative: it only contributes; no code runs."
-                    : "Runs code in Yavin's extension host (needs a trusted folder)."}
+                {manifest?.vsix
+                  ? manifest.vsix.runtime
+                    ? "A VS Code extension: its code runs in Yavin's extension sandbox through the VS Code compatibility layer (needs a trusted folder)."
+                    : "A VS Code extension: its declarative contributions install; its code does not run."
+                  : latest?.packageFormat === "vsix"
+                    ? "A VS Code extension (not verified until installed)."
+                    : (manifest
+                          ? manifest.main
+                            ? "code"
+                            : "declarative"
+                          : extension?.extensionKind) === "declarative"
+                      ? "Declarative: it only contributes; no code runs."
+                      : "Runs code in Yavin's extension host (needs a trusted folder)."}
               </Row>
               {(manifest?.dependencies.length ?? 0) > 0 && (
                 <Row label="Depends on">{manifest!.dependencies.join(", ")}</Row>
@@ -556,11 +571,43 @@ export function ExtensionDetails({
               )}
             </Section>
           )}
-          {tab === "requirements" && manifest?.vsix && (
+          {tab === "requirements" && manifest?.vsix && vscode && (
             <Section title="VS Code compatibility">
-              <div data-testid="vsix-report">
-                {manifest.vsix.vscode && <Row label="Made for">VS Code {manifest.vsix.vscode}</Row>}
-                <Row label="Installed">{manifest.vsix.supported.join("; ")}</Row>
+              <div data-testid="vsix-report" data-verdict={vscode.verdict}>
+                <Row label="Verdict">
+                  <span
+                    data-testid="vsix-verdict"
+                    className={
+                      vscode.verdict === "Compatible"
+                        ? "text-emerald-300"
+                        : vscode.verdict === "Incompatible"
+                          ? "text-red-300"
+                          : "text-amber-300"
+                    }
+                  >
+                    {vscode.verdict}
+                  </span>
+                  {vscode.reasons.length > 0 && <span> — {vscode.reasons.join(" ")}</span>}
+                </Row>
+                {manifest.vsix.vscode && (
+                  <Row label="Made for">
+                    VS Code {manifest.vsix.vscode} (shown, not enforced: Yavin provides the APIs
+                    listed in its compatibility inventory, not a VS Code version)
+                  </Row>
+                )}
+                <Row label="Installed">{vscode.installed}</Row>
+                <Row label="Activation">
+                  <span data-testid="vsix-activation">{vscode.activation}</span>
+                </Row>
+                {unsupportedApis.length > 0 && (
+                  <Row label="Used, not provided">
+                    <ul className="list-disc pl-4" data-testid="vsix-unsupported">
+                      {unsupportedApis.map((line) => (
+                        <li key={line}>{line}</li>
+                      ))}
+                    </ul>
+                  </Row>
+                )}
                 {manifest.vsix.ignored.length > 0 && (
                   <Row label="Not supported">
                     <ul className="list-disc pl-4">

@@ -1,0 +1,469 @@
+{
+  "about": "EXT-25 Open VSX benchmark: real extensions, pinned versions (resolved 2026-10-20 on open-vsx.org). Categories are the module spec's 14.",
+  "categories": {
+    "themes": "Themes and icon themes",
+    "grammars": "Grammars and snippets",
+    "langconfig": "Language configuration",
+    "formatters": "Formatters",
+    "linters": "Linters and diagnostics",
+    "lsp": "Language servers",
+    "providers": "Completion, hover and definitions",
+    "commands": "Commands, menus, keybindings, status bar",
+    "views": "Explorer and custom views",
+    "scm": "Source control",
+    "testing": "Testing",
+    "debuggers": "Debuggers",
+    "webviews": "Webviews and custom editors",
+    "productivity": "Productivity"
+  },
+  "extensions": [
+    {
+      "category": "themes",
+      "namespace": "dracula-theme",
+      "name": "theme-dracula",
+      "version": "2.25.1",
+      "page": "https://open-vsx.org/extension/dracula-theme/theme-dracula"
+    },
+    {
+      "category": "themes",
+      "namespace": "zhuangtongfa",
+      "name": "material-theme",
+      "version": "3.20.3",
+      "page": "https://open-vsx.org/extension/zhuangtongfa/material-theme"
+    },
+    {
+      "category": "themes",
+      "namespace": "GitHub",
+      "name": "github-vscode-theme",
+      "version": "6.3.5",
+      "page": "https://open-vsx.org/extension/GitHub/github-vscode-theme"
+    },
+    {
+      "category": "themes",
+      "namespace": "jdinhlife",
+      "name": "gruvbox",
+      "version": "1.29.1",
+      "page": "https://open-vsx.org/extension/jdinhlife/gruvbox"
+    },
+    {
+      "category": "themes",
+      "namespace": "PKief",
+      "name": "material-icon-theme",
+      "version": "5.39.0",
+      "page": "https://open-vsx.org/extension/PKief/material-icon-theme"
+    },
+    {
+      "category": "themes",
+      "namespace": "vscode-icons-team",
+      "name": "vscode-icons",
+      "version": "13.0.0",
+      "page": "https://open-vsx.org/extension/vscode-icons-team/vscode-icons"
+    },
+    {
+      "category": "themes",
+      "namespace": "Catppuccin",
+      "name": "catppuccin-vsc",
+      "version": "3.19.0",
+      "page": "https://open-vsx.org/extension/Catppuccin/catppuccin-vsc"
+    },
+    {
+      "category": "grammars",
+      "namespace": "scala-lang",
+      "name": "scala",
+      "version": "0.5.10",
+      "page": "https://open-vsx.org/extension/scala-lang/scala"
+    },
+    {
+      "category": "grammars",
+      "namespace": "mathiasfrohlich",
+      "name": "Kotlin",
+      "version": "1.7.1",
+      "page": "https://open-vsx.org/extension/mathiasfrohlich/Kotlin"
+    },
+    {
+      "category": "grammars",
+      "namespace": "slevesque",
+      "name": "shader",
+      "version": "1.1.5",
+      "page": "https://open-vsx.org/extension/slevesque/shader"
+    },
+    {
+      "category": "grammars",
+      "namespace": "bungcip",
+      "name": "better-toml",
+      "version": "0.3.2",
+      "page": "https://open-vsx.org/extension/bungcip/better-toml"
+    },
+    {
+      "category": "grammars",
+      "namespace": "jeff-hykin",
+      "name": "better-cpp-syntax",
+      "version": "1.27.1",
+      "page": "https://open-vsx.org/extension/jeff-hykin/better-cpp-syntax"
+    },
+    {
+      "category": "grammars",
+      "namespace": "13xforever",
+      "name": "language-x86-64-assembly",
+      "version": "3.1.5",
+      "page": "https://open-vsx.org/extension/13xforever/language-x86-64-assembly"
+    },
+    {
+      "category": "langconfig",
+      "namespace": "mrmlnc",
+      "name": "vscode-apache",
+      "version": "1.2.0",
+      "page": "https://open-vsx.org/extension/mrmlnc/vscode-apache"
+    },
+    {
+      "category": "langconfig",
+      "namespace": "coolbear",
+      "name": "systemd-unit-file",
+      "version": "1.0.6",
+      "page": "https://open-vsx.org/extension/coolbear/systemd-unit-file"
+    },
+    {
+      "category": "langconfig",
+      "namespace": "nwolverson",
+      "name": "language-purescript",
+      "version": "0.2.10",
+      "page": "https://open-vsx.org/extension/nwolverson/language-purescript"
+    },
+    {
+      "category": "langconfig",
+      "namespace": "tamasfe",
+      "name": "even-better-toml",
+      "version": "0.21.2",
+      "page": "https://open-vsx.org/extension/tamasfe/even-better-toml"
+    },
+    {
+      "category": "formatters",
+      "namespace": "esbenp",
+      "name": "prettier-vscode",
+      "version": "12.4.0",
+      "page": "https://open-vsx.org/extension/esbenp/prettier-vscode"
+    },
+    {
+      "category": "formatters",
+      "namespace": "foxundermoon",
+      "name": "shell-format",
+      "version": "7.2.8",
+      "page": "https://open-vsx.org/extension/foxundermoon/shell-format"
+    },
+    {
+      "category": "formatters",
+      "namespace": "ms-python",
+      "name": "black-formatter",
+      "version": "2025.2.0",
+      "page": "https://open-vsx.org/extension/ms-python/black-formatter"
+    },
+    {
+      "category": "formatters",
+      "namespace": "xaver",
+      "name": "clang-format",
+      "version": "1.9.0",
+      "page": "https://open-vsx.org/extension/xaver/clang-format"
+    },
+    {
+      "category": "linters",
+      "namespace": "dbaeumer",
+      "name": "vscode-eslint",
+      "version": "3.0.34",
+      "page": "https://open-vsx.org/extension/dbaeumer/vscode-eslint"
+    },
+    {
+      "category": "linters",
+      "namespace": "streetsidesoftware",
+      "name": "code-spell-checker",
+      "version": "4.10.0",
+      "page": "https://open-vsx.org/extension/streetsidesoftware/code-spell-checker"
+    },
+    {
+      "category": "linters",
+      "namespace": "timonwong",
+      "name": "shellcheck",
+      "version": "0.48.1",
+      "page": "https://open-vsx.org/extension/timonwong/shellcheck"
+    },
+    {
+      "category": "linters",
+      "namespace": "DavidAnson",
+      "name": "vscode-markdownlint",
+      "version": "0.62.1",
+      "page": "https://open-vsx.org/extension/DavidAnson/vscode-markdownlint"
+    },
+    {
+      "category": "linters",
+      "namespace": "charliermarsh",
+      "name": "ruff",
+      "version": "2026.88.0",
+      "page": "https://open-vsx.org/extension/charliermarsh/ruff"
+    },
+    {
+      "category": "lsp",
+      "namespace": "redhat",
+      "name": "vscode-yaml",
+      "version": "2.1.2026102008",
+      "page": "https://open-vsx.org/extension/redhat/vscode-yaml"
+    },
+    {
+      "category": "lsp",
+      "namespace": "rust-lang",
+      "name": "rust-analyzer",
+      "version": "0.4.3090",
+      "page": "https://open-vsx.org/extension/rust-lang/rust-analyzer"
+    },
+    {
+      "category": "lsp",
+      "namespace": "golang",
+      "name": "Go",
+      "version": "0.56.1",
+      "page": "https://open-vsx.org/extension/golang/Go"
+    },
+    {
+      "category": "lsp",
+      "namespace": "llvm-vs-code-extensions",
+      "name": "vscode-clangd",
+      "version": "0.6.0",
+      "page": "https://open-vsx.org/extension/llvm-vs-code-extensions/vscode-clangd"
+    },
+    {
+      "category": "lsp",
+      "namespace": "sumneko",
+      "name": "lua",
+      "version": "3.19.2",
+      "page": "https://open-vsx.org/extension/sumneko/lua"
+    },
+    {
+      "category": "providers",
+      "namespace": "christian-kohler",
+      "name": "path-intellisense",
+      "version": "2.8.0",
+      "page": "https://open-vsx.org/extension/christian-kohler/path-intellisense"
+    },
+    {
+      "category": "providers",
+      "namespace": "christian-kohler",
+      "name": "npm-intellisense",
+      "version": "1.4.5",
+      "page": "https://open-vsx.org/extension/christian-kohler/npm-intellisense"
+    },
+    {
+      "category": "providers",
+      "namespace": "Zignd",
+      "name": "html-css-class-completion",
+      "version": "1.20.0",
+      "page": "https://open-vsx.org/extension/Zignd/html-css-class-completion"
+    },
+    {
+      "category": "providers",
+      "namespace": "formulahendry",
+      "name": "auto-rename-tag",
+      "version": "0.1.10",
+      "page": "https://open-vsx.org/extension/formulahendry/auto-rename-tag"
+    },
+    {
+      "category": "commands",
+      "namespace": "Tyriar",
+      "name": "sort-lines",
+      "version": "1.12.0",
+      "page": "https://open-vsx.org/extension/Tyriar/sort-lines"
+    },
+    {
+      "category": "commands",
+      "namespace": "wmaurer",
+      "name": "change-case",
+      "version": "1.0.0",
+      "page": "https://open-vsx.org/extension/wmaurer/change-case"
+    },
+    {
+      "category": "commands",
+      "namespace": "alefragnani",
+      "name": "Bookmarks",
+      "version": "14.1.1",
+      "page": "https://open-vsx.org/extension/alefragnani/Bookmarks"
+    },
+    {
+      "category": "commands",
+      "namespace": "vscodevim",
+      "name": "vim",
+      "version": "1.32.4",
+      "page": "https://open-vsx.org/extension/vscodevim/vim"
+    },
+    {
+      "category": "commands",
+      "namespace": "stkb",
+      "name": "rewrap",
+      "version": "1.16.3",
+      "page": "https://open-vsx.org/extension/stkb/rewrap"
+    },
+    {
+      "category": "views",
+      "namespace": "Gruntfuggly",
+      "name": "todo-tree",
+      "version": "0.0.215",
+      "page": "https://open-vsx.org/extension/Gruntfuggly/todo-tree"
+    },
+    {
+      "category": "views",
+      "namespace": "alefragnani",
+      "name": "project-manager",
+      "version": "13.1.1",
+      "page": "https://open-vsx.org/extension/alefragnani/project-manager"
+    },
+    {
+      "category": "views",
+      "namespace": "sleistner",
+      "name": "vscode-fileutils",
+      "version": "3.10.3",
+      "page": "https://open-vsx.org/extension/sleistner/vscode-fileutils"
+    },
+    {
+      "category": "scm",
+      "namespace": "eamodio",
+      "name": "gitlens",
+      "version": "2026.10.200514",
+      "page": "https://open-vsx.org/extension/eamodio/gitlens"
+    },
+    {
+      "category": "scm",
+      "namespace": "mhutchie",
+      "name": "git-graph",
+      "version": "1.30.0",
+      "page": "https://open-vsx.org/extension/mhutchie/git-graph"
+    },
+    {
+      "category": "scm",
+      "namespace": "donjayamanne",
+      "name": "githistory",
+      "version": "0.6.20",
+      "page": "https://open-vsx.org/extension/donjayamanne/githistory"
+    },
+    {
+      "category": "scm",
+      "namespace": "waderyan",
+      "name": "gitblame",
+      "version": "14.0.0",
+      "page": "https://open-vsx.org/extension/waderyan/gitblame"
+    },
+    {
+      "category": "testing",
+      "namespace": "hbenl",
+      "name": "vscode-test-explorer",
+      "version": "2.22.1",
+      "page": "https://open-vsx.org/extension/hbenl/vscode-test-explorer"
+    },
+    {
+      "category": "testing",
+      "namespace": "vitest",
+      "name": "explorer",
+      "version": "1.52.2",
+      "page": "https://open-vsx.org/extension/vitest/explorer"
+    },
+    {
+      "category": "testing",
+      "namespace": "Orta",
+      "name": "vscode-jest",
+      "version": "6.4.4",
+      "page": "https://open-vsx.org/extension/Orta/vscode-jest"
+    },
+    {
+      "category": "debuggers",
+      "namespace": "vadimcn",
+      "name": "vscode-lldb",
+      "version": "1.12.3",
+      "page": "https://open-vsx.org/extension/vadimcn/vscode-lldb"
+    },
+    {
+      "category": "debuggers",
+      "namespace": "ms-python",
+      "name": "debugpy",
+      "version": "2026.6.0",
+      "page": "https://open-vsx.org/extension/ms-python/debugpy"
+    },
+    {
+      "category": "debuggers",
+      "namespace": "firefox-devtools",
+      "name": "vscode-firefox-debug",
+      "version": "2.15.0",
+      "page": "https://open-vsx.org/extension/firefox-devtools/vscode-firefox-debug"
+    },
+    {
+      "category": "webviews",
+      "namespace": "hediet",
+      "name": "vscode-drawio",
+      "version": "1.6.6",
+      "page": "https://open-vsx.org/extension/hediet/vscode-drawio"
+    },
+    {
+      "category": "webviews",
+      "namespace": "tomoki1207",
+      "name": "pdf",
+      "version": "1.2.2",
+      "page": "https://open-vsx.org/extension/tomoki1207/pdf"
+    },
+    {
+      "category": "webviews",
+      "namespace": "jock",
+      "name": "svg",
+      "version": "1.5.3",
+      "page": "https://open-vsx.org/extension/jock/svg"
+    },
+    {
+      "category": "webviews",
+      "namespace": "shd101wyy",
+      "name": "markdown-preview-enhanced",
+      "version": "0.8.40",
+      "page": "https://open-vsx.org/extension/shd101wyy/markdown-preview-enhanced"
+    },
+    {
+      "category": "productivity",
+      "namespace": "EditorConfig",
+      "name": "EditorConfig",
+      "version": "0.18.2",
+      "page": "https://open-vsx.org/extension/EditorConfig/EditorConfig"
+    },
+    {
+      "category": "productivity",
+      "namespace": "usernamehw",
+      "name": "errorlens",
+      "version": "3.29.0",
+      "page": "https://open-vsx.org/extension/usernamehw/errorlens"
+    },
+    {
+      "category": "productivity",
+      "namespace": "oderwat",
+      "name": "indent-rainbow",
+      "version": "8.3.1",
+      "page": "https://open-vsx.org/extension/oderwat/indent-rainbow"
+    },
+    {
+      "category": "productivity",
+      "namespace": "yzhang",
+      "name": "markdown-all-in-one",
+      "version": "3.6.2",
+      "page": "https://open-vsx.org/extension/yzhang/markdown-all-in-one"
+    },
+    {
+      "category": "productivity",
+      "namespace": "naumovs",
+      "name": "color-highlight",
+      "version": "2.8.0",
+      "page": "https://open-vsx.org/extension/naumovs/color-highlight"
+    },
+    {
+      "category": "productivity",
+      "namespace": "aaron-bond",
+      "name": "better-comments",
+      "version": "3.0.2",
+      "page": "https://open-vsx.org/extension/aaron-bond/better-comments"
+    },
+    {
+      "category": "productivity",
+      "namespace": "mechatroner",
+      "name": "rainbow-csv",
+      "version": "3.24.1",
+      "page": "https://open-vsx.org/extension/mechatroner/rainbow-csv"
+    }
+  ]
+}
