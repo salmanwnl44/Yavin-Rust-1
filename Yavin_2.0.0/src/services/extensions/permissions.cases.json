@@ -697,6 +697,88 @@
         "collection": "acme.hello#diagnostics#1"
       },
       "need": "none"
+    },
+    {
+      "method": "webview.create",
+      "params": {
+        "id": "acme.hello#webview#1"
+      },
+      "need": "none"
+    },
+    {
+      "method": "webview.create",
+      "params": {
+        "id": "other.ext#webview#1"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "webview.update",
+      "params": {
+        "id": "acme.hello#webview#1"
+      },
+      "need": "none"
+    },
+    {
+      "method": "webview.update",
+      "params": {
+        "id": "other.ext#webview#1"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "webview.postMessage",
+      "params": {
+        "id": "acme.hello#webview#1"
+      },
+      "need": "none"
+    },
+    {
+      "method": "webview.postMessage",
+      "params": {
+        "id": "other.ext#webview#1"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "webview.reveal",
+      "params": {
+        "id": "acme.hello#webview#1"
+      },
+      "need": "none"
+    },
+    {
+      "method": "webview.reveal",
+      "params": {
+        "id": "other.ext#webview#1"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "webview.dispose",
+      "params": {
+        "id": "acme.hello#webview#1"
+      },
+      "need": "none"
+    },
+    {
+      "method": "webview.dispose",
+      "params": {
+        "id": "other.ext#webview#1"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "webview.create",
+      "params": {},
+      "need": "invalid"
+    },
+    {
+      "method": "webview.postMessage",
+      "params": {
+        "id": "acme.hello.x#webview#1"
+      },
+      "need": "notOwned"
     }
   ],
   "events": [
@@ -743,6 +825,18 @@
     {
       "event": "files.change",
       "need": "workspace.fs.read"
+    },
+    {
+      "event": "webview.message",
+      "need": "none"
+    },
+    {
+      "event": "webview.viewState",
+      "need": "none"
+    },
+    {
+      "event": "webview.disposed",
+      "need": "none"
     }
   ]
 }

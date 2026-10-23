@@ -16,6 +16,7 @@ import { createProfileRegistry } from "./terminalProfiles.ts";
 import { createTerminalSettings } from "./terminalSettings.ts";
 import { createSettingsRegistry } from "./settings/settings.ts";
 import { ICON_THEME_SETTING, iconThemes } from "./extensions/iconThemes.ts";
+import { createWebviewStore } from "./extensions/webviews.ts";
 import { EDITOR_SETTING_LIST } from "../editor/editorSettings.ts";
 import { TASK_DEFINITIONS } from "./tasks/model.ts";
 import { createTaskService, type TaskService } from "./tasks/service.ts";
@@ -206,6 +207,21 @@ export const extensionDecorations = createDecorationStore();
 /** Extensions' status bar items (EXT-25), for the status bar. */
 export const extensionStatusBar = createStatusBarStore();
 /**
+ * Extensions' webview panels (EXT-31): pages served natively to isolated frames, as editor tabs
+ * (`extensions/webviews.ts`). Only the desktop application serves them.
+ */
+export const extensionWebviews = createWebviewStore(
+  {
+    open: (request) =>
+      isTauri()
+        ? native("extensions_webview_open", request)
+        : Promise.reject(new Error("Unavailable: webviews are shown by the desktop application.")),
+    update: (request) => native("extensions_webview_update", request).then(() => undefined),
+    close: (token) => native("extensions_webview_close", { token }).then(() => undefined),
+  },
+  (text) => console.warn(text),
+);
+/**
  * Enabled extensions' colour themes and snippets (EXT-04), read from their installed copy by
  * the native side; the editor applies them (`editor/declarativeMonaco.ts`).
  */
@@ -366,6 +382,7 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
           window: windowProxy,
           decorations: extensionDecorations,
           statusBar: extensionStatusBar,
+          webviews: extensionWebviews,
           providers: extensionProviders,
           // EXT-29: extensions' diagnostics in the Problems view, under owners of their own.
           problems: { publish: publishProblems, clear: clearProblems },

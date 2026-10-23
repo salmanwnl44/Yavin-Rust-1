@@ -308,8 +308,8 @@ const JUDGED = {
   "alefragnani.bookmarks": [
     "Bookmarks with gutter icons",
     "No",
-    ["webview", "coreapi"],
-    "Opens a webview at activation; gutter icons and selection events.",
+    ["coreapi"],
+    "Its What's New webview is created since EXT-31; activation then stops at workspace.fs.readFile of its own package file (refused: workspace.fs reaches the workspace only); gutter icons and selection events.",
   ],
   "vscodevim.vim": [
     "Vim emulation",
@@ -391,8 +391,8 @@ const JUDGED = {
   "jock.svg": [
     "SVG preview and editing",
     "Partly",
-    ["coreapi", "webview"],
-    "Its grammar and snippets apply; activates since EXT-29 (file watchers): minify and copy-data-URI run (3/6 commands); preview is a webview.",
+    ["coreapi"],
+    "Its grammar and snippets apply; minify and copy-data-URI run. Since EXT-31 its webviews open (packaged test webview-svg.spec.ts: Preview All's page loads sandboxed and its message reaches the extension), but Preview All then stops at workspace.findFiles (unsupported), and Preview SVG previews only documents whose language is svg, while Yavin keeps .svg as its own XML (EXT-25).",
   ],
   "shd101wyy.markdown-preview-enhanced": [
     "Markdown preview",

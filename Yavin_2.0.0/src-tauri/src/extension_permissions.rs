@@ -194,6 +194,8 @@ pub fn need_of_event(event: &str) -> Need {
     match event {
         // EXT-27: whether the window is focused -- nothing of the user's work.
         "configuration.changed" | "window.state" => Need::Nothing,
+        // EXT-31: its own webview panels' messages, view state and disposal (to the owner only).
+        "webview.message" | "webview.viewState" | "webview.disposed" => Need::Nothing,
         "documents.open" | "documents.change" | "documents.close" | "editor.active" => {
             Need::Capability(DOCUMENTS_READ.into())
         }
@@ -219,6 +221,12 @@ pub fn need_of_request(caller: &str, method: &str, params: &Value) -> Need {
         "languages.register" | "languages.unregister" => owned(params, "providerId", caller, '#'),
         // Its own status bar items (EXT-25): `<id>#status#<n>`, shown in Yavin's own style.
         "statusBar.set" | "statusBar.remove" => owned(params, "id", caller, '#'),
+        // EXT-31: its own webview panels (`<id>#webview#<n>`), shown in isolated frames.
+        "webview.create"
+        | "webview.update"
+        | "webview.postMessage"
+        | "webview.reveal"
+        | "webview.dispose" => owned(params, "id", caller, '#'),
         // EXT-29: its own prompts (`<id>#prompt#<n>`): Yavin's picker and input box, which the
         // user answers; its own diagnostic collections (`<id>#diagnostics#<n>`), in Problems.
         "window.quickPick" | "window.inputBox" | "window.cancelPrompt" => {
@@ -352,8 +360,9 @@ mod tests {
             })
             .collect();
         // EXT-25: documents.edit, statusBar.set, statusBar.remove; EXT-27: window.state; EXT-29:
-        // window.quickPick, window.inputBox, window.cancelPrompt, diagnostics.set, diagnostics.clear.
-        assert_eq!(methods.len(), 30, "{methods:?}");
+        // window.quickPick, window.inputBox, window.cancelPrompt, diagnostics.set, diagnostics.clear;
+        // EXT-31: webview.create, webview.update, webview.postMessage, webview.reveal, webview.dispose.
+        assert_eq!(methods.len(), 35, "{methods:?}");
         for method in methods {
             assert_ne!(
                 need_of_request("acme.hello", method, &json!({})),

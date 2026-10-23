@@ -16,6 +16,16 @@ import { ContextMenu } from "../ui/ContextMenu";
 import type { MenuItem } from "../ui/ContextMenu";
 import type { WelcomeHint } from "../welcome/WelcomePage";
 import { noteFocusRequest, type FocusRequest } from "../../services/focusIntent";
+import { ExtensionWebview } from "../extensions/ExtensionWebview";
+import {
+  panelOfTab,
+  type WebviewPanel,
+  type WebviewStore,
+} from "../../services/extensions/webviews";
+
+/** A tab that shows a document: not the welcome page, not an extension's webview (EXT-31). */
+const isDocument = (tab: EditorTab | undefined): tab is EditorTab =>
+  !!tab && tab.id !== "welcome" && panelOfTab(tab.id) === null;
 
 /**
  * The code editor (Monaco), loaded when an editor is first shown rather than with the window:
@@ -98,7 +108,10 @@ export function EditorArea({
   tabMenu,
   onMenuError,
   symbolCrumbs,
+  webviews,
 }: {
+  /** EXT-31: extensions' webview panels, their store, and whether the editor's theme is light. */
+  webviews?: { store: WebviewStore; panels: readonly WebviewPanel[]; light: boolean };
   tabs: EditorTab[];
   activeTabId: string;
   onSelectTab: (path: string, name?: string) => void;
@@ -174,7 +187,9 @@ export function EditorArea({
   // When the shown document was asked for (EXT-24): an editor that loads late takes focus only
   // if the user has not moved it somewhere new since (focusIntent.ts).
   const focusRequest = useRef<{ key: string; request: FocusRequest } | null>(null);
-  const shownKey = activeTab && activeTab.id !== "welcome" ? activeTab.path : null;
+  const shownKey = isDocument(activeTab) ? activeTab.path : null;
+  // EXT-31: the webview panel in front, if a webview's tab is.
+  const shownPanel = activeTab ? panelOfTab(activeTab.id) : null;
   useLayoutEffect(() => {
     if (shownKey && focusRequest.current?.key !== shownKey)
       focusRequest.current = { key: shownKey, request: noteFocusRequest() };
@@ -182,6 +197,7 @@ export function EditorArea({
 
   const getBreadcrumbs = () => {
     if (!activeTab || activeTab.id === "welcome") return "Yavin IDE › Welcome";
+    if (shownPanel) return `Extension › ${activeTab.name}`;
     return activeTab.path.replace(/\\/g, "/").replace(/\//g, " › ");
   };
 
@@ -266,6 +282,10 @@ export function EditorArea({
 
                   {tab.id === "welcome" ? (
                     <span className="text-indigo-400 font-mono text-[11px]">✦</span>
+                  ) : panelOfTab(tab.id) ? (
+                    <span aria-hidden className="text-sky-400 font-mono text-[11px]">
+                      ◫
+                    </span>
                   ) : (
                     <FileIcon name={tab.name} className="size-3.5" />
                   )}
@@ -315,7 +335,7 @@ export function EditorArea({
 
         {/* Action icons */}
         <div className="flex shrink-0 items-center gap-1 text-zinc-500 pl-1 pr-2">
-          {activeTab && activeTab.id !== "welcome" && activeTab.dirty && (
+          {isDocument(activeTab) && activeTab.dirty && (
             <button
               onClick={() => onSaveFile(activeTab.path)}
               className="flex items-center gap-1 px-2 py-0.5 rounded bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 hover:bg-indigo-600 hover:text-white text-[10.5px] font-mono transition-all mr-1"
@@ -397,11 +417,9 @@ export function EditorArea({
       {/* Breadcrumbs Bar */}
       <div className="flex h-6.5 items-center justify-between border-b border-[#121212] bg-[#020202] px-3 text-[11px] text-zinc-500 shrink-0">
         <div className="flex items-center gap-1 overflow-hidden truncate">
-          {activeTab && activeTab.id !== "welcome" && (
-            <FileIcon name={activeTab.name} className="size-3.5 mr-0.5" />
-          )}
+          {isDocument(activeTab) && <FileIcon name={activeTab.name} className="size-3.5 mr-0.5" />}
           <span className="text-zinc-300 truncate shrink">{getBreadcrumbs()}</span>
-          {activeTab && activeTab.id !== "welcome" && symbolCrumbs}
+          {isDocument(activeTab) && symbolCrumbs}
         </div>
         <div className="flex items-center gap-3 shrink-0 text-zinc-500 font-mono text-[10px]">
           {details?.join(" • ")}
@@ -415,7 +433,19 @@ export function EditorArea({
         aria-labelledby={activeTab ? `tab-${activeTab.id}` : undefined}
         className="flex min-h-0 flex-1 flex-col"
       >
-        {!activeTab || activeTab.id === "welcome" ? (
+        {/* EXT-31: webview panels -- the one in front, and those kept alive while hidden. */}
+        {webviews?.panels.map((panel) =>
+          panel.id === shownPanel || webviews.store.keepsAlive(panel.id) ? (
+            <ExtensionWebview
+              key={panel.id}
+              panel={panel}
+              store={webviews.store}
+              hidden={panel.id !== shownPanel}
+              light={webviews.light}
+            />
+          ) : null,
+        )}
+        {shownPanel ? null : !activeTab || activeTab.id === "welcome" ? (
           <WelcomePage
             workspace={workspacePath}
             recentFolders={recentFolders}

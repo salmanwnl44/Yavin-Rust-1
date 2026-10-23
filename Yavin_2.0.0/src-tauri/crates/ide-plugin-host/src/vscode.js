@@ -1945,6 +1945,227 @@
       statusItems.set(id, live);
       return live;
     };
+    // --- Webview panels (EXT-31) ----------------------------------------------------------------
+    // A panel is `webview.create` with an id the extension owns (`<id>#webview#n`) and a token
+    // (32 hex digits from the OS's random source) naming its page's origin path: Yavin serves the
+    // page natively, in an isolated frame, and relays messages (`extension_webviews.rs`,
+    // `services/extensions/webviews.ts`). What VS Code offers that Yavin does not is said once.
+    const WEBVIEW_ORIGIN = "https://yavin-webview.invalid";
+    const MAX_WEBVIEW_MESSAGE = 1024 * 1024;
+    const MAX_WEBVIEW_HTML = 4 * 1024 * 1024;
+    const MAX_WEBVIEWS = 32;
+    let nextWebview = 1;
+    const webviewPanels = new Map();
+    const COPY_ROOT = init.extensionPath ? String(init.extensionPath).replace(/\\/g, "/").replace(/\/+$/, "") : null;
+    /** A file URI's path inside the extension's copy (`/`-separated), or null outside it. */
+    const insideCopy = (uri) => {
+      if (!COPY_ROOT || !uri || uri.scheme !== "file") return null;
+      const full = uri.fsPath.replace(/\\/g, "/");
+      if (full.toLowerCase() === COPY_ROOT.toLowerCase()) return "";
+      if (!full.toLowerCase().startsWith(`${COPY_ROOT.toLowerCase()}/`)) return null;
+      const rest = full.slice(COPY_ROOT.length + 1);
+      return rest.split("/").every((p) => p && p !== "." && p !== "..") ? rest : null;
+    };
+    const saidOnce = new Set();
+    const sayOnce = (what) => {
+      if (saidOnce.has(what)) return;
+      saidOnce.add(what);
+      log("warn")(`Webviews: ${what}`);
+    };
+    const webviewToken = () => Array.from(web.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+    const messageText = (message) => {
+      const text = JSON.stringify(message === undefined ? null : message);
+      if (text === undefined) throw new TypeError("A webview message is JSON: this one cannot be sent.");
+      if (text.length > MAX_WEBVIEW_MESSAGE) throw new RangeError(`A webview message is at most ${MAX_WEBVIEW_MESSAGE / 1024} KiB of JSON.`);
+      return text;
+    };
+    let followingWebviews = false;
+    const followWebviews = () => {
+      if (followingWebviews) return;
+      followingWebviews = true;
+      on("webview.message")((payload) => {
+        const panel = payload && webviewPanels.get(payload.id);
+        if (panel) panel._receive(payload.message);
+      });
+      on("webview.viewState")((payload) => {
+        const panel = payload && webviewPanels.get(payload.id);
+        if (panel) panel._viewState(!!payload.visible, !!payload.active);
+      });
+      on("webview.disposed")((payload) => {
+        const panel = payload && webviewPanels.get(payload.id);
+        if (panel) panel._closed();
+      });
+    };
+    function createWebviewPanel(viewType, title, showOptions, options) {
+      if (typeof viewType !== "string" || !viewType || viewType.length > 200) throw new TypeError("A webview panel's viewType is a string.");
+      if (webviewPanels.size >= MAX_WEBVIEWS) throw new Error(`At most ${MAX_WEBVIEWS} webview panels at once.`);
+      followWebviews();
+      const id = `${init.extensionId}#webview#${nextWebview++}`;
+      const token = webviewToken();
+      const o = Object.assign({}, options || {});
+      const show = typeof showOptions === "object" && showOptions ? showOptions : { viewColumn: showOptions };
+      for (const [key, what] of [["enableCommandUris", "command links (enableCommandUris) do nothing"], ["enableForms", "forms (enableForms) do not submit"], ["portMapping", "port mapping is not supported"]])
+        if (o[key]) sayOnce(what);
+      if (show.viewColumn !== undefined && show.viewColumn !== enums.ViewColumn.One && show.viewColumn !== enums.ViewColumn.Active && show.viewColumn !== enums.ViewColumn.Beside)
+        sayOnce("panels open in Yavin's one editor area: view columns are not kept");
+      /** Resource roots inside the copy; a root outside it serves nothing (never the whole copy). */
+      const rootsOf = (list) => {
+        if (list === undefined) return [];
+        const kept = [];
+        for (const uri of Array.isArray(list) ? list : []) {
+          const rel = insideCopy(uri);
+          if (rel === null) sayOnce(`a resource root outside the extension serves nothing (${uri && uri.toString ? uri.toString() : String(uri)})`);
+          else kept.push(rel);
+        }
+        return kept.length ? kept.slice(0, 16) : [".yavin-none"];
+      };
+      let roots = rootsOf(o.localResourceRoots);
+      let html = "";
+      let disposed = false;
+      let visible = true;
+      let active = !show.preserveFocus;
+      let titleText = String(title ?? "");
+      let pending = null;
+      const disposeEmitter = new EventEmitter();
+      const viewStateEmitter = new EventEmitter();
+      const messageEmitter = new EventEmitter();
+      const created = call("webview.create", {
+        id,
+        token,
+        viewType,
+        title: titleText.slice(0, 200),
+        scripts: !!o.enableScripts,
+        retain: !!o.retainContextWhenHidden,
+        roots,
+        preserveFocus: !!show.preserveFocus,
+      });
+      created.catch((error) => {
+        log("error")(`The webview "${viewType}" could not be shown: ${error && error.message}`);
+        panel._closed();
+      });
+      /** Changes to the page, sent once per turn, after the panel exists. */
+      const update = (change) => {
+        if (disposed) return;
+        pending = Object.assign(pending || {}, change);
+        if (pending.queued) return;
+        pending.queued = true;
+        Promise.resolve().then(async () => {
+          const next = pending;
+          pending = null;
+          delete next.queued;
+          await created.catch(() => null);
+          if (!disposed) call("webview.update", Object.assign({ id }, next)).catch((error) => log("error")(`The webview "${viewType}": ${error && error.message}`));
+        });
+      };
+      const asWebviewUri = (uri) => {
+        const rel = insideCopy(uri);
+        if (rel === null || rel === "") {
+          sayOnce("asWebviewUri is for the extension's own files: a file outside it is not served");
+          return Uri.from({ scheme: "https", authority: "yavin-webview.invalid", path: `/${token}/outside` });
+        }
+        // The path as it is: the Uri encodes it once, when it is written out.
+        return Uri.from({ scheme: "https", authority: "yavin-webview.invalid", path: `/${token}/res/${rel}` });
+      };
+      const webview = {
+        get html() {
+          return html;
+        },
+        set html(value) {
+          const text = String(value ?? "");
+          if (text.length > MAX_WEBVIEW_HTML) throw new RangeError(`A webview's HTML is at most ${MAX_WEBVIEW_HTML / 1024 / 1024} MiB.`);
+          html = text;
+          update({ html: text });
+        },
+        get options() {
+          return Object.freeze({ enableScripts: !!o.enableScripts, enableCommandUris: !!o.enableCommandUris, enableForms: !!o.enableForms, localResourceRoots: o.localResourceRoots, portMapping: o.portMapping });
+        },
+        set options(value) {
+          const next = Object.assign({}, value || {});
+          if (next.enableCommandUris) sayOnce("command links (enableCommandUris) do nothing");
+          o.enableScripts = !!next.enableScripts;
+          o.enableCommandUris = next.enableCommandUris;
+          o.enableForms = next.enableForms;
+          o.localResourceRoots = next.localResourceRoots;
+          roots = rootsOf(next.localResourceRoots);
+          update({ scripts: !!next.enableScripts, roots });
+        },
+        cspSource: WEBVIEW_ORIGIN,
+        asWebviewUri,
+        async postMessage(message) {
+          if (disposed) return false;
+          const text = messageText(message);
+          await created;
+          if (disposed) return false;
+          return (await call("webview.postMessage", { id, message: JSON.parse(text) })) === true;
+        },
+        onDidReceiveMessage: messageEmitter.event,
+      };
+      const panel = {
+        viewType,
+        get title() {
+          return titleText;
+        },
+        set title(value) {
+          titleText = String(value ?? "");
+          update({ title: titleText.slice(0, 200) });
+        },
+        iconPath: undefined,
+        webview,
+        get options() {
+          return Object.freeze({ enableFindWidget: !!o.enableFindWidget, retainContextWhenHidden: !!o.retainContextWhenHidden });
+        },
+        get viewColumn() {
+          return disposed ? undefined : enums.ViewColumn.One;
+        },
+        get active() {
+          return active;
+        },
+        get visible() {
+          return visible;
+        },
+        onDidDispose: disposeEmitter.event,
+        onDidChangeViewState: viewStateEmitter.event,
+        reveal(viewColumn, preserveFocus) {
+          if (disposed) return;
+          created.then(() => call("webview.reveal", { id, preserveFocus: !!preserveFocus })).catch(() => {});
+        },
+        dispose() {
+          if (disposed) return;
+          created.then(() => call("webview.dispose", { id })).catch(() => {});
+          panel._closed();
+        },
+        _receive(message) {
+          if (disposed) return;
+          try {
+            messageEmitter.fire(message);
+          } catch (error) {
+            log("error")(`A webview message listener threw: ${error && error.message}`);
+          }
+        },
+        _viewState(nowVisible, nowActive) {
+          if (disposed || (nowVisible === visible && nowActive === active)) return;
+          visible = nowVisible;
+          active = nowActive;
+          viewStateEmitter.fire(Object.freeze({ webviewPanel: panel }));
+        },
+        _closed() {
+          if (disposed) return;
+          disposed = true;
+          visible = false;
+          active = false;
+          webviewPanels.delete(id);
+          try {
+            disposeEmitter.fire();
+          } finally {
+            disposeEmitter.dispose();
+            viewStateEmitter.dispose();
+            messageEmitter.dispose();
+          }
+        },
+      };
+      webviewPanels.set(id, panel);
+      return panel;
+    }
     const showDocument = async (target, options) => {
       const uri = target && target.uri ? target.uri : target;
       const selection = options && options.selection ? toYavinRange(options.selection) : null;
@@ -2461,6 +2682,7 @@
       showErrorMessage: message("error"),
       createOutputChannel: outputChannel,
       createStatusBarItem: statusItem,
+      createWebviewPanel,
       setStatusBarMessage(text, hide) {
         const item = statusItem(enums.StatusBarAlignment.Left, -1000);
         item.text = text;
@@ -2547,7 +2769,7 @@
         return Promise.resolve(task({ report() {} }, source.token));
       },
     };
-    for (const name of ["showOpenDialog", "showSaveDialog", "showWorkspaceFolderPick", "createQuickPick", "createInputBox", "createWebviewPanel", "registerWebviewPanelSerializer", "registerWebviewViewProvider", "registerCustomEditorProvider", "createTerminal", "registerTerminalLinkProvider", "registerTerminalProfileProvider", "registerUriHandler", "registerFileDecorationProvider", "onDidChangeTextEditorVisibleRanges", "onDidChangeTextEditorOptions", "onDidChangeTextEditorViewColumn", "onDidChangeActiveColorTheme", "onDidChangeActiveTerminal", "onDidOpenTerminal", "onDidCloseTerminal", "showNotebookDocument", "createWebviewTextEditorInset"])
+    for (const name of ["showOpenDialog", "showSaveDialog", "showWorkspaceFolderPick", "createQuickPick", "createInputBox", "registerWebviewPanelSerializer", "registerWebviewViewProvider", "registerCustomEditorProvider", "createTerminal", "registerTerminalLinkProvider", "registerTerminalProfileProvider", "registerUriHandler", "registerFileDecorationProvider", "onDidChangeTextEditorVisibleRanges", "onDidChangeTextEditorOptions", "onDidChangeTextEditorViewColumn", "onDidChangeActiveColorTheme", "onDidChangeActiveTerminal", "onDidOpenTerminal", "onDidCloseTerminal", "showNotebookDocument", "createWebviewTextEditorInset"])
       windowApi[name] = unsupportedFn(`window.${name}`);
     for (const name of ["activeColorTheme", "tabGroups", "terminals", "activeTerminal", "activeNotebookEditor", "visibleNotebookEditors"])
       throwingGetter(windowApi, name, `window.${name}`);

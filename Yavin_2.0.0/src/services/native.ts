@@ -210,6 +210,30 @@ interface Commands {
   };
   /** One of an installed extension's files (its themes, snippets: EXT-04), contained. */
   extensions_read_resource: { args: { id: string; path: string }; result: string };
+  // EXT-31: a webview panel's page, served natively to an isolated frame (`extension_webviews.rs`).
+  extensions_webview_open: {
+    args: {
+      token: string;
+      extensionId: string;
+      html: string;
+      state: string | null;
+      scripts: boolean;
+      roots: string[];
+    };
+    result: string;
+  };
+  extensions_webview_update: {
+    args: {
+      token: string;
+      html?: string;
+      state?: string | null;
+      setState?: boolean;
+      scripts?: boolean;
+      roots?: string[];
+    };
+    result: null;
+  };
+  extensions_webview_close: { args: { token: string }; result: null };
   // --- Extension marketplace and installer (IDE-09) ---
   marketplace_default_registry: { args: Record<string, never>; result: string };
   marketplace_get_text: { args: { registryUrl: string; path: string }; result: string };

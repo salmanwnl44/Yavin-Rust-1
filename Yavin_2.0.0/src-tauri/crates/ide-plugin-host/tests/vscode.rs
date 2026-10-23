@@ -215,7 +215,7 @@ const outcome = (run) => { try { const v = run(); return v && typeof v.then === 
 exports.activate = function (context) {
   context.subscriptions.push(vscode.commands.registerCommand("sortLines.sortLines", async () => ({
     openDialog: outcome(() => vscode.window.showOpenDialog({})),
-    webview: outcome(() => vscode.window.createWebviewPanel("x", "x", 1, {})),
+    webview: outcome(() => vscode.window.registerWebviewViewProvider("x", {})),
     debug: outcome(() => vscode.debug.startDebugging(undefined, "x")),
     scm: outcome(() => vscode.scm.createSourceControl("git", "Git")),
     rename: outcome(() => vscode.languages.registerRenameProvider("x", {})),
@@ -289,7 +289,7 @@ exports.activate = function (context) {
         );
     };
     unsupported("openDialog", "window.showOpenDialog");
-    unsupported("webview", "window.createWebviewPanel");
+    unsupported("webview", "window.registerWebviewViewProvider");
     unsupported("debug", "debug.startDebugging");
     unsupported("scm", "scm.createSourceControl");
     unsupported("rename", "languages.registerRenameProvider");

@@ -66,6 +66,7 @@ import {
   type ProviderRegistry,
 } from "./window.ts";
 import type { Diagnostic as Problem } from "../panel/problemMatchers.ts";
+import { MAX_MESSAGE as MAX_WEBVIEW_MESSAGE, type WebviewStore } from "./webviews.ts";
 import { DOCUMENTS_EDIT, DOCUMENTS_READ } from "./permissions.ts";
 
 export type ExtensionState =
@@ -168,6 +169,11 @@ export interface ExtensionHostOptions {
     clear(owner: string): void;
   };
   notify(level: "info" | "warning" | "error", extensionId: string, message: string): void;
+  /**
+   * EXT-31: the window's webview panels (`webviews.ts`): an extension's pages, in isolated
+   * frames. Without it, `createWebviewPanel` is refused (`Unavailable`).
+   */
+  webviews?: WebviewStore;
   channel?(extensionId: string, name: string): Pick<OutputChannel, "appendLine">;
   timeouts?: Partial<HostTimeouts>;
   /** The process crashed (not stopped by Yavin). */
@@ -190,7 +196,26 @@ const EVENTS = new Set([
   "documents.willSave",
   "editor.selection",
   "files.change",
+  // EXT-31: its own webview panels' messages, view state and disposal -- to the owner only.
+  "webview.message",
+  "webview.viewState",
+  "webview.disposed",
 ]);
+/** Webview limits the host checks before the window does (`webviews.ts`). */
+const WEBVIEW_HTML_LIMIT = 4 * 1024 * 1024;
+const WEBVIEW_ROOTS_LIMIT = 16;
+/** A resource root inside the extension's copy: `/`-separated, no `..`, drive or backslash. */
+const webviewRoot = (value: unknown): value is string =>
+  typeof value === "string" &&
+  value.length <= 400 &&
+  (value === "" ||
+    (!value.startsWith("/") &&
+      value
+        .split("/")
+        .every(
+          (part) =>
+            part !== "" && part !== "." && part !== ".." && !/[:\\\u0000-\u001f]/.test(part),
+        )));
 /** How long, in all, the extensions following will-save may delay a save (VS Code's budget). */
 const WILL_SAVE_MS = 1500;
 /** Of an extension: diagnostics files in the Problems view, and items in one prompt. */
@@ -620,6 +645,8 @@ export function createExtensionHost(options: ExtensionHostOptions) {
 
   /** What an extension contributed at run time, removed (handlers, rows, providers, decorations). */
   const clearContributions = (extensionId: string) => {
+    // EXT-31: its webview panels close with it (natively too); it hears nothing more.
+    options.webviews?.disposeExtension(extensionId);
     for (const [command, owner] of handlers) if (owner === extensionId) handlers.delete(command);
     for (const [view, owner] of viewProviders)
       if (owner === extensionId) {
@@ -735,6 +762,18 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       fail("NotOwned", "A prompt's id is the extension's own.");
     return id;
   };
+  /** A webview panel's id, which must be the extension's own (`<id>#webview#n`). */
+  const webviewId = (one: Running, params: Record<string, unknown>) => {
+    const id = stringParam(params, "id", 200);
+    if (!id.startsWith(`${one.entry.id}#webview#`))
+      fail("NotOwned", "A webview panel's id is the extension's own.");
+    return id;
+  };
+  const webviewTitle = (value: unknown) =>
+    String(value ?? "")
+      .replace(/[\u0000-\u001f\u007f]/g, " ")
+      .trim()
+      .slice(0, 200);
   const promptOrigin = (one: Running, params: Record<string, unknown>) => ({
     extensionId: one.entry.id,
     extensionName: one.entry.manifest.displayName ?? one.entry.id,
@@ -1146,6 +1185,88 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         resource,
         decorations,
       });
+      return null;
+    },
+    // EXT-31: its own webview panels. The page is served natively to an isolated frame; what the
+    // frame sends reaches only this extension.
+    async "webview.create"(one, params) {
+      const store = options.webviews ?? fail("Unavailable", "This window shows no webviews.");
+      const id = webviewId(one, params);
+      const token = stringParam(params, "token", 32);
+      if (!/^[0-9a-f]{32}$/.test(token))
+        fail("InvalidRequest", "A webview's token is 32 hexadecimal digits.");
+      const viewType = stringParam(params, "viewType", 200);
+      const roots = Array.isArray(params.roots) ? params.roots : [];
+      if (roots.length > WEBVIEW_ROOTS_LIMIT || !roots.every(webviewRoot))
+        fail(
+          "InvalidRequest",
+          `At most ${WEBVIEW_ROOTS_LIMIT} resource roots, each a folder inside the extension.`,
+        );
+      const owner = one.entry.id;
+      await store.create(
+        {
+          id,
+          extensionId: owner,
+          extensionName: one.entry.manifest.displayName ?? owner,
+          token,
+          viewType,
+          title: webviewTitle(params.title),
+          scripts: params.scripts === true,
+          retain: params.retain === true,
+          roots: roots as string[],
+          preserveFocus: params.preserveFocus === true,
+        },
+        {
+          message: (message) => emit("webview.message", { id, message }, owner),
+          viewState: (visible, active) => emit("webview.viewState", { id, visible, active }, owner),
+          disposed: () => emit("webview.disposed", { id }, owner),
+        },
+      );
+      return null;
+    },
+    async "webview.update"(one, params) {
+      const store = options.webviews ?? fail("Unavailable", "This window shows no webviews.");
+      const id = webviewId(one, params);
+      if (
+        params.html !== undefined &&
+        (typeof params.html !== "string" || params.html.length > WEBVIEW_HTML_LIMIT)
+      )
+        fail(
+          "TooLarge",
+          `A webview's HTML is a string of at most ${WEBVIEW_HTML_LIMIT / 1024 / 1024} MiB.`,
+        );
+      if (
+        params.roots !== undefined &&
+        (!Array.isArray(params.roots) ||
+          params.roots.length > WEBVIEW_ROOTS_LIMIT ||
+          !params.roots.every(webviewRoot))
+      )
+        fail(
+          "InvalidRequest",
+          `At most ${WEBVIEW_ROOTS_LIMIT} resource roots, each a folder inside the extension.`,
+        );
+      await store.update(id, one.entry.id, {
+        ...(typeof params.html === "string" ? { html: params.html } : {}),
+        ...(params.title !== undefined ? { title: webviewTitle(params.title) } : {}),
+        ...(typeof params.scripts === "boolean" ? { scripts: params.scripts } : {}),
+        ...(Array.isArray(params.roots) ? { roots: params.roots as string[] } : {}),
+      });
+      return null;
+    },
+    "webview.postMessage"(one, params) {
+      const store = options.webviews ?? fail("Unavailable", "This window shows no webviews.");
+      const id = webviewId(one, params);
+      if (JSON.stringify(params.message ?? null).length > MAX_WEBVIEW_MESSAGE)
+        fail("TooLarge", `A webview message is at most ${MAX_WEBVIEW_MESSAGE / 1024} KiB of JSON.`);
+      return store.postMessage(id, one.entry.id, params.message ?? null);
+    },
+    "webview.reveal"(one, params) {
+      const store = options.webviews ?? fail("Unavailable", "This window shows no webviews.");
+      store.reveal(webviewId(one, params), one.entry.id, params.preserveFocus === true);
+      return null;
+    },
+    "webview.dispose"(one, params) {
+      options.webviews?.dispose(webviewId(one, params), one.entry.id);
       return null;
     },
     // EXT-25: its own status bar items, in Yavin's own style.

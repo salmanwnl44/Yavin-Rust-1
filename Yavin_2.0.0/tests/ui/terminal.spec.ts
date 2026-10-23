@@ -380,6 +380,13 @@ async function desktop(
               return true;
             },
             __yavin_untimer: () => undefined,
+            // Random bytes as hex, as runtime.rs gives them (EXT-28; EXT-31's webview tokens).
+            __yavin_random: (n: number) =>
+              n > 65536
+                ? null
+                : Array.from(crypto.getRandomValues(new Uint8Array(n)), (b) =>
+                    b.toString(16).padStart(2, "0"),
+                  ).join(""),
           };
           const init = JSON.stringify({
             ...ids,
@@ -1016,6 +1023,36 @@ async function desktop(
                 skipped: 0,
               };
             if (command === "marketplace_default_registry") return "https://registry.test/yavin/";
+            // EXT-31: webview pages, kept as the native side keeps them; the test serves them
+            // from the webview origin (`serveWebviews`).
+            if (command === "extensions_webview_open") {
+              const all = ((
+                window as unknown as { __webviews?: Record<string, unknown> }
+              ).__webviews ??= {});
+              all[args.token as string] = {
+                html: args.html,
+                scripts: args.scripts,
+                state: args.state,
+              };
+              return `https://yavin-webview.invalid/${args.token}/index.html`;
+            }
+            if (command === "extensions_webview_update") {
+              const one = (
+                window as unknown as { __webviews?: Record<string, Record<string, unknown>> }
+              ).__webviews?.[args.token as string];
+              if (one) {
+                if (args.html !== undefined) one.html = args.html;
+                if (args.scripts !== undefined) one.scripts = args.scripts;
+                if (args.setState) one.state = args.state;
+              }
+              return null;
+            }
+            if (command === "extensions_webview_close") {
+              delete (window as unknown as { __webviews?: Record<string, unknown> }).__webviews?.[
+                args.token as string
+              ];
+              return null;
+            }
             if (command === "extensions_read_resource") {
               const text = setup.extensionResources?.[`${args.id}:${args.path}`];
               if (text === undefined)
@@ -5165,6 +5202,182 @@ test("EXT-30 a file icon theme: chosen in Settings, its SVG icons are the explor
   await choice.selectOption(`ext:${ICONS}:acme-icons`);
   await page.reload();
   await expect(themed("notes.ts")).toHaveCount(1);
+});
+
+// --- EXT-31: a VS Code webview panel in the window ---------------------------------------------
+
+/**
+ * Serves webview pages as the native side does (`extension_webviews.rs`): the page the mock kept
+ * for the token, the same bootstrap first (read from the file the native side embeds), and the
+ * same policy header. The isolation the real application adds (WebView2's frame guard, Tauri's
+ * IPC refusing the frame) is checked in the packaged test.
+ */
+async function serveWebviews(page: Page) {
+  const bootstrap = readFileSync("src-tauri/src/webview_bootstrap.js", "utf8");
+  const origin = "https://yavin-webview.invalid";
+  const csp = `default-src 'none'; script-src ${origin} 'unsafe-inline'; style-src ${origin} 'unsafe-inline'; img-src ${origin} data: blob:; font-src ${origin} data:; media-src ${origin} data: blob:; connect-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'`;
+  await page.route(`${origin}/**`, async (route) => {
+    const url = new URL(route.request().url());
+    const [, token, file] = url.pathname.split("/");
+    const kept = await page.evaluate(
+      (t) =>
+        (
+          window as unknown as {
+            __webviews?: Record<string, { html: string; state: string | null }>;
+          }
+        ).__webviews?.[t] ?? null,
+      token,
+    );
+    if (!kept || file !== "index.html")
+      return route.fulfill({ status: 404, body: "no such webview" });
+    const script = `<script>${bootstrap.replace("__YAVIN_WEBVIEW_STATE__", () => (kept.state ?? "null").replace(/</g, "\\u003c"))}</script>`;
+    const head = kept.html.search(/<head(\s[^>]*)?>/i);
+    const at = head < 0 ? 0 : kept.html.indexOf(">", head) + 1;
+    await route.fulfill({
+      status: 200,
+      headers: { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": csp },
+      body: kept.html.slice(0, at) + script + kept.html.slice(at),
+    });
+  });
+}
+
+const WEB_PROBE = "acme.webprobe";
+const WEB_PROBE_CODE = `
+const vscode = require("vscode");
+exports.activate = (context) => {
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  item.text = "Open web probe";
+  item.command = "webprobe.open";
+  item.show();
+  context.subscriptions.push(item, vscode.commands.registerCommand("webprobe.open", () => {
+    const panel = vscode.window.createWebviewPanel("webprobe.view", "Web Probe", vscode.ViewColumn.One, { enableScripts: true });
+    // The extension's own policy, with its own nonce: Yavin's bootstrap still runs first.
+    panel.webview.html = \`<!DOCTYPE html><html><head>
+      <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-abc123'; style-src 'unsafe-inline';">
+      </head><body>
+      <h1 id="title">Hello from the extension</h1>
+      <button id="ping">Ping</button><p id="reply">no reply</p><p id="probe"></p>
+      <script nonce="abc123">
+        const api = acquireVsCodeApi();
+        document.getElementById("ping").addEventListener("click", () => api.postMessage({ type: "ping", n: 1 }));
+        window.addEventListener("message", (e) => { document.getElementById("reply").textContent = "reply: " + e.data.text; });
+        const tries = [];
+        try { tries.push("parent " + window.parent.document.title); } catch (e) { tries.push("parent blocked"); }
+        try { localStorage.setItem("x", "1"); tries.push("storage open"); } catch (e) { tries.push("storage blocked"); }
+        tries.push(typeof acquireVsCodeApi === "function" ? "api" : "no api");
+        try { acquireVsCodeApi(); tries.push("twice"); } catch (e) { tries.push("once"); }
+        tries.push("theme " + document.body.className);
+        document.getElementById("probe").textContent = tries.join("; ");
+        api.setState({ seen: true });
+      </script></body></html>\`;
+    panel.webview.onDidReceiveMessage((m) => {
+      if (m && m.type === "ping") panel.webview.postMessage({ text: "pong " + m.n });
+    });
+    panel.onDidDispose(() => vscode.window.showInformationMessage("web probe closed"));
+  }));
+};
+`;
+const WEB_PROBE_MANIFEST = JSON.stringify({
+  manifestVersion: 1,
+  publisher: "acme",
+  name: "webprobe",
+  version: "1.0.0",
+  displayName: "Web Probe",
+  engines: { yavin: "^2.1.0" },
+  main: "extension/out/main.js",
+  activationEvents: ["*"],
+  contributes: {},
+  vsix: {
+    publisher: "Acme",
+    name: "webprobe",
+    vscode: "^1.80.0",
+    code: true,
+    runtime: {
+      api: "vscode",
+      level: "1.90.0",
+      entry: "main",
+      commands: {},
+      settings: {},
+      views: {},
+      defaults: {},
+    },
+    supported: ["Its code (main: out/main.js) runs in Yavin's extension sandbox"],
+    ignored: [],
+    rejected: [],
+    signature: "not verified",
+  },
+});
+
+test("EXT-31 a webview panel is a tab with the extension's page in a sandboxed frame: messages both ways, its state kept, closing it disposes the panel", async ({
+  page,
+}) => {
+  await serveWebviews(page);
+  await desktop(page, {
+    extensions: [
+      {
+        folder: `/data/extensions/.store/${WEB_PROBE}/1.0.0-abcd1234`,
+        error: null,
+        manifest: WEB_PROBE_MANIFEST,
+      },
+    ],
+    extensionCode: { [WEB_PROBE]: WEB_PROBE_CODE },
+    grants: { [WEB_PROBE]: [] },
+    workspaceFiles: { "notes.txt": "hi" },
+  });
+  await page
+    .locator(`[data-extension-status^="${WEB_PROBE}#status#"]`, { hasText: "Open web probe" })
+    .click();
+  const tab = page.getByRole("tab", { name: /Web Probe/ });
+  await expect(tab).toBeVisible();
+  await expect(tab).toHaveAttribute("aria-selected", "true");
+  const iframe = page.locator("iframe[data-webview]");
+  await expect(iframe).toHaveAttribute("title", "Web Probe (Web Probe)");
+  // Sandboxed: scripts only -- an opaque origin, no forms, popups or top navigation.
+  await expect(iframe).toHaveAttribute("sandbox", "allow-scripts");
+  await expect(iframe).toHaveAttribute("referrerpolicy", "no-referrer");
+  const frame = page.frameLocator("iframe[data-webview]");
+  await expect(frame.locator("#title")).toHaveText("Hello from the extension");
+  // The page reaches nothing of the window; the API is acquired once; VS Code's theme classes.
+  await expect(frame.locator("#probe")).toHaveText(
+    "parent blocked; storage blocked; api; once; theme vscode-dark",
+  );
+  // A message to the extension, and its answer back.
+  // The window's question to the frame after its load is answered by Yavin's bootstrap: the
+  // page's own message listener never sees it.
+  await page.waitForTimeout(1500);
+  await expect(frame.locator("#reply")).toHaveText("no reply");
+  await frame.locator("#ping").click();
+  await expect(frame.locator("#reply")).toHaveText("reply: pong 1");
+  // setState: kept (natively, here the mock) for the page's next load.
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          Object.values(
+            (window as unknown as { __webviews?: Record<string, { state: string | null }> })
+              .__webviews ?? {},
+          )[0]?.state ?? null,
+      ),
+    )
+    .toBe('{"seen":true}');
+  // Another tab in front: the panel is hidden (not kept alive, so its frame goes); back again,
+  // its page loads again with its state.
+  await page.getByRole("tab", { name: /Welcome/ }).click();
+  await expect(iframe).toHaveCount(0);
+  await tab.click();
+  await expect(frame.locator("#title")).toHaveText("Hello from the extension");
+  // Closing its tab disposes the panel: the extension hears it; the page is gone natively.
+  await tab.hover();
+  await page.getByRole("button", { name: "Close Web Probe" }).click();
+  await expect(page.getByRole("status", { name: "Extension message" })).toContainText(
+    "web probe closed",
+  );
+  await expect(iframe).toHaveCount(0);
+  expect(
+    await page.evaluate(
+      () => Object.keys((window as unknown as { __webviews?: object }).__webviews ?? {}).length,
+    ),
+  ).toBe(0);
 });
 
 test("an incompatible extension says why and cannot be installed", async ({ page }) => {

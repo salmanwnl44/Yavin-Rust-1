@@ -12,6 +12,7 @@ import { createDocumentService, type DocumentIO, type TextDocument } from "../..
 import { createSettingsRegistry } from "../../settings/settings.ts";
 import { allProblems, clearProblems, publishProblems } from "../../panel/problems.ts";
 import { createPromptService } from "../prompts.ts";
+import { createWebviewStore, type WebviewNative } from "../webviews.ts";
 import { createWindowFocus } from "../../windowFocus.ts";
 import { applyExtensionEdit } from "../documentEdit.ts";
 import { documentInfoOf } from "../documentInfo.ts";
@@ -130,6 +131,26 @@ export function vscodeWorld() {
   // EXT-29: the Problems store is Yavin's own (one per process): each world starts it empty.
   clearProblems();
   const prompts = createPromptService();
+  // EXT-31: the webview store, over a native side that records what it is asked (the real one is
+  // tested in Rust: extension_webviews_tests.rs, and in the packaged application).
+  const webviewNative = {
+    opened: [] as Parameters<WebviewNative["open"]>[0][],
+    updates: [] as Parameters<WebviewNative["update"]>[0][],
+    closed: [] as string[],
+  };
+  const webviewWarnings: string[] = [];
+  const webviews = createWebviewStore(
+    {
+      open: async (request) => {
+        webviewNative.opened.push(request);
+        return `https://yavin-webview.invalid/${request.token}/index.html`;
+      },
+      update: async (request) => void webviewNative.updates.push(request),
+      close: async (token) => void webviewNative.closed.push(token),
+    },
+    (text) => webviewWarnings.push(text),
+    { readyGraceMs: 10 },
+  );
   const fileListeners = new Set<(changes: readonly FileChange[]) => void>();
   const selectionListeners = new Set<(change: SelectionChange) => void>();
   const logs = new Map<string, string[]>();
@@ -239,6 +260,32 @@ export function vscodeWorld() {
         : null;
     },
   });
+  // Every event the window sends, and to which extension: what reaches an extension's layer,
+  // whether or not its code would act on it (EXT-31: a panel's messages go to its owner only).
+  const sentEvents: { extensionId: string; event: string; id: unknown }[] = [];
+  const transport = {
+    async start() {
+      const channel = await host.transport.start();
+      return {
+        ...channel,
+        send(text: string) {
+          const message = JSON.parse(text) as {
+            type?: string;
+            extensionId?: string;
+            event?: string;
+            payload?: { id?: unknown };
+          };
+          if (message.type === "event")
+            sentEvents.push({
+              extensionId: String(message.extensionId),
+              event: String(message.event),
+              id: message.payload?.id,
+            });
+          return channel.send(text);
+        },
+      };
+    },
+  };
   const manager = createExtensionHostManager({
     registry,
     settings,
@@ -246,13 +293,14 @@ export function vscodeWorld() {
     workspace: WORKSPACE,
     folder: FOLDER,
     workspaceGeneration: 1,
-    transport: host.transport,
+    transport,
     trusted: async () => true,
     window,
     decorations,
     providers,
     statusBar,
     problems: { publish: publishProblems, clear: clearProblems },
+    webviews,
     notify: (level, id, message) => notes.push([level, id, message]),
     channel: (id) => ({
       appendLine: (text: string) => logs.set(id, [...(logs.get(id) ?? []), text]),
@@ -283,6 +331,25 @@ export function vscodeWorld() {
     disk,
     locked,
     prompts,
+    webviews,
+    webviewNative,
+    webviewWarnings,
+    sentEvents,
+    /**
+     * EXT-31: a panel's frame, as the window would hold it: attached (its tab in front), its
+     * page ready; what it receives, and a way to post as its page would.
+     */
+    frame(panelId: string, ready = true) {
+      const received: unknown[] = [];
+      const window = {
+        postMessage: (value: unknown) => void received.push(value),
+      } as unknown as Window;
+      webviews.attachFrame(panelId, window);
+      const post = (kind: string, payload: unknown) =>
+        webviews.frameMessage(panelId, { yavinWebview: 1, kind, payload });
+      if (ready) post("ready", null);
+      return { received, post, window };
+    },
     /** The Problems view's entries (Yavin's own store). */
     problems: () => allProblems(),
     /** The native watcher reports a batch. */

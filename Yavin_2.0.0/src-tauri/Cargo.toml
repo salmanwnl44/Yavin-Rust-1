@@ -56,6 +56,10 @@ semver = "1"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+# Extension webviews (EXT-31): their origin is served, and every frame navigation that is not to
+# a webview's own page cancelled, through WebView2 (`extension_webviews::attach`); wry's versions.
+webview2-com = "0.38"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
 # A Local Git restore recreates Windows junctions (FSCTL_SET_REPARSE_POINT), never by a process;
 # the window's focus is the foreground window (EXT-27, `window_focus.rs`).
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging"] }

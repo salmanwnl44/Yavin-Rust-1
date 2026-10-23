@@ -55,6 +55,8 @@ impl Window {
             "window.quickPick" => self.pick.clone(),
             "window.inputBox" => self.input.clone(),
             "documents.edit" => json!(true),
+            // EXT-31: a panel is shown; a message is delivered.
+            "webview.postMessage" => json!(true),
             _ => {
                 let _ = params;
                 Value::Null
@@ -497,4 +499,128 @@ fn file_watchers_follow_files_change_with_globs_relative_patterns_and_ignore_fla
             "rel create new.md"
         ])
     );
+}
+
+#[test]
+fn a_webview_panel_speaks_the_protocol_with_a_fresh_token_and_hears_its_own_events() {
+    let mut e = Ext::start();
+    e.step(
+        r#"T.got = []; T.states = []; T.disposed = 0;
+        T.p = vscode.window.createWebviewPanel("core.view", "Core view", vscode.ViewColumn.One, { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.file("C:/ext/acme.core/extension/media"), vscode.Uri.file("C:/Windows")] });
+        T.p.webview.onDidReceiveMessage((m) => T.got.push(m));
+        T.p.onDidChangeViewState((ev) => T.states.push([ev.webviewPanel.visible, ev.webviewPanel.active]));
+        T.p.onDidDispose(() => T.disposed++);
+        T.p.webview.html = "<p>one</p>"; T.p.webview.html = "<p>two</p>"; T.p.title = "Renamed";
+        T.uri = T.p.webview.asWebviewUri(vscode.Uri.file("C:/ext/acme.core/extension/media/a b.js")).toString();
+        T.outside = T.p.webview.asWebviewUri(vscode.Uri.file("C:/Users/me/secret.txt")).toString();
+        // The update waits for the panel to exist (the window's answer to webview.create).
+        await new Promise((r) => setTimeout(r, 50));
+        return null;"#,
+    );
+    let created = e.asked("webview.create");
+    assert_eq!(created.len(), 1);
+    let c = &created[0];
+    assert!(c["id"].as_str().unwrap().starts_with("acme.core#webview#"));
+    let token = c["token"].as_str().unwrap().to_string();
+    assert!(
+        token.len() == 32
+            && token
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "{token}"
+    );
+    assert_eq!(c["viewType"], "core.view");
+    assert_eq!(c["scripts"], true);
+    assert_eq!(c["retain"], true);
+    assert_eq!(
+        c["roots"],
+        json!(["extension/media"]),
+        "the root outside the copy dropped"
+    );
+    // Changes in one turn are one request, the last HTML.
+    let updates = e.asked("webview.update");
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    assert_eq!(updates[0]["html"], "<p>two</p>");
+    assert_eq!(updates[0]["title"], "Renamed");
+    let [uri, outside]: [Value; 2] = e
+        .step("return [T.uri, T.outside];")
+        .as_array()
+        .unwrap()
+        .clone()
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        uri,
+        format!("https://yavin-webview.invalid/{token}/res/extension/media/a%20b.js")
+    );
+    assert_eq!(
+        outside,
+        format!("https://yavin-webview.invalid/{token}/outside")
+    );
+    assert!(e
+        .window
+        .logs
+        .iter()
+        .any(|l| l.contains("a resource root outside the extension serves nothing")));
+    // Messages: to the panel (the window answers whether it was delivered), and from it.
+    assert_eq!(
+        e.step(r#"return await T.p.webview.postMessage({ a: 1 });"#),
+        true
+    );
+    assert_eq!(
+        e.asked("webview.postMessage")[0]["message"],
+        json!({"a": 1})
+    );
+    let id = c["id"].clone();
+    e.event(
+        "webview.message",
+        json!({"id": id, "message": {"from": "page"}}),
+    );
+    e.event(
+        "webview.message",
+        json!({"id": "acme.core#webview#999", "message": "not ours"}),
+    );
+    e.event(
+        "webview.viewState",
+        json!({"id": id, "visible": false, "active": false}),
+    );
+    assert_eq!(
+        e.step("return [T.got, T.states, T.p.visible];"),
+        json!([[{"from": "page"}], [[false, false]], false])
+    );
+    // Too large: refused in the extension, before any request.
+    let error = e.step(
+        r#"try { await T.p.webview.postMessage("x".repeat(1024 * 1024 + 1)); return "sent"; } catch (e) { return e.message; }"#,
+    );
+    assert!(
+        error.as_str().unwrap().contains("at most 1024 KiB"),
+        "{error}"
+    );
+    assert_eq!(e.asked("webview.postMessage").len(), 1);
+    // The window closed its tab: disposed, heard once; then nothing more is sent.
+    e.event("webview.disposed", json!({"id": id}));
+    assert_eq!(
+        e.step(r#"return [T.disposed, await T.p.webview.postMessage("late"), T.p.viewColumn === undefined];"#),
+        json!([1, false, true])
+    );
+    assert_eq!(e.asked("webview.postMessage").len(), 1);
+    // The extension's own dispose: the window is told, onDidDispose once.
+    e.step(r#"T.q = vscode.window.createWebviewPanel("core.b", "B", 1, {}); T.qd = 0; T.q.onDidDispose(() => T.qd++); T.q.dispose(); T.q.dispose(); await new Promise((r) => setTimeout(r, 50));"#);
+    assert_eq!(e.asked("webview.dispose").len(), 1);
+    assert_eq!(e.step("return T.qd;"), 1);
+    assert_eq!(
+        e.asked("webview.create")[1]["scripts"],
+        false,
+        "scripts only when enabled"
+    );
+}
+
+#[test]
+fn console_has_debug_and_trace_as_extensions_call_them() {
+    let mut e = Ext::start();
+    e.step(r#"console.debug("dbg", 1); console.trace("here"); console.log("plain");"#);
+    let logs = e.window.logs.join("\n");
+    assert!(logs.contains("dbg 1"), "{logs}");
+    assert!(logs.contains("here") && logs.contains("Trace"), "{logs}");
+    assert!(logs.contains("plain"));
 }

@@ -117,6 +117,7 @@ import {
   declarativeContributions,
   extensionDecorations,
   extensionStatusBar,
+  extensionWebviews,
   extensionProviders,
   extensionInstaller,
   extensionRegistry,
@@ -153,6 +154,7 @@ import { registryRefusal, registryTrust } from "./services/extensions/marketplac
 import { discoverInstalledOnce } from "./services/extensions/discovery";
 import { followContributedThemes } from "./editor/themes";
 import { iconThemes } from "./services/extensions/iconThemes";
+import { panelOfTab, webviewTabId } from "./services/extensions/webviews";
 import { documentInfoOf } from "./services/extensions/documentInfo";
 import { describeCapability } from "./services/extensions/permissions";
 import type {
@@ -360,7 +362,17 @@ export default function App() {
   });
   const [openTabs, setTabs] = useState<OpenTab[]>([WELCOME_TAB]);
   // What each tab shows about its document is read from the document, never stored twice.
+  // EXT-31: extensions' webview panels, each a tab of its own.
+  const webviewPanels = useSyncExternalStore(
+    extensionWebviews.subscribe,
+    extensionWebviews.getSnapshot,
+  );
   const tabs: EditorTab[] = openTabs.map((tab) => {
+    const panelId = panelOfTab(tab.id);
+    if (panelId) {
+      const panel = webviewPanels.find((one) => one.id === panelId);
+      return { ...tab, name: panel?.title || tab.name, dirty: false };
+    }
     const doc = tab.id === "welcome" ? undefined : documents.get(tab.path);
     return doc
       ? { ...tab, name: doc.name, dirty: doc.dirty, status: documentStatus(doc) }
@@ -660,16 +672,18 @@ export default function App() {
    */
   // The stored tabs, not the drawn ones: those are rebuilt on every render, and the session
   // would be rewritten on every keystroke.
+  const sessionTabs = openTabs.filter((tab) => !panelOfTab(tab.id));
+  const sessionActive = panelOfTab(activeTabId) ? "welcome" : activeTabId;
   const sessionState = useRef({
-    tabs: openTabs,
-    activeTabId,
+    tabs: sessionTabs,
+    activeTabId: sessionActive,
     activeActivityTab,
     isSidebarOpen,
     isTerminalOpen,
   });
   sessionState.current = {
-    tabs: openTabs,
-    activeTabId,
+    tabs: sessionTabs,
+    activeTabId: sessionActive,
     activeActivityTab,
     isSidebarOpen,
     isTerminalOpen,
@@ -1001,6 +1015,11 @@ export default function App() {
     run(async () => {
       setDiff(null);
       setSettingsOpen(false);
+      if (panelOfTab(path)) {
+        // EXT-31: a webview panel's tab is only brought to the front.
+        if (openTabs.some((tab) => tab.id === path)) setActiveTabId(path);
+        return;
+      }
       if (path === "welcome") {
         // Its tab may have been closed -- Help > Welcome is how it comes back -- and
         // selecting a tab that is not there leaves the strip with nothing selected.
@@ -1065,6 +1084,10 @@ export default function App() {
       views.forget(doc.key);
     }
     setTabs((prev) => prev.filter((tab) => !closing.has(tab.id)));
+    for (const id of ids) {
+      const panelId = panelOfTab(id);
+      if (panelId) extensionWebviews.closeFromWindow(panelId);
+    }
     if (closing.has(activeTabId)) {
       // The tab beside it comes forward, as in a browser: the nearest one to the right that
       // stays open, else to the left.
@@ -1356,14 +1379,49 @@ export default function App() {
   // included, so there is one store for each, not window state beside a setting.
   const settingsWorkspace = workspace.folders.length ? workspace.id : null;
   const editorView = useEditorSettings(settings, settingsWorkspace, minimap);
-  // A file icon theme's light variant (EXT-30) applies while the editor's theme is light.
-  useEffect(() => {
+  // Whether the editor's theme is light: a file icon theme's light variant (EXT-30) and
+  // webviews' default colours (EXT-31) follow it.
+  const editorLight = useMemo(() => {
     const id = editorView.settings.theme;
     const contributed = declarativeContributions.getSnapshot().themes.find((one) => one.id === id);
-    iconThemes.setLight(
-      id === "yavin-light" || contributed?.base === "vs" || contributed?.base === "hc-light",
-    );
+    return id === "yavin-light" || contributed?.base === "vs" || contributed?.base === "hc-light";
   }, [editorView.settings.theme]);
+  useEffect(() => iconThemes.setLight(editorLight), [editorLight]);
+  // EXT-31: a panel an extension opens is a tab in front; one it reveals comes to the front;
+  // one that goes leaves the tabs.
+  const revealedPanels = useRef(new Map<string, number>());
+  useEffect(() => {
+    const live = new Set(webviewPanels.map((panel) => webviewTabId(panel.id)));
+    let front: string | null = null;
+    for (const panel of webviewPanels) {
+      const seen = revealedPanels.current.get(panel.id);
+      if (seen === panel.revealed) continue;
+      revealedPanels.current.set(panel.id, panel.revealed);
+      // Shown means in front, in Yavin's one editor area; `preserveFocus` only keeps the keyboard
+      // where it was, and Yavin never moves the keyboard into a panel.
+      front = webviewTabId(panel.id);
+    }
+    for (const id of [...revealedPanels.current.keys()])
+      if (!live.has(webviewTabId(id))) revealedPanels.current.delete(id);
+    setTabs((previous) => {
+      const kept = previous.filter((tab) => !panelOfTab(tab.id) || live.has(tab.id));
+      const added = webviewPanels
+        .filter((panel) => !kept.some((tab) => tab.id === webviewTabId(panel.id)))
+        .map((panel) => ({
+          id: webviewTabId(panel.id),
+          name: panel.title,
+          path: webviewTabId(panel.id),
+        }));
+      return added.length || kept.length !== previous.length ? [...kept, ...added] : previous;
+    });
+    if (front) setActiveTabId(front);
+    else setActiveTabId((active) => (panelOfTab(active) && !live.has(active) ? "welcome" : active));
+  }, [webviewPanels]);
+  // Which panel is in front: its extension hears onDidChangeViewState.
+  useEffect(
+    () => extensionWebviews.setShown(panelOfTab(activeTabId)),
+    [activeTabId, webviewPanels],
+  );
   const { wordWrap, zoom } = editorView;
   /** A View-menu toggle writes where the value comes from: this workspace if it set one. */
   const changeSetting = <T,>(definition: SettingDefinition<T>, value: T) => {
@@ -4049,6 +4107,7 @@ export default function App() {
               />
             ) : (
               <EditorArea
+                webviews={{ store: extensionWebviews, panels: webviewPanels, light: editorLight }}
                 tabs={tabs}
                 activeTabId={activeTabId}
                 onSelectTab={(path) => handleOpenFile(path)}

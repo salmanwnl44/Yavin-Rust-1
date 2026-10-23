@@ -123,6 +123,12 @@ export function createInProcessTransport(options: InProcessHostOptions) {
               );
               return true;
             },
+            // Random bytes as hex, as runtime.rs gives them (EXT-28; EXT-31's webview tokens).
+            __yavin_random(n: number) {
+              if (!Number.isInteger(n) || n < 0 || n > 65536) return null;
+              const bytes = globalThis.crypto.getRandomValues(new Uint8Array(n));
+              return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+            },
             __yavin_untimer(timer: number) {
               const handle = timers.get(timer);
               if (handle !== undefined) {

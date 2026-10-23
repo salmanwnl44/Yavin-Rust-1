@@ -134,6 +134,10 @@ export function needOfEvent(event: string): Need {
     case "configuration.changed":
     // EXT-27: whether the window is focused -- nothing of the user's work.
     case "window.state":
+    // EXT-31: its own webview panels' messages, view state and disposal (sent to the owner only).
+    case "webview.message":
+    case "webview.viewState":
+    case "webview.disposed":
       return none;
     case "documents.open":
     case "documents.change":
@@ -171,6 +175,13 @@ export function needOfRequest(
     // Its own status bar items (EXT-25): `<id>#status#<n>`, shown in Yavin's own style.
     case "statusBar.set":
     case "statusBar.remove":
+      return owned(params, "id", caller, "#");
+    // EXT-31: its own webview panels (`<id>#webview#<n>`), shown in isolated frames.
+    case "webview.create":
+    case "webview.update":
+    case "webview.postMessage":
+    case "webview.reveal":
+    case "webview.dispose":
       return owned(params, "id", caller, "#");
     // EXT-29: its own prompts (`<id>#prompt#<n>`): Yavin's picker and input box, which the user answers.
     case "window.quickPick":

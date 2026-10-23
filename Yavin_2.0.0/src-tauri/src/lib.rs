@@ -24,6 +24,7 @@ mod extension_profiles;
 mod extension_secrets;
 mod extension_service;
 mod extension_trust;
+mod extension_webviews;
 mod extensions;
 mod external;
 mod git;
@@ -721,6 +722,13 @@ pub fn run() {
                 webview
                     .state::<ExtHostSessions>()
                     .page_loaded(webview.label());
+                // EXT-31: the page that showed its webviews is gone; the webview origin is
+                // served to this webview, and its frames guarded.
+                let webviews = webview.state::<extension_webviews::Webviews>();
+                webviews.close_all(webview.label(), None);
+                if webviews.needs_guard(webview.label()) {
+                    extension_webviews::attach(webview, webview.app_handle().clone());
+                }
             }
         })
         .on_window_event(|window, event| {
@@ -728,9 +736,13 @@ pub fn run() {
                 window
                     .state::<ExtHostSessions>()
                     .window_closed(window.label());
+                window
+                    .state::<extension_webviews::Webviews>()
+                    .window_closed(window.label());
             }
         })
         .manage(ExtensionService::default())
+        .manage(extension_webviews::Webviews::default())
         .manage(Recovery::default())
         .manage(LocalGit::default())
         .setup(|app| {
@@ -898,6 +910,9 @@ pub fn run() {
             extensions_profile_settings,
             extensions_set_grants,
             extensions_read_resource,
+            extension_webviews::extensions_webview_open,
+            extension_webviews::extensions_webview_update,
+            extension_webviews::extensions_webview_close,
             ext_host_start,
             ext_host_send,
             ext_host_stop,

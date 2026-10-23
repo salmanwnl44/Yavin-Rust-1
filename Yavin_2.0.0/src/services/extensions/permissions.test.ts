@@ -54,7 +54,7 @@ test("permissions: every bridge method the host serves has a decision", () => {
   );
   // EXT-25: documents.edit, statusBar.set, statusBar.remove; EXT-27: window.state; EXT-29:
   // window.quickPick, window.inputBox, window.cancelPrompt, diagnostics.set, diagnostics.clear.
-  assert.equal(methods.length, 30, methods.join(", "));
+  assert.equal(methods.length, 35, methods.join(", "));
   for (const method of methods)
     assert.notEqual(needOfRequest("acme.hello", method, {}).kind, "unknown", method);
 });

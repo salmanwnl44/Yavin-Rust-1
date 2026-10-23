@@ -1,5 +1,5 @@
 {
-  "note": "EXT-27: behaviours of the VS Code compatibility layer and its window side, each broken in turn; the tests named must catch it (scripts/conformance-mutations.mjs). Paths are relative to Yavin_2.0.0. EXT-28 adds R1-R21: the runtime (web.js, intl.js, the loader, the random source, rejection reports), each caught by tests/runtime.rs. EXT-29 adds C1-C9 (the window side: prompts, problems, will-save, file events, ownership) and S1-S7 (the layer: watchers, prompts, tokens, validation, code actions, diagnostics batches). EXT-30 adds I1-I8: file icon themes (paths kept inside the package, SVG only and bounded, VS Code's choice of icon, a disabled extension's theme, the manifest's check).",
+  "note": "EXT-27: behaviours of the VS Code compatibility layer and its window side, each broken in turn; the tests named must catch it (scripts/conformance-mutations.mjs). Paths are relative to Yavin_2.0.0. EXT-28 adds R1-R21: the runtime (web.js, intl.js, the loader, the random source, rejection reports), each caught by tests/runtime.rs. EXT-29 adds C1-C9 (the window side: prompts, problems, will-save, file events, ownership) and S1-S7 (the layer: watchers, prompts, tokens, validation, code actions, diagnostics batches). EXT-30 adds I1-I8: file icon themes (paths kept inside the package, SVG only and bounded, VS Code's choice of icon, a disabled extension's theme, the manifest's check). EXT-31 adds V01-V09: webview panels (ownership, bounded and ready-gated frame messages, disposal with the extension, messages to the owner only, resource roots, the window's update loop, the window's permission rule).",
   "mutations": [
     {
       "id": "EXT-27 B1",
@@ -759,6 +759,114 @@
         }
       ],
       "node": ["src/services/extensions/iconThemes.test.ts"]
+    },
+    {
+      "id": "EXT-31 V01",
+      "what": "one extension can act on another's panel",
+      "edits": [
+        {
+          "file": "src/services/extensions/webviews.ts",
+          "from": "    if (!one || one.panel.extensionId !== extensionId)",
+          "to": "    if (!one)"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeWebview.test.ts"]
+    },
+    {
+      "id": "EXT-31 V02",
+      "what": "a page's messages are not bounded",
+      "edits": [
+        {
+          "file": "src/services/extensions/webviews.ts",
+          "from": "        const text = jsonWithin(payload, MAX_MESSAGE);",
+          "to": "        const text = jsonWithin(payload, Infinity);"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeWebview.test.ts"]
+    },
+    {
+      "id": "EXT-31 V03",
+      "what": "a page may flood the window",
+      "edits": [
+        {
+          "file": "src/services/extensions/webviews.ts",
+          "from": "        if (++one.budget.count > FRAME_MESSAGES_PER_SECOND) {",
+          "to": "        if (++one.budget.count > Infinity) {"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeWebview.test.ts"]
+    },
+    {
+      "id": "EXT-31 V04",
+      "what": "a page is heard before it is ready",
+      "edits": [
+        {
+          "file": "src/services/extensions/webviews.ts",
+          "from": "      if (!one.ready) return;\n",
+          "to": ""
+        }
+      ],
+      "node": ["src/services/extensions/vscodeWebview.test.ts"]
+    },
+    {
+      "id": "EXT-31 V05",
+      "what": "a stopped extension's panels stay",
+      "edits": [
+        {
+          "file": "src/services/extensions/host.ts",
+          "from": "    options.webviews?.disposeExtension(extensionId);",
+          "to": "    void options.webviews;"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeWebview.test.ts"]
+    },
+    {
+      "id": "EXT-31 V06",
+      "what": "a panel's messages reach every extension",
+      "edits": [
+        {
+          "file": "src/services/extensions/host.ts",
+          "from": "          message: (message) => emit(\"webview.message\", { id, message }, owner),",
+          "to": "          message: (message) => emit(\"webview.message\", { id, message }),"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeWebview.test.ts"]
+    },
+    {
+      "id": "EXT-31 V07",
+      "what": "resource roots outside the extension serve its whole copy",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "        return kept.length ? kept.slice(0, 16) : [\".yavin-none\"];",
+          "to": "        return kept.length ? kept.slice(0, 16) : [];"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeWebview.test.ts"]
+    },
+    {
+      "id": "EXT-31 V08",
+      "what": "every tab change is news (the window's update loop)",
+      "edits": [
+        {
+          "file": "src/services/extensions/webviews.ts",
+          "from": "    if (changed) publish();",
+          "to": "    publish();"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeWebview.test.ts"]
+    },
+    {
+      "id": "EXT-31 V09",
+      "what": "webview panels need not be the extension's own (window)",
+      "edits": [
+        {
+          "file": "src/services/extensions/permissions.ts",
+          "from": "    case \"webview.dispose\":\n      return owned(params, \"id\", caller, \"#\");",
+          "to": "    case \"webview.dispose\":\n      return none;"
+        }
+      ],
+      "node": ["src/services/extensions/permissions.test.ts"]
     }
   ]
 }

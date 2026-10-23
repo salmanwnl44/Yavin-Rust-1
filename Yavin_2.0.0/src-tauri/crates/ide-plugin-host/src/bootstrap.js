@@ -310,7 +310,17 @@
     appendLine: (text) => post({ type: "log", level: "info", text: String(text) }),
   });
   const log = (level) => (...parts) => post({ type: "log", level, text: parts.map(String).join(" ") });
-  globalThis.console = Object.freeze({ log: log("info"), info: log("info"), warn: log("warn"), error: log("error") });
+  // EXT-31: debug and trace too -- extensions call them (SVG Preview's preview starts with
+  // console.debug), and a missing one fails as "not a function".
+  globalThis.console = Object.freeze({
+    log: log("info"),
+    info: log("info"),
+    debug: log("info"),
+    warn: log("warn"),
+    error: log("error"),
+    // As Node.js prints it: "Trace: <message>", then where it was called from.
+    trace: (...parts) => log("info")("Trace:", ...parts, `\n${new Error().stack ?? ""}`),
+  });
 
   const reply = (requestId, run) => {
     let result;

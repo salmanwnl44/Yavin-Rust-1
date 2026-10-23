@@ -1808,6 +1808,150 @@
         }
       ],
       "args": ["-p", "yavin-ide", "--lib", "--", "vsix"]
+    },
+    {
+      "id": "EXT-31 W01",
+      "what": "a webview page may reach the network",
+      "edits": [
+        {
+          "file": "src/extension_webviews.rs",
+          "from": "connect-src 'none'; frame-src 'none';",
+          "to": "connect-src *; frame-src 'none';"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_webviews"]
+    },
+    {
+      "id": "EXT-31 W02",
+      "what": "a panel's page is served to another window",
+      "edits": [
+        {
+          "file": "src/extension_webviews.rs",
+          "from": "let Some(panel) = panel.filter(|p| p.window == window) else {",
+          "to": "let Some(panel) = panel.filter(|_| true) else {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_webviews"]
+    },
+    {
+      "id": "EXT-31 W03",
+      "what": "\"..\" is accepted in a webview path",
+      "edits": [
+        {
+          "file": "src/extension_webviews.rs",
+          "from": "                && part != \"..\"",
+          "to": "                && part != \"....\""
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_webviews"]
+    },
+    {
+      "id": "EXT-31 W04",
+      "what": "a webview file outside its resource roots is served",
+      "edits": [
+        {
+          "file": "src/extension_webviews.rs",
+          "from": "    let inside_root = roots.is_empty()",
+          "to": "    let inside_root = true || roots.is_empty()"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_webviews"]
+    },
+    {
+      "id": "EXT-31 W05",
+      "what": "a webview file that leads out of the copy is served",
+      "edits": [
+        {
+          "file": "src/extension_webviews.rs",
+          "from": "    if !real.starts_with(&base) {",
+          "to": "    if false && !real.starts_with(&base) {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_webviews"]
+    },
+    {
+      "id": "EXT-31 W06",
+      "what": "a frame may navigate anywhere",
+      "edits": [
+        {
+          "file": "src/extension_webviews.rs",
+          "from": "        let Some(rest) = uri.strip_prefix(ORIGIN).and_then(|r| r.strip_prefix('/')) else {\n            return false;\n        };",
+          "to": "        let Some(rest) = uri.strip_prefix(ORIGIN).and_then(|r| r.strip_prefix('/')) else {\n            return true;\n        };"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_webviews"]
+    },
+    {
+      "id": "EXT-31 W07",
+      "what": "the bootstrap comes after the extension's own policy",
+      "edits": [
+        {
+          "file": "src/extension_webviews.rs",
+          "from": "        .unwrap_or(0);",
+          "to": "        .map(|_| html.len())\n        .unwrap_or(html.len());"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_webviews"]
+    },
+    {
+      "id": "EXT-31 W08",
+      "what": "saved state can close the bootstrap script",
+      "edits": [
+        {
+          "file": "src/extension_webviews.rs",
+          "from": "    let state = state.unwrap_or(\"null\").replace('<', \"\\\\u003c\");",
+          "to": "    let state = state.unwrap_or(\"null\").to_string();"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_webviews"]
+    },
+    {
+      "id": "EXT-31 W09",
+      "what": "a webview token can be bound twice",
+      "edits": [
+        {
+          "file": "src/extension_webviews.rs",
+          "from": "        if panels.contains_key(token) {",
+          "to": "        if false && panels.contains_key(token) {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_webviews"]
+    },
+    {
+      "id": "EXT-31 W10",
+      "what": "a webview's HTML is not bounded",
+      "edits": [
+        {
+          "file": "src/extension_webviews.rs",
+          "from": "    if html.is_some_and(|h| h.len() > MAX_HTML) {",
+          "to": "    if html.is_some_and(|h| h.len() > MAX_HTML * 1000) {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_webviews"]
+    },
+    {
+      "id": "EXT-31 W11",
+      "what": "a page with scripts off still gets the bootstrap",
+      "edits": [
+        {
+          "file": "src/extension_webviews.rs",
+          "from": "    if !scripts {",
+          "to": "    if false && !scripts {"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_webviews"]
+    },
+    {
+      "id": "EXT-31 W12",
+      "what": "webview panels need not be the extension's own (native)",
+      "edits": [
+        {
+          "file": "src/extension_permissions.rs",
+          "from": "        | \"webview.dispose\" => owned(params, \"id\", caller, '#'),",
+          "to": "        | \"webview.dispose\" => Need::Nothing,"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_permissions"]
     }
   ]
 }

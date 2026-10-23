@@ -1,5 +1,5 @@
 {
-  "about": "EXT-25, graded by evidence at EXT-26 by behavioural tests at EXT-27, and its runtime part again at EXT-28: what Yavin provides of the VS Code extension API, through the compatibility layer (src-tauri/crates/ide-plugin-host/src/vscode.js) and the VS Code package adapter (src-tauri/src/vsix.rs). FULL: as VS Code documents it, and tested. PARTIAL: provided with the limitation noted, and tested. STUB: present but fabricated or inert. UNSUPPORTED: fails with an UnsupportedApi error naming it (logged once). NOT VERIFIED: implemented (`implemented` says how far) but no test or benchmark run exercises its behaviour. `evidence`: L1 present (the inventory test), L2 behaviour tested, L3 exercised by real extensions in the Open VSX benchmark. 'baseline' is before EXT-25, when no VS Code extension code ran at all. Checked against the layer by crates/ide-plugin-host/tests/vscode.rs (the_inventory_matches_the_layer). EXT-27 adds L4: the window (tests/ui) and the packaged application (tests/real). EXT-29 adds the pickers, file watchers, save and selection events, formatting and code-action providers, and diagnostics in the Problems view. EXT-30 adds file icon themes (their SVG icons).",
+  "about": "EXT-25, graded by evidence at EXT-26 by behavioural tests at EXT-27, and its runtime part again at EXT-28: what Yavin provides of the VS Code extension API, through the compatibility layer (src-tauri/crates/ide-plugin-host/src/vscode.js) and the VS Code package adapter (src-tauri/src/vsix.rs). FULL: as VS Code documents it, and tested. PARTIAL: provided with the limitation noted, and tested. STUB: present but fabricated or inert. UNSUPPORTED: fails with an UnsupportedApi error naming it (logged once). NOT VERIFIED: implemented (`implemented` says how far) but no test or benchmark run exercises its behaviour. `evidence`: L1 present (the inventory test), L2 behaviour tested, L3 exercised by real extensions in the Open VSX benchmark. 'baseline' is before EXT-25, when no VS Code extension code ran at all. Checked against the layer by crates/ide-plugin-host/tests/vscode.rs (the_inventory_matches_the_layer). EXT-27 adds L4: the window (tests/ui) and the packaged application (tests/real). EXT-29 adds the pickers, file watchers, save and selection events, formatting and code-action providers, and diagnostics in the Problems view. EXT-30 adds file icon themes (their SVG icons). EXT-31 adds webview panels.",
   "level": "1.90.0",
   "statuses": ["FULL", "PARTIAL", "STUB", "UNSUPPORTED", "NOT VERIFIED"],
   "api": [
@@ -358,10 +358,14 @@
     {
       "api": "window.createWebviewPanel",
       "tier": 3,
-      "status": "UNSUPPORTED",
+      "status": "PARTIAL",
       "baseline": "UNSUPPORTED",
-      "notes": "Webviews need an isolated HTML surface Yavin does not have; see the audit.",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "notes": "EXT-31: a sandboxed frame in Yavin's editor area, served from its own origin under a fixed policy (no network, no IPC, no navigation). html, options (enableScripts, localResourceRoots inside the extension's package), cspSource, asWebviewUri, postMessage both ways (1 MiB each), acquireVsCodeApi with getState/setState, title, reveal, visible/active, onDidChangeViewState, onDidDispose. Not kept: view columns (one editor area), enableCommandUris, enableForms, portMapping, retainContextWhenHidden beyond 8 panels; roots outside the package load nothing; theme variables only. No serializer: a panel does not survive a reload.",
+      "evidence": [
+        "L2: real host, crates/ide-plugin-host/tests/core_api.rs (a_webview_panel_speaks_the_protocol…); the window, src/services/extensions/vscodeWebview.test.ts; native, src-tauri/src/extension_webviews_tests.rs",
+        "L3: Bookmarks (its What's New panel is created) and SVG Preview (Preview All) in the benchmark's activation run (benchmark/openvsx/ext31/)",
+        "L4: tests/ui/terminal.spec.ts (EXT-31 webview), tests/real/webview.spec.ts (isolation in the installed application), tests/real/webview-svg.spec.ts (SVG Preview from Open VSX, when its package is given)"
+      ]
     },
     {
       "api": "window.registerWebviewViewProvider",
