@@ -86,7 +86,11 @@ test("messages pass both ways, JSON only and bounded; before the page is ready t
   frame.post("message", "too early");
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.deepEqual(await w.step("return T.got;"), [], "not heard before ready");
+  // A "ready" from another revision's page (an earlier one still in the frame) is not ours.
   frame.post("ready", null);
+  frame.post("ready", 99);
+  assert.deepEqual(frame.received, [], "an earlier page's ready is not taken");
+  frame.ready();
   assert.deepEqual(frame.received, [{ hello: [1, 2] }]);
   assert.equal(await w.step(`return await T.p.webview.postMessage("again");`), true);
   assert.deepEqual(frame.received.at(-1), "again");
@@ -390,4 +394,46 @@ test("a frame that loads something else is served its page again; a load of our 
   stale.post("pong", ping.yavinPing);
   await grace();
   assert.equal(w.webviews.getSnapshot()[0].revision, 2);
+});
+
+test("a frame that keeps an earlier page after an update (its navigation dropped) is given its page again; the right page's ready ends it", async (t) => {
+  const w = await ready();
+  t.after(() => w.manager.dispose());
+  const shown = await panel(w);
+  w.webviews.setShown(shown.id);
+  const revision = () => w.webviews.getSnapshot()[0].revision;
+  const watch = () => new Promise((resolve) => setTimeout(resolve, 60));
+  const first = w.frame(shown.id);
+  // The extension sets new HTML: the frame is given the next page (as the component does on a
+  // new address), but WebView2 keeps the earlier one, which says ready for its own revision.
+  await w.step(`T.p.webview.html = "<p>next</p>"; return 1;`);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const given = revision();
+  assert.ok(given > shown.revision, "the update is a new page");
+  w.webviews.attachFrame(shown.id, first.window);
+  first.post("ready", given - 1);
+  assert.equal(await w.step(`return await T.p.webview.postMessage("for the new page");`), true);
+  assert.ok(!first.received.includes("for the new page"), "nothing sent to the earlier page");
+  await watch();
+  assert.equal(revision(), given + 1, "its page is given again");
+  assert.match(w.webviewWarnings.join("\n"), /did not show its page; its page was shown again/);
+  // The page it was given this time says ready: it is ours, and nothing more happens.
+  const second = w.frame(shown.id);
+  assert.ok(second.received.includes("for the new page"), "the waiting message is delivered");
+  await watch();
+  assert.equal(revision(), given + 1);
+});
+
+test("a page without scripts has no bootstrap to say it is ready: it is not served again for that", async (t) => {
+  const w = await ready();
+  t.after(() => w.manager.dispose());
+  const shown = await panel(w, "{ enableScripts: false }");
+  w.webviews.setShown(shown.id);
+  w.frame(shown.id, false);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(w.webviews.getSnapshot()[0].revision, shown.revision);
+  assert.deepEqual(
+    w.webviewWarnings.filter((x) => /did not show its page/.test(x)),
+    [],
+  );
 });

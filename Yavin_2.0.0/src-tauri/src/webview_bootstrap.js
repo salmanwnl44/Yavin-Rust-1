@@ -105,5 +105,8 @@
     },
     true,
   );
-  send("ready", null);
+  // Which of the panel's pages this is (`?v=`, the window's revision): the window takes "ready"
+  // only from the page it last asked for, never from an earlier one still in the frame.
+  const revision = Number(new URLSearchParams(location.search).get("v"));
+  send("ready", Number.isInteger(revision) ? revision : null);
 })();

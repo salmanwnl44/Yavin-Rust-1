@@ -114,6 +114,8 @@ interface Live {
   loads: number;
   /** The load whose ping our page has answered. */
   answered: number;
+  /** Waiting for the page the frame was last given to say it is ready (`attachFrame`). */
+  watch: ReturnType<typeof setTimeout> | null;
 }
 
 /** `value` as JSON text within `max`, or null (not JSON, or too large). */
@@ -161,6 +163,8 @@ export function createWebviewStore(
   const remove = (one: Live, notify: boolean) => {
     if (!live.delete(one.panel.id)) return;
     if (one.stateTimer) clearTimeout(one.stateTimer);
+    if (one.watch) clearTimeout(one.watch);
+    one.watch = null;
     one.queue = [];
     one.frame = null;
     void native.close(one.token).catch(() => undefined);
@@ -263,6 +267,7 @@ export function createWebviewStore(
         restores: [],
         loads: 0,
         answered: 0,
+        watch: null,
       });
       publish();
     },
@@ -359,6 +364,23 @@ export function createWebviewStore(
       if (!one) return;
       one.frame = frame;
       one.ready = false;
+      if (one.watch) clearTimeout(one.watch);
+      one.watch = null;
+      // A frame given a page (a new address: created, updated, served again) must show it.
+      // WebView2 can drop a frame's navigation that follows another closely -- measured: the
+      // frame kept the panel's first, empty page while its address was the next. A page that
+      // has not said it is ready by then is served again (bounded, with the restores). Without
+      // scripts there is no bootstrap to say so, and nothing to watch.
+      if (frame && one.panel.scripts) {
+        const revision = one.panel.revision;
+        one.watch = setTimeout(() => {
+          one.watch = null;
+          if (live.get(id) !== one || one.frame !== frame || one.ready) return;
+          if (one.panel.revision !== revision) return;
+          // What the extension sent meanwhile waits for it: no page of this revision ever had it.
+          serveAgain(id, one, "did not show its page", true);
+        }, graceMs * 3);
+      }
     },
     /**
      * A message from a panel's frame -- already known to come from that frame (the component
@@ -370,6 +392,11 @@ export function createWebviewStore(
       const { yavinWebview, kind, payload } = data as Record<string, unknown>;
       if (yavinWebview !== 1 || typeof kind !== "string") return;
       if (kind === "ready") {
+        // Only the page the frame was last given: an earlier one still in the frame (its next
+        // navigation dropped or not yet done) is not ours to speak to or hear.
+        if (payload !== one.panel.revision) return;
+        if (one.watch) clearTimeout(one.watch);
+        one.watch = null;
         one.ready = true;
         const queued = one.queue;
         one.queue = [];
@@ -454,6 +481,14 @@ export function createWebviewStore(
 
   function judgeLoad(id: string, one: Live, load: number) {
     if (live.get(id) !== one || one.loads !== load || !one.frame || one.answered === load) return;
+    serveAgain(id, one, "tried to leave its page (stopped)");
+  }
+
+  /**
+   * Serves a panel's page to its frame again, with its saved state; at most 3 times a minute.
+   * `keepQueue`: the messages waiting are still the page's (it never loaded, rather than left).
+   */
+  function serveAgain(id: string, one: Live, why: string, keepQueue = false) {
     // Not our page: nothing more is sent to it.
     one.ready = false;
     const now = Date.now();
@@ -469,9 +504,9 @@ export function createWebviewStore(
     }
     one.restores.push(now);
     warn(
-      `The webview "${one.panel.title}" (${one.panel.extensionId}) tried to leave its page; it was stopped, and the page shown again.`,
+      `The webview "${one.panel.title}" (${one.panel.extensionId}) ${why}; its page was shown again.`,
     );
-    one.queue = [];
+    if (!keepQueue) one.queue = [];
     const reload = () => {
       if (live.get(id) === one) change(one, { revision: one.panel.revision + 1 });
     };

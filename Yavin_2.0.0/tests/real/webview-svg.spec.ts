@@ -276,7 +276,47 @@ test("EXT-31 SVG Preview (Open VSX): its Preview All webview loads sandboxed and
         .locator("body")
         .innerHTML({ timeout: 3000 })
         .catch((error) => String(error));
+      // The webview frame's own document (how far it loaded) and the element holding it.
+      const webviewFrame = page.frames().find((frame) => frame.url().includes("yavin-webview"));
+      const documentState = webviewFrame
+        ? await webviewFrame
+            .evaluate(
+              () =>
+                `${performance
+                  .getEntriesByType("navigation")
+                  .map((entry) => entry.name)
+                  .join(" ")}: ` +
+                `${document.readyState}, ${document.documentElement.outerHTML.length} chars, ` +
+                `scripts ${document.scripts.length}, acquireVsCodeApi ${typeof (window as unknown as Record<string, unknown>).acquireVsCodeApi}`,
+            )
+            .catch((error) => String(error).slice(0, 200))
+        : "no webview frame";
+      const element = await page
+        .locator("iframe[data-webview]")
+        .evaluateAll((all) =>
+          all.map((one) => `${one.getAttribute("src")} hidden=${one.hasAttribute("hidden")}`),
+        )
+        .catch((error) => [String(error)]);
+      // Diagnosis only: does the same address, set again, load the page?
+      const again = await page
+        .locator("iframe[data-webview]")
+        .first()
+        .evaluate(async (one: HTMLIFrameElement) => {
+          const src = one.src;
+          one.src = src;
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          return src;
+        })
+        .catch((error) => String(error).slice(0, 200));
+      const afterAgain = await page
+        .frameLocator("iframe[data-webview]")
+        .locator("#__listview")
+        .count()
+        .catch(() => -1);
       logs.push(
+        `set again (${again}): #__listview ${afterAgain}`,
+        `frame document: ${documentState}`,
+        `iframes: ${element.join(" | ")}`,
         `frame body: ${frameHtml.slice(0, 600)}`,
         `frames: ${page
           .frames()

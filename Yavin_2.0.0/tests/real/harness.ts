@@ -224,6 +224,9 @@ export async function palette(page: Page, command: string) {
 /** The Extensions view, opened if it is not the one showing (its icon on an open view hides it). */
 export async function extensionsView(page: Page) {
   const view = page.getByRole("complementary", { name: "Extensions" });
+  // A window that restores the Extensions view may show it a moment after starting: clicking
+  // its icon then would hide it. Given that moment first, then opened if still not showing.
+  await view.waitFor({ state: "visible", timeout: 3000 }).catch(() => undefined);
   if (!(await view.isVisible()))
     await page.getByTitle("Extensions & Plugins (Ctrl+Shift+X)", { exact: true }).click();
   await expect(view).toBeVisible();

@@ -337,7 +337,8 @@ export function vscodeWorld() {
     sentEvents,
     /**
      * EXT-31: a panel's frame, as the window would hold it: attached (its tab in front), its
-     * page ready; what it receives, and a way to post as its page would.
+     * page ready; what it receives, and a way to post as its page would. `ready()` says ready
+     * as the bootstrap does, for the page the frame was last given (the panel's revision).
      */
     frame(panelId: string, ready = true) {
       const received: unknown[] = [];
@@ -347,8 +348,10 @@ export function vscodeWorld() {
       webviews.attachFrame(panelId, window);
       const post = (kind: string, payload: unknown) =>
         webviews.frameMessage(panelId, { yavinWebview: 1, kind, payload });
-      if (ready) post("ready", null);
-      return { received, post, window };
+      const sayReady = () =>
+        post("ready", webviews.getSnapshot().find((panel) => panel.id === panelId)?.revision);
+      if (ready) sayReady();
+      return { received, post, window, ready: sayReady };
     },
     /** The Problems view's entries (Yavin's own store). */
     problems: () => allProblems(),

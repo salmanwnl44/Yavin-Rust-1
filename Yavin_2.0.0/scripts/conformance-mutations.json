@@ -1,5 +1,5 @@
 {
-  "note": "EXT-27: behaviours of the VS Code compatibility layer and its window side, each broken in turn; the tests named must catch it (scripts/conformance-mutations.mjs). Paths are relative to Yavin_2.0.0. EXT-28 adds R1-R21: the runtime (web.js, intl.js, the loader, the random source, rejection reports), each caught by tests/runtime.rs. EXT-29 adds C1-C9 (the window side: prompts, problems, will-save, file events, ownership) and S1-S7 (the layer: watchers, prompts, tokens, validation, code actions, diagnostics batches). EXT-30 adds I1-I8: file icon themes (paths kept inside the package, SVG only and bounded, VS Code's choice of icon, a disabled extension's theme, the manifest's check). EXT-31 adds V01-V09: webview panels (ownership, bounded and ready-gated frame messages, disposal with the extension, messages to the owner only, resource roots, the window's update loop, the window's permission rule).",
+  "note": "EXT-27: behaviours of the VS Code compatibility layer and its window side, each broken in turn; the tests named must catch it (scripts/conformance-mutations.mjs). Paths are relative to Yavin_2.0.0. EXT-28 adds R1-R21: the runtime (web.js, intl.js, the loader, the random source, rejection reports), each caught by tests/runtime.rs. EXT-29 adds C1-C9 (the window side: prompts, problems, will-save, file events, ownership) and S1-S7 (the layer: watchers, prompts, tokens, validation, code actions, diagnostics batches). EXT-30 adds I1-I8: file icon themes (paths kept inside the package, SVG only and bounded, VS Code's choice of icon, a disabled extension's theme, the manifest's check). EXT-31 adds V01-V09: webview panels (ownership, bounded and ready-gated frame messages, disposal with the extension, messages to the owner only, resource roots, the window's update loop, the window's permission rule), and V10-V11 (only the page the frame was last given is ready; a frame that kept an earlier page is given its page again).",
   "mutations": [
     {
       "id": "EXT-27 B1",
@@ -867,6 +867,30 @@
         }
       ],
       "node": ["src/services/extensions/permissions.test.ts"]
+    },
+    {
+      "id": "EXT-31 V10",
+      "what": "an earlier page's ready is taken (a dropped navigation's page spoken to)",
+      "edits": [
+        {
+          "file": "src/services/extensions/webviews.ts",
+          "from": "        if (payload !== one.panel.revision) return;\n",
+          "to": ""
+        }
+      ],
+      "node": ["src/services/extensions/vscodeWebview.test.ts"]
+    },
+    {
+      "id": "EXT-31 V11",
+      "what": "a frame that kept an earlier page is left with it",
+      "edits": [
+        {
+          "file": "src/services/extensions/webviews.ts",
+          "from": "          serveAgain(id, one, \"did not show its page\", true);",
+          "to": "          void serveAgain;"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeWebview.test.ts"]
     }
   ]
 }
