@@ -2125,6 +2125,1013 @@
         }
       ],
       "args": ["-p", "ide-plugin-host", "--test", "workers", "--", "a_worker_that_throws"]
+    },
+    {
+      "id": "EXT-33 F01",
+      "what": "a relative PATH entry is searched for Yavin's own tools (a planted program chosen)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/lsp_process.rs",
+          "from": "        folders.extend(std::env::split_paths(&path).filter(|folder| folder.is_absolute()));",
+          "to": "        folders.extend(std::env::split_paths(&path));"
+        }
+      ],
+      "args": ["-p", "ide-workspace", "--lib", "--", "only_absolute_path_folders"]
+    },
+    {
+      "id": "EXT-33 F02",
+      "what": "a suffix-less name is chosen on Windows",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/lsp_process.rs",
+          "from": "        [\".exe\", \".cmd\", \".bat\"]",
+          "to": "        [\"\", \".exe\", \".cmd\", \".bat\"]"
+        }
+      ],
+      "args": ["-p", "ide-workspace", "--lib", "--", "only_absolute_path_folders"]
+    },
+    {
+      "id": "EXT-33 F03",
+      "what": "finding files needs no capability (native rule)",
+      "edits": [
+        {
+          "file": "src/extension_permissions.rs",
+          "from": "            Need::Nothing => need(FS_READ),",
+          "to": "            Need::Nothing => Need::Nothing,"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "extension_permissions"]
+    },
+    {
+      "id": "EXT-33 F04",
+      "what": "the search's hard exclusion of repository metadata is dropped",
+      "edits": [
+        {
+          "file": "src/workbench.rs",
+          "from": "    args.extend([\"--glob\", \"!.git/**\", \"--glob\", \"!**/.git/**\"].map(String::from));",
+          "to": "    let _ = ();"
+        }
+      ],
+      "args": ["-p", "yavin-ide", "--lib", "--", "a_listing_for_an_extension"]
+    },
+    {
+      "id": "EXT-33 H01",
+      "what": "an untrusted workspace is not stopped from changing its Git repository",
+      "edits": [
+        {
+          "file": "src/git.rs",
+          "from": "    if !trusted && !untrusted_read_allowed(subcommand, &args[1..]) {\n        return Err(RESTRICTED_GIT.into());\n    }\n\n    validate_args(subcommand, &args[1..])?;",
+          "to": "    if false && !untrusted_read_allowed(subcommand, &args[1..]) {\n        return Err(RESTRICTED_GIT.into());\n    }\n\n    validate_args(subcommand, &args[1..])?;"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "git::tests::an_untrusted_workspace_allows_reads_and_refuses_the_rest"
+      ]
+    },
+    {
+      "id": "EXT-33 H02",
+      "what": "Git runs with the repository configuration that can make it run a program",
+      "edits": [
+        {
+          "file": "src/git.rs",
+          "from": "    if harden {\n        command.args(HARDENING).args(&drivers);\n    }",
+          "to": "    if false {\n        command.args(HARDENING).args(&drivers);\n    }"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "git::tests::command_line_overrides_beat_a_repositorys_own_config"
+      ]
+    },
+    {
+      "id": "EXT-33 H03",
+      "what": "a language server the project provides runs without the user choosing it",
+      "edits": [
+        {
+          "file": "src/lsp.rs",
+          "from": "    let Some(artifact) = project_artifact(spec, workspace, folder, &resolved) else {\n        return Ok(resolved);\n    };",
+          "to": "    let Some(artifact) = None::<PathBuf> else {\n        return Ok(resolved);\n    };"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "lsp::project_server_tests::a_project_server_is_refused_until_chosen_then_runs_only_while_unchanged"
+      ]
+    },
+    {
+      "id": "EXT-33 H04",
+      "what": "a chosen project server still runs after its file changed",
+      "edits": [
+        {
+          "file": "src/lsp.rs",
+          "from": "                && c.sha256.as_deref()\n                    == crate::extension_package::sha256_file(&artifact).ok().as_deref() =>",
+          "to": "                && (c.sha256.is_some()\n                    || c.sha256.as_deref()\n                        == crate::extension_package::sha256_file(&artifact).ok().as_deref()) =>"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "lsp::project_server_tests::a_project_server_is_refused_until_chosen_then_runs_only_while_unchanged"
+      ]
+    },
+    {
+      "id": "EXT-33 H05",
+      "what": "a filter or diff driver the repository configures is left live for untrusted reads",
+      "edits": [
+        {
+          "file": "src/git.rs",
+          "from": "        command.args(HARDENING).args(&drivers);",
+          "to": "        command.args(HARDENING);"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "git::tests::a_hostile_repositorys_configured_programs_never_run_for_untrusted_reads"
+      ]
+    },
+    {
+      "id": "EXT-33 H06",
+      "what": "a driver name the -c syntax cannot spell is skipped instead of refused",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/git_harden.rs",
+          "from": "        if driver.contains('=') {",
+          "to": "        if false && driver.contains('=') {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--lib",
+        "--",
+        "git_harden::tests::a_driver_name_the_c_syntax_cannot_spell_is_refused"
+      ]
+    },
+    {
+      "id": "EXT-33 H07",
+      "what": "a submodule or embedded repository's own filters run during untrusted status/diff (V1)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/git_harden.rs",
+          "from": "    \"-c\",\n    \"diff.ignoreSubmodules=all\",",
+          "to": "    \"-c\",\n    \"diff.ignoreSubmodules=no\","
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "git::tests::a_hostile_repositorys_configured_programs_never_run_for_untrusted_reads"
+      ]
+    },
+    {
+      "id": "EXT-33 H08",
+      "what": "the background index check keeps the repository's own filter/diff drivers live (V2)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/operations.rs",
+          "from": "            .args(HARDENING)\n            .args(&drivers)\n            .args([\n                \"--no-pager\",",
+          "to": "            .args(HARDENING)\n            .args([\n                \"--no-pager\",",
+          "what": "the background index check keeps the repository's own filter/diff drivers live (V2)"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--lib",
+        "--",
+        "operations::tests::the_background_index_check_runs_no_configured_program"
+      ]
+    },
+    {
+      "id": "EXT-33 H09",
+      "what": "the installed server choice still runs a workspace file it would auto-load (V3/V5)",
+      "edits": [
+        {
+          "file": "src/lsp.rs",
+          "from": "            if project_artifact(spec, workspace, folder, &installed).is_some() {",
+          "to": "            if false && project_artifact(spec, workspace, folder, &installed).is_some() {"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "lsp::project_server_tests::an_installed_path_inside_the_workspace_is_still_the_projects"
+      ]
+    },
+    {
+      "id": "EXT-33 H10",
+      "what": "the background index check drops the fixed hardening set (V2)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/operations.rs",
+          "from": "        command\n            .current_dir(root)\n            .args(HARDENING)\n            .args(&drivers)\n            .args([\n                \"--no-pager\",",
+          "to": "        command\n            .current_dir(root)\n            .args(&drivers)\n            .args([\n                \"--no-pager\","
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--lib",
+        "--",
+        "operations::tests::the_background_index_check_runs_no_configured_program"
+      ]
+    },
+    {
+      "id": "EXT-33 B01",
+      "what": "a C1 program is run without matching the pinned identity (executable substitution)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/broker.rs",
+          "from": "        if !actual.eq_ignore_ascii_case(&program.sha256) {",
+          "to": "        if false && !actual.eq_ignore_ascii_case(&program.sha256) {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "broker",
+        "--",
+        "a_substituted_or_mismatched_program_is_refused"
+      ]
+    },
+    {
+      "id": "EXT-33 B02",
+      "what": "a C1 filter accepts input past its bound",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/broker.rs",
+          "from": "        if stdin.len() > MAX_STDIN {",
+          "to": "        if false && stdin.len() > MAX_STDIN {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--lib",
+        "--",
+        "broker::tests::input_past_the_bound_is_refused_before_launch"
+      ]
+    },
+    {
+      "id": "EXT-33 B03",
+      "what": "the C1 concurrency cap does not hold",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/broker.rs",
+          "from": "    if counter.fetch_add(1, Ordering::AcqRel) >= max {",
+          "to": "    if counter.fetch_add(1, Ordering::AcqRel) >= u32::MAX {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--lib",
+        "--",
+        "broker::tests::the_concurrency_cap_holds_and_slots_are_returned"
+      ]
+    },
+    {
+      "id": "EXT-33 B04",
+      "what": "a C1 file-name slot accepts path separators (argument injection)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/broker.rs",
+          "from": "                    && !name.contains(['/', '\\\\', ':', '\\0', '\\r', '\\n', '\"'])",
+          "to": "                    && !name.contains(['\\0'])"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--lib",
+        "--",
+        "broker::tests::a_file_name_slot_is_a_bare_name_only"
+      ]
+    },
+    {
+      "id": "EXT-33 B05",
+      "what": "a C1 filter that floods then exits slips past the output bound",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/broker.rs",
+          "from": "        if overflow.load(Ordering::SeqCst) {\n            return Err(C1Error::new(",
+          "to": "        if false && overflow.load(Ordering::SeqCst) {\n            return Err(C1Error::new("
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "broker",
+        "--",
+        "output_past_the_bound_ends_the_run"
+      ]
+    },
+    {
+      "id": "EXT-33 GR01",
+      "what": "a grant is created without the user's approval (consent bypass)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/grants.rs",
+          "from": "        if !approver.approve(&consent) {",
+          "to": "        if false && !approver.approve(&consent) {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--lib",
+        "--",
+        "grants::tests::a_grant_exists_only_after_approval"
+      ]
+    },
+    {
+      "id": "EXT-33 GR02",
+      "what": "a grant is reused across extensions (identity not bound)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/grants.rs",
+          "from": "        self.extension_id == key.extension_id",
+          "to": "        true || self.extension_id == key.extension_id"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--lib",
+        "--",
+        "grants::tests::a_grant_is_not_reused_across_extensions_or_installs"
+      ]
+    },
+    {
+      "id": "EXT-33 GR03",
+      "what": "a grant survives an extension update (copy not bound)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/grants.rs",
+          "from": "            && self.copy_id == key.copy_id",
+          "to": "            && (true || self.copy_id == key.copy_id)"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--lib",
+        "--",
+        "grants::tests::a_changed_copy_program_or_profile_needs_reapproval"
+      ]
+    },
+    {
+      "id": "EXT-33 GR04",
+      "what": "a grant survives a changed program (hash not checked)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/grants.rs",
+          "from": "            && self\n                .program_sha256\n                .eq_ignore_ascii_case(&key.program_sha256)",
+          "to": "            && (true\n                || self\n                    .program_sha256\n                    .eq_ignore_ascii_case(&key.program_sha256))"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--lib",
+        "--",
+        "grants::tests::a_changed_copy_program_or_profile_needs_reapproval"
+      ]
+    },
+    {
+      "id": "EXT-33 GR05",
+      "what": "a workspace-bound grant applies in any workspace",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/grants.rs",
+          "from": "            && (self.workspace.is_none() || self.workspace == key.workspace)",
+          "to": "            && (true || self.workspace.is_none() || self.workspace == key.workspace)"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--lib",
+        "--",
+        "grants::tests::a_workspace_bound_grant_applies_only_there"
+      ]
+    },
+    {
+      "id": "EXT-33 GR06",
+      "what": "revocation does not signal a running process to end",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/grants.rs",
+          "from": "                    launch.flag.store(false, Ordering::SeqCst);",
+          "to": "                    launch.flag.store(true, Ordering::SeqCst);"
+        }
+      ],
+      "args": ["-p", "ide-workspace", "--test", "grants", "--", "revocation_ends_a_running_filter"]
+    },
+    {
+      "id": "EXT-33 R01",
+      "what": "a C1 filter's stderr is not bounded",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/broker.rs",
+          "from": "                        let take = MAX_STDERR.saturating_sub(text.len()).min(n);",
+          "to": "                        let take = n;"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "broker",
+        "--",
+        "stderr_is_bounded_and_does_not_deadlock"
+      ]
+    },
+    {
+      "id": "EXT-33 R02",
+      "what": "a C1 filter's job memory cap is far larger than specified",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/broker.rs",
+          "from": "pub const MEMORY_BYTES: u64 = 512 << 20;",
+          "to": "pub const MEMORY_BYTES: u64 = 8192 << 20;"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "broker",
+        "--",
+        "the_job_memory_cap_refuses_an_over_limit_allocation"
+      ]
+    },
+    {
+      "id": "EXT-33 R03",
+      "what": "a C1 filter's CPU is not capped to one core",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/broker.rs",
+          "from": "            cpu_rate: cpu_rate_for(\n                1,",
+          "to": "            cpu_rate: cpu_rate_for(\n                9999,"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "broker",
+        "--",
+        "the_cpu_hard_cap_holds_under_sustained_load"
+      ]
+    },
+    {
+      "id": "EXT-33 E4-01",
+      "what": "the per-extension concurrency cap does not hold",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/grants.rs",
+          "from": "                if *count >= MAX_PER_EXTENSION {",
+          "to": "                if *count >= u32::MAX {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "grants",
+        "--",
+        "an_extension_cannot_exceed_its_per_extension_cap"
+      ]
+    },
+    {
+      "id": "EXT-33 E4-02",
+      "what": "a filter's extension identity comes from the request, not the loaded copy",
+      "edits": [
+        {
+          "file": "src/process_capability.rs",
+          "from": "        let key = LaunchKey {\n            extension_id: copy.id.clone(),",
+          "to": "        let key = LaunchKey {\n            extension_id: request.profile.clone(),"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "process_capability::tests::identity_comes_from_the_copy_not_the_request"
+      ]
+    },
+    {
+      "id": "EXT-33 E4-03",
+      "what": "process.runFilter runs without the process capability",
+      "edits": [
+        {
+          "file": "src/extension_permissions.rs",
+          "from": "            } else if !slots_ok {\n                Need::Invalid(\"\\\"slots\\\" must be an array\".into())\n            } else {\n                need(PROCESS)\n            }",
+          "to": "            } else if !slots_ok {\n                Need::Invalid(\"\\\"slots\\\" must be an array\".into())\n            } else {\n                Need::Nothing\n            }"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "extension_host::real_host::a_filter_request_is_gated_by_the_process_capability_natively"
+      ]
+    },
+    {
+      "id": "EXT-33 ACL-01",
+      "what": "the workspace read grant broadens the access mask to include write",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/sandbox.rs",
+          "from": "                grfAccessPermissions: FILE_GENERIC_READ,",
+          "to": "                grfAccessPermissions: FILE_GENERIC_READ | 0x4000_0000,"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "workspace_acl",
+        "--",
+        "a_read_only_grant_allows_reads_and_denies_every_write"
+      ]
+    },
+    {
+      "id": "EXT-33 ACL-02",
+      "what": "ACE ownership is not checked by SID, so one container's grant is seen as another's",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/sandbox.rs",
+          "from": "                        if !trustee.is_null() && EqualSid(trustee, sid.0) != 0 {",
+          "to": "                        if !trustee.is_null() && (EqualSid(trustee, sid.0) != 0 || true) {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "workspace_acl",
+        "--",
+        "a_grant_to_one_container_is_not_shared_with_another"
+      ]
+    },
+    {
+      "id": "EXT-33 ACL-03",
+      "what": "safe_grant does not refuse a tree the container can already write (broad-ACE check bypassed)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/workspace_acl.rs",
+          "from": "    if crate::sandbox::container_writable(&root, container).map_err(GrantError::Failed)? {",
+          "to": "    if false && crate::sandbox::container_writable(&root, container).map_err(GrantError::Failed)? {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "workspace_acl",
+        "--",
+        "safe_grant_refuses_a_tree_the_container_can_already_write"
+      ]
+    },
+    {
+      "id": "EXT-33 ACL-04",
+      "what": "safe_grant does not refuse an outward reparse (root/path safety bypassed)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/workspace_acl.rs",
+          "from": "    if let Some(bad) = outward_reparse(&root) {",
+          "to": "    if let Some(bad) = (None as Option<std::path::PathBuf>) {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "workspace_acl",
+        "--",
+        "safe_grant_refuses_an_outward_junction"
+      ]
+    },
+    {
+      "id": "EXT-33 ACL-05",
+      "what": "safe_grant skips journaling, so a crash leaves an unreconcilable residual grant",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/workspace_acl.rs",
+          "from": "    journal.record(&root.to_string_lossy(), container)?;",
+          "to": "    if false { journal.record(&root.to_string_lossy(), container)?; }"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "workspace_acl",
+        "--",
+        "startup_reconciliation_removes_a_grant_a_crash_left_behind"
+      ]
+    },
+    {
+      "id": "EXT-33 ACL-06",
+      "what": "safe_grant does not refuse a workspace hard-linked to outside data",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/workspace_acl.rs",
+          "from": "    if let Some(bad) = external_hard_link(&root) {",
+          "to": "    if let Some(bad) = (None as Option<std::path::PathBuf>) {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "workspace_acl",
+        "--",
+        "safe_grant_refuses_an_external_hard_link"
+      ]
+    },
+    {
+      "id": "EXT-33 ACL-07",
+      "what": "server-start gating is bypassed for a workspace with no grant at all (may_start returns Ok)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/workspace_acl.rs",
+          "from": "                None => return Err(GrantError::NotReady(\"no grant for this workspace\".into())),",
+          "to": "                None => return Ok(()),"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "workspace_acl",
+        "--",
+        "may_start_gates_a_server_launch_on_a_verified_grant"
+      ]
+    },
+    {
+      "id": "EXT-33 ACL-08",
+      "what": "a grant worker superseded by a newer revoke does not undo its applied ACE (stale-op reapply)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/workspace_acl.rs",
+          "from": "                    let _ = revoke(g, &journal);",
+          "to": "                    if false { let _ = revoke(g, &journal); }"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "workspace_acl",
+        "--",
+        "a_newer_revoke_prevents_a_stale_grant_from_reapplying"
+      ]
+    },
+    {
+      "id": "EXT-33 ACL-09",
+      "what": "server-start gating accepts a non-Granted state (failed/pending/revoking grant may start)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/workspace_acl.rs",
+          "from": "                        return Err(GrantError::NotReady(format!(\"grant state is {other:?}\")));",
+          "to": "                        return Ok(());"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--test",
+        "workspace_acl",
+        "--",
+        "may_start_refuses_a_failed_grant"
+      ]
+    },
+    {
+      "id": "EXT-33 C2-10",
+      "what": "the C2 launch does not require consent (the deny-by-default grant gate is bypassed)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/c2.rs",
+          "from": "            .map_err(|e| denial(\"PermissionDenied\", e.message))?;",
+          "to": "            .map_err(|e| denial(\"PermissionDenied\", e.message)).unwrap_or(0);"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--features",
+        "c2-test-profiles",
+        "--test",
+        "c2",
+        "--",
+        "without_consent_a_launch_is_refused_and_nothing_is_applied"
+      ]
+    },
+    {
+      "id": "EXT-33 C2-11",
+      "what": "the container identity ignores the extension copy, so a different copy reuses one container (identity substitution)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/workspace_identity.rs",
+          "from": "    for field in [IDENTITY_VERSION, class.tag(), copy_id, root_key.as_str()] {",
+          "to": "    for field in [IDENTITY_VERSION, class.tag(), \"\", root_key.as_str()] {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--lib",
+        "--",
+        "workspace_identity::tests::a_different_copy_derives_a_different_identity"
+      ]
+    },
+    {
+      "id": "EXT-33 C2-12",
+      "what": "the C2 launch does not require a verified workspace grant (it proceeds on a failed grant; server-start gate bypassed)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/c2.rs",
+          "from": "                _ => return false,",
+          "to": "                _ => return true,"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--features",
+        "c2-test-profiles",
+        "--test",
+        "c2",
+        "--",
+        "a_broad_writable_workspace_is_refused"
+      ]
+    },
+    {
+      "id": "EXT-33 C2-14",
+      "what": "revocation does not remove the workspace ACE (cleanup skipped, grant-owned access persists)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/c2.rs",
+          "from": "            self.acl.begin_revoke(&acl_key);",
+          "to": "            let _ = &acl_key;"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--features",
+        "c2-test-profiles",
+        "--test",
+        "c2",
+        "--",
+        "revocation_stops_the_server_cleans_the_acl_and_blocks_relaunch"
+      ]
+    },
+    {
+      "id": "EXT-33 C2-15",
+      "what": "the production authority registers a C2 server profile (a test profile leaks into production)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/c2.rs",
+          "from": "            profiles: Vec::new(),",
+          "to": "            profiles: vec![C2Profile { id: \"leaked\", program: ProgramId { path: std::path::PathBuf::from(\"x.exe\"), sha256: String::new() }, argv: Vec::new(), memory_bytes: 16 << 20, cpu_rate: 1 }],"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--features",
+        "c2-test-profiles",
+        "--test",
+        "c2",
+        "--",
+        "production_registers_no_profiles_and_launches_nothing"
+      ]
+    },
+    {
+      "id": "EXT-33 C2T-01",
+      "what": "the Tauri layer's launch identity ignores the loaded copy's version (HostCopy identity bypass)",
+      "edits": [
+        {
+          "file": "src/c2_capability.rs",
+          "from": "            copy.version,",
+          "to": "            \"fixed-copy\","
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--features",
+        "c2-test-profiles",
+        "--lib",
+        "--",
+        "c2_capability::tests::identity_is_built_from_the_copy_not_a_request"
+      ]
+    },
+    {
+      "id": "EXT-33 C2T-02",
+      "what": "the Tauri consent command no longer requires a native open workspace (accepts an empty/renderer-free workspace)",
+      "edits": [
+        {
+          "file": "src/c2_capability.rs",
+          "from": "    let workspace = workspace.ok_or(\"open a folder before allowing a server to read it.\")?;",
+          "to": "    let workspace = workspace.unwrap_or(\"\");"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--features",
+        "c2-test-profiles",
+        "--lib",
+        "--",
+        "c2_capability::tests::consent_requires_a_native_open_workspace"
+      ]
+    },
+    {
+      "id": "EXT-33 C2T-03",
+      "what": "the native consent gate no longer requires approval (consent skipped)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/grants.rs",
+          "from": "        if !approver.approve(&consent) {",
+          "to": "        if false {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--lib",
+        "--",
+        "grants::tests::a_grant_exists_only_after_approval"
+      ]
+    },
+    {
+      "id": "EXT-33 C2T-04",
+      "what": "c2_revoke no longer verifies the grant exists as a C2 grant (revocation ownership check bypassed)",
+      "edits": [
+        {
+          "file": "src/c2_capability.rs",
+          "from": "    if !is_c2 {",
+          "to": "    if false {"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--features",
+        "c2-test-profiles",
+        "--lib",
+        "--",
+        "c2_capability::tests::revoking_an_unknown_grant_is_refused"
+      ]
+    },
+    {
+      "id": "EXT-33 C2T-05",
+      "what": "the production C2 authority registers a server profile, caught at the application layer",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/c2.rs",
+          "from": "            profiles: Vec::new(),",
+          "to": "            profiles: vec![C2Profile { id: \"prod-leak\", program: ProgramId { path: std::path::PathBuf::from(\"srv.exe\"), sha256: String::new() }, argv: Vec::new(), memory_bytes: 16 << 20, cpu_rate: 1 }],"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--features",
+        "c2-test-profiles",
+        "--lib",
+        "--",
+        "c2_capability::tests::the_production_authority_registers_no_profiles"
+      ]
+    },
+    {
+      "id": "EXT-33 C2S-01",
+      "what": "the server-channel launch identity ignores the loaded copy's id (caller identity bypass)",
+      "edits": [
+        {
+          "file": "src/c2_capability.rs",
+          "from": "        extension_id: copy.id.clone(),",
+          "to": "        extension_id: \"any\".into(),"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--features",
+        "c2-test-profiles",
+        "--lib",
+        "--",
+        "c2_capability::tests::identity_is_built_from_the_copy_not_a_request"
+      ]
+    },
+    {
+      "id": "EXT-33 C2S-03",
+      "what": "process.callServer no longer needs the process capability (C2 reachable through the ordinary extension API)",
+      "edits": [
+        {
+          "file": "src/extension_permissions.rs",
+          "from": "            } else if !op_ok {\n                Need::Invalid(\"\\\"op\\\" must be a string\".into())\n            } else if !input_ok {\n                Need::Invalid(\"\\\"input\\\" must be a string\".into())\n            } else {\n                need(PROCESS)\n            }",
+          "to": "            } else if !op_ok {\n                Need::Invalid(\"\\\"op\\\" must be a string\".into())\n            } else if !input_ok {\n                Need::Invalid(\"\\\"input\\\" must be a string\".into())\n            } else {\n                Need::Nothing\n            }"
+        }
+      ],
+      "args": [
+        "-p",
+        "yavin-ide",
+        "--lib",
+        "--",
+        "extension_permissions::tests::only_call_server_is_an_extension_c2_method_and_it_needs_process"
+      ]
+    },
+    {
+      "id": "EXT-33 C2S-04",
+      "what": "the request-size bound is removed, so an extension can send an unbounded request",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/c2.rs",
+          "from": "        if input.len() > MAX_REQUEST {",
+          "to": "        if false {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--features",
+        "c2-test-profiles",
+        "--test",
+        "c2",
+        "--",
+        "an_oversized_request_is_refused"
+      ]
+    },
+    {
+      "id": "EXT-33 C2S-05",
+      "what": "the response-size bound is removed, so a server response is read without a cap",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/c2.rs",
+          "from": "    if n > max {",
+          "to": "    if false {"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--features",
+        "c2-test-profiles",
+        "--test",
+        "c2",
+        "--",
+        "an_oversized_response_is_refused"
+      ]
+    },
+    {
+      "id": "EXT-33 C2S-06",
+      "what": "revocation no longer removes/ends the channel server or cleans its ACL (revocation bypass)",
+      "edits": [
+        {
+          "file": "crates/ide-workspace/src/c2.rs",
+          "from": "        let channel = self\n            .channels\n            .lock()\n            .unwrap_or_else(|p| p.into_inner())\n            .remove(&grant_id);",
+          "to": "        let channel: Option<Arc<ChannelServer>> = None;"
+        }
+      ],
+      "args": [
+        "-p",
+        "ide-workspace",
+        "--features",
+        "c2-test-profiles",
+        "--test",
+        "c2",
+        "--",
+        "revocation_ends_the_channel_and_refuses_further_requests"
+      ]
     }
   ]
 }

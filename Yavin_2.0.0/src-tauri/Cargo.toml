@@ -24,6 +24,9 @@ tauri-build = { version = "2", features = [] }
 # Accepts plain-HTTP extension registries on the loopback interface: the end-to-end test's local
 # registry (IDE-09). Never enabled in a normal build.
 test-registry = []
+# EXT-33 E5 (test-only): forwards ide-workspace's `c2-test-profiles` so the C2 capability tests can
+# register a test server profile. Off in production, so no profile can ship.
+c2-test-profiles = ["ide-workspace/c2-test-profiles"]
 
 [dependencies]
 tauri = { version = "2", features = [] }

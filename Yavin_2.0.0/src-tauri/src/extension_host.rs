@@ -301,6 +301,24 @@ pub trait HostAuthority: Send + Sync + 'static {
     fn allow(&self, copy: &HostCopy, capability: Option<&str>) -> Result<(), Denial>;
     /// A secret request of the code of `copy` (EXT-13), done natively: its answer.
     fn secret(&self, copy: &HostCopy, method: &str, params: &Value) -> Result<Value, Denial>;
+    /// A `process.runFilter` request of the code of `copy` (EXT-33 E4), done natively through the
+    /// grant authority and broker: its result, or a denial. Deny by default: an authority with no
+    /// process capability refuses it, so the capability is opt-in and fail-closed.
+    fn run_filter(&self, _copy: &HostCopy, _params: &Value) -> Result<Value, Denial> {
+        Err(Denial::new(
+            "UnsupportedApi",
+            "running filters is not available here.",
+        ))
+    }
+    /// A `process.callServer` request of the code of `copy` (EXT-33 E5), routed natively to the C2
+    /// authority: its bounded response, or a denial. Deny by default: an authority with no C2
+    /// authority refuses it (opt-in, fail-closed), exactly as C1.
+    fn call_server(&self, _copy: &HostCopy, _params: &Value) -> Result<Value, Denial> {
+        Err(Denial::new(
+            "UnsupportedApi",
+            "contained servers are not available here.",
+        ))
+    }
     /// Records what happened (EXT-14). Best effort: never fails, never decides.
     fn note(&self, _event: Event) {}
     /// Changes whenever a grant does (EXT-16): a refusal is told again after one. Never decides.
@@ -568,6 +586,103 @@ impl Shared {
                         extension_id: id.to_string(),
                         method: method.to_string(),
                         capability: Some(crate::extension_permissions::SECRETS.to_string()),
+                        code: denial.code.to_string(),
+                        message: denial.message,
+                    };
+                    self.tell(&denied).then_some(denied)
+                }
+                _ => None,
+            };
+            return Screened::Refuse(answer.to_string(), told);
+        }
+        // A C1 filter (EXT-33 E4): allowed like any request (the `process` capability), then run
+        // here through the native grant authority and broker -- the window never holds the
+        // process, and identity comes from the loaded copy, not the request.
+        if method == "process.runFilter" {
+            let result = self.decide(id, method, &params).and_then(|_| {
+                let copy = self.loaded(id).ok_or_else(|| {
+                    (
+                        Denial::new("NotLoaded", format!("{id} is not loaded in this host.")),
+                        None,
+                    )
+                })?;
+                self.authority
+                    .run_filter(&copy, &params)
+                    .map_err(|denial| (denial, None))
+            });
+            let answer = match &result {
+                Ok(result) => {
+                    json!({"type": "response", "extensionId": id, "workspaceId": value.get("workspaceId"), "hostGeneration": value.get("hostGeneration"), "requestId": value.get("requestId"), "ok": true, "result": result})
+                }
+                Err((denial, _)) => {
+                    json!({"type": "response", "extensionId": id, "workspaceId": value.get("workspaceId"), "hostGeneration": value.get("hostGeneration"), "requestId": value.get("requestId"), "ok": false, "error": {"code": denial.code, "message": denial.message}})
+                }
+            };
+            if let Err((denial, _)) = &result {
+                self.note(
+                    denial.code,
+                    "process",
+                    Some(id),
+                    Some("method process.runFilter".into()),
+                );
+            }
+            let told = match result {
+                Err((denial, capability))
+                    if capability.is_some() || denial.code == "PermissionDenied" =>
+                {
+                    let denied = Denied {
+                        extension_id: id.to_string(),
+                        method: method.to_string(),
+                        capability: Some(crate::extension_permissions::PROCESS.to_string()),
+                        code: denial.code.to_string(),
+                        message: denial.message,
+                    };
+                    self.tell(&denied).then_some(denied)
+                }
+                _ => None,
+            };
+            return Screened::Refuse(answer.to_string(), told);
+        }
+        // A C2 contained-server request (EXT-33 E5): allowed like any request needing the `process`
+        // capability, then routed natively to the C2 authority. The separate C2 grant (consent),
+        // not the capability alone, is the gate; the window never holds the server, and identity is
+        // the loaded copy's -- distinct from the C1 `process.runFilter` path above.
+        if method == "process.callServer" {
+            let result = self.decide(id, method, &params).and_then(|_| {
+                let copy = self.loaded(id).ok_or_else(|| {
+                    (
+                        Denial::new("NotLoaded", format!("{id} is not loaded in this host.")),
+                        None,
+                    )
+                })?;
+                self.authority
+                    .call_server(&copy, &params)
+                    .map_err(|denial| (denial, None))
+            });
+            let answer = match &result {
+                Ok(result) => {
+                    json!({"type": "response", "extensionId": id, "workspaceId": value.get("workspaceId"), "hostGeneration": value.get("hostGeneration"), "requestId": value.get("requestId"), "ok": true, "result": result})
+                }
+                Err((denial, _)) => {
+                    json!({"type": "response", "extensionId": id, "workspaceId": value.get("workspaceId"), "hostGeneration": value.get("hostGeneration"), "requestId": value.get("requestId"), "ok": false, "error": {"code": denial.code, "message": denial.message}})
+                }
+            };
+            if let Err((denial, _)) = &result {
+                self.note(
+                    denial.code,
+                    "process",
+                    Some(id),
+                    Some("method process.callServer".into()),
+                );
+            }
+            let told = match result {
+                Err((denial, capability))
+                    if capability.is_some() || denial.code == "PermissionDenied" =>
+                {
+                    let denied = Denied {
+                        extension_id: id.to_string(),
+                        method: method.to_string(),
+                        capability: Some(crate::extension_permissions::PROCESS.to_string()),
                         code: denial.code.to_string(),
                         message: denial.message,
                     };
@@ -1406,6 +1521,23 @@ impl HostAuthority for AppAuthority {
             .state::<ExtensionService>()
             .secret(copy, self.workspace.as_deref(), method, params)
     }
+    fn run_filter(&self, copy: &HostCopy, params: &Value) -> Result<Value, Denial> {
+        // Trust is necessary (as for every class), but the grant, not trust, is the consent.
+        self.trusted()?;
+        self.app
+            .state::<crate::process_capability::ProcessCapability>()
+            .run_filter(copy, self.workspace.as_deref(), params)
+    }
+    fn call_server(&self, copy: &HostCopy, params: &Value) -> Result<Value, Denial> {
+        // Trust is necessary, but the C2 grant (consent) is the gate. The workspace is native.
+        self.trusted()?;
+        crate::c2_capability::call_server(
+            &self.app.state::<ide_workspace::c2::C2Authority>(),
+            copy,
+            self.workspace.as_deref(),
+            params,
+        )
+    }
     fn allow(&self, copy: &HostCopy, capability: Option<&str>) -> Result<(), Denial> {
         self.trusted()?;
         self.app
@@ -1565,15 +1697,32 @@ pub struct ServiceAuthority {
     pub trusted: std::sync::atomic::AtomicBool,
     /// The workspace its host was started in (EXT-13: a workspace secret's).
     pub workspace: Mutex<Option<String>>,
+    /// EXT-33 E4: the C1 process capability this authority routes `process.runFilter` to, when a
+    /// test wired one. `None` uses the trait's default-deny.
+    pub process: Option<Arc<crate::process_capability::ProcessCapability>>,
+    /// EXT-33 E5: the C2 authority this authority routes `process.callServer` to, when a test wired
+    /// one. `None` uses the trait's default-deny.
+    pub c2: Option<Arc<ide_workspace::c2::C2Authority>>,
 }
 
 #[cfg(test)]
 impl ServiceAuthority {
     pub fn new(service: Arc<ExtensionService>) -> Arc<ServiceAuthority> {
+        Self::with(service, None, None)
+    }
+
+    /// A service authority wiring an optional C1 capability and C2 authority (EXT-33 E4/E5 tests).
+    pub fn with(
+        service: Arc<ExtensionService>,
+        process: Option<Arc<crate::process_capability::ProcessCapability>>,
+        c2: Option<Arc<ide_workspace::c2::C2Authority>>,
+    ) -> Arc<ServiceAuthority> {
         Arc::new(ServiceAuthority {
             service,
             trusted: std::sync::atomic::AtomicBool::new(true),
             workspace: Mutex::new(None),
+            process,
+            c2,
         })
     }
     fn trusted(&self) -> Result<(), Denial> {
@@ -1599,6 +1748,32 @@ impl HostAuthority for ServiceAuthority {
         let workspace = held(&self.workspace).clone();
         self.service
             .secret(copy, workspace.as_deref(), method, params)
+    }
+    fn run_filter(&self, copy: &HostCopy, params: &Value) -> Result<Value, Denial> {
+        self.trusted()?;
+        match &self.process {
+            Some(process) => {
+                let workspace = held(&self.workspace).clone();
+                process.run_filter(copy, workspace.as_deref(), params)
+            }
+            None => Err(Denial::new(
+                "UnsupportedApi",
+                "running filters is not available here.",
+            )),
+        }
+    }
+    fn call_server(&self, copy: &HostCopy, params: &Value) -> Result<Value, Denial> {
+        self.trusted()?;
+        match &self.c2 {
+            Some(c2) => {
+                let workspace = held(&self.workspace).clone();
+                crate::c2_capability::call_server(c2, copy, workspace.as_deref(), params)
+            }
+            None => Err(Denial::new(
+                "UnsupportedApi",
+                "contained servers are not available here.",
+            )),
+        }
     }
     fn allow(&self, copy: &HostCopy, capability: Option<&str>) -> Result<(), Denial> {
         self.trusted()?;

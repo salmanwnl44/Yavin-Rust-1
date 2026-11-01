@@ -499,6 +499,54 @@ mod search_tests {
         assert_eq!(names, ["blob.bin", "src/a.ts", "src/b.rs"]);
     }
 
+    /// EXT-33 E0: an extension's `workspace.findFiles`, as the window asks for it -- hidden and
+    /// ignored files found (as VS Code's), repository metadata never; a glob is only ever a glob.
+    #[test]
+    fn a_listing_for_an_extension_finds_hidden_and_ignored_files_never_git_and_globs_stay_globs() {
+        let root = workspace("find");
+        let names = |include: &[&str], exclude: &[&str]| {
+            let mut request = options("");
+            request.files_only = true;
+            request.hidden = true;
+            request.ignored = true;
+            request.include = include.iter().map(|g| g.to_string()).collect();
+            request.exclude = exclude.iter().map(|g| g.to_string()).collect();
+            let output = run(&root, request);
+            let mut names: Vec<String> = output
+                .stdout
+                .split('\0')
+                .filter(|name| !name.is_empty())
+                .map(|name| name.replace('\\', "/").trim_start_matches("./").to_string())
+                .collect();
+            names.sort();
+            (names, output.stdout, output.stderr)
+        };
+        let (all, _, _) = names(&["**"], &[]);
+        assert_eq!(
+            all,
+            [
+                ".gitignore",
+                ".hidden/c.txt",
+                "blob.bin",
+                "build/out.js",
+                "src/a.ts",
+                "src/b.rs"
+            ]
+        );
+        assert_eq!(names(&["**/*.ts"], &[]).0, ["src/a.ts"]);
+        assert_eq!(names(&["src/**"], &["**/*.rs"]).0, ["src/a.ts"]);
+        // Values that look like ripgrep's options are its glob's value: nothing matches, and
+        // ripgrep neither prints its version nor runs a preprocessor.
+        for hostile in ["--version", "--pre=whoami", "-uuu"] {
+            let (found, stdout, stderr) = names(&[hostile], &[]);
+            assert!(found.is_empty(), "{hostile}: {found:?}");
+            assert!(
+                !stdout.contains("ripgrep") && !stderr.contains("ripgrep "),
+                "{hostile}: {stdout} {stderr}"
+            );
+        }
+    }
+
     #[test]
     fn a_cancelled_search_ends_without_results() {
         let root = workspace("cancel");

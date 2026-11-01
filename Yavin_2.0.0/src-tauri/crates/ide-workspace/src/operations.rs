@@ -18,6 +18,7 @@
 //! it. And an operation that fails is forgotten at once, so its expectations cannot account for
 //! anything that happens afterwards.
 
+use crate::git_harden::{self, HARDENING};
 use crate::process::capture_within;
 use crate::resource_events::{ChangeKind, ResourceChange};
 use std::collections::{HashSet, VecDeque};
@@ -488,23 +489,58 @@ fn credit_git(root: &str, id: u64, changes: &mut [ResourceChange]) {
 /// Paths per `git status`: keeps each command line far below Windows' 32,767-character limit.
 const PATHS_PER_GIT_CHECK: usize = 100;
 
+/// EXT-33 E0.3 (V2): the Git driver overrides for `root`, so Yavin's background `git_dirty`
+/// runs under the same hardening as the user-facing Git (`git.rs`). Listing the driver names
+/// runs none of them (it is `git config` under [`HARDENING`]). `None` if the names cannot be
+/// read, or if one cannot be spelled as a `-c` key: `git_dirty` then declines to check rather
+/// than run a repository's own program. This is why a `GitClean` operation records only when
+/// trusted or newly cloned, but the hardening here holds even for a hostile just-cloned remote.
+fn dirty_driver_overrides(root: &str) -> Option<Vec<String>> {
+    let mut command = Command::new("git");
+    command
+        .current_dir(root)
+        .args(HARDENING)
+        .args(["config", "-z", "--name-only", "--get-regexp"])
+        .arg(git_harden::DRIVER_REGEXP)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C");
+    let output = capture_within(
+        command,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        GIT_CHECK_TIMEOUT,
+    )
+    .ok()?;
+    // `--get-regexp` exits 1 when nothing matches; anything else is a configuration Git could
+    // not read, so nothing is assumed about its drivers.
+    if output.code != 0 && !(output.code == 1 && output.stdout.is_empty()) {
+        return None;
+    }
+    git_harden::driver_overrides_from(&output.stdout).ok()
+}
+
 /// The paths among `relative` (to `root`) that are *not* exactly what Git's index holds --
 /// modified, deleted, untracked, ignored, conflicted -- or `None` if Git could not say.
 ///
 /// Read-only and safe to run beside the operation it checks: no optional locks (so never
-/// `index.lock`), the repository's fsmonitor hook disabled (it is a command the repository
-/// configures), and literal pathspecs after `--`.
+/// `index.lock`) and literal pathspecs after `--`. EXT-33 E0.3 (V2): hardened exactly like the
+/// user-facing Git -- the fixed `HARDENING` settings (fsmonitor, hooks, submodule recursion and
+/// the rest) plus every filter and diff driver the repository names emptied -- so this
+/// background check never runs a repository's own program, even on a freshly cloned hostile
+/// remote. If the drivers cannot be read safely, it declines (returns `None`).
 fn git_dirty(root: &str, relative: &[String]) -> Option<HashSet<String>> {
+    let drivers = dirty_driver_overrides(root)?;
     let mut dirty = HashSet::new();
     for chunk in relative.chunks(PATHS_PER_GIT_CHECK) {
         let mut command = Command::new("git");
         command
             .current_dir(root)
+            .args(HARDENING)
+            .args(&drivers)
             .args([
                 "--no-pager",
                 "--literal-pathspecs",
-                "-c",
-                "core.fsmonitor=false",
                 "status",
                 "--porcelain=v1",
                 "-z",
@@ -1059,6 +1095,123 @@ mod tests {
         git(&dir, &["commit", "-qm", "other"]);
         git(&dir, &["switch", "-q", "main"]);
         dir
+    }
+
+    /// EXT-33 E0.3 (V1, V2): the background index check (`git_dirty`) must not run a
+    /// repository's own program. A submodule and a bare embedded repository each carry a clean
+    /// filter that only appends to a marker file; a control proves the filter is wired, then
+    /// `git_dirty` on the outer repository must leave no marker while still doing its job.
+    #[test]
+    fn the_background_index_check_runs_no_configured_program() {
+        let outer = temp("git-dirty-hostile");
+        let marker = |name: &str| outer.join(format!("ran-{name}"));
+        let planted = |name: &str| format!("echo ran >> '{}'; cat", clean(&marker(name)));
+        git(&outer, &["init", "-q", "-b", "main"]);
+        git(&outer, &["config", "user.email", "t@example.com"]);
+        git(&outer, &["config", "user.name", "Tester"]);
+        git(&outer, &["config", "core.autocrlf", "false"]);
+        // The outer repository names its own clean filter via `.gitattributes` (emptied by the
+        // per-name driver overrides) and an fsmonitor hook (emptied by the fixed `HARDENING`):
+        // two reliable triggers, one for each half of `git_dirty`'s hardening.
+        git(&outer, &["config", "filter.outer.clean", &planted("outer")]);
+        git(&outer, &["config", "core.fsmonitor", &planted("fsmon")]);
+        fs::write(outer.join(".gitattributes"), "tracked.txt filter=outer\n").unwrap();
+        fs::write(outer.join("tracked.txt"), "aa\n").unwrap();
+        git(&outer, &["add", "."]);
+        git(&outer, &["commit", "-qm", "base"]);
+
+        // A real submodule with its own marker-writing clean filter.
+        let sub = temp("git-dirty-sub");
+        git(&sub, &["init", "-q", "-b", "main"]);
+        git(&sub, &["config", "user.email", "t@example.com"]);
+        git(&sub, &["config", "user.name", "Tester"]);
+        git(&sub, &["config", "core.autocrlf", "false"]);
+        git(&sub, &["config", "filter.ev.clean", &planted("sub")]);
+        fs::write(sub.join(".gitattributes"), "*.txt filter=ev\n").unwrap();
+        fs::write(sub.join("s.txt"), "s0\n").unwrap();
+        git(&sub, &["add", "."]);
+        git(&sub, &["commit", "-qm", "s"]);
+        git(
+            &outer,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &clean(&sub),
+                "sub",
+            ],
+        );
+        git(&outer, &["commit", "-qm", "with-sub"]);
+
+        // A bare embedded repository (a nested `.git`, not a submodule) with the same filter.
+        let nested = outer.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        git(&nested, &["init", "-q", "-b", "main"]);
+        git(&nested, &["config", "user.email", "t@example.com"]);
+        git(&nested, &["config", "user.name", "Tester"]);
+        git(&nested, &["config", "core.autocrlf", "false"]);
+        git(&nested, &["config", "filter.ev.clean", &planted("emb")]);
+        fs::write(nested.join(".gitattributes"), "*.txt filter=ev\n").unwrap();
+        fs::write(nested.join("n.txt"), "n0\n").unwrap();
+        git(&nested, &["add", "."]);
+        git(&nested, &["commit", "-qm", "n"]);
+
+        let markers = || {
+            let mut found: Vec<String> = fs::read_dir(&outer)
+                .unwrap()
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| n.starts_with("ran-"))
+                .collect();
+            found.sort();
+            for name in &found {
+                fs::remove_file(outer.join(name)).unwrap();
+            }
+            found
+        };
+
+        // Control: the outer repository's own clean filter and fsmonitor are live. A plain
+        // path-scoped status, as `git_dirty` runs but without the hardening, runs both on a
+        // same-size change.
+        fs::write(outer.join("tracked.txt"), "bb\n").unwrap();
+        git(&outer, &["status", "--porcelain=v1", "--", "tracked.txt"]);
+        let live = markers();
+        assert!(
+            live.iter().any(|n| n == "ran-outer"),
+            "the control must prove the outer filter is live: {live:?}"
+        );
+        assert!(
+            live.iter().any(|n| n == "ran-fsmon"),
+            "the control must prove the outer fsmonitor is live: {live:?}"
+        );
+        // And the embedded repository's filter is live (its own status runs it).
+        fs::write(nested.join("n.txt"), "n1\n").unwrap();
+        git(&nested, &["status", "--porcelain=v1"]);
+        assert!(
+            markers().iter().any(|n| n == "ran-emb"),
+            "the control must prove the embedded filter is live"
+        );
+
+        // The background check, over the outer paths, runs none of them.
+        fs::write(outer.join("tracked.txt"), "cc\n").unwrap();
+        fs::write(sub.join("s.txt"), "s2\n").unwrap();
+        fs::write(nested.join("n.txt"), "n2\n").unwrap();
+        let root = clean(&outer);
+        let dirty = git_dirty(
+            &root,
+            &[
+                "tracked.txt".to_string(),
+                "sub".to_string(),
+                "nested".to_string(),
+            ],
+        )
+        .expect("git_dirty should report");
+        assert_eq!(markers(), Vec::<String>::new(), "git_dirty ran a program");
+        // It still does its job: the edited tracked file is reported dirty.
+        assert!(dirty.contains("tracked.txt"), "{dirty:?}");
+
+        fs::remove_dir_all(&outer).ok();
+        fs::remove_dir_all(&sub).ok();
     }
 
     #[test]

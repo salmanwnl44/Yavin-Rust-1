@@ -25,7 +25,7 @@
 //! **Elsewhere** nothing is implemented, so nothing starts: `spawn` refuses.
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// What a sandboxed process is allowed, beyond nothing.
 #[derive(Clone, Debug, PartialEq)]
@@ -129,6 +129,61 @@ pub fn spawn(program: &Path, args: &[&str], policy: &SandboxPolicy) -> Result<Sp
     imp::spawn(program, args, policy)
 }
 
+/// EXT-33 (Q5 ACL foundation): grant the AppContainer `container`'s SID **read-only** access to
+/// `folder` and its descendants, merged into the folder's existing DACL (other ACEs preserved).
+/// This is the one ACL primitive a C2 server would need to read a workspace; it is read-only
+/// (`FILE_GENERIC_READ`, inheritable), never write/execute/delete. It does **not** make the grant
+/// safe on its own: the caller must first verify the tree has no outward reparse points and no
+/// pre-existing ACE (e.g. `ALL APPLICATION PACKAGES`) that already grants the container write.
+/// Not exposed to the renderer or extensions.
+pub fn grant_read_tree(folder: &Path, container: &str) -> Result<(), String> {
+    imp::grant_read_tree(folder, container)
+}
+
+/// Removes every ACE for `container`'s SID from `folder`'s DACL (allow and deny), preserving all
+/// other entries. Idempotent: removing an absent grant is success.
+pub fn revoke_read_tree(folder: &Path, container: &str) -> Result<(), String> {
+    imp::revoke_read_tree(folder, container)
+}
+
+/// How many explicit ACEs on `folder`'s own DACL name `container`'s SID -- for verifying a grant
+/// applied, and that revocation left **zero** residue.
+pub fn container_aces(folder: &Path, container: &str) -> Result<usize, String> {
+    imp::container_aces(folder, container)
+}
+
+/// EXT-33 (Q5): whether any allow ACE on `folder`'s DACL would grant **write** (or delete /
+/// change-permissions / change-owner) to a SID the sandboxed process holds -- `container`'s own
+/// SID, `ALL APPLICATION PACKAGES` (S-1-15-2-1), or `ALL RESTRICTED APPLICATION PACKAGES`
+/// (S-1-15-2-2). A read-only grant cannot cancel such an ACE, so a caller must **refuse** the
+/// grant when this is true: the read-only guarantee cannot be made on that folder.
+pub fn container_writable(folder: &Path, container: &str) -> Result<bool, String> {
+    imp::container_writable(folder, container)
+}
+
+/// EXT-33 (Q5, hard links): if `file` is a hard link whose object also has a name outside
+/// `canonical_root`, that outside name; else `None`. Used to refuse a workspace whose files are
+/// hard-linked to data outside it (where a grant's inherited ACE, applied to the shared object,
+/// would expose that data to the container).
+pub fn external_hard_link_name(file: &Path, canonical_root: &Path) -> Option<PathBuf> {
+    imp::external_hard_link_name(file, canonical_root)
+}
+
+/// The string form (`S-1-15-2-…`) of the AppContainer SID derived from `container`'s name. The
+/// derivation is deterministic, so this is the SID the sandbox token will carry **and** the SID the
+/// workspace ACL is granted to -- used to prove those three agree. Not renderer-reachable.
+pub fn container_sid_string(container: &str) -> Result<String, String> {
+    imp::container_sid_string(container)
+}
+
+/// The AppContainer SID (string form) actually on `child`'s process token, or an error if the
+/// process cannot be opened, its token read, or it is not an AppContainer. Lets a caller verify the
+/// running server is in exactly the container whose name was derived and whose workspace ACL was
+/// granted -- so a mismatch (a server not in its intended container) can be caught and killed.
+pub fn process_container_sid(child: &SandboxedChild) -> Result<String, String> {
+    imp::process_container_sid(&child.inner)
+}
+
 #[cfg(not(windows))]
 mod imp {
     use super::*;
@@ -150,6 +205,28 @@ mod imp {
     pub fn spawn(_: &Path, _: &[&str], _: &SandboxPolicy) -> Result<Spawned, String> {
         Err("SandboxUnavailable: extension code runs only where Yavin can sandbox it, and this platform has no sandbox implemented; extensions' themes and snippets still work.".into())
     }
+
+    pub fn grant_read_tree(_: &Path, _: &str) -> Result<(), String> {
+        Err("SandboxUnavailable: workspace ACL grants are a Windows mechanism.".into())
+    }
+    pub fn revoke_read_tree(_: &Path, _: &str) -> Result<(), String> {
+        Err("SandboxUnavailable: workspace ACL grants are a Windows mechanism.".into())
+    }
+    pub fn container_aces(_: &Path, _: &str) -> Result<usize, String> {
+        Ok(0)
+    }
+    pub fn container_writable(_: &Path, _: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+    pub fn external_hard_link_name(_: &Path, _: &Path) -> Option<std::path::PathBuf> {
+        None
+    }
+    pub fn container_sid_string(_: &str) -> Result<String, String> {
+        Err("SandboxUnavailable: AppContainer SIDs are a Windows mechanism.".into())
+    }
+    pub fn process_container_sid(_: &Child) -> Result<String, String> {
+        Err("SandboxUnavailable: AppContainer SIDs are a Windows mechanism.".into())
+    }
 }
 
 #[cfg(windows)]
@@ -158,24 +235,32 @@ mod imp {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::path::PathBuf;
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::Foundation::{
-        GetLastError, LocalFree, SetHandleInformation, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
-        ERROR_PATH_NOT_FOUND, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
+        CloseHandle, GetLastError, LocalFree, SetHandleInformation, ERROR_ACCESS_DENIED,
+        ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, HANDLE, HANDLE_FLAG_INHERIT,
+        INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
-        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-        GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID,
+        ConvertStringSidToSidW, GetExplicitEntriesFromAclW, GetNamedSecurityInfoW,
+        SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
+        NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID,
         TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
     };
     use windows_sys::Win32::Security::{
-        FreeSid, ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID,
-        SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
+        EqualSid, FreeSid, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
+        OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
     };
-    use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_READ};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FindClose, FindFirstFileNameW, FindNextFileNameW, GetFileInformationByHandle,
+        GetVolumePathNameW, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicUIRestrictions,
         JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
@@ -279,6 +364,84 @@ mod imp {
         Ok(Sid(sid))
     }
 
+    /// The string form (`S-1-15-2-…`) of a SID. The buffer Windows allocates is freed before return.
+    fn sid_to_string(sid: PSID) -> Result<String, String> {
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        let mut out: *mut u16 = null_mut();
+        // SAFETY: `sid` is a valid SID; on success `out` is a LocalAlloc'd string we free below.
+        let ok = unsafe { ConvertSidToStringSidW(sid, &mut out) };
+        if ok == 0 || out.is_null() {
+            return Err("SandboxUnavailable: a SID could not be formatted.".into());
+        }
+        // SAFETY: `out` is a NUL-terminated wide string owned here until LocalFree.
+        let text = unsafe {
+            let mut len = 0usize;
+            while *out.add(len) != 0 {
+                len += 1;
+            }
+            let slice = std::slice::from_raw_parts(out, len);
+            let s = String::from_utf16_lossy(slice);
+            LocalFree(out as _);
+            s
+        };
+        Ok(text)
+    }
+
+    pub fn container_sid_string(container: &str) -> Result<String, String> {
+        let sid = container_sid(container)?;
+        sid_to_string(sid.0)
+    }
+
+    pub fn process_container_sid(child: &Child) -> Result<String, String> {
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenAppContainerSid, TOKEN_APPCONTAINER_INFORMATION, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let pid = child.id();
+        // SAFETY: open the child for a token query, read its AppContainer SID, free every handle.
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return Err("the server process could not be opened for a token query.".into());
+            }
+            let mut token: HANDLE = null_mut();
+            if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+                CloseHandle(process);
+                return Err("the server token could not be opened.".into());
+            }
+            // First call sizes the buffer; AppContainer SID length varies.
+            let mut size = 0u32;
+            GetTokenInformation(token, TokenAppContainerSid, null_mut(), 0, &mut size);
+            let result = if size == 0 {
+                Err("the server carries no AppContainer SID (not contained).".into())
+            } else {
+                let mut buf = vec![0u8; size as usize];
+                if GetTokenInformation(
+                    token,
+                    TokenAppContainerSid,
+                    buf.as_mut_ptr() as _,
+                    size,
+                    &mut size,
+                ) != 0
+                {
+                    let info = &*(buf.as_ptr() as *const TOKEN_APPCONTAINER_INFORMATION);
+                    if info.TokenAppContainer.is_null() {
+                        Err("the server is not in an AppContainer.".into())
+                    } else {
+                        sid_to_string(info.TokenAppContainer)
+                    }
+                } else {
+                    Err("the server token's AppContainer SID could not be read.".into())
+                }
+            };
+            CloseHandle(token);
+            CloseHandle(process);
+            result
+        }
+    }
+
     /// Grants the container read and execute on `program` (the file alone), once per run. A
     /// file the user may not change (an installation in Program Files) already grants all
     /// application packages that; whether it can be run is the start's to find out.
@@ -339,6 +502,340 @@ mod imp {
                 LocalFree(merged as _);
             }
             LocalFree(descriptor as _);
+        }
+    }
+
+    /// EXT-33 (Q5): add one inheritable, read-only ACE for `container`'s SID to `folder`'s DACL,
+    /// merged with the existing entries (nothing else is changed). Read-only = `FILE_GENERIC_READ`
+    /// alone: no `FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `DELETE`, `WRITE_DAC` or `WRITE_OWNER`.
+    pub fn grant_read_tree(folder: &Path, container: &str) -> Result<(), String> {
+        let sid = container_sid(container)?;
+        let path = wide(folder.as_os_str());
+        // SAFETY: Win32 security calls on a NUL-terminated path; buffers Windows returns are freed;
+        // the SID outlives the calls.
+        unsafe {
+            let mut dacl: *mut ACL = null_mut();
+            let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+            if GetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            ) != 0
+            {
+                return Err(
+                    "SandboxUnavailable: the folder's permissions could not be read.".into(),
+                );
+            }
+            let access = EXPLICIT_ACCESS_W {
+                grfAccessPermissions: FILE_GENERIC_READ,
+                grfAccessMode: GRANT_ACCESS,
+                grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                Trustee: TRUSTEE_W {
+                    pMultipleTrustee: null_mut(),
+                    MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                    TrusteeForm: TRUSTEE_IS_SID,
+                    TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+                    ptstrName: sid.0 as _,
+                },
+            };
+            let mut merged: *mut ACL = null_mut();
+            let built = SetEntriesInAclW(1, &access, dacl, &mut merged);
+            let result = if built == 0 {
+                let applied = SetNamedSecurityInfoW(
+                    path.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    merged,
+                    null(),
+                );
+                if applied == 0 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "SandboxUnavailable: the read grant could not be applied (0x{applied:08x})."
+                    ))
+                }
+            } else {
+                Err(format!(
+                    "SandboxUnavailable: the read grant could not be built (0x{built:08x})."
+                ))
+            };
+            if !merged.is_null() {
+                LocalFree(merged as _);
+            }
+            LocalFree(descriptor as _);
+            result
+        }
+    }
+
+    /// EXT-33 (Q5): remove every ACE for `container`'s SID from `folder`'s DACL, preserving all
+    /// others. `REVOKE_ACCESS` removes the trustee's allow and deny ACEs alike.
+    pub fn revoke_read_tree(folder: &Path, container: &str) -> Result<(), String> {
+        let sid = container_sid(container)?;
+        let path = wide(folder.as_os_str());
+        // SAFETY: as `grant_read_tree`.
+        unsafe {
+            let mut dacl: *mut ACL = null_mut();
+            let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+            if GetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            ) != 0
+            {
+                return Err(
+                    "SandboxUnavailable: the folder's permissions could not be read.".into(),
+                );
+            }
+            let access = EXPLICIT_ACCESS_W {
+                grfAccessPermissions: 0,
+                grfAccessMode: REVOKE_ACCESS,
+                grfInheritance: NO_INHERITANCE,
+                Trustee: TRUSTEE_W {
+                    pMultipleTrustee: null_mut(),
+                    MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                    TrusteeForm: TRUSTEE_IS_SID,
+                    TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+                    ptstrName: sid.0 as _,
+                },
+            };
+            let mut merged: *mut ACL = null_mut();
+            let built = SetEntriesInAclW(1, &access, dacl, &mut merged);
+            let result = if built == 0 {
+                let applied = SetNamedSecurityInfoW(
+                    path.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    merged,
+                    null(),
+                );
+                if applied == 0 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "SandboxUnavailable: the read grant could not be removed (0x{applied:08x})."
+                    ))
+                }
+            } else {
+                Err(format!(
+                    "SandboxUnavailable: the removal could not be built (0x{built:08x})."
+                ))
+            };
+            if !merged.is_null() {
+                LocalFree(merged as _);
+            }
+            LocalFree(descriptor as _);
+            result
+        }
+    }
+
+    /// EXT-33 (Q5): how many explicit ACEs on `folder`'s own DACL name `container`'s SID.
+    pub fn container_aces(folder: &Path, container: &str) -> Result<usize, String> {
+        let sid = container_sid(container)?;
+        let path = wide(folder.as_os_str());
+        // SAFETY: as above; the entries array Windows allocates is freed with LocalFree.
+        unsafe {
+            let mut dacl: *mut ACL = null_mut();
+            let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+            if GetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            ) != 0
+            {
+                return Err(
+                    "SandboxUnavailable: the folder's permissions could not be read.".into(),
+                );
+            }
+            let mut count: u32 = 0;
+            let mut entries: *mut EXPLICIT_ACCESS_W = null_mut();
+            let mut found = 0usize;
+            if GetExplicitEntriesFromAclW(dacl, &mut count, &mut entries) == 0 && !entries.is_null()
+            {
+                for i in 0..count as isize {
+                    let entry = &*entries.offset(i);
+                    if entry.Trustee.TrusteeForm == TRUSTEE_IS_SID {
+                        let trustee = entry.Trustee.ptstrName as PSID;
+                        if !trustee.is_null() && EqualSid(trustee, sid.0) != 0 {
+                            found += 1;
+                        }
+                    }
+                }
+                LocalFree(entries as _);
+            }
+            LocalFree(descriptor as _);
+            Ok(found)
+        }
+    }
+
+    /// Access bits that mean "can change the folder/files": write, append, write-EA,
+    /// write-attributes, delete, change-permissions, change-owner, and the generic forms.
+    const WRITE_MASK: u32 = 0x0002 // FILE_WRITE_DATA / FILE_ADD_FILE
+        | 0x0004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+        | 0x0010 // FILE_WRITE_EA
+        | 0x0100 // FILE_WRITE_ATTRIBUTES
+        | 0x0001_0000 // DELETE
+        | 0x0004_0000 // WRITE_DAC
+        | 0x0008_0000 // WRITE_OWNER
+        | 0x4000_0000 // GENERIC_WRITE
+        | 0x1000_0000; // GENERIC_ALL
+
+    /// Resolves a string SID (freed with LocalFree); `None` if it cannot be parsed.
+    unsafe fn string_sid(text: &str) -> Option<PSID> {
+        let wide = wide(OsStr::new(text));
+        let mut sid: PSID = null_mut();
+        if ConvertStringSidToSidW(wide.as_ptr(), &mut sid) != 0 && !sid.is_null() {
+            Some(sid)
+        } else {
+            None
+        }
+    }
+
+    pub fn container_writable(folder: &Path, container: &str) -> Result<bool, String> {
+        let sid = container_sid(container)?;
+        let path = wide(folder.as_os_str());
+        // SAFETY: Win32 security calls; allocated buffers are freed with LocalFree.
+        unsafe {
+            let aap = string_sid("S-1-15-2-1"); // ALL APPLICATION PACKAGES
+            let arap = string_sid("S-1-15-2-2"); // ALL RESTRICTED APPLICATION PACKAGES
+            let dangerous = |t: PSID| {
+                EqualSid(t, sid.0) != 0
+                    || aap.is_some_and(|a| EqualSid(t, a) != 0)
+                    || arap.is_some_and(|a| EqualSid(t, a) != 0)
+            };
+            let mut dacl: *mut ACL = null_mut();
+            let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+            let mut writable = false;
+            if GetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            ) == 0
+            {
+                let mut count: u32 = 0;
+                let mut entries: *mut EXPLICIT_ACCESS_W = null_mut();
+                if GetExplicitEntriesFromAclW(dacl, &mut count, &mut entries) == 0
+                    && !entries.is_null()
+                {
+                    for i in 0..count as isize {
+                        let entry = &*entries.offset(i);
+                        let grants = entry.grfAccessMode == GRANT_ACCESS;
+                        let writes = entry.grfAccessPermissions & WRITE_MASK != 0;
+                        if grants && writes && entry.Trustee.TrusteeForm == TRUSTEE_IS_SID {
+                            let trustee = entry.Trustee.ptstrName as PSID;
+                            if !trustee.is_null() && dangerous(trustee) {
+                                writable = true;
+                                break;
+                            }
+                        }
+                    }
+                    LocalFree(entries as _);
+                }
+                LocalFree(descriptor as _);
+            } else {
+                // Could not read the DACL: fail closed -- treat as writable so the grant is refused.
+                writable = true;
+            }
+            if let Some(a) = aap {
+                LocalFree(a as _);
+            }
+            if let Some(a) = arap {
+                LocalFree(a as _);
+            }
+            Ok(writable)
+        }
+    }
+
+    /// EXT-33 (Q5, hard links): if `file` has more than one hard link and any of its names is
+    /// outside `canonical_root`, that outside name; else `None`. Hard links are same-volume only,
+    /// so `FindFirstFileNameW` enumerates every name. A file that cannot be opened or queried is
+    /// skipped (`None`): it is not readable to the container either.
+    pub fn external_hard_link_name(file: &Path, canonical_root: &Path) -> Option<PathBuf> {
+        let wide_file = wide(file.as_os_str());
+        // SAFETY: Win32 file calls on NUL-terminated paths; the handle is closed; buffers owned.
+        unsafe {
+            let handle = CreateFileW(
+                wide_file.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                null_mut(),
+            );
+            if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+                return None;
+            }
+            let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+            let got = GetFileInformationByHandle(handle, &mut info) != 0;
+            CloseHandle(handle);
+            if !got || info.nNumberOfLinks <= 1 {
+                return None;
+            }
+            // The drive (e.g. `D:`) to prepend to each volume-relative link name.
+            let mut volume = [0u16; 260];
+            if GetVolumePathNameW(wide_file.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) == 0
+            {
+                return None;
+            }
+            let drive: String = {
+                let v = String::from_utf16_lossy(
+                    &volume[..volume.iter().position(|&c| c == 0).unwrap_or(0)],
+                );
+                v.trim_end_matches('\\').to_string()
+            };
+            let mut buf = vec![0u16; 1024];
+            let mut len = buf.len() as u32;
+            let find = FindFirstFileNameW(wide_file.as_ptr(), 0, &mut len, buf.as_mut_ptr());
+            if find == INVALID_HANDLE_VALUE || find.is_null() {
+                return None;
+            }
+            let mut external = None;
+            loop {
+                let name = String::from_utf16_lossy(&buf[..len.saturating_sub(1) as usize]);
+                let full = PathBuf::from(format!("{drive}{name}"));
+                let inside = std::fs::canonicalize(&full)
+                    .map(|c| {
+                        let text = c.to_string_lossy();
+                        let stripped = text.strip_prefix(r"\\?\").unwrap_or(&text).to_string();
+                        PathBuf::from(stripped).starts_with(canonical_root)
+                    })
+                    .unwrap_or(false);
+                if !inside {
+                    external = Some(full);
+                    break;
+                }
+                len = buf.len() as u32;
+                if FindNextFileNameW(find, &mut len, buf.as_mut_ptr()) == 0 {
+                    break;
+                }
+            }
+            FindClose(find);
+            external
         }
     }
 

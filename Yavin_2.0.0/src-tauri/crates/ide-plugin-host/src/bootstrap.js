@@ -257,6 +257,27 @@
       },
       executeCommand: (id, ...args) => call("commands.execute", { id, args }),
     }),
+    // EXT-33 E4: Yavin's own C1 filter API. `runFilter` names a Yavin-shipped profile and typed
+    // slots; it never names a program or raw arguments. The native broker runs it only once the
+    // user has granted it, in a no-capability sandbox.
+    process: Object.freeze({
+      runFilter: (profile, slots, input) =>
+        call("process.runFilter", {
+          profile,
+          slots: Array.isArray(slots) ? slots : [],
+          input: String(input == null ? "" : input),
+        }),
+      // EXT-33 E5: send one request to a Yavin-shipped contained server (named by profile). The
+      // extension supplies only an operation name and bounded input; identity, the program, the
+      // workspace and the AppContainer are all native, and a separate user consent per workspace is
+      // required. The reply is a bounded { data, error } -- never a process handle or raw pipe.
+      callServer: (profile, op, input) =>
+        call("process.callServer", {
+          profile,
+          op: String(op == null ? "" : op),
+          input: String(input == null ? "" : input),
+        }),
+    }),
     window: Object.freeze({
       showInformationMessage: (message) => call("window.showMessage", { level: "info", message: String(message) }),
       showWarningMessage: (message) => call("window.showMessage", { level: "warning", message: String(message) }),

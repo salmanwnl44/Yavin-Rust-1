@@ -102,6 +102,33 @@ impl Yavin {
 
     /// Test extensions with more in their manifests (`extra`: its permissions, EXT-07).
     fn with(test: &str, wanted: &[(&str, Value, &str)]) -> Yavin {
+        Self::build(test, wanted, None, None)
+    }
+
+    /// As `with`, but routing `process.runFilter` to `process` (EXT-33 E4).
+    fn with_process(
+        test: &str,
+        wanted: &[(&str, Value, &str)],
+        process: Arc<crate::process_capability::ProcessCapability>,
+    ) -> Yavin {
+        Self::build(test, wanted, Some(process), None)
+    }
+
+    /// As `with`, but routing `process.callServer` to `c2` (EXT-33 E5).
+    fn with_c2(
+        test: &str,
+        wanted: &[(&str, Value, &str)],
+        c2: Arc<ide_workspace::c2::C2Authority>,
+    ) -> Yavin {
+        Self::build(test, wanted, None, Some(c2))
+    }
+
+    fn build(
+        test: &str,
+        wanted: &[(&str, Value, &str)],
+        process: Option<Arc<crate::process_capability::ProcessCapability>>,
+        c2: Option<Arc<ide_workspace::c2::C2Authority>>,
+    ) -> Yavin {
         let scratch =
             std::env::temp_dir().join(format!("yavin-ext-e2e-{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
@@ -152,7 +179,7 @@ impl Yavin {
             sessions: ExtHostSessions::default(),
             events,
             sink: Arc::new(Channel(Mutex::new(sender))),
-            authority: ServiceAuthority::new(extensions.clone()),
+            authority: ServiceAuthority::with(extensions.clone(), process, c2),
             extensions,
             _scratch: Scratch(scratch),
         }
@@ -2247,6 +2274,183 @@ fn secrets_are_kept_natively_and_never_reach_the_window() {
     );
     let _ = store.forget_extension("acme.keeper");
     let _ = store.forget_extension("acme.other");
+}
+
+// --- EXT-33 E4: the C1 filter API through the real host ----------------------------------------
+
+/// A sample extension that runs a filter through Yavin's own `process.runFilter` API and returns
+/// the result, or the error's code if it is refused.
+const FILTER: &str = r#"module.exports.activate = function (c, yavin) {
+    c.subscriptions.push(yavin.commands.registerCommand(EXT + ".fmt", function () {
+        return yavin.process.runFilter("probe", [], "hello").then(
+            function (r) { return { ran: true, stdout: r.stdout }; },
+            function (e) { return { ran: false, code: e && e.code }; }
+        );
+    }));
+};"#;
+
+/// `process.runFilter` goes extension JS → the native broker and back, never through the window:
+/// the capability gate stops an extension that was not granted `process`, and a granted one
+/// reaches the native authority (which, with no profile registered, answers `UnknownProfile`).
+/// Identity is the loaded copy's, so the window is told only the method and capability, no payload.
+#[test]
+fn a_filter_request_is_gated_by_the_process_capability_natively() {
+    let allowed = format!("var EXT = \"acme.fmt\";\n{FILTER}");
+    let rogue = format!("var EXT = \"acme.rogue\";\n{FILTER}");
+    // An empty-profile capability: the path and its gates run, but nothing is ever spawned.
+    let grants = std::env::temp_dir().join(format!("yavin-e4-rt-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&grants);
+    let capability = Arc::new(crate::process_capability::ProcessCapability::new(grants));
+    let yavin = Yavin::with_process(
+        "ext33-e4-filter",
+        &[
+            ("acme.fmt", permissions(&["process"]), allowed.as_str()),
+            ("acme.rogue", permissions(&["process"]), rogue.as_str()),
+        ],
+        capability,
+    );
+    // Only acme.fmt is granted the capability; acme.rogue declares it but is not granted.
+    yavin.grant("acme.fmt", &["process"]);
+    let session = yavin.start();
+    yavin.handshake(session, 44_001, 2000);
+    for id in ["acme.fmt", "acme.rogue"] {
+        assert_eq!(yavin.load(session, 44_001, id)["type"], "loaded");
+        assert_eq!(
+            yavin.ask(session, 44_001, id, "a", "activate", json!({})).0["ok"],
+            true
+        );
+    }
+
+    // Granted: the request reaches the native authority. No profile is registered, so the answer
+    // is UnknownProfile -- proving it went all the way through the capability gate and the broker.
+    let (answer, asked, denied) = yavin.ask_seeing(
+        session,
+        44_001,
+        "acme.fmt",
+        "r-ok",
+        "command.run",
+        json!({"id": "acme.fmt.fmt", "args": []}),
+    );
+    assert_eq!(answer["result"]["ran"], false, "{answer}");
+    assert_eq!(answer["result"]["code"], "UnknownProfile", "{answer}");
+    // The window never saw a process.runFilter request or any program/profile detail.
+    for m in &asked {
+        assert_ne!(m["method"], json!("process.runFilter"), "{m}");
+    }
+    assert!(
+        denied.is_empty(),
+        "a granted call is not a refusal: {denied:?}"
+    );
+
+    // Not granted: refused at the capability gate, natively. The window is told only the method and
+    // the capability -- never what the request carried.
+    let (refused, _asked, denied) = yavin.ask_seeing(
+        session,
+        44_001,
+        "acme.rogue",
+        "r-no",
+        "command.run",
+        json!({"id": "acme.rogue.fmt", "args": []}),
+    );
+    assert_eq!(refused["result"]["ran"], false, "{refused}");
+    assert_eq!(refused["result"]["code"], "PermissionDenied", "{refused}");
+    assert!(
+        denied
+            .iter()
+            .any(|d| d.method == "process.runFilter" && d.capability.as_deref() == Some("process")),
+        "{denied:?}"
+    );
+}
+
+/// A sample extension that calls Yavin's `process.callServer` (EXT-33 E5) and returns the result,
+/// or the error code if refused.
+const SERVER_CALL: &str = r#"module.exports.activate = function (c, yavin) {
+    c.subscriptions.push(yavin.commands.registerCommand(EXT + ".call", function () {
+        return yavin.process.callServer("test-server", "echo", "hi").then(
+            function (r) { return { ran: true, data: r && r.data }; },
+            function (e) { return { ran: false, code: e && e.code }; }
+        );
+    }));
+};"#;
+
+/// `process.callServer` goes extension JS → the native C2 authority and back, never through the
+/// window: the `process` capability gate stops an ungranted extension, and a granted one reaches
+/// the native authority (which, with no C2 profile registered, answers `UnknownProfile`). This is a
+/// distinct path from the C1 `process.runFilter` capability, and the window sees only the method
+/// and capability, never the payload.
+#[test]
+fn a_server_request_is_gated_by_the_process_capability_and_c2_authority() {
+    let allowed = format!("var EXT = \"acme.srv\";\n{SERVER_CALL}");
+    let rogue = format!("var EXT = \"acme.rogue\";\n{SERVER_CALL}");
+    let dir = std::env::temp_dir().join(format!("yavin-e5-rt-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let grants = dir.join("c2-grants.json");
+    let journal = dir.join("c2-journal.json");
+    let _ = std::fs::remove_file(&grants);
+    // An empty-profile C2 authority: the gate and routing run, but nothing can launch.
+    let c2 = Arc::new(ide_workspace::c2::C2Authority::new(grants, journal));
+    let yavin = Yavin::with_c2(
+        "ext33-e5-callserver",
+        &[
+            ("acme.srv", permissions(&["process"]), allowed.as_str()),
+            ("acme.rogue", permissions(&["process"]), rogue.as_str()),
+        ],
+        c2,
+    );
+    // A native workspace must be open for a C2 request; set one so we reach the authority (not the
+    // no-workspace refusal). It is the native state, never anything the extension supplies.
+    *yavin.authority.workspace.lock().unwrap() = Some(dir.to_string_lossy().into_owned());
+    // Only acme.srv is granted the capability; acme.rogue declares it but is not granted.
+    yavin.grant("acme.srv", &["process"]);
+    let session = yavin.start();
+    yavin.handshake(session, 44_001, 2000);
+    for id in ["acme.srv", "acme.rogue"] {
+        assert_eq!(yavin.load(session, 44_001, id)["type"], "loaded");
+        assert_eq!(
+            yavin.ask(session, 44_001, id, "a", "activate", json!({})).0["ok"],
+            true
+        );
+    }
+
+    // Granted the capability, but no C2 profile is registered, so the native authority answers
+    // UnknownProfile -- proving the request went through the capability gate to the C2 authority.
+    let (answer, asked, denied) = yavin.ask_seeing(
+        session,
+        44_001,
+        "acme.srv",
+        "s-ok",
+        "command.run",
+        json!({"id": "acme.srv.call", "args": []}),
+    );
+    assert_eq!(answer["result"]["ran"], false, "{answer}");
+    assert_eq!(answer["result"]["code"], "UnknownProfile", "{answer}");
+    for m in &asked {
+        assert_ne!(m["method"], json!("process.callServer"), "{m}");
+    }
+    assert!(
+        denied.is_empty(),
+        "a granted call is not a refusal: {denied:?}"
+    );
+
+    // Not granted: refused at the capability gate, natively, told as the method + capability.
+    let (refused, _asked, denied) = yavin.ask_seeing(
+        session,
+        44_001,
+        "acme.rogue",
+        "s-no",
+        "command.run",
+        json!({"id": "acme.rogue.call", "args": []}),
+    );
+    assert_eq!(refused["result"]["ran"], false, "{refused}");
+    assert_eq!(refused["result"]["code"], "PermissionDenied", "{refused}");
+    assert!(
+        denied
+            .iter()
+            .any(|d| d.method == "process.callServer"
+                && d.capability.as_deref() == Some("process")),
+        "{denied:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // --- EXT-14: diagnostics from the real host ----------------------------------------------------

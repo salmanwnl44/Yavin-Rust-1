@@ -374,7 +374,14 @@ fn wait_for_exit(child: &Arc<Mutex<Process>>) -> Option<i32> {
 
 /// Where `program` is: in the project's own `node_modules/.bin` first when `node_package` (a
 /// project pins its own TypeScript server, say), then on `PATH`. On Windows the executable
-/// suffixes are tried in `PATHEXT` order, since npm installs `name.cmd` shims.
+/// suffixes are tried in `PATHEXT` order, since npm installs `name.cmd` shims -- `.exe` first.
+///
+/// EXT-33 E0-B: only absolute `PATH` folders are looked in -- a relative entry (`.`, or an
+/// empty one) would be resolved against Yavin's own working folder, where nothing should be
+/// found -- and on Windows only what Windows can start (`.exe`, and `.cmd`/`.bat` shims), never
+/// a suffix-less name. This lookup is for Yavin's own fixed allow-lists (`lsp.rs`,
+/// `checkers.rs`, `dap.rs`) in trusted folders; it is not, and must not become, a lookup for
+/// programs an extension names (`PROCESS_CAPABILITY_DESIGN.md`, §9.3).
 pub fn resolve_program(
     program: &str,
     node_package: bool,
@@ -382,7 +389,7 @@ pub fn resolve_program(
     path_var: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
     let names: Vec<String> = if cfg!(windows) {
-        [".exe", ".cmd", ".bat", ""]
+        [".exe", ".cmd", ".bat"]
             .iter()
             .map(|suffix| format!("{program}{suffix}"))
             .collect()
@@ -394,7 +401,7 @@ pub fn resolve_program(
         folders.push(project.join("node_modules").join(".bin"));
     }
     if let Some(path) = path_var {
-        folders.extend(std::env::split_paths(&path));
+        folders.extend(std::env::split_paths(&path).filter(|folder| folder.is_absolute()));
     }
     folders.iter().find_map(|folder| {
         names
@@ -443,6 +450,45 @@ mod tests {
         assert_eq!(resolve_program("missing", true, &project, path_var), None);
         let _ = std::fs::remove_dir_all(project);
         let _ = std::fs::remove_dir_all(elsewhere);
+    }
+
+    /// EXT-33 E0-B: a relative `PATH` entry is never looked in (it would be Yavin's own working
+    /// folder), and on Windows a name Windows cannot start is never chosen.
+    #[test]
+    fn only_absolute_path_folders_and_startable_names_are_chosen() {
+        let here = std::env::current_dir().unwrap();
+        let planted = if cfg!(windows) {
+            "yavin-e0b-planted.cmd"
+        } else {
+            "yavin-e0b-planted"
+        };
+        std::fs::write(here.join(planted), "").unwrap();
+        let relative = Some(std::env::join_paths([".", ""]).unwrap_or_else(|_| ".".into()));
+        let found = resolve_program("yavin-e0b-planted", false, &here, relative);
+        let _ = std::fs::remove_file(here.join(planted));
+        assert_eq!(found, None, "a relative PATH entry was searched");
+        let folder = temp("resolve-names");
+        let absolute = Some(std::env::join_paths([&folder]).unwrap());
+        if cfg!(windows) {
+            // Suffix-less: not something Windows starts, so not chosen.
+            std::fs::write(folder.join("tool"), "").unwrap();
+            assert_eq!(
+                resolve_program("tool", false, &folder, absolute.clone()),
+                None
+            );
+            // A shim when that is all there is, and the program itself before any shim.
+            std::fs::write(folder.join("tool.cmd"), "").unwrap();
+            assert_eq!(
+                resolve_program("tool", false, &folder, absolute.clone()),
+                Some(folder.join("tool.cmd"))
+            );
+            std::fs::write(folder.join("tool.exe"), "").unwrap();
+            assert_eq!(
+                resolve_program("tool", false, &folder, absolute),
+                Some(folder.join("tool.exe"))
+            );
+        }
+        let _ = std::fs::remove_dir_all(folder);
     }
 
     struct Recorder(Mutex<mpsc::Sender<String>>);

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::{env, path::Path, sync::Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
+mod c2_capability;
 mod checkers;
 mod config;
 mod dap;
@@ -36,6 +37,7 @@ mod openvsx;
 mod package_trust;
 mod paths;
 mod ports;
+mod process_capability;
 mod registry_trust;
 mod session;
 mod terminal;
@@ -84,7 +86,10 @@ use localgit::{
     localgit_status, localgit_switch, localgit_tags, localgit_tree, localgit_unstage,
     localgit_verify, LocalGit,
 };
-use lsp::{lsp_send, lsp_servers, lsp_start, lsp_stop, lsp_stop_all, LspSessions};
+use lsp::{
+    lsp_choose_program, lsp_send, lsp_servers, lsp_start, lsp_stop, lsp_stop_all, LspSessions,
+    ProjectServers,
+};
 use ports::{list_listening_ports, stop_listening_process};
 use session::{forget_workspace, read_session, save_workspace_session, Sessions};
 use terminal::{
@@ -713,6 +718,7 @@ pub fn run() {
         .manage(Sessions::default())
         .manage(Checks::default())
         .manage(LspSessions::default())
+        .manage(ProjectServers::default())
         .manage(DapSessions::default())
         .manage(ExtHostSessions::default())
         // A window's extension hosts are its own (EXT-11): its page loading again ends what the
@@ -758,6 +764,33 @@ pub fn run() {
             if let Ok(folder) = app.path().app_local_data_dir() {
                 app.state::<LocalGit>().set_base(folder.join("local-git"));
             }
+            // EXT-33 E4: the native C1 process capability. Its grants live in Yavin's config
+            // folder; it ships with no profiles, so nothing runs until a profile is approved.
+            let grants_file = app
+                .path()
+                .app_config_dir()
+                .map(|dir| dir.join("process-grants.json"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("process-grants.json"));
+            app.manage(process_capability::ProcessCapability::new(grants_file));
+            // EXT-33 E5: the native C2 contained-server authority. Its grants and ACL journal live
+            // in Yavin's config folder; it ships with no profiles, so nothing launches. Startup
+            // reconciliation removes any workspace ACE a crash left before a launch is permitted.
+            let config = app.path().app_config_dir().ok();
+            let c2_grants = config
+                .as_ref()
+                .map(|dir| dir.join("c2-grants.json"))
+                .unwrap_or_else(|| std::path::PathBuf::from("c2-grants.json"));
+            let c2_journal = config
+                .as_ref()
+                .map(|dir| dir.join("c2-acl-journal.json"))
+                .unwrap_or_else(|| std::path::PathBuf::from("c2-acl-journal.json"));
+            let c2 = ide_workspace::c2::C2Authority::new(c2_grants, c2_journal);
+            if let Err(e) = c2.reconcile() {
+                // Fail closed: a workspace ACE could not be reconciled, so record it; launches are
+                // gated by `may_start`'s fresh re-verify regardless, and production launches none.
+                eprintln!("EXT-33 E5: C2 startup reconciliation did not complete cleanly: {e:?}");
+            }
+            app.manage(c2);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -884,6 +917,7 @@ pub fn run() {
             terminal_stats,
             lsp_servers,
             lsp_start,
+            lsp_choose_program,
             lsp_send,
             lsp_stop,
             lsp_stop_all,
@@ -917,6 +951,12 @@ pub fn run() {
             ext_host_send,
             ext_host_stop,
             ext_host_stop_all,
+            process_capability::process_request_consent,
+            process_capability::process_revoke,
+            process_capability::process_grants,
+            c2_capability::c2_request_consent,
+            c2_capability::c2_revoke,
+            c2_capability::c2_grants,
             marketplace::marketplace_default_registry,
             marketplace::marketplace_get_text,
             marketplace::marketplace_index,
@@ -947,6 +987,9 @@ pub fn run() {
                     dap::stop_all(&handle.state::<DapSessions>());
                     // Extension hosts, and whatever their extensions were doing (IDE-08).
                     extension_host::stop_all(&handle.state::<ExtHostSessions>());
+                    // EXT-33 E5: end any contained server, remove its workspace ACE, and wait for
+                    // the ACL workers to quiesce so none outlives the app.
+                    handle.state::<ide_workspace::c2::C2Authority>().shutdown();
                     // A checker is a child process too, and a cold `cargo check` outlives
                     // the window by minutes if nothing stops it.
                     checkers::cancel_running(&handle.state::<Checks>());

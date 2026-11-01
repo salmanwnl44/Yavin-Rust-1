@@ -1,6 +1,10 @@
+pub mod broker;
+pub mod c2;
 pub mod durable;
 pub mod extension_id;
 pub mod file_tree;
+pub mod git_harden;
+pub mod grants;
 pub mod lsp_framing;
 pub mod lsp_process;
 pub mod operations;
@@ -9,3 +13,5 @@ pub mod recovery;
 pub mod resource_events;
 pub mod sandbox;
 pub mod watcher;
+pub mod workspace_acl;
+pub mod workspace_identity;

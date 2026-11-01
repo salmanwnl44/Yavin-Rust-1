@@ -45,6 +45,9 @@ pub const DOCUMENTS_EDIT: &str = "documents.edit";
 pub const COMMANDS_EXECUTE: &str = "commands.execute:";
 /// Keeping its own secrets in the OS credential store (EXT-13).
 pub const SECRETS: &str = "secrets";
+/// Running a predefined C1 filter through the native broker (EXT-33 E4). Declaring it is not
+/// consent to run: each program+profile also needs a grant the user approves (`GrantAuthority`).
+pub const PROCESS: &str = "process";
 /// What a manifest without `permissions` is taken to request.
 pub const LEGACY: [&str; 3] = [DOCUMENTS_READ, EDITOR_CONTROL, FS_READ];
 
@@ -52,7 +55,7 @@ pub const LEGACY: [&str; 3] = [DOCUMENTS_READ, EDITOR_CONTROL, FS_READ];
 /// asking: its own commands need no capability, so naming them is not one.
 pub fn capability(raw: &str, owner: &str) -> Option<String> {
     match raw {
-        FS_READ | DOCUMENTS_READ | DOCUMENTS_EDIT | EDITOR_CONTROL | SECRETS => {
+        FS_READ | DOCUMENTS_READ | DOCUMENTS_EDIT | EDITOR_CONTROL | SECRETS | PROCESS => {
             Some(raw.to_string())
         }
         _ => {
@@ -256,7 +259,46 @@ pub fn need_of_request(caller: &str, method: &str, params: &Value) -> Need {
             need(EDITOR_CONTROL)
         }
         "fs.readFile" | "fs.exists" => need(FS_READ),
+        // EXT-33 E0: finding workspace files by glob (`<id>#find#<n>`, its own, cancellable),
+        // through Yavin's own search -- the same reach as reading them.
+        "fs.findFiles" | "fs.cancelFind" => match owned(params, "id", caller, '#') {
+            Need::Nothing => need(FS_READ),
+            other => other,
+        },
         "documents.edit" => need(DOCUMENTS_EDIT),
+        // A predefined C1 filter (EXT-33 E4): a profile id, typed slots and the input text. The
+        // program and arguments are never named here; a grant is still required natively.
+        "process.runFilter" => {
+            let profile_ok = string(params, "profile").is_some();
+            let input_ok = string(params, "input").is_some();
+            let slots_ok = params.get("slots").is_none_or(Value::is_array);
+            if !profile_ok {
+                Need::Invalid("\"profile\" must be a string".into())
+            } else if !input_ok {
+                Need::Invalid("\"input\" must be a string".into())
+            } else if !slots_ok {
+                Need::Invalid("\"slots\" must be an array".into())
+            } else {
+                need(PROCESS)
+            }
+        }
+        // A C2 contained-server request (EXT-33 E5): a profile id, an op name and bounded input.
+        // It needs the `process` capability like a C1 filter; the separate native C2 grant (a user
+        // consent per workspace) is the real gate, checked natively. No program/SID/workspace here.
+        "process.callServer" => {
+            let profile_ok = string(params, "profile").is_some();
+            let op_ok = string(params, "op").is_some();
+            let input_ok = string(params, "input").is_some();
+            if !profile_ok {
+                Need::Invalid("\"profile\" must be a string".into())
+            } else if !op_ok {
+                Need::Invalid("\"op\" must be a string".into())
+            } else if !input_ok {
+                Need::Invalid("\"input\" must be a string".into())
+            } else {
+                need(PROCESS)
+            }
+        }
         // Its own secrets (EXT-13): handled natively, never passed to the window.
         "secrets.get" | "secrets.store" | "secrets.delete" => {
             let scope_ok = params.get("scope").is_none_or(|s| {
@@ -361,8 +403,9 @@ mod tests {
             .collect();
         // EXT-25: documents.edit, statusBar.set, statusBar.remove; EXT-27: window.state; EXT-29:
         // window.quickPick, window.inputBox, window.cancelPrompt, diagnostics.set, diagnostics.clear;
-        // EXT-31: webview.create, webview.update, webview.postMessage, webview.reveal, webview.dispose.
-        assert_eq!(methods.len(), 35, "{methods:?}");
+        // EXT-31: webview.create, webview.update, webview.postMessage, webview.reveal, webview.dispose;
+        // EXT-33 E0: fs.findFiles, fs.cancelFind.
+        assert_eq!(methods.len(), 37, "{methods:?}");
         for method in methods {
             assert_ne!(
                 need_of_request("acme.hello", method, &json!({})),
@@ -370,6 +413,49 @@ mod tests {
                 "{method} has no decision"
             );
         }
+    }
+
+    /// EXT-33 E5: the only extension-callable C2 method is `process.callServer`, and it needs the
+    /// `process` capability (the separate native C2 grant is the real gate, checked natively).
+    /// Consent, launch, revoke and arbitrary ACL/exec have **no** extension method, so each
+    /// resolves to `Unknown` (denied). The E4 C1 filter is unchanged.
+    #[test]
+    fn only_call_server_is_an_extension_c2_method_and_it_needs_process() {
+        // The channel method is gated by the PROCESS capability (deny-by-default; a C2 grant is
+        // still required natively before anything runs).
+        assert_eq!(
+            need_of_request(
+                "acme.hello",
+                "process.callServer",
+                &json!({"profile": "srv", "op": "echo", "input": "x"})
+            ),
+            Need::Capability(PROCESS.to_string())
+        );
+        // No consent/launch/revoke/ACL method is exposed to extensions.
+        for method in [
+            "process.startServer",
+            "process.requestServerConsent",
+            "process.revokeServer",
+            "process.launch",
+            "process.grantAcl",
+            "c2.launch",
+            "c2.requestConsent",
+        ] {
+            assert_eq!(
+                need_of_request("acme.hello", method, &json!({"profile": "x"})),
+                Need::Unknown,
+                "{method} must not be an extension capability"
+            );
+        }
+        // E4 is unchanged: the C1 filter still maps to the PROCESS capability.
+        assert_eq!(
+            need_of_request(
+                "acme.hello",
+                "process.runFilter",
+                &json!({"profile": "fmt", "input": "x", "slots": []})
+            ),
+            Need::Capability(PROCESS.to_string())
+        );
     }
 
     #[test]

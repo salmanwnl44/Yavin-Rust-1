@@ -319,6 +319,18 @@ pub fn is_trusted(
     Ok(state_for(guard.as_ref().expect("loaded"), workspace_root(state)).trusted)
 }
 
+/// Whether `path` -- a specific folder, which may differ from the open workspace -- has been
+/// trusted. EXT-33 E0.1: Git resolves this for the repository it is about to operate on, to
+/// decide whether to honour that repository's configuration or run with protective overrides.
+pub fn is_path_trusted(
+    app: &AppHandle,
+    trust: &State<'_, Trust>,
+    path: &Path,
+) -> Result<bool, String> {
+    let guard = store(app, trust)?;
+    Ok(guard.as_ref().expect("loaded").decision_for(path) == Some(Decision::Trusted))
+}
+
 /// Refuses when the open folder has not been trusted. Called by anything that would run the
 /// project's own toolchain.
 pub fn require_trust(

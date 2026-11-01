@@ -231,13 +231,75 @@ fn repo_of(state: &Repos, repo_id: &str) -> Result<Arc<Repo>, String> {
 /// literal pathspecs, no interactive credential/editor prompts, and the same 16 MB
 /// output cap the previous single-repo design enforced.
 fn run(root: &Path, args: &[&str]) -> Result<ToolOutput, String> {
-    run_command(root, args, None, Arc::new(AtomicBool::new(false)), false)
+    run_command(
+        root,
+        args,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        false,
+        true,
+    )
+}
+
+/// EXT-33 E0.1 (F-G1): command-line `-c` overrides that disable every Git configuration key a
+/// repository could set to make Git run a program as it reads the repository. Command-line `-c`
+/// wins over `.git/config`, so a value planted there is overridden; an empty value clears the
+/// key (for `credential.helper`, Git documents an empty value as resetting the helper list).
+/// Per-driver `diff.<name>.textconv`/`command`, which are selected by the work tree's
+/// `.gitattributes` and so cannot be named here, are disabled instead by the `--no-ext-diff`
+/// and `--no-textconv` flags Yavin passes on every patch-producing command (`repository.ts`).
+/// Hooks are not disabled here; an untrusted workspace is refused every operation that could run
+/// one (`exec_on`), so none fires.
+/// EXT-33 E0.1/E0.3 (F-G1): the fixed `-c` settings that neutralise every configuration key a
+/// repository can use to make Git run a program. Shared with Yavin's own background bookkeeping
+/// (`operations::git_dirty`) so both are hardened from one definition; see `git_harden`.
+use ide_workspace::git_harden::{self, HARDENING};
+
+/// EXT-33 E0.1 (F-G1): `-c` overrides emptying every filter driver (`filter.<name>.clean`,
+/// `smudge`, `process`) and diff driver (`diff.<name>.textconv`, `command`) the configuration
+/// defines. `.gitattributes` (the working tree's, or `.git/info/attributes`) picks a driver by
+/// name, so no fixed list can cover them: they are read from the configuration, by a
+/// `git config` that runs none of them, under the fixed `HARDENING`. A name the `-c` syntax
+/// cannot spell (one holding `=`) refuses the operation rather than leave its driver live.
+fn driver_overrides(root: &Path) -> Result<Vec<String>, String> {
+    let mut args: Vec<&str> = HARDENING.to_vec();
+    args.extend([
+        "config",
+        "-z",
+        "--name-only",
+        "--get-regexp",
+        git_harden::DRIVER_REGEXP,
+    ]);
+    let listed = run_command(
+        root,
+        &args,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        true,
+        false,
+    )?;
+    // `--get-regexp` exits 1 when nothing matches; anything else is a configuration Git could
+    // not read, so nothing is assumed about its drivers.
+    if listed.code != 0 && !(listed.code == 1 && listed.stdout.is_empty()) {
+        return Err(format!(
+            "Git could not read this repository's configuration: {}",
+            listed.stderr.trim()
+        ));
+    }
+    git_harden::driver_overrides_from(&listed.stdout)
 }
 
 /// A read-only Git command for Local Git's comparison with real Git (LG-09): the same hardened
 /// runner, with optional locks off so that even `status` never writes the index.
 pub(crate) fn run_read_only(root: &Path, args: &[&str]) -> Result<ToolOutput, String> {
-    run_command(root, args, None, Arc::new(AtomicBool::new(false)), true)
+    run_command(
+        root,
+        args,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        true,
+        true,
+    )
 }
 
 /// The top level of the repository `path` is in -- none when it is in none (or Git is missing).
@@ -278,10 +340,25 @@ fn run_command(
     input: Option<String>,
     cancel: Arc<AtomicBool>,
     read_only: bool,
+    harden: bool,
 ) -> Result<ToolOutput, String> {
+    // Read before the command is built: the drivers' names come from the configuration itself.
+    let drivers = if harden {
+        driver_overrides(root)?
+    } else {
+        Vec::new()
+    };
     let mut command = Command::new("git");
+    command.current_dir(root);
+    // EXT-33 E0.1 (F-G1): command-line `-c` settings take precedence over the repository's own
+    // `.git/config`, so these neutralise every Git configuration key that can make Git run a
+    // program while reading a repository -- the way a downloaded folder could run code when
+    // merely opened. Applied to Yavin's own bookkeeping always, and to every operation in an
+    // untrusted workspace; a trusted workspace keeps its own configuration, exactly as before.
+    if harden {
+        command.args(HARDENING).args(&drivers);
+    }
     command
-        .current_dir(root)
         .args(["--no-pager", "--literal-pathspecs"])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -838,6 +915,10 @@ const STASH: &[FlagRule] = &[
     flag("--staged"),
     flag("-p"),
     flag("--no-color"),
+    // EXT-33 E0.1: `stash show -p` with no external diff or textconv driver, as every other
+    // patch Yavin shows -- the drivers `.gitattributes` names cannot be overridden by `-c`.
+    flag("--no-ext-diff"),
+    flag("--no-textconv"),
     value_flag("-m"),
 ];
 const TAG: &[FlagRule] = &[flag("-l"), flag("-d")];
@@ -1267,8 +1348,20 @@ fn exec_on(
     args: &[String],
     input: Option<String>,
     cancel: Arc<AtomicBool>,
+    trusted: bool,
 ) -> Result<ToolOutput, String> {
     let subcommand = args.first().ok_or("Missing Git subcommand")?;
+
+    // EXT-33 E0.1 (F-G1): in an untrusted workspace, run only operations that read the
+    // repository without changing it, reaching the network, or updating a ref -- so no hook,
+    // filter, merge driver or network helper the repository configured ever runs. Everything
+    // else is refused until the folder is trusted (as the language servers, checkers, tasks
+    // and terminal already are), before the argument shape is even considered. The permitted
+    // reads still run hardened (below).
+    if !trusted && !untrusted_read_allowed(subcommand, &args[1..]) {
+        return Err(RESTRICTED_GIT.into());
+    }
+
     validate_args(subcommand, &args[1..])?;
 
     let _scope_guard = scope_lock
@@ -1283,7 +1376,27 @@ fn exec_on(
     };
 
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_command(&repo.root, &args_ref, input, cancel, read_only)
+    run_command(&repo.root, &args_ref, input, cancel, read_only, !trusted)
+}
+
+/// EXT-33 E0.1: the message for a Git operation refused because the workspace is not trusted.
+/// TypeScript shows it as-is (`describeGitError` leaves unknown messages untouched).
+pub(crate) const RESTRICTED_GIT: &str =
+    "This folder is open in Restricted Mode, so Yavin changes its Git repository only after you trust the folder. Viewing history and changes still works.";
+
+/// EXT-33 E0.1 (F-G1): whether `subcommand` may run in an untrusted workspace -- a pure read
+/// that writes nothing, reaches no network and updates no ref. `operation_scope`'s `Read` set,
+/// plus the read form of `symbolic-ref` (the current branch's name, which the view shows for
+/// any repository). Anything not listed is refused: unknown is not trusted.
+fn untrusted_read_allowed(subcommand: &str, rest: &[String]) -> bool {
+    if matches!(operation_scope(subcommand, rest), Scope::Read) {
+        return true;
+    }
+    // `symbolic-ref --short HEAD` / `symbolic-ref HEAD`: reading a symbolic ref. A second
+    // positional (the value) would set it, so the read form has none.
+    subcommand == "symbolic-ref"
+        && !rest.iter().filter(|a| !a.starts_with('-')).nth(1).is_some()
+        && !rest.iter().any(|a| a == "-d" || a == "--delete")
 }
 
 // Every extra parameter here is a distinct piece of Tauri-managed state
@@ -1292,7 +1405,9 @@ fn exec_on(
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn git_exec(
+    app: AppHandle,
     state: State<'_, Repos>,
+    trust: State<'_, crate::trust::Trust>,
     stash_locks: State<'_, StashLocks>,
     network_locks: State<'_, NetworkLocks>,
     jobs: State<'_, GitJobs>,
@@ -1303,6 +1418,19 @@ pub async fn git_exec(
     id: String,
 ) -> Result<ToolOutput, String> {
     let repo = repo_of(&state, &repo_id)?;
+    // EXT-33 E0.1 (F-G1): the trust of the repository being operated on (which may differ from
+    // the open workspace folder); resolved before `spawn_blocking`, since `State` cannot cross
+    // that boundary. An unreadable trust store is treated as not trusted.
+    let trusted = crate::trust::is_path_trusted(&app, &trust, &repo.root).unwrap_or(false);
+    // EXT-33 E0.3 (V2): refuse an untrusted operation here, before any bookkeeping. `exec_on`
+    // gates again (so direct callers and the trusted path are covered), but doing it first
+    // means a refused untrusted write never registers a `GitClean` expectation or a crash
+    // intent -- which a concurrent watcher batch would otherwise honour by running the
+    // weaker `operations::git_dirty` against this untrusted repository.
+    let subcommand = args.first().ok_or("Missing Git subcommand")?;
+    if !trusted && !untrusted_read_allowed(subcommand, &args[1..]) {
+        return Err(RESTRICTED_GIT.into());
+    }
     let scope_lock = resolve_scope_lock(&stash_locks, &network_locks, &repo.repository_id, &args)?;
     let cancel = register_job(&jobs, &id, &repo_id)?;
     // Removes this job's entry on every exit path below, including the `?` on the
@@ -1335,7 +1463,7 @@ pub async fn git_exec(
         None => None,
     };
     let result = tauri::async_runtime::spawn_blocking(move || {
-        exec_on(&repo, scope_lock, &args, input, cancel)
+        exec_on(&repo, scope_lock, &args, input, cancel, trusted)
     })
     .await
     .map_err(|e| e.to_string())
@@ -1445,6 +1573,7 @@ mod tests {
             args,
             input,
             Arc::new(AtomicBool::new(false)),
+            true,
         )
     }
 
@@ -1845,6 +1974,7 @@ mod tests {
                     &call,
                     None,
                     Arc::new(AtomicBool::new(false)),
+                    true,
                 )
             })
         };
@@ -1935,7 +2065,7 @@ mod tests {
         let scope_lock =
             resolve_scope_lock(&stash_locks, &network_locks, &repo.repository_id, &call).unwrap();
         let started = Instant::now();
-        let result = exec_on(&repo, scope_lock, &call, None, cancel);
+        let result = exec_on(&repo, scope_lock, &call, None, cancel, true);
         let elapsed = started.elapsed();
 
         let stash_list_after = git(&["stash", "list"]);
@@ -3541,7 +3671,9 @@ mod tests {
         let waiter = {
             let repo = repo.clone();
             let cancel = cancel.clone();
-            std::thread::spawn(move || exec_on(&repo, None, &args(&["add", "."]), None, cancel))
+            std::thread::spawn(move || {
+                exec_on(&repo, None, &args(&["add", "."]), None, cancel, true)
+            })
         };
         std::thread::sleep(Duration::from_millis(300));
         assert!(
@@ -3577,5 +3709,438 @@ mod tests {
             poll_interval(Duration::from_secs(60)),
             Duration::from_millis(20)
         );
+    }
+
+    /// EXT-33 E0.1: `exec_on` with a chosen trust, for the untrusted-workspace tests.
+    fn exec_trust(repo: &Repo, args: &[String], trusted: bool) -> Result<ToolOutput, String> {
+        let stash_locks = StashLocks::default();
+        let network_locks = NetworkLocks::default();
+        let scope_lock =
+            resolve_scope_lock(&stash_locks, &network_locks, &repo.repository_id, args).unwrap();
+        exec_on(
+            repo,
+            scope_lock,
+            args,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            trusted,
+        )
+    }
+
+    /// EXT-33 E0.1 (F-G1): the hardening set is well formed and names every Git configuration
+    /// key known to make Git run a program as it reads a repository.
+    #[test]
+    fn the_hardening_set_covers_every_config_key_that_runs_a_program() {
+        assert_eq!(
+            HARDENING.len() % 2,
+            0,
+            "each override is a `-c key=value` pair"
+        );
+        let keys: Vec<&str> = HARDENING
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "-c");
+                pair[1].split('=').next().unwrap()
+            })
+            .collect();
+        for required in [
+            "core.fsmonitor",
+            "core.hooksPath",
+            "core.pager",
+            "core.editor",
+            "core.sshCommand",
+            "core.askpass",
+            "core.alternateRefsCommand",
+            "diff.external",
+            "log.showSignature",
+            "gpg.program",
+            "credential.helper",
+            "protocol.ext.allow",
+            "uploadpack.packObjectsHook",
+            // EXT-33 E0.3: submodule recursion (V1) and the non-OpenPGP signature programs.
+            "diff.ignoreSubmodules",
+            "gpg.ssh.program",
+            "gpg.x509.program",
+        ] {
+            assert!(keys.contains(&required), "hardening is missing {required}");
+        }
+    }
+
+    /// EXT-33 E0.3 (V2): every worktree-writing subcommand is refused in an untrusted workspace.
+    /// `git_exec` refuses such an operation before it records a `GitClean` expectation or a
+    /// crash intent, so a concurrent watcher batch never runs the background index check
+    /// (`operations::git_dirty`) against an untrusted repository. This proves the invariant the
+    /// ordering relies on: no worktree-writing op is ever an allowed untrusted read.
+    #[test]
+    fn no_worktree_writing_operation_is_an_allowed_untrusted_read() {
+        for op in [
+            &["switch", "main"][..],
+            &["pull"],
+            &["merge", "main"],
+            &["rebase", "main"],
+            &["cherry-pick", "abc"],
+            &["revert", "abc"],
+            &["stash"],
+            &["stash", "push"],
+            &["stash", "pop"],
+            &["stash", "apply"],
+            &["restore", "--worktree", "a"],
+            &["rm", "a"],
+            &["apply", "p.diff"],
+            &["reset", "--hard"],
+        ] {
+            let args: Vec<String> = op.iter().map(|s| s.to_string()).collect();
+            assert!(writes_worktree(&args), "{op:?} should write the worktree");
+            assert!(
+                !untrusted_read_allowed(&args[0], &args[1..]),
+                "{op:?} must be refused untrusted, before any GitClean expectation"
+            );
+        }
+    }
+
+    /// EXT-33 E0.1 (F-G1): a command-line `-c` override wins over the same key in a
+    /// repository's own `.git/config`, so a program a repository configured is never the
+    /// effective value. Proven with `config --get` -- no configured program is ever run.
+    #[test]
+    fn command_line_overrides_beat_a_repositorys_own_config() {
+        let (dir, git) = fixture();
+        // A repository that configures programs for the read-path keys (as a hostile download
+        // might). They are set, never run: the test only reads back the effective value.
+        assert!(git(&["config", "core.fsmonitor", "/tmp/would-run"]));
+        assert!(git(&["config", "diff.external", "/tmp/would-run"]));
+        assert!(git(&["config", "core.pager", "/tmp/would-run"]));
+        let effective = |key: &str, overridden: bool| {
+            let mut base = vec!["-c".to_string(), format!("{key}=OVERRIDDEN")];
+            if !overridden {
+                base.clear();
+            }
+            base.extend(["config", "--get", key].iter().map(|s| s.to_string()));
+            run_command(
+                &dir,
+                &base.iter().map(String::as_str).collect::<Vec<_>>(),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                false,
+                false,
+            )
+            .map(|o| o.stdout.trim().to_string())
+        };
+        // Without an override, the repository's value stands; with one, the override wins.
+        assert_eq!(
+            effective("core.fsmonitor", false).unwrap(),
+            "/tmp/would-run"
+        );
+        assert_eq!(effective("core.fsmonitor", true).unwrap(), "OVERRIDDEN");
+        // And the real hardening sets these keys empty, so they stand for nothing to run.
+        let hardened = run_command(
+            &dir,
+            &["config", "--get", "core.fsmonitor"],
+            None,
+            Arc::new(AtomicBool::new(false)),
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(
+            hardened.stdout.trim().is_empty(),
+            "hardened fsmonitor is empty"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// EXT-33 E0.1 (F-G1), adversarial: a repository whose own configuration names a program
+    /// for every key Git consults while reading (fsmonitor, a clean filter and diff driver picked
+    /// by `.gitattributes`, the index hook). Each "program" only appends to a marker file. The
+    /// control proves every one is live when Git runs the repository as configured; the
+    /// untrusted reads, and Yavin's own hardened bookkeeping, must then run none of them.
+    #[test]
+    fn a_hostile_repositorys_configured_programs_never_run_for_untrusted_reads() {
+        let (dir, git) = fixture();
+        let marker = |name: &str| dir.join(format!("ran-{name}"));
+        let append = |name: &str| format!("echo ran >> '{}'", clean_path_str(marker(name)));
+        assert!(git(&["config", "core.fsmonitor", &append("fsmonitor")]));
+        assert!(git(&[
+            "config",
+            "filter.evil.clean",
+            &format!("{}; cat", append("clean"))
+        ]));
+        assert!(git(&["config", "filter.evil.process", &append("process")]));
+        assert!(git(&[
+            "config",
+            "diff.evil.textconv",
+            &format!("{}; cat", append("textconv"))
+        ]));
+        assert!(git(&[
+            "config",
+            "diff.evil.command",
+            &format!("{}; true", append("diffcmd"))
+        ]));
+        fs::write(dir.join(".gitattributes"), "*.txt filter=evil diff=evil\n").unwrap();
+        let hooks = dir.join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        for hook in ["post-index-change", "reference-transaction"] {
+            fs::write(hooks.join(hook), format!("#!/bin/sh\n{}\n", append(hook))).unwrap();
+        }
+        // EXT-33 E0.3 (V1): an embedded repository -- a nested `.git` shipped inside the folder,
+        // as a downloaded archive can carry -- with its own marker-writing clean filter in its
+        // own config. That config is invisible to `driver_overrides` (which sees only the outer
+        // repository), so only `diff.ignoreSubmodules=all` in `HARDENING` keeps a status or diff
+        // that recurses into it from running its filter.
+        let git_in = |at: &Path, a: &[&str]| {
+            Command::new("git")
+                .current_dir(at)
+                .args(a)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        let nested = dir.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(git_in(&nested, &["init", "-q", "-b", "main"]));
+        assert!(git_in(&nested, &["config", "user.email", "t@t.invalid"]));
+        assert!(git_in(&nested, &["config", "user.name", "T"]));
+        assert!(git_in(&nested, &["config", "core.autocrlf", "false"]));
+        assert!(git_in(
+            &nested,
+            &[
+                "config",
+                "filter.ev.clean",
+                &format!("{}; cat", append("sub"))
+            ]
+        ));
+        fs::write(nested.join(".gitattributes"), "*.txt filter=ev\n").unwrap();
+        fs::write(nested.join("n.txt"), "n0\n").unwrap();
+        assert!(git_in(&nested, &["add", "."]));
+        assert!(git_in(&nested, &["commit", "-qm", "n"]));
+        let ran = || {
+            let mut ran: Vec<String> = fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| n.starts_with("ran-"))
+                .collect();
+            ran.sort();
+            for name in &ran {
+                fs::remove_file(dir.join(name)).unwrap();
+            }
+            ran
+        };
+        // A change in the working tree, so that comparing it with the index needs the filter.
+        let touch = |text: &str| fs::write(dir.join("a.txt"), text).unwrap();
+        let unhardened = |args: &[&str]| {
+            run_command(
+                &dir,
+                args,
+                None,
+                Arc::new(AtomicBool::new(false)),
+                false,
+                false,
+            )
+        };
+
+        // Control: run as the repository is configured, each planted program runs.
+        touch("changed\n");
+        let _ = unhardened(&["status", "--porcelain=v1"]);
+        let _ = unhardened(&["diff"]);
+        let control = ran();
+        for live in ["ran-fsmonitor", "ran-diffcmd"] {
+            assert!(
+                control.iter().any(|n| n == live),
+                "the control must prove {live} is live: {control:?}"
+            );
+        }
+        assert!(
+            control
+                .iter()
+                .any(|n| n == "ran-clean" || n == "ran-process"),
+            "the control must prove the filter is live: {control:?}"
+        );
+        let _ = unhardened(&["diff", "--no-ext-diff"]);
+        assert!(
+            ran().iter().any(|n| n == "ran-textconv"),
+            "textconv is live"
+        );
+
+        // Untrusted: every read the view makes runs none of them.
+        let repo = open(&dir);
+        for (i, read) in [
+            &["status", "--porcelain=v1"][..],
+            &["status", "--porcelain=v2", "--branch", "-z"],
+            &["diff", "--no-ext-diff", "--no-textconv"],
+            &["diff", "--no-ext-diff", "--no-textconv", "--cached"],
+            &["diff", "--no-ext-diff", "--no-textconv", "HEAD"],
+            &["cat-file", "--filters", ":a.txt"],
+            &["log", "-n", "1"],
+        ]
+        .iter()
+        .enumerate()
+        {
+            touch(&format!("changed {i}\n"));
+            let out = exec_trust(&repo, &args(read), false);
+            assert!(out.is_ok(), "untrusted read {read:?}: {out:?}");
+            assert_eq!(
+                ran(),
+                Vec::<String>::new(),
+                "untrusted {read:?} ran a program"
+            );
+        }
+        // EXT-33 E0.3 (V1): the embedded repository's filter is live (its own diff runs it),
+        // yet an untrusted status and diff of the outer repository run none of it. The content
+        // stays the same size as the committed `n0\n`, so even `status` must hash it to decide.
+        let touch_sub = |text: &str| fs::write(dir.join("nested/n.txt"), text).unwrap();
+        touch_sub("n1\n");
+        assert!(git_in(&nested, &["diff"]));
+        assert!(
+            ran().iter().any(|n| n == "ran-sub"),
+            "the control must prove the embedded filter is live"
+        );
+        for read in [
+            &["status", "--porcelain=v1"][..],
+            &["status", "--porcelain=v2", "--branch", "-z"],
+            &["diff", "--no-ext-diff", "--no-textconv"],
+        ] {
+            touch_sub("n2\n");
+            let out = exec_trust(&repo, &args(read), false);
+            assert!(out.is_ok(), "untrusted {read:?}: {out:?}");
+            assert_eq!(
+                ran(),
+                Vec::<String>::new(),
+                "untrusted {read:?} ran the embedded repository's filter"
+            );
+        }
+        // Yavin's own bookkeeping (always hardened), even where it may write the index.
+        touch("changed again\n");
+        let out = run(&dir, &["status", "--porcelain=v1"]).unwrap();
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(ran(), Vec::<String>::new(), "hardened status ran a program");
+        // Hardened, a diff with the window's `--no-ext-diff --no-textconv` shows the change; one
+        // without them still runs no driver: the emptied textconv and external command fail
+        // closed ("cannot spawn"), never falling back to the repository's.
+        touch("changed once more\n");
+        let out = run(&dir, &["diff", "--no-ext-diff", "--no-textconv"]).unwrap();
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(out.stdout.contains("+changed once more"), "{}", out.stdout);
+        for diff in [&["diff", "--no-ext-diff"][..], &["diff"], &["diff", "HEAD"]] {
+            touch(&format!("changed for {}\n", diff.len()));
+            let out = run(&dir, diff).unwrap();
+            assert_eq!(
+                ran(),
+                Vec::<String>::new(),
+                "hardened {diff:?} ran a program"
+            );
+            assert!(
+                out.code == 0 || out.stderr.contains("cannot spawn"),
+                "{diff:?}: {}",
+                out.stderr
+            );
+        }
+        // Trusted, the repository's own configuration stands (its filter runs, as before).
+        touch("trusted\n");
+        let _ = exec_trust(
+            &repo,
+            &args(&["diff", "--no-ext-diff", "--no-textconv"]),
+            true,
+        );
+        assert!(
+            ran().iter().any(|n| n == "ran-clean" || n == "ran-process"),
+            "a trusted repository keeps its filters"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// EXT-33 E0.1 (F-G1): every filter and diff driver the configuration names is emptied, by
+    /// its exact (case-kept, dotted) name; a name `-c` cannot spell refuses the operation.
+    #[test]
+    fn every_configured_driver_is_emptied_and_an_unspellable_one_refuses() {
+        let (dir, git) = fixture();
+        assert!(git(&["config", "filter.Mixed.Case.clean", "x"]));
+        assert!(git(&["config", "filter.lfs.smudge", "x"]));
+        assert!(git(&["config", "diff.pic.textconv", "x"]));
+        assert!(git(&["config", "diff.renames", "true"]));
+        let overrides = driver_overrides(&dir).unwrap();
+        let pairs: Vec<&str> = overrides
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(String::as_str)
+            .collect();
+        assert!(overrides.iter().step_by(2).all(|c| c == "-c"));
+        for expected in [
+            "filter.Mixed.Case.clean=",
+            "filter.Mixed.Case.smudge=",
+            "filter.Mixed.Case.process=",
+            "filter.Mixed.Case.required=false",
+            "filter.lfs.clean=",
+            "filter.lfs.process=",
+            "diff.pic.textconv=",
+            "diff.pic.command=",
+        ] {
+            assert!(pairs.contains(&expected), "{expected} in {pairs:?}");
+        }
+        assert!(
+            !pairs.iter().any(|p| p.starts_with("diff.renames")),
+            "{pairs:?}"
+        );
+        // Applied, the configuration reads back empty for each of them.
+        let out = run(&dir, &["config", "--get", "filter.Mixed.Case.clean"]).unwrap();
+        assert!(out.stdout.trim().is_empty(), "{}", out.stdout);
+
+        assert!(git(&["config", "filter.a=b.clean", "x"]));
+        let refused = driver_overrides(&dir).unwrap_err();
+        assert!(refused.contains("cannot safely disable"), "{refused}");
+        assert!(
+            run(&dir, &["status"]).is_err(),
+            "nothing runs on it hardened"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// EXT-33 E0.1 (F-G1): an untrusted workspace reads but does not change its repository,
+    /// reach the network, or run a hook-triggering operation; a trusted one does everything.
+    #[test]
+    fn an_untrusted_workspace_allows_reads_and_refuses_the_rest() {
+        let (dir, _git) = fixture();
+        let repo = open(&dir);
+        // Reads succeed even when untrusted.
+        for read in [
+            &["status", "--porcelain=v1"][..],
+            &["log", "-n", "1"],
+            &["diff", "--no-ext-diff", "--no-textconv"],
+            &["rev-parse", "HEAD"],
+            &["symbolic-ref", "--short", "HEAD"],
+            &["for-each-ref", "--format=%(refname)"],
+        ] {
+            let out = exec_trust(&repo, &args(read), false);
+            assert!(out.is_ok(), "untrusted read {read:?}: {out:?}");
+        }
+        // Everything that writes, updates a ref, or reaches the network is refused until trust.
+        for blocked in [
+            &["add", "a.txt"][..],
+            &["commit", "-m", "x"],
+            &["checkout", "-b", "y"],
+            &["switch", "main"],
+            &["merge", "main"],
+            &["reset", "--soft", "HEAD~1"],
+            &["branch", "-d", "gone"],
+            &["tag", "v1"],
+            &["stash", "push"],
+            &["fetch"],
+            &["symbolic-ref", "HEAD", "refs/heads/evil"],
+        ] {
+            let refused = exec_trust(&repo, &args(blocked), false);
+            assert_eq!(
+                refused.err().as_deref(),
+                Some(RESTRICTED_GIT),
+                "{blocked:?}"
+            );
+            // Trusted, the same operation is allowed to run (it reaches Git, pass or fail).
+            assert_ne!(
+                exec_trust(&repo, &args(blocked), true).err().as_deref(),
+                Some(RESTRICTED_GIT),
+                "trusted {blocked:?} must not be refused for trust",
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }
