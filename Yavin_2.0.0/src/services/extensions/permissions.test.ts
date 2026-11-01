@@ -53,8 +53,9 @@ test("permissions: every bridge method the host serves has a decision", () => {
     (match) => match[1],
   );
   // EXT-25: documents.edit, statusBar.set, statusBar.remove; EXT-27: window.state; EXT-29:
-  // window.quickPick, window.inputBox, window.cancelPrompt, diagnostics.set, diagnostics.clear.
-  assert.equal(methods.length, 35, methods.join(", "));
+  // window.quickPick, window.inputBox, window.cancelPrompt, diagnostics.set, diagnostics.clear;
+  // EXT-31: the five webview requests; EXT-33 E0: fs.findFiles, fs.cancelFind.
+  assert.equal(methods.length, 37, methods.join(", "));
   for (const method of methods)
     assert.notEqual(needOfRequest("acme.hello", method, {}).kind, "unknown", method);
 });

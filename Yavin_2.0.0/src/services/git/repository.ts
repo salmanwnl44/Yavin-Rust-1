@@ -551,7 +551,16 @@ export class Repository {
   /** "View Stash…": the stash's own unified diff against the commit it was taken from --
    * the same format `diff()`/`commitFileDiff()` already produce, so it reuses their viewer. */
   stashShow(index: number): Promise<string> {
-    return this.run(["stash", "show", "--no-color", "-p", `stash@{${index}}`]);
+    // EXT-33 E0.1: no external diff or textconv driver (named by .gitattributes), as every patch.
+    return this.run([
+      "stash",
+      "show",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-color",
+      "-p",
+      `stash@{${index}}`,
+    ]);
   }
   stashList(): Promise<string> {
     return this.run(["stash", "list"]);

@@ -3038,6 +3038,12 @@
     // does not show them (they are the extension's, not the window's documents).
     const contentProviders = new Map();
     const MAX_VIRTUAL_DOCUMENT = 8 * 1024 * 1024;
+    // EXT-33 E0: workspace.findFiles -- through Yavin's own search (the workspace only; hidden and
+    // ignored files included, as VS Code's; `.git` never), at most 10 000 results. `exclude`
+    // undefined: VS Code's default files.exclude (Yavin has no such setting); null: none.
+    const DEFAULT_EXCLUDE = "**/{.git,.svn,.hg,CVS,.DS_Store,Thumbs.db}";
+    const MAX_FIND_RESULTS = 10000;
+    let nextFind = 1;
     const RESERVED_SCHEMES = new Set(["file", "untitled", "http", "https", "data", "vscode", "vscode-userdata", "yavin-storage", "yavin-webview"]);
     const workspaceApi = {
       get workspaceFolders() { return folders; },
@@ -3086,6 +3092,33 @@
           docs.delete(info.uri);
           listener.call(thisArg, entry.document);
         }, disposables),
+      async findFiles(include, exclude, maxResults, token) {
+        const globOf = (pattern, what) => {
+          if (typeof pattern === "string") return pattern;
+          if (pattern && typeof pattern.pattern === "string" && pattern.baseUri) {
+            const base = relativeOf(pattern.baseUri);
+            if (base === null) throw new Error(`workspace.findFiles: the ${what} pattern's base is outside the workspace (Yavin searches the workspace only).`);
+            return base ? `${base}/${pattern.pattern}` : pattern.pattern;
+          }
+          throw new TypeError(`workspace.findFiles: the ${what} pattern is a glob or a RelativePattern.`);
+        };
+        if (!folder) return [];
+        const includeGlob = globOf(include, "include");
+        const excludeGlob = exclude === null ? null : exclude === undefined ? DEFAULT_EXCLUDE : globOf(exclude, "exclude");
+        const max = Number.isInteger(maxResults) && maxResults > 0 ? Math.min(maxResults, MAX_FIND_RESULTS) : MAX_FIND_RESULTS;
+        if (token && token.isCancellationRequested) return [];
+        const id = `${init.extensionId}#find#${nextFind++}`;
+        const following = token && typeof token.onCancellationRequested === "function" ? token.onCancellationRequested(() => call("fs.cancelFind", { id }).catch(() => {})) : null;
+        try {
+          const found = await call("fs.findFiles", { id, include: includeGlob, exclude: excludeGlob, maxResults: max });
+          if (token && token.isCancellationRequested) return [];
+          // Yavin's spelling of each file, as its documents have: the same Uri, path and string.
+          const uris = found && Array.isArray(found.uris) ? found.uris : [];
+          return uris.filter((uri) => typeof uri === "string" && uri.startsWith("file:")).map((uri) => Uri.parse(uri));
+        } finally {
+          if (following && typeof following.dispose === "function") following.dispose();
+        }
+      },
       registerTextDocumentContentProvider(scheme, provider) {
         const name = String(scheme || "");
         if (!/^[a-z][a-z0-9+.-]*$/i.test(name) || RESERVED_SCHEMES.has(name.toLowerCase()))
@@ -3157,7 +3190,7 @@
         "workspace.fs",
       ),
     };
-    for (const name of ["findFiles", "saveAll", "registerFileSystemProvider", "registerTaskProvider", "registerNotebookSerializer", "onDidCreateFiles", "onDidDeleteFiles", "onDidRenameFiles", "onWillCreateFiles", "onWillDeleteFiles", "onWillRenameFiles", "openNotebookDocument", "updateWorkspaceFolders", "onDidOpenNotebookDocument", "onDidCloseNotebookDocument", "onDidChangeNotebookDocument", "decode", "encode", "findTextInFiles", "save", "saveAs"])
+    for (const name of ["saveAll", "registerFileSystemProvider", "registerTaskProvider", "registerNotebookSerializer", "onDidCreateFiles", "onDidDeleteFiles", "onDidRenameFiles", "onWillCreateFiles", "onWillDeleteFiles", "onWillRenameFiles", "openNotebookDocument", "updateWorkspaceFolders", "onDidOpenNotebookDocument", "onDidCloseNotebookDocument", "onDidChangeNotebookDocument", "decode", "encode", "findTextInFiles", "save", "saveAs"])
       workspaceApi[name] = unsupportedFn(`workspace.${name}`);
     throwingGetter(workspaceApi, "notebookDocuments", "workspace.notebookDocuments");
     void decoder;

@@ -1,5 +1,5 @@
 {
-  "about": "EXT-25, graded by evidence at EXT-26 by behavioural tests at EXT-27, and its runtime part again at EXT-28: what Yavin provides of the VS Code extension API, through the compatibility layer (src-tauri/crates/ide-plugin-host/src/vscode.js) and the VS Code package adapter (src-tauri/src/vsix.rs). FULL: as VS Code documents it, and tested. PARTIAL: provided with the limitation noted, and tested. STUB: present but fabricated or inert. UNSUPPORTED: fails with an UnsupportedApi error naming it (logged once). NOT VERIFIED: implemented (`implemented` says how far) but no test or benchmark run exercises its behaviour. `evidence`: L1 present (the inventory test), L2 behaviour tested, L3 exercised by real extensions in the Open VSX benchmark. 'baseline' is before EXT-25, when no VS Code extension code ran at all. Checked against the layer by crates/ide-plugin-host/tests/vscode.rs (the_inventory_matches_the_layer). EXT-27 adds L4: the window (tests/ui) and the packaged application (tests/real). EXT-29 adds the pickers, file watchers, save and selection events, formatting and code-action providers, and diagnostics in the Problems view. EXT-30 adds file icon themes (their SVG icons). EXT-31 adds webview panels. EXT-32 adds tabs, content providers and storage addresses, and inert providers of what Yavin's editor does not show (STUB); workers (`new Worker`) are the host's, outside this API (`worker.rs`).",
+  "about": "EXT-25, graded by evidence at EXT-26 by behavioural tests at EXT-27, and its runtime part again at EXT-28: what Yavin provides of the VS Code extension API, through the compatibility layer (src-tauri/crates/ide-plugin-host/src/vscode.js) and the VS Code package adapter (src-tauri/src/vsix.rs). FULL: as VS Code documents it, and tested. PARTIAL: provided with the limitation noted, and tested. STUB: present but fabricated or inert. UNSUPPORTED: fails with an UnsupportedApi error naming it (logged once). NOT VERIFIED: implemented (`implemented` says how far) but no test or benchmark run exercises its behaviour. `evidence`: L1 present (the inventory test), L2 behaviour tested, L3 exercised by real extensions in the Open VSX benchmark. 'baseline' is before EXT-25, when no VS Code extension code ran at all. Checked against the layer by crates/ide-plugin-host/tests/vscode.rs (the_inventory_matches_the_layer). EXT-27 adds L4: the window (tests/ui) and the packaged application (tests/real). EXT-29 adds the pickers, file watchers, save and selection events, formatting and code-action providers, and diagnostics in the Problems view. EXT-30 adds file icon themes (their SVG icons). EXT-31 adds webview panels. EXT-32 adds tabs, content providers and storage addresses, and inert providers of what Yavin's editor does not show (STUB); workers (`new Worker`) are the host's, outside this API (`worker.rs`). EXT-33 E0 adds workspace.findFiles, through Yavin's own search.",
   "level": "1.90.0",
   "statuses": ["FULL", "PARTIAL", "STUB", "UNSUPPORTED", "NOT VERIFIED"],
   "api": [
@@ -605,9 +605,13 @@
     {
       "api": "workspace.findFiles",
       "tier": 1,
-      "status": "UNSUPPORTED",
+      "status": "PARTIAL",
       "baseline": "UNSUPPORTED",
-      "evidence": ["L2: the inventory test (each unsupported member fails with UnsupportedApi)"]
+      "evidence": [
+        "L2: the window, src/services/extensions/vscodeFindFiles.test.ts; native, src-tauri/src/workbench.rs (a_listing_for_an_extension_finds_hidden_and_ignored_files_never_git_and_globs_stay_globs)",
+        "L3/L4: SVG Preview (Open VSX) Preview All in the installed application, tests/real/webview-svg.spec.ts"
+      ],
+      "notes": "EXT-33 E0: through Yavin's own search (its bundled ripgrep, file listing): the workspace only, a glob or a RelativePattern inside it; hidden and ignored files included, .git never; exclude undefined is VS Code's default files.exclude (Yavin has no such setting), null is none; at most 10 000 results; a cancelled token stops the search. Globs are ripgrep's (case-sensitive); absolute, .., option-like and negated globs are refused. Needs workspace.fs.read."
     },
     {
       "api": "workspace.createFileSystemWatcher",

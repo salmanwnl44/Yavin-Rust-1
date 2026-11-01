@@ -1,5 +1,5 @@
 {
-  "note": "EXT-27: behaviours of the VS Code compatibility layer and its window side, each broken in turn; the tests named must catch it (scripts/conformance-mutations.mjs). Paths are relative to Yavin_2.0.0. EXT-28 adds R1-R21: the runtime (web.js, intl.js, the loader, the random source, rejection reports), each caught by tests/runtime.rs. EXT-29 adds C1-C9 (the window side: prompts, problems, will-save, file events, ownership) and S1-S7 (the layer: watchers, prompts, tokens, validation, code actions, diagnostics batches). EXT-30 adds I1-I8: file icon themes (paths kept inside the package, SVG only and bounded, VS Code's choice of icon, a disabled extension's theme, the manifest's check). EXT-31 adds V01-V09: webview panels (ownership, bounded and ready-gated frame messages, disposal with the extension, messages to the owner only, resource roots, the window's update loop, the window's permission rule), and V10-V11 (only the page the frame was last given is ready; a frame that kept an earlier page is given its page again). EXT-32 adds Z01-Z06: the layer for language clients (cancellation tokens for completion, hover and symbols; inert providers said once; tabs; content providers' schemes; storage addresses; an ended worker's silence).",
+  "note": "EXT-27: behaviours of the VS Code compatibility layer and its window side, each broken in turn; the tests named must catch it (scripts/conformance-mutations.mjs). Paths are relative to Yavin_2.0.0. EXT-28 adds R1-R21: the runtime (web.js, intl.js, the loader, the random source, rejection reports), each caught by tests/runtime.rs. EXT-29 adds C1-C9 (the window side: prompts, problems, will-save, file events, ownership) and S1-S7 (the layer: watchers, prompts, tokens, validation, code actions, diagnostics batches). EXT-30 adds I1-I8: file icon themes (paths kept inside the package, SVG only and bounded, VS Code's choice of icon, a disabled extension's theme, the manifest's check). EXT-31 adds V01-V09: webview panels (ownership, bounded and ready-gated frame messages, disposal with the extension, messages to the owner only, resource roots, the window's update loop, the window's permission rule), and V10-V11 (only the page the frame was last given is ready; a frame that kept an earlier page is given its page again). EXT-32 adds Z01-Z06: the layer for language clients (cancellation tokens for completion, hover and symbols; inert providers said once; tabs; content providers' schemes; storage addresses; an ended worker's silence). EXT-33 E0 adds G01-G06: workspace.findFiles (globs refused before Yavin's search, results inside the workspace, stopped with its extension and its token, its own id).",
   "mutations": [
     {
       "id": "EXT-27 B1",
@@ -984,6 +984,78 @@
         }
       ],
       "cargo": ["-p", "ide-plugin-host", "--test", "workers", "--", "messages_pass_both_ways"]
+    },
+    {
+      "id": "EXT-33 G01",
+      "what": "an option-like or negated glob reaches Yavin's search",
+      "edits": [
+        {
+          "file": "src/services/extensions/host.ts",
+          "from": "    if (/[\\0\\r\\n]/.test(glob) || /^[-!]/.test(glob))",
+          "to": "    if (/[\\0\\r\\n]/.test(glob))"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeFindFiles.test.ts"]
+    },
+    {
+      "id": "EXT-33 G02",
+      "what": "an absolute or .. glob reaches Yavin's search",
+      "edits": [
+        {
+          "file": "src/services/extensions/host.ts",
+          "from": "    if (/^([a-z]:|\\/)/i.test(glob) || glob.split(\"/\").includes(\"..\"))",
+          "to": "    if (false)"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeFindFiles.test.ts"]
+    },
+    {
+      "id": "EXT-33 G03",
+      "what": "a found path outside the workspace is answered",
+      "edits": [
+        {
+          "file": "src/services/extensions/host.ts",
+          "from": "          if (!full.toLowerCase().startsWith(`${base}/`)) continue;\n",
+          "to": ""
+        }
+      ],
+      "node": ["src/services/extensions/vscodeFindFiles.test.ts"]
+    },
+    {
+      "id": "EXT-33 G04",
+      "what": "a stopped extension's search goes on",
+      "edits": [
+        {
+          "file": "src/services/extensions/host.ts",
+          "from": "    for (const [id, find] of finds)\n      if (find.extensionId === extensionId) {\n        finds.delete(id);\n        find.controller.abort();\n      }\n",
+          "to": ""
+        }
+      ],
+      "node": ["src/services/extensions/vscodeFindFiles.test.ts"]
+    },
+    {
+      "id": "EXT-33 G05",
+      "what": "a cancelled token does not stop Yavin's search",
+      "edits": [
+        {
+          "file": "src-tauri/crates/ide-plugin-host/src/vscode.js",
+          "from": "token.onCancellationRequested(() => call(\"fs.cancelFind\", { id }).catch(() => {}))",
+          "to": "token.onCancellationRequested(() => {})"
+        }
+      ],
+      "node": ["src/services/extensions/vscodeFindFiles.test.ts"]
+    },
+    {
+      "id": "EXT-33 G06",
+      "what": "a search's id need not be the extension's own (window rule)",
+      "edits": [
+        {
+          "file": "src/services/extensions/permissions.ts",
+          "from": "      return own.kind === \"none\" ? needs(FS_READ) : own;",
+          "to": "      return needs(FS_READ);"
+        }
+      ],
+      "node": ["src/services/extensions/permissions.test.ts"]
     }
   ]
 }

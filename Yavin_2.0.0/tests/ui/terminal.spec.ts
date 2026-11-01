@@ -2402,6 +2402,13 @@ async function showView(page: Page, label: string) {
     .click();
 }
 
+// The Ports view opens on its "Local" placeholder; the machine-wide list is behind the "Global"
+// scope tab, so tests that assert the listing select it first.
+async function showGlobalPorts(page: Page) {
+  await showView(page, "PORTS");
+  await page.getByRole("tab", { name: "Global" }).click();
+}
+
 test("Ports lists what is listening, with the process holding each one", async ({ page }) => {
   await desktop(page, {
     ports: [
@@ -2409,7 +2416,7 @@ test("Ports lists what is listening, with the process holding each one", async (
       { port: 8080, address: "0.0.0.0", pid: 9012, process: "" },
     ],
   });
-  await showView(page, "PORTS");
+  await showGlobalPorts(page);
 
   const ports = page.getByRole("region", { name: "Ports" });
   await expect(ports.getByRole("row")).toHaveCount(3); // header plus two services
@@ -2422,7 +2429,7 @@ test("Ports lists what is listening, with the process holding each one", async (
 
 test("Ports says what it is for when nothing is listening", async ({ page }) => {
   await desktop(page, { ports: [] });
-  await showView(page, "PORTS");
+  await showGlobalPorts(page);
   await expect(page.getByRole("region", { name: "Ports" })).toContainText("Start a dev server");
 });
 
@@ -2430,7 +2437,7 @@ test("a port opens over http on loopback, which is how a dev server is served", 
   page,
 }) => {
   await desktop(page, { ports: [{ port: 5173, address: "127.0.0.1", pid: 1, process: "node" }] });
-  await showView(page, "PORTS");
+  await showGlobalPorts(page);
 
   await page.getByRole("button", { name: "Open port 5173 in your browser" }).click();
   await expect
@@ -2440,7 +2447,7 @@ test("a port opens over http on loopback, which is how a dev server is served", 
 
 test("stopping a process asks first and names what it will end", async ({ page }) => {
   await desktop(page, { ports: [{ port: 5173, address: "127.0.0.1", pid: 1, process: "node" }] });
-  await showView(page, "PORTS");
+  await showGlobalPorts(page);
 
   let asked = "";
   page.on("dialog", (dialog) => {
@@ -2456,7 +2463,7 @@ test("stopping a process asks first and names what it will end", async ({ page }
 
 test("confirming the stop ends the process holding that port", async ({ page }) => {
   await desktop(page, { ports: [{ port: 5173, address: "127.0.0.1", pid: 1, process: "node" }] });
-  await showView(page, "PORTS");
+  await showGlobalPorts(page);
 
   page.on("dialog", (dialog) => void dialog.accept());
   await page.getByRole("button", { name: "Stop the process on port 5173" }).click();

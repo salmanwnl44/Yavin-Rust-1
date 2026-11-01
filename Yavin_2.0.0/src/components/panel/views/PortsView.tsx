@@ -17,7 +17,13 @@ function addressFor(port: ListeningPort): string {
  * ports something is listening on, name the process holding each, and offer to open, copy or
  * stop it.
  */
+/** Which scope the Ports view is showing. "global" is the ready machine-wide list; "local" (ports
+ * this workspace itself opened) is planned and not implemented yet. */
+type PortScope = "local" | "global";
+
 export function PortsView() {
+  // Default to Local so the machine-wide ("global") list is not shown directly on open.
+  const [scope, setScope] = useState<PortScope>("local");
   const [ports, setPorts] = useState<ListeningPort[] | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -54,13 +60,17 @@ export function PortsView() {
   }, []);
 
   useEffect(() => {
+    // Only the global (machine-wide) scope enumerates ports. The local scope is a planned
+    // placeholder, so there is nothing to poll — and this avoids shelling out to netstat/tasklist
+    // while it is shown.
+    if (scope !== "global") return;
     void refresh();
     // Ports come and go as servers start and stop, so the list refreshes itself. Five seconds
     // matches the Source Control poll and is far cheaper than it. The view is unmounted when
     // another view shows or the panel closes, which is what stops this.
     const timer = setInterval(() => void refresh(), 5000);
     return () => clearInterval(timer);
-  }, [refresh]);
+  }, [refresh, scope]);
 
   const stop = async (port: ListeningPort) => {
     if (
@@ -77,133 +87,175 @@ export function PortsView() {
     }
   };
 
-  if (ports === null && !error)
-    return <EmptyView label="Ports" message="Looking for local services…" />;
+  // The two scopes the panel offers. "Global" is the ready machine-wide list; "Local" is a
+  // planned placeholder. Rendering is split so the tab bar always shows and only the body swaps.
+  const scopeTabs = (
+    <div
+      role="tablist"
+      aria-label="Ports scope"
+      className="flex shrink-0 items-center gap-1 border-b border-[#141414] px-2 py-1"
+    >
+      {(["local", "global"] as const).map((s) => (
+        <button
+          key={s}
+          role="tab"
+          aria-selected={scope === s}
+          onClick={() => setScope(s)}
+          className={`rounded px-2 py-0.5 text-[11px] font-medium capitalize ${
+            scope === s ? "bg-[#161616] text-zinc-200" : "text-zinc-500 hover:text-zinc-200"
+          }`}
+        >
+          {s}
+        </button>
+      ))}
+    </div>
+  );
 
-  if (error && !ports?.length)
+  const localScope = (
+    <EmptyView
+      label="Local ports"
+      message="Local ports — the ports this workspace's own processes open — are planned and not implemented yet. Switch to Global to see every service listening on this machine."
+    />
+  );
+
+  function globalScope() {
+    if (ports === null && !error)
+      return <EmptyView label="Ports" message="Looking for local services…" />;
+
+    if (error && !ports?.length)
+      return (
+        <EmptyView
+          label="Ports"
+          message={`Local services could not be listed. ${error}`}
+          action={
+            <button
+              onClick={() => void refresh()}
+              className="rounded bg-indigo-600 px-3 py-1 text-[11px] font-medium text-white hover:bg-indigo-500"
+            >
+              Try Again
+            </button>
+          }
+        />
+      );
+
+    if (!ports?.length)
+      return (
+        <EmptyView
+          label="Ports"
+          message="Nothing on this machine is listening on a TCP port. Start a dev server and it will appear here."
+          action={
+            <button
+              onClick={() => void refresh()}
+              className="rounded bg-indigo-600 px-3 py-1 text-[11px] font-medium text-white hover:bg-indigo-500"
+            >
+              Refresh
+            </button>
+          }
+        />
+      );
+
     return (
-      <EmptyView
-        label="Ports"
-        message={`Local services could not be listed. ${error}`}
-        action={
+      <>
+        <div className="flex shrink-0 items-center gap-2 border-b border-[#141414] px-3 py-1">
+          <span className="text-[11px] text-zinc-500">
+            {ports.length} global service{ports.length === 1 ? "" : "s"}
+          </span>
+          {error && <span className="truncate text-[11px] text-red-400">{error}</span>}
           <button
             onClick={() => void refresh()}
-            className="rounded bg-indigo-600 px-3 py-1 text-[11px] font-medium text-white hover:bg-indigo-500"
-          >
-            Try Again
-          </button>
-        }
-      />
-    );
-
-  if (!ports?.length)
-    return (
-      <EmptyView
-        label="Ports"
-        message="Nothing on this machine is listening on a TCP port. Start a dev server and it will appear here."
-        action={
-          <button
-            onClick={() => void refresh()}
-            className="rounded bg-indigo-600 px-3 py-1 text-[11px] font-medium text-white hover:bg-indigo-500"
+            disabled={busy}
+            className="ml-auto rounded px-2 py-0.5 text-[11px] text-zinc-500 hover:text-zinc-200 disabled:opacity-40"
           >
             Refresh
           </button>
-        }
-      />
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-auto">
+          <table className="w-full text-left text-[11px]">
+            <thead className="sticky top-0 bg-[#030303] text-zinc-500">
+              <tr>
+                <th scope="col" className="px-3 py-1 font-medium">
+                  Port
+                </th>
+                <th scope="col" className="px-3 py-1 font-medium">
+                  Address
+                </th>
+                <th scope="col" className="px-3 py-1 font-medium">
+                  Running Process
+                </th>
+                <th scope="col" className="px-3 py-1 font-medium">
+                  Origin
+                </th>
+                <th scope="col" className="px-3 py-1" />
+              </tr>
+            </thead>
+            <tbody>
+              {ports.map((port) => (
+                <tr key={`${port.port}:${port.pid}`} className="group/row hover:bg-[#0c0c0c]">
+                  <td className="px-3 py-1 font-mono text-zinc-200">{port.port}</td>
+                  <td className="px-3 py-1 font-mono text-zinc-400">{addressFor(port)}</td>
+                  <td className="px-3 py-1 text-zinc-300">
+                    {port.process || <span className="text-zinc-600">Unknown</span>}
+                    <span className="ml-1.5 text-zinc-600">pid {port.pid}</span>
+                  </td>
+                  <td className="px-3 py-1 text-zinc-500">
+                    {/* Everything here was found by looking, not forwarded by the user. */}
+                    Detected
+                  </td>
+                  <td className="px-3 py-1">
+                    <div className="flex items-center justify-end gap-1 opacity-0 transition-opacity group-hover/row:opacity-100 focus-within:opacity-100">
+                      <button
+                        title={`Open ${addressFor(port)} in your browser`}
+                        aria-label={`Open port ${port.port} in your browser`}
+                        onClick={() =>
+                          void native("open_external_url", { url: addressFor(port) }).catch(
+                            (reason) => setError(String(reason)),
+                          )
+                        }
+                        className="rounded px-1.5 py-0.5 text-zinc-500 hover:bg-[#161616] hover:text-zinc-200"
+                      >
+                        Open
+                      </button>
+                      <button
+                        title="Copy the address"
+                        aria-label={`Copy the address for port ${port.port}`}
+                        onClick={() =>
+                          void navigator.clipboard.writeText(addressFor(port)).then(
+                            () => {
+                              setCopied(port.port);
+                              setTimeout(() => setCopied(0), 1500);
+                            },
+                            () => setError("The clipboard is not available."),
+                          )
+                        }
+                        className="rounded px-1.5 py-0.5 text-zinc-500 hover:bg-[#161616] hover:text-zinc-200"
+                      >
+                        {copied === port.port ? "Copied" : "Copy"}
+                      </button>
+                      <button
+                        title={`Stop the process listening on port ${port.port}`}
+                        aria-label={`Stop the process on port ${port.port}`}
+                        onClick={() => void stop(port)}
+                        className="rounded px-1.5 py-0.5 text-zinc-500 hover:bg-[#161616] hover:text-red-400"
+                      >
+                        Stop
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </>
     );
+  }
 
   return (
     <section aria-label="Ports" className="flex h-full min-h-0 flex-col">
-      <div className="flex shrink-0 items-center gap-2 border-b border-[#141414] px-3 py-1">
-        <span className="text-[11px] text-zinc-500">
-          {ports.length} local service{ports.length === 1 ? "" : "s"}
-        </span>
-        {error && <span className="truncate text-[11px] text-red-400">{error}</span>}
-        <button
-          onClick={() => void refresh()}
-          disabled={busy}
-          className="ml-auto rounded px-2 py-0.5 text-[11px] text-zinc-500 hover:text-zinc-200 disabled:opacity-40"
-        >
-          Refresh
-        </button>
-      </div>
-
-      <div className="min-h-0 flex-1 overflow-auto">
-        <table className="w-full text-left text-[11px]">
-          <thead className="sticky top-0 bg-[#030303] text-zinc-500">
-            <tr>
-              <th scope="col" className="px-3 py-1 font-medium">
-                Port
-              </th>
-              <th scope="col" className="px-3 py-1 font-medium">
-                Address
-              </th>
-              <th scope="col" className="px-3 py-1 font-medium">
-                Running Process
-              </th>
-              <th scope="col" className="px-3 py-1 font-medium">
-                Origin
-              </th>
-              <th scope="col" className="px-3 py-1" />
-            </tr>
-          </thead>
-          <tbody>
-            {ports.map((port) => (
-              <tr key={`${port.port}:${port.pid}`} className="group/row hover:bg-[#0c0c0c]">
-                <td className="px-3 py-1 font-mono text-zinc-200">{port.port}</td>
-                <td className="px-3 py-1 font-mono text-zinc-400">{addressFor(port)}</td>
-                <td className="px-3 py-1 text-zinc-300">
-                  {port.process || <span className="text-zinc-600">Unknown</span>}
-                  <span className="ml-1.5 text-zinc-600">pid {port.pid}</span>
-                </td>
-                <td className="px-3 py-1 text-zinc-500">
-                  {/* Everything here was found by looking, not forwarded by the user. */}
-                  Detected
-                </td>
-                <td className="px-3 py-1">
-                  <div className="flex items-center justify-end gap-1 opacity-0 transition-opacity group-hover/row:opacity-100 focus-within:opacity-100">
-                    <button
-                      title={`Open ${addressFor(port)} in your browser`}
-                      aria-label={`Open port ${port.port} in your browser`}
-                      onClick={() =>
-                        void native("open_external_url", { url: addressFor(port) }).catch(
-                          (reason) => setError(String(reason)),
-                        )
-                      }
-                      className="rounded px-1.5 py-0.5 text-zinc-500 hover:bg-[#161616] hover:text-zinc-200"
-                    >
-                      Open
-                    </button>
-                    <button
-                      title="Copy the address"
-                      aria-label={`Copy the address for port ${port.port}`}
-                      onClick={() =>
-                        void navigator.clipboard.writeText(addressFor(port)).then(
-                          () => {
-                            setCopied(port.port);
-                            setTimeout(() => setCopied(0), 1500);
-                          },
-                          () => setError("The clipboard is not available."),
-                        )
-                      }
-                      className="rounded px-1.5 py-0.5 text-zinc-500 hover:bg-[#161616] hover:text-zinc-200"
-                    >
-                      {copied === port.port ? "Copied" : "Copy"}
-                    </button>
-                    <button
-                      title={`Stop the process listening on port ${port.port}`}
-                      aria-label={`Stop the process on port ${port.port}`}
-                      onClick={() => void stop(port)}
-                      className="rounded px-1.5 py-0.5 text-zinc-500 hover:bg-[#161616] hover:text-red-400"
-                    >
-                      Stop
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      {scopeTabs}
+      <div className="flex min-h-0 flex-1 flex-col">
+        {scope === "local" ? localScope : globalScope()}
       </div>
     </section>
   );

@@ -136,6 +136,14 @@ export interface ExtensionWindow {
   /** The workspace's file changes, from the native watcher (EXT-29): VS Code's file watchers. */
   files?: { subscribe(listener: (changes: readonly FileChange[]) => void): () => void };
   /**
+   * EXT-33 E0: the files of `folder` (the host's workspace) matching `include` and none of
+   * `exclude`, through Yavin's own search: full paths, and whether the list is incomplete.
+   */
+  findFiles?(
+    request: { folder: string; include: string; exclude: readonly string[] },
+    signal: AbortSignal,
+  ): Promise<{ files: string[]; truncated: boolean }>;
+  /**
    * Yavin's picker and input box for extensions (EXT-29), one shown at a time: the answer, or
    * null when the user (or `signal`) cancels it.
    */
@@ -178,6 +186,11 @@ export function createWindowProxy(current: () => ExtensionWindow | null): Extens
       revealRange: (range) => current()?.editor.revealRange(range) ?? false,
     },
     readFile: async (path) => window().readFile(path),
+    findFiles: async (request, signal) => {
+      const find = window().findFiles;
+      if (!find) unavailable();
+      return find!(request, signal);
+    },
     // The window's own focus store, when it has one (read when a host starts following it).
     get focus() {
       return current()?.focus;

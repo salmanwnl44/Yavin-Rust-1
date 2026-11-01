@@ -524,6 +524,43 @@
       "need": "workspace.fs.read"
     },
     {
+      "method": "fs.findFiles",
+      "params": {
+        "id": "acme.hello#find#1",
+        "include": "**/*.ts"
+      },
+      "need": "workspace.fs.read"
+    },
+    {
+      "method": "fs.findFiles",
+      "params": {
+        "id": "acme.other#find#1",
+        "include": "**/*.ts"
+      },
+      "need": "notOwned"
+    },
+    {
+      "method": "fs.findFiles",
+      "params": {
+        "include": "**/*.ts"
+      },
+      "need": "invalid"
+    },
+    {
+      "method": "fs.cancelFind",
+      "params": {
+        "id": "acme.hello#find#1"
+      },
+      "need": "workspace.fs.read"
+    },
+    {
+      "method": "fs.cancelFind",
+      "params": {
+        "id": "acme.other#find#1"
+      },
+      "need": "notOwned"
+    },
+    {
       "method": "fs.writeFile",
       "params": {
         "path": "a.ts"

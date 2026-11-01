@@ -224,6 +224,12 @@ export function needOfRequest(
     case "fs.readFile":
     case "fs.exists":
       return needs(FS_READ);
+    // EXT-33 E0: finding workspace files by glob (`<id>#find#<n>`, its own, cancellable).
+    case "fs.findFiles":
+    case "fs.cancelFind": {
+      const own = owned(params, "id", caller, "#");
+      return own.kind === "none" ? needs(FS_READ) : own;
+    }
     case "documents.edit":
       return needs(DOCUMENTS_EDIT);
     case "secrets.get":

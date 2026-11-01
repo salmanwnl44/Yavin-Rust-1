@@ -37,7 +37,9 @@ export type ServerState =
   | "restarting"
   | "failed"
   | "unavailable"
-  | "disabled";
+  | "disabled"
+  /** EXT-33 E0.1: the project provides its own server, which runs only once the user chooses. */
+  | "approval";
 
 /** How a server process is reached: natively (`lsp.rs`), or an in-memory fake in tests. */
 export interface ServerTransport {
@@ -72,6 +74,11 @@ export interface ClientHandlers {
 
 /** A transport's error for a server that is not installed starts with this. */
 export const NOT_INSTALLED = "not-installed:";
+/**
+ * EXT-33 E0.1: a transport's error for a server the project provides that the user has not
+ * chosen to run (`lsp.rs`, `NEEDS_APPROVAL`) starts with this.
+ */
+export const NEEDS_APPROVAL = "needs-approval:";
 
 const SHUTDOWN_TIMEOUT = 2_000;
 const EXIT_TIMEOUT = 2_000;
@@ -239,6 +246,8 @@ export function createLanguageClient(init: {
         const text = String(error instanceof Error ? error.message : error);
         if (text.startsWith(NOT_INSTALLED))
           setState("unavailable", text.slice(NOT_INSTALLED.length).trim());
+        else if (text.startsWith(NEEDS_APPROVAL))
+          setState("approval", text.slice(NEEDS_APPROVAL.length).trim());
         else setState("failed", text);
         return;
       }
@@ -301,7 +310,8 @@ export function createLanguageClient(init: {
       const open = channel;
       generation++;
       if (!open) {
-        if (state !== "unavailable" && state !== "disabled") setState("stopped");
+        if (state !== "unavailable" && state !== "disabled" && state !== "approval")
+          setState("stopped");
         return;
       }
       setState("stopping");

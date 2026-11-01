@@ -91,7 +91,7 @@ import {
   useTotalChanges,
 } from "./services/git";
 import type { Decorations } from "./services/git";
-import { hitOffset, listFiles } from "./services/search";
+import { findFiles, hitOffset, listFiles } from "./services/search";
 import { createCursorStatus } from "./services/cursorStatus";
 import { createLspManager } from "./services/lsp/manager";
 import { describeStatus } from "./services/lsp/manager";
@@ -2208,6 +2208,9 @@ export default function App() {
         },
       },
       readFile: (path) => native("read_file_content", { path }),
+      // EXT-33 E0: an extension's workspace.findFiles, through Yavin's own search.
+      findFiles: (request, signal) =>
+        findFiles(request.folder, request.include, request.exclude, signal),
       // EXT-27: the window's real focus (its focus and blur events), for window.state.
       focus: focus ?? undefined,
       // EXT-29: the native watcher's batches, and Yavin's picker and input box.
@@ -2535,6 +2538,35 @@ export default function App() {
     return {
       ...described,
       onClick: () => {
+        // EXT-33 E0.1: the project provides its own server: the user chooses, natively recorded.
+        if (status.state === "approval") {
+          const key = activeKeyRef.current ?? undefined;
+          setDialog({
+            title: `Choose the ${status.label} language server`,
+            message: status.message,
+            options: [
+              {
+                value: "project",
+                label: "Use the project's server",
+                description: "Runs the program this project provides, as it is now",
+              },
+              {
+                value: "installed",
+                label: "Use the installed server",
+                description: "Runs the one installed on this computer, never the project's",
+              },
+            ],
+            submit: async (choice) => {
+              await native("lsp_choose_program", {
+                server: status.serverId,
+                root: status.folder,
+                choice: choice === "project" ? "project" : "installed",
+              });
+              await lsp.restart(key);
+            },
+          });
+          return;
+        }
         if (
           status.state === "failed" ||
           status.state === "crashed" ||

@@ -41,6 +41,7 @@ function setup(
     trusted?: boolean;
     options?: Record<string, FakeServerOptions>;
     failStart?: string;
+    needsApproval?: string;
     definition?: Partial<LanguageServerDefinition>;
     folders?: string[];
     manager?: Partial<LspManagerOptions>;
@@ -51,6 +52,7 @@ function setup(
     installed: init.installed ?? ["typescript"],
     options: init.options,
     failStart: init.failStart,
+    needsApproval: init.needsApproval,
   });
   const problems = new Map<string, readonly ProblemDiagnostic[]>();
   const definition = { ...typescript, requestTimeout: 2_000, ...init.definition };
@@ -334,6 +336,17 @@ test("not installed, Restricted Mode, a failed start and a silent initialize eac
   await until(() => denied.manager.statusFor("/w/a.ts")?.state === "failed");
   assert.match(denied.manager.statusFor("/w/a.ts")!.message, /permission denied/);
 
+  // EXT-33 E0.1: the project's own server waits for the user's choice; it is not a failure.
+  const project = setup({ "/w/a.ts": "" }, { needsApproval: "typescript" });
+  await project.documents.open("/w/a.ts");
+  await until(() => project.manager.statusFor("/w/a.ts")?.state === "approval");
+  const waiting = project.manager.statusFor("/w/a.ts")!;
+  assert.match(waiting.message, /^This project provides its own typescript language server/);
+  assert.ok(!waiting.message.includes("needs-approval:"), "the marker is not shown");
+  assert.equal(project.fake.started.length, 0, "nothing runs before the choice");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(project.manager.statusFor("/w/a.ts")?.state, "approval", "no retry loop");
+
   const silent = setup(
     { "/w/a.ts": "" },
     { options: { typescript: { silent: ["initialize"] } }, definition: { startupTimeout: 50 } },
@@ -415,6 +428,7 @@ test("the status bar's words for each state say what it means, calmly while star
   );
   assert.equal(at("unavailable").text, "TypeScript: not installed");
   assert.equal(at("disabled").text, "TypeScript: Restricted Mode");
+  assert.equal(at("approval").text, "TypeScript: choose server");
 });
 
 test("a server that never answers shutdown is ended anyway, after the timeout", async () => {

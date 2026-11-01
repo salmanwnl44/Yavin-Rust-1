@@ -157,6 +157,14 @@ export function vscodeWorld() {
 
   // Documents: Yavin's document service over an in-memory disk.
   const disk = new Map<string, string>();
+  // EXT-33 E0: what the window's search was asked (workspace.findFiles), and what it answers.
+  const finds: {
+    folder: string;
+    include: string;
+    exclude: readonly string[];
+    signal: AbortSignal;
+  }[] = [];
+  const found = { files: [] as string[], truncated: false, hold: false };
   const locked = new Set<string>();
   const io: DocumentIO = {
     read: async (path) => {
@@ -229,6 +237,16 @@ export function vscodeWorld() {
       openLocation: async () => undefined,
       setSelection: (range) => ((selection = range), !!active),
       revealRange: () => !!active,
+    },
+    findFiles: async (request, signal) => {
+      finds.push({ ...request, signal });
+      if (found.hold && !signal.aborted)
+        await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+      // Workspace-relative names, or (to test what the host keeps) an absolute path as it is.
+      return {
+        files: found.files.map((file) => (/^[a-z]:/i.test(file) ? file : `${FOLDER}/${file}`)),
+        truncated: found.truncated,
+      };
     },
     readFile: async (path) => {
       const text = disk.get(path.replace(/\\/g, "/"));
@@ -335,6 +353,8 @@ export function vscodeWorld() {
     webviewNative,
     webviewWarnings,
     sentEvents,
+    finds,
+    found,
     /**
      * EXT-31: a panel's frame, as the window would hold it: attached (its tab in front), its
      * page ready; what it receives, and a way to post as its page would. `ready()` says ready

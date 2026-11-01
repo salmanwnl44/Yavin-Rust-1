@@ -397,7 +397,7 @@ const JUDGED = {
     "SVG preview and editing",
     "Partly",
     ["coreapi"],
-    "Its grammar and snippets apply; minify and copy-data-URI run. Since EXT-31 its webviews open (packaged test webview-svg.spec.ts: Preview All's page loads sandboxed and its message reaches the extension), but Preview All then stops at workspace.findFiles (unsupported), and Preview SVG previews only documents whose language is svg, while Yavin keeps .svg as its own XML (EXT-25).",
+    "Its grammar and snippets apply; its 6 commands run. Since EXT-33 E0 its Preview All works in the installed application (webview-svg.spec.ts): the workspace's SVG files found with workspace.findFiles (Yavin's own search) and drawn in its webview, a click opening one. Preview SVG previews only documents whose language is svg, while Yavin keeps .svg as its own XML (EXT-25).",
   ],
   "shd101wyy.markdown-preview-enhanced": [
     "Markdown preview",

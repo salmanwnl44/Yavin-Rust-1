@@ -85,6 +85,11 @@ interface Commands {
     args: { server: string; root: string };
     result: { session: number; program: string };
   };
+  /** EXT-33 E0.1: run the project's own server (that very file) or the installed one. */
+  lsp_choose_program: {
+    args: { server: string; root: string; choice: "project" | "installed" };
+    result: void;
+  };
   lsp_send: { args: { session: number; message: string }; result: void };
   lsp_stop: { args: { session: number }; result: void };
   lsp_stop_all: { args: Record<string, never>; result: void };

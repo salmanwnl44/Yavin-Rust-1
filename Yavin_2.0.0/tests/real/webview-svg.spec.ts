@@ -4,9 +4,10 @@
  * the one Open VSX serves, downloaded by the benchmark (not in the repository): this test runs
  * only when `YAVIN_E2E_SVG_VSIX` names it. A loopback mirror serves it, signed under a key this
  * run makes (as `webview.spec.ts`). The test opens an `.svg` file and runs the extension's two
- * webview commands. "Preview All Svg" must open its page sandboxed, run its script, and deliver
- * its message to the extension (which then stops at `workspace.findFiles`, unsupported);
- * "Preview SVG" is recorded (it previews only documents whose language is `svg`).
+ * webview commands. "Preview All Svg" must open its page sandboxed, run its script, deliver its
+ * message to the extension, find the workspace's SVG files (`workspace.findFiles`, Yavin's own
+ * search, EXT-33 E0) and draw each; a click on one must open it in Yavin's editor. "Preview SVG"
+ * is recorded (it previews only documents whose language is `svg`).
  */
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { createServer, type Server } from "node:http";
@@ -162,7 +163,7 @@ async function extensionLog(page: Page): Promise<string[]> {
   return output.getByRole("listitem").allTextContents();
 }
 
-test("EXT-31 SVG Preview (Open VSX): its Preview All webview loads sandboxed and its page's message reaches the extension, which stops at workspace.findFiles", async () => {
+test("EXT-31 SVG Preview (Open VSX): its Preview All webview finds the workspace's SVG files and draws them, and a click opens one", async () => {
   const env = {
     ...registryEnv(registryUrl),
     YAVIN_TEST_OPENVSX: base,
@@ -236,9 +237,8 @@ test("EXT-31 SVG Preview (Open VSX): its Preview All webview loads sandboxed and
     });
 
     // Its webview of every SVG in the workspace ("Preview All Svg"): its page, under Yavin's
-    // sandbox, runs its script and asks the extension for the files by message. The extension
-    // hears it and looks for them with workspace.findFiles, which Yavin does not provide: that is
-    // where the feature stops (EXT-31 records it; it is not a webview API).
+    // sandbox, runs its script and asks the extension for the files by message; the extension finds
+    // them with workspace.findFiles (Yavin's own search, EXT-33 E0) and its page draws each.
     await palette(page, "Preview All Svg");
     const tab = page.getByRole("tab", { name: /Preview All SVG/ });
     await expect(tab).toBeVisible({ timeout: 30_000 });
@@ -249,24 +249,31 @@ test("EXT-31 SVG Preview (Open VSX): its Preview All webview loads sandboxed and
       /^https:\/\/yavin-webview\.invalid\/[0-9a-f]{32}\/index\.html\?/,
     );
     const frame = page.frameLocator("iframe[data-webview]");
-    await expect(frame.locator("#__listview")).toHaveCount(1);
     // Its script ran (it logs as it asks)...
     await expect.poll(() => logs.some((line) => line.endsWith(": init update"))).toBe(true);
-    // ...and its message reached the extension, whose handler then reached findFiles.
+    // ...the extension found the file, and its page draws it (an image of the drawing, 120 wide).
+    const icon = frame.locator(".svg-icon", { hasText: "drawing.svg" });
+    await expect(icon).toBeVisible({ timeout: 30_000 });
     await expect
-      .poll(async () => (await extensionLog(page)).join("\n"), { timeout: 15_000 })
-      .toContain("UnsupportedApi: workspace.findFiles is not supported by Yavin.");
+      .poll(() => icon.locator("img").evaluate((img: HTMLImageElement) => img.naturalWidth))
+      .toBe(120);
+    // A click in its page reaches the extension, which opens the file in Yavin's editor.
+    await page.getByRole("tab", { name: /drawing\.svg/ }).hover();
+    await page.getByRole("button", { name: "Close drawing.svg" }).click();
+    await expect(page.getByRole("tab", { name: /drawing\.svg/ })).toHaveCount(0);
+    await icon.click();
+    await expect(page.getByRole("tab", { name: /drawing\.svg/ })).toBeVisible({ timeout: 15_000 });
     test.info().annotations.push({
       type: "Preview All Svg",
       description:
-        "its page loads sandboxed and its message reaches the extension; the list stays empty: workspace.findFiles is unsupported",
+        "the workspace's drawing found and drawn in its webview (120 px wide); a click opened it",
     });
     // Closing its tab disposes the panel; asked again, the extension makes a new one.
     await tab.hover();
     await page.getByRole("button", { name: "Close Preview All SVG" }).click();
     await expect(iframe).toHaveCount(0);
     await palette(page, "Preview All Svg");
-    await expect(frame.locator("#__listview")).toHaveCount(1, { timeout: 30_000 });
+    await expect(icon).toBeVisible({ timeout: 30_000 });
     passed = true;
   } finally {
     // On a failure: what the frame holds, the window's frames, and the extension's own log.

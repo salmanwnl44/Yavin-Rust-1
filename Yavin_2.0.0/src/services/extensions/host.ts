@@ -182,6 +182,9 @@ export interface ExtensionHostOptions {
 
 const MESSAGE_LIMIT = 20;
 const LOG_LIMIT = 500;
+/** EXT-33 E0: the most files one workspace.findFiles answers, and the longest glob it takes. */
+const MAX_FOUND = 10_000;
+const MAX_GLOB = 1000;
 const MAX_PENDING = 256;
 const MALFORMED_LIMIT = 100;
 const EVENTS = new Set([
@@ -267,6 +270,8 @@ export function createExtensionHost(options: ExtensionHostOptions) {
   const problemOwners = new Map<string, Set<string>>();
   /** Prompts shown for extensions (EXT-29), by id: cancelled when it stops, crashes or asks. */
   const prompts = new Map<string, { extensionId: string; controller: AbortController }>();
+  /** File searches for extensions (EXT-33 E0), by id: stopped when it stops, crashes or asks. */
+  const finds = new Map<string, { extensionId: string; controller: AbortController }>();
   let nextToken = 1;
   let hostState: HostState = "idle";
   let hostReason: string | null = null;
@@ -666,6 +671,11 @@ export function createExtensionHost(options: ExtensionHostOptions) {
         prompts.delete(id);
         prompt.controller.abort();
       }
+    for (const [id, find] of finds)
+      if (find.extensionId === extensionId) {
+        finds.delete(id);
+        find.controller.abort();
+      }
     running.get(extensionId)?.events.clear();
   };
 
@@ -810,6 +820,27 @@ export function createExtensionHost(options: ExtensionHostOptions) {
     if (!raw || typeof raw.message !== "string" || !raw.message) return null;
     const severity = raw.severity === "warning" || raw.severity === "info" ? raw.severity : "error";
     return { message: raw.message.slice(0, 500), severity };
+  };
+  /** A file search's id: the extension's own (`<id>#find#n`, EXT-33 E0). */
+  const findId = (one: Running, params: Record<string, unknown>) => {
+    const id = stringParam(params, "id", 200);
+    if (!id.startsWith(`${one.entry.id}#find#`))
+      fail("NotOwned", "A search's id is the extension's own.");
+    return id;
+  };
+  /**
+   * A glob for Yavin's search (ripgrep's): relative to the workspace, `/`-separated -- never
+   * absolute, never `..`, never an option (`-`) or a negation (`!`, which Yavin adds itself).
+   */
+  const globParam = (value: unknown, name: string): string => {
+    if (typeof value !== "string" || !value || value.length > MAX_GLOB)
+      fail("InvalidRequest", `"${name}" is a glob of at most ${MAX_GLOB} characters.`);
+    const glob = (value as string).replace(/\\/g, "/");
+    if (/[\0\r\n]/.test(glob) || /^[-!]/.test(glob))
+      fail("InvalidRequest", `"${name}" is not a glob Yavin searches with.`);
+    if (/^([a-z]:|\/)/i.test(glob) || glob.split("/").includes(".."))
+      fail("OutsideWorkspace", `"${name}" is relative to the workspace folder.`);
+    return glob;
   };
   /** A diagnostic collection's id: the extension's own (`<id>#diagnostics#n`). */
   const collectionOf = (one: Running, params: Record<string, unknown>) => {
@@ -1532,6 +1563,61 @@ export function createExtensionHost(options: ExtensionHostOptions) {
       if (text.length > MAX_MESSAGE / 2)
         fail("TooLarge", "The file is too large to send to an extension.");
       return text;
+    },
+    // EXT-33 E0: workspace files by glob, through Yavin's own search -- the workspace only,
+    // `.git` never, at most MAX_FOUND, as paths relative to it; cancellable by its own id.
+    async "fs.findFiles"(one, params) {
+      const id = findId(one, params);
+      const include = globParam(params.include, "include");
+      const exclude =
+        params.exclude === null || params.exclude === undefined
+          ? []
+          : [globParam(params.exclude, "exclude")];
+      const max =
+        typeof params.maxResults === "number" &&
+        Number.isInteger(params.maxResults) &&
+        params.maxResults > 0
+          ? Math.min(params.maxResults, MAX_FOUND)
+          : MAX_FOUND;
+      const folder = options.folder ?? fail("Unavailable", "There is no workspace.");
+      const find = windowOf().findFiles;
+      if (!find) fail("Unavailable", "Finding files is not available in this window.");
+      if (finds.has(id)) fail("InvalidRequest", `"${id}" is already searching.`);
+      const controller = new AbortController();
+      finds.set(id, { extensionId: one.entry.id, controller });
+      try {
+        const found = await find!({ folder, include, exclude }, controller.signal);
+        const root = folder.replace(/\\/g, "/").replace(/\/$/, "");
+        const base = root.toLowerCase();
+        const files: string[] = [];
+        for (const path of found.files) {
+          const full = path.replace(/\\/g, "/");
+          if (!full.toLowerCase().startsWith(`${base}/`)) continue;
+          const relative = full.slice(base.length + 1);
+          if (!relative || relative.split("/").some((part) => !part || part === "..")) continue;
+          files.push(relative);
+          if (files.length > max) break;
+        }
+        const kept = files.slice(0, max);
+        return {
+          files: kept,
+          // As Yavin spells a file (`resource.ts`): the extension's Uris equal its documents'.
+          uris: kept.map((relative) => formatUri(fileUri(`${root}/${relative}`))),
+          truncated: found.truncated || files.length > max,
+          cancelled: controller.signal.aborted,
+        };
+      } finally {
+        if (finds.get(id)?.controller === controller) finds.delete(id);
+      }
+    },
+    "fs.cancelFind"(one, params) {
+      const id = findId(one, params);
+      const find = finds.get(id);
+      if (find && find.extensionId === one.entry.id) {
+        finds.delete(id);
+        find.controller.abort();
+      }
+      return null;
     },
     async "fs.exists"(one, params) {
       try {

@@ -900,6 +900,9 @@ export function describeStatus(status: ServerStatus): {
       return { text: `${label}: not installed`, title: message, tone: "warning" };
     case "disabled":
       return { text: `${label}: Restricted Mode`, title: message, tone: "warning" };
+    // EXT-33 E0.1: the project's own server, not yet chosen.
+    case "approval":
+      return { text: `${label}: choose server`, title: message, tone: "warning" };
     default:
       return {
         text: `${label}: stopped`,

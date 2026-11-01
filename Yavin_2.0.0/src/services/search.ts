@@ -100,6 +100,46 @@ export async function listFiles(workspace: string) {
   return parseFileList(output, workspace);
 }
 
+/**
+ * EXT-33 E0: the workspace's files matching `include` and none of `exclude` (ripgrep globs, as
+ * the search view's), for an extension's `workspace.findFiles`: full depth, hidden files and
+ * ignored files included (as VS Code's), `.git` never. `signal` stops the search (`cancel_search`).
+ * The native side refuses a `workspace` that is not the one open.
+ */
+export async function findFiles(
+  workspace: string,
+  include: string,
+  exclude: readonly string[],
+  signal: AbortSignal,
+): Promise<{ files: string[]; truncated: boolean }> {
+  const id = crypto.randomUUID();
+  const stop = () => void native("cancel_search", { id }).catch(() => undefined);
+  if (signal.aborted) return { files: [], truncated: false };
+  signal.addEventListener("abort", stop, { once: true });
+  try {
+    const output = await native("search_project", {
+      workspace,
+      id,
+      options: {
+        query: "",
+        caseSensitive: false,
+        wholeWord: false,
+        regex: false,
+        hidden: true,
+        ignored: true,
+        include: [include],
+        exclude: [...exclude],
+        folder: workspace,
+        buffer: null,
+        filesOnly: true,
+      },
+    });
+    return signal.aborted ? { files: [], truncated: false } : parseFileList(output, workspace);
+  } finally {
+    signal.removeEventListener("abort", stop);
+  }
+}
+
 export function byteToColumn(text: string, byte: number): number {
   return decoder.decode(encoder.encode(text).slice(0, byte)).length;
 }

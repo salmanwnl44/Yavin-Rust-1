@@ -1,4 +1,4 @@
-import { NOT_INSTALLED } from "./client.ts";
+import { NEEDS_APPROVAL, NOT_INSTALLED } from "./client.ts";
 import type { ServerChannel, ServerTransport } from "./client.ts";
 import { createFakeServer } from "./fakeServer.ts";
 import type { FakeServer, FakeServerOptions } from "./fakeServer.ts";
@@ -15,6 +15,8 @@ export function createFakeTransport(
     options?: Record<string, FakeServerOptions>;
     /** A start that fails outright, as a missing permission would. */
     failStart?: string;
+    /** EXT-33 E0.1: a server the project provides that the user has not chosen to run. */
+    needsApproval?: string;
   } = {},
 ) {
   const started: { serverId: string; root: string; server: FakeServer }[] = [];
@@ -22,6 +24,10 @@ export function createFakeTransport(
     async start(serverId, root) {
       if (init.failStart === serverId)
         throw new Error(`${serverId} could not be run: permission denied.`);
+      if (init.needsApproval === serverId)
+        throw new Error(
+          `${NEEDS_APPROVAL} This project provides its own ${serverId} language server (/w/node_modules/.bin/server.cmd). Yavin runs it only once you choose it.`,
+        );
       if (init.installed && !init.installed.includes(serverId))
         throw new Error(`${NOT_INSTALLED} The ${serverId} language server is not installed.`);
       const messages = new Set<(message: string) => void>();
