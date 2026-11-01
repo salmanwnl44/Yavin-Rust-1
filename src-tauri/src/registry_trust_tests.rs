@@ -1082,7 +1082,7 @@ fn the_pinned_floor_admits_the_published_registry() {
     let pinned = RegistryAnchors::parse(BUILTIN).unwrap();
     let official = pinned
         .for_base(
-            "https://raw.githubusercontent.com/salmanwnl44/Yavin-Rust-1/main/Yavin_2.0.0/registry/",
+            "https://raw.githubusercontent.com/salmanwnl44/Yavin-Rust-1/main/registry/",
         )
         .unwrap();
     let published: serde_json::Value =

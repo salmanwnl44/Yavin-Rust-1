@@ -17,7 +17,7 @@ permissions:
 
 defaults:
   run:
-    working-directory: Yavin_2.0.0
+    working-directory: .
 
 jobs:
   version:
@@ -45,7 +45,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: Yavin_2.0.0/package-lock.json
+          cache-dependency-path: package-lock.json
       - run: npm ci
       - run: npm run format:check
       - run: npm test
@@ -60,7 +60,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: Yavin_2.0.0/package-lock.json
+          cache-dependency-path: package-lock.json
       - run: npm ci
       # The GitHub reporter names each failing test as an annotation on the run.
       - run: npx playwright test --reporter=github,line
@@ -69,7 +69,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ui-test-results-${{ github.sha }}
-          path: Yavin_2.0.0/test-results
+          path: test-results
           retention-days: 14
 
   rust:
@@ -81,26 +81,26 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: Yavin_2.0.0/package-lock.json
+          cache-dependency-path: package-lock.json
       - run: rustup update stable
       - run: rustup default stable
       - run: rustup component add rustfmt clippy
       - run: ./scripts/setup-search.ps1
         shell: pwsh
       - run: cargo fmt --all --check
-        working-directory: Yavin_2.0.0/src-tauri
+        working-directory: src-tauri
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-        working-directory: Yavin_2.0.0/src-tauri
+        working-directory: src-tauri
       - run: cargo clippy --workspace --all-targets --locked --features test-registry -- -D warnings
-        working-directory: Yavin_2.0.0/src-tauri
+        working-directory: src-tauri
       - run: cargo test --workspace --locked
-        working-directory: Yavin_2.0.0/src-tauri
+        working-directory: src-tauri
       - run: cargo test --workspace --locked --features test-registry
-        working-directory: Yavin_2.0.0/src-tauri
+        working-directory: src-tauri
       # The terminal's output stress tests (up to 50 MB through the bounded stream), kept out of
       # the default run for time; real shells and process containment run above, on Windows.
       - run: cargo test -p yavin-ide --lib --locked terminal_stream::tests::stress -- --include-ignored
-        working-directory: Yavin_2.0.0/src-tauri
+        working-directory: src-tauri
 
   registry:
     runs-on: ubuntu-latest
@@ -144,7 +144,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: Yavin_2.0.0/package-lock.json
+          cache-dependency-path: package-lock.json
       - run: rustup update stable
       - run: rustup default stable
       - run: npm ci

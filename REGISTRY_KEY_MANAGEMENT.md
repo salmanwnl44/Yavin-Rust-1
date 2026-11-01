@@ -4,7 +4,7 @@
 
 ## What the key does, and what it does not
 
-The registry signing key signs `registry/index.json` (Ed25519, domain `Yavin.RegistryIndex.v1\0`, exact bytes; EXT-20). Yavin trusts it only through the anchors compiled into each release (`src-tauri/src/registry_anchors.json`). Whoever holds it can make Yavin accept **any index** — any list of packages and checksums — served at the pinned registry address (`https://raw.githubusercontent.com/salmanwnl44/Yavin-Rust-1/main/Yavin_2.0.0/registry/`). It does not authenticate publishers, and it cannot make Yavin install a package that is not served there.
+The registry signing key signs `registry/index.json` (Ed25519, domain `Yavin.RegistryIndex.v1\0`, exact bytes; EXT-20). Yavin trusts it only through the anchors compiled into each release (`src-tauri/src/registry_anchors.json`). Whoever holds it can make Yavin accept **any index** — any list of packages and checksums — served at the pinned registry address (`https://raw.githubusercontent.com/salmanwnl44/Yavin-Rust-1/main/registry/`). It does not authenticate publishers, and it cannot make Yavin install a package that is not served there.
 
 ## Current state (verified 2026-10-20, without reading the key)
 
@@ -36,7 +36,7 @@ Whichever is chosen:
 The index is valid for 365 days (`VALID_DAYS` in `scripts/build-registry.mjs`); CI's daily `registry` job and `build-registry.mjs --check` fail **90 days** before expiry (`YAVIN_REGISTRY_WARN_DAYS`). Current index: sequence 1, expires **2027-10-19** — renew by **2027-07-21**.
 
 1. On `main`, with no other registry change pending: run `registry-sign.yml` (reason: "renewal") — or, with a local custodied key, `node scripts/build-registry.mjs --renew`. It takes the next sequence (never reuses one), new dates, signs the exact bytes, and verifies the signature under the pinned key before writing.
-2. Verify the candidate offline: `node scripts/verify-registry.mjs --files Yavin_2.0.0/registry`.
+2. Verify the candidate offline: `node scripts/verify-registry.mjs --files registry`.
 3. Review the diff: only `sequence`, `issuedAt`, `expiresAt` and the signature change.
 4. Commit and push to `main`; then verify the **deployed** files: `node scripts/verify-registry.mjs` (fails unless the deployed bytes are the repository's and verify).
 5. In the next Yavin release, raise `minSequence` in `registry_anchors.json` to the new sequence (the freshness floor).

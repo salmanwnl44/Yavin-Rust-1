@@ -26,7 +26,7 @@ jobs:
     environment: registry-signing
     defaults:
       run:
-        working-directory: Yavin_2.0.0
+        working-directory: .
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,6 +55,6 @@ jobs:
         with:
           name: signed-registry-index-${{ github.run_id }}
           path: |
-            Yavin_2.0.0/registry/index.json
-            Yavin_2.0.0/registry/index.json.sig
+            registry/index.json
+            registry/index.json.sig
           retention-days: 7

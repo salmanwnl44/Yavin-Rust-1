@@ -4,7 +4,7 @@
   "registries": [
     {
       "id": "yavin-official",
-      "base": "https://raw.githubusercontent.com/salmanwnl44/Yavin-Rust-1/main/Yavin_2.0.0/registry/",
+      "base": "https://raw.githubusercontent.com/salmanwnl44/Yavin-Rust-1/main/registry/",
       "minSequence": 1,
       "keys": [
         {

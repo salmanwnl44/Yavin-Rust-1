@@ -1,5 +1,5 @@
 {
-  "note": "Each protection removed in turn: the named tests must then fail (EXT-24). Run with node scripts/security-mutations.mjs from Yavin_2.0.0. A pattern that no longer matches exactly once fails the run: re-target it.",
+  "note": "Each protection removed in turn: the named tests must then fail (EXT-24). Run with node scripts/security-mutations.mjs from the repository root. A pattern that no longer matches exactly once fails the run: re-target it.",
   "mutations": [
     {
       "id": "EXT-09 M1",

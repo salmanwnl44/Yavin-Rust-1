@@ -440,7 +440,7 @@ pub fn fetch_url(
 
 /// Yavin's own registry: static files in Yavin's public repository, served over HTTPS.
 pub const OFFICIAL_REGISTRY: &str =
-    "https://raw.githubusercontent.com/salmanwnl44/Yavin-Rust-1/main/Yavin_2.0.0/registry/";
+    "https://raw.githubusercontent.com/salmanwnl44/Yavin-Rust-1/main/registry/";
 
 /// The registry Yavin uses unless the user's settings name another. A `test-registry` build
 /// (the end-to-end test's) may point it elsewhere with `YAVIN_TEST_REGISTRY`; no other build
