@@ -2045,7 +2045,7 @@ test("the browser preview says a shell needs the desktop application", async ({ 
   await expect(page.getByLabel("Split Terminal")).toBeDisabled();
 });
 
-test("the panel offers the five views, with Terminal showing by default", async ({ page }) => {
+test("the panel offers its views, with Terminal showing by default", async ({ page }) => {
   await desktop(page);
   await openPanel(page);
 
@@ -2056,6 +2056,7 @@ test("the panel offers the five views, with Terminal showing by default", async 
     "DEBUG CONSOLE",
     "TERMINAL",
     "PORTS",
+    "TEST RESULTS",
   ]);
   await expect(tabs.getByRole("tab", { name: "TERMINAL" })).toHaveAttribute(
     "aria-selected",
@@ -2075,9 +2076,10 @@ test("each view says what it will hold rather than claiming a broken connection"
     ["OUTPUT", "Output"],
     ["DEBUG CONSOLE", "Debug Console"],
     ["PORTS", "Ports"],
+    ["TEST RESULTS", "Test Results"],
   ] as const) {
     await tabs.getByRole("tab", { name: tab }).click();
-    await expect(page.getByRole("region", { name: region })).toBeVisible();
+    await expect(page.getByRole("region", { name: region }).first()).toBeVisible();
   }
 });
 

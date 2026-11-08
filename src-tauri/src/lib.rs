@@ -43,12 +43,13 @@ mod session;
 mod terminal;
 mod terminal_shell;
 mod terminal_stream;
+mod test_runner;
 mod trust;
 mod vsix;
 mod window_focus;
 mod workbench;
 use checkers::{available_checkers, cancel_checker, run_checker, Checks};
-use dap::{dap_send, dap_start, dap_stop, dap_stop_all, DapSessions};
+use dap::{dap_available_adapters, dap_send, dap_start, dap_stop, dap_stop_all, DapSessions};
 use extension_host::{
     ext_host_send, ext_host_start, ext_host_stop, ext_host_stop_all, ExtHostSessions,
 };
@@ -97,6 +98,7 @@ use terminal::{
     terminal_resize, terminal_shells, terminal_stats, terminal_subscribe, terminal_unsubscribe,
     terminal_write, Terminals,
 };
+use test_runner::{cancel_test, run_test, TestRuns};
 use trust::{forget_trusted_folder, set_workspace_trust, trusted_folders, workspace_trust, Trust};
 use workbench::{cancel_search, search_project, write_file_guarded};
 
@@ -717,6 +719,7 @@ pub fn run() {
         .manage(Trust::default())
         .manage(Sessions::default())
         .manage(Checks::default())
+        .manage(TestRuns::default())
         .manage(LspSessions::default())
         .manage(ProjectServers::default())
         .manage(DapSessions::default())
@@ -899,6 +902,8 @@ pub fn run() {
             forget_workspace,
             run_checker,
             cancel_checker,
+            run_test,
+            cancel_test,
             list_listening_ports,
             stop_listening_process,
             git_repo_state,
@@ -925,6 +930,7 @@ pub fn run() {
             dap_send,
             dap_stop,
             dap_stop_all,
+            dap_available_adapters,
             extensions_list,
             extensions_restore_set_aside,
             extensions_dismiss_set_aside,
@@ -993,6 +999,8 @@ pub fn run() {
                     // A checker is a child process too, and a cold `cargo check` outlives
                     // the window by minutes if nothing stops it.
                     checkers::cancel_running(&handle.state::<Checks>());
+                    // A test run is a child process too (WS5); stop any still going.
+                    test_runner::cancel_all_runs(&handle.state::<TestRuns>());
                     // Leftover temporary files of this process's own records. The records
                     // themselves are gone unless an operation is still running, which the
                     // next start then settles.

@@ -113,19 +113,19 @@ export function PortsView() {
 
   const localScope = (
     <EmptyView
-      label="Local ports"
+      label="Local"
       message="Local ports — the ports this workspace's own processes open — are planned and not implemented yet. Switch to Global to see every service listening on this machine."
     />
   );
 
   function globalScope() {
     if (ports === null && !error)
-      return <EmptyView label="Ports" message="Looking for local services…" />;
+      return <EmptyView label="Global" message="Looking for local services…" />;
 
     if (error && !ports?.length)
       return (
         <EmptyView
-          label="Ports"
+          label="Global"
           message={`Local services could not be listed. ${error}`}
           action={
             <button
@@ -141,7 +141,7 @@ export function PortsView() {
     if (!ports?.length)
       return (
         <EmptyView
-          label="Ports"
+          label="Global"
           message="Nothing on this machine is listening on a TCP port. Start a dev server and it will appear here."
           action={
             <button

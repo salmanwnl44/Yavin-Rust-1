@@ -4212,6 +4212,7 @@ export default function App() {
                   activeFile={activeTab?.path}
                   ide={terminalIde}
                   debugService={debug}
+                  workspaceFolder={workspace.folders[0] ?? null}
                   extensionViews={extensionSnapshot.views
                     .filter((view) => view.location === "panel")
                     .map((view) => ({

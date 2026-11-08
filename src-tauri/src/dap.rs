@@ -19,12 +19,19 @@
 use crate::trust::{require_trust, Trust};
 use crate::{with_workspace, Workspace};
 use ide_workspace::lsp_process::{resolve_program, ServerEvents, ServerProcess};
+use ide_workspace::process::kill_tree;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
+
+/// How long js-debug has to start listening on its loopback port before Yavin gives up.
+const BRIDGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// An adapter Yavin knows how to start: its program and exact arguments.
 struct AdapterSpec {
@@ -35,18 +42,37 @@ struct AdapterSpec {
     args: &'static [&'static str],
     /// The program is a Python interpreter, which the user may choose (`debug.python`).
     python: bool,
+    /// A **TCP** adapter (js-debug): `program` is `node`, and this is the workspace-relative DAP
+    /// server entry it runs. The server listens on an ephemeral loopback port Yavin picks and
+    /// connects to (`src-tauri`'s bridge); its DAP flows over that socket, not stdio. `None` for a
+    /// stdio adapter (debugpy).
+    node_entry: Option<&'static str>,
     /// What to install when it is missing.
     install: &'static str,
 }
 
-const ADAPTERS: &[AdapterSpec] = &[AdapterSpec {
-    id: "debugpy",
-    label: "Python (debugpy)",
-    program: "python",
-    args: &["-m", "debugpy.adapter"],
-    python: true,
-    install: "pip install debugpy",
-}];
+const ADAPTERS: &[AdapterSpec] = &[
+    AdapterSpec {
+        id: "debugpy",
+        label: "Python (debugpy)",
+        program: "python",
+        args: &["-m", "debugpy.adapter"],
+        python: true,
+        node_entry: None,
+        install: "pip install debugpy",
+    },
+    AdapterSpec {
+        // JavaScript/TypeScript via vscode-js-debug's standalone DAP server (WS6). It speaks DAP
+        // over TCP, so Yavin starts it and bridges the socket into the stdio DAP session.
+        id: "node",
+        label: "JavaScript (js-debug)",
+        program: "node",
+        args: &[],
+        python: false,
+        node_entry: Some("node_modules/@vscode/js-debug/src/dapDebugServer.js"),
+        install: "npm install -D @vscode/js-debug",
+    },
+];
 
 fn find(id: &str) -> Option<&'static AdapterSpec> {
     ADAPTERS.iter().find(|adapter| adapter.id == id)
@@ -168,6 +194,83 @@ fn program_for(spec: &AdapterSpec, python: Option<&str>, folder: &Path) -> Resul
     })
 }
 
+// --- TCP transport bridge (js-debug) ------------------------------------------------------------
+
+/// An ephemeral loopback port: bind `127.0.0.1:0`, read the port the OS chose, release it. There
+/// is a small window before the adapter binds it, which the connect loop tolerates; nothing but
+/// loopback is ever used, and the renderer never supplies a port or address.
+fn ephemeral_loopback_port() -> Result<u16, String> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .map_err(|e| format!("AdapterFailedToStart: no local port for the debug adapter: {e}"))?;
+    listener
+        .local_addr()
+        .map(|addr| addr.port())
+        .map_err(|e| format!("AdapterFailedToStart: {e}"))
+}
+
+/// Connect to the adapter's loopback port, retrying until it is listening or the deadline passes.
+fn connect_loopback(port: u16, timeout: Duration) -> Result<TcpStream, String> {
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let deadline = Instant::now() + timeout;
+    loop {
+        match TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
+            Ok(stream) => return Ok(stream),
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(40)),
+            Err(e) => {
+                return Err(format!(
+                    "AdapterFailedToStart: the JavaScript debug adapter did not start listening on \
+                     127.0.0.1:{port} within {}s ({e}).",
+                    timeout.as_secs()
+                ))
+            }
+        }
+    }
+}
+
+/// Start a TCP (js-debug) adapter and bridge its loopback socket into the stdio DAP session. Yavin
+/// picks the ephemeral port, starts `node <entry> <port> 127.0.0.1` (in the servers' Job Object,
+/// so the whole tree is cleaned up), and connects. Loopback only; no external exposure; on a
+/// failed connect the child is ended so nothing is left running.
+fn start_tcp_node_adapter(
+    node: &Path,
+    entry: &Path,
+    folder: &Path,
+    events: Arc<dyn ServerEvents>,
+) -> Result<ServerProcess, String> {
+    if !entry.is_file() {
+        return Err(
+            "AdapterUnavailable: The JavaScript debug adapter (js-debug) is not installed. \
+             Install it with `npm install -D @vscode/js-debug`."
+                .to_string(),
+        );
+    }
+    let port = ephemeral_loopback_port()?;
+    let mut command = Command::new(node);
+    command
+        .arg(entry)
+        .arg(port.to_string())
+        .arg("127.0.0.1")
+        .current_dir(folder)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("AdapterFailedToStart: {e}"))?;
+    match connect_loopback(port, BRIDGE_CONNECT_TIMEOUT) {
+        Ok(stream) => ServerProcess::from_tcp(child, stream, events),
+        Err(error) => {
+            kill_tree(&mut child);
+            Err(error)
+        }
+    }
+}
+
 /// Starts adapter `adapter` in the folder `root` (inside the workspace). Its messages arrive
 /// as `dap-message` events, its log as `dap-log`, its end as `dap-exit`.
 #[tauri::command]
@@ -190,16 +293,18 @@ pub async fn dap_start(
     }
     let program = program_for(spec, python.as_deref(), &folder)?;
     let session = sessions.next.fetch_add(1, Ordering::Relaxed) + 1;
-    let process = ServerProcess::spawn(
-        &program,
-        spec.args,
-        &folder,
-        Arc::new(Emitting {
-            app: app.clone(),
-            session,
-        }),
-    )
-    .map_err(|why| format!("AdapterFailedToStart: {why}"))?;
+    let events = Arc::new(Emitting {
+        app: app.clone(),
+        session,
+    });
+    // A TCP adapter (js-debug) is started and bridged over a loopback socket; a stdio adapter
+    // (debugpy) runs on the shared process host directly. Either way the result is one
+    // `ServerProcess` the session owns identically.
+    let process = match spec.node_entry {
+        Some(entry) => start_tcp_node_adapter(&program, &folder.join(entry), &folder, events)?,
+        None => ServerProcess::spawn(&program, spec.args, &folder, events)
+            .map_err(|why| format!("AdapterFailedToStart: {why}"))?,
+    };
     sessions
         .live
         .lock()
@@ -209,6 +314,44 @@ pub async fn dap_start(
         session,
         program: program.to_string_lossy().into_owned(),
     })
+}
+
+/// Whether an adapter's **complete launch path** resolves in this workspace: the executable (a
+/// Python interpreter for debugpy — the package itself is confirmed at launch; the program on
+/// PATH otherwise) **and**, for a TCP adapter (js-debug), its DAP-server entry installed in the
+/// workspace. Only then is its transport supported end to end.
+fn adapter_available(spec: &AdapterSpec, folder: &Path, path: &Option<std::ffi::OsString>) -> bool {
+    if let Some(entry) = spec.node_entry {
+        // js-debug: `node` must resolve AND its server entry must be installed (the TCP bridge is
+        // built in); a bare `node` without js-debug is not enough.
+        return resolve_program(spec.program, false, folder, path.clone()).is_some()
+            && folder.join(entry).is_file();
+    }
+    if spec.python {
+        return ["python", "python3", "py"]
+            .iter()
+            .any(|name| resolve_program(name, false, folder, path.clone()).is_some());
+    }
+    resolve_program(spec.program, false, folder, path.clone()).is_some()
+}
+
+/// Which allow-listed adapters are **available for launch** in this workspace (WS6). The renderer
+/// gates Debug Test on this, so a framework is enabled only when its whole adapter path resolves —
+/// never merely because it is registered. Here it reflects the complete path: a registered-but-
+/// uninstalled adapter (or an installed one whose transport dependency is missing) is left out.
+#[tauri::command(async)]
+pub fn dap_available_adapters(
+    state: State<'_, Workspace>,
+    root: String,
+) -> Result<Vec<String>, String> {
+    let folder = with_workspace(&state, |manager| manager.validate_path(&root))
+        .unwrap_or(PathBuf::from(root));
+    let path = std::env::var_os("PATH");
+    Ok(ADAPTERS
+        .iter()
+        .filter(|spec| adapter_available(spec, &folder, &path))
+        .map(|spec| spec.id.to_string())
+        .collect())
 }
 
 fn live(sessions: &DapSessions, session: u32) -> Result<Arc<ServerProcess>, String> {
@@ -271,10 +414,12 @@ mod tests {
     #[test]
     fn only_a_listed_adapter_can_be_started() {
         assert!(find("debugpy").is_some());
-        for id in ["", "python", "cmd", "debugpy; calc", "../debugpy", "node"] {
+        assert!(find("node").is_some());
+        for id in ["", "python", "cmd", "debugpy; calc", "../debugpy", "lldb"] {
             assert!(find(id).is_none(), "{id}");
         }
         for adapter in ADAPTERS {
+            // The program is a bare executable name; its node_entry (a path) is a fixed constant.
             assert!(!adapter.program.contains(['/', '\\', ' ']));
             for argument in adapter.args {
                 assert!(!argument.is_empty() && !argument.contains(char::is_whitespace));
@@ -288,6 +433,42 @@ mod tests {
                 adapter.id
             );
         }
+    }
+
+    #[test]
+    fn adapter_availability_reflects_the_whole_launch_path_not_just_the_binary() {
+        let dir = std::env::temp_dir().join(format!("yavin-dap-avail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::env::var_os("PATH");
+        let node = find("node").unwrap();
+        // With `node` installed but js-debug absent, the node adapter is NOT available: its TCP
+        // server entry (the transport dependency) is missing.
+        if resolve_program("node", false, &dir, path.clone()).is_some() {
+            assert!(
+                !adapter_available(node, &dir, &path),
+                "node without js-debug must be unavailable"
+            );
+            // Install the entry: now the whole path resolves.
+            let entry = dir.join(node.node_entry.unwrap());
+            std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+            std::fs::write(&entry, b"// fake js-debug entry").unwrap();
+            assert!(
+                adapter_available(node, &dir, &path),
+                "node with js-debug installed is available"
+            );
+        } else {
+            eprintln!("skipped: node is not installed");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connect_loopback_times_out_on_a_port_nothing_listens_on() {
+        // An ephemeral port we bind then release: nothing is listening, so the connect gives up.
+        let port = ephemeral_loopback_port().unwrap();
+        let error = connect_loopback(port, Duration::from_millis(200)).unwrap_err();
+        assert!(error.starts_with("AdapterFailedToStart:"), "{error}");
     }
 
     #[test]
@@ -482,5 +663,99 @@ mod tests {
             }
         };
         assert!(ended, "stopping the adapter ends it");
+    }
+
+    // --- The TCP transport bridge, against a real node DAP server (stand-in for js-debug) --------
+
+    /// A tiny DAP server over TCP written in Node — the same transport shape as js-debug, so the
+    /// bridge is exercised for real without downloading js-debug. It answers `initialize` and
+    /// `disconnect`, parsing and emitting `Content-Length` frames.
+    const FAKE_DAP_SERVER: &str = r#"
+const net = require('net');
+const port = parseInt(process.argv[2], 10);
+const host = process.argv[3] || '127.0.0.1';
+let seq = 10;
+const server = net.createServer((socket) => {
+  let buf = Buffer.alloc(0);
+  const send = (obj) => {
+    const b = Buffer.from(JSON.stringify(obj));
+    socket.write('Content-Length: ' + b.length + '\r\n\r\n');
+    socket.write(b);
+  };
+  socket.on('data', (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    for (;;) {
+      const i = buf.indexOf('\r\n\r\n');
+      if (i === -1) break;
+      const m = /Content-Length: (\d+)/i.exec(buf.slice(0, i).toString());
+      if (!m) { buf = buf.slice(i + 4); continue; }
+      const len = parseInt(m[1], 10);
+      if (buf.length < i + 4 + len) break;
+      const req = JSON.parse(buf.slice(i + 4, i + 4 + len).toString());
+      buf = buf.slice(i + 4 + len);
+      if (req.command === 'initialize') {
+        send({ seq: seq++, type: 'response', request_seq: req.seq, success: true, command: 'initialize', body: { supportsConfigurationDoneRequest: true } });
+      } else if (req.command === 'disconnect') {
+        send({ seq: seq++, type: 'response', request_seq: req.seq, success: true, command: 'disconnect' });
+        socket.end();
+        server.close();
+      } else {
+        send({ seq: seq++, type: 'response', request_seq: req.seq, success: true, command: req.command });
+      }
+    }
+  });
+});
+server.listen(port, host);
+"#;
+
+    #[test]
+    fn the_tcp_bridge_carries_a_real_dap_exchange_with_a_node_server() {
+        let path = std::env::var_os("PATH");
+        let Some(node) = resolve_program("node", false, Path::new("."), path) else {
+            eprintln!("skipped: node is not installed");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("yavin-dap-tcp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-dap-server.js");
+        std::fs::write(&script, FAKE_DAP_SERVER).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        // The real bridge: pick a loopback port, start the node server, connect, wire the socket.
+        let process = start_tcp_node_adapter(&node, &script, &dir, Arc::new(Recorder(sender)))
+            .expect("the bridge connects to the node DAP server");
+        process
+            .send(r#"{"seq":1,"type":"request","command":"initialize","arguments":{"adapterID":"pwa-node"}}"#)
+            .unwrap();
+        // The framed response comes back through the socket, the shared framing, and the events.
+        let answer = loop {
+            let message = receiver
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the server answers over TCP")
+                .expect("the server stays up");
+            let value: serde_json::Value = serde_json::from_str(&message).unwrap();
+            if value["type"] == "response" {
+                break value;
+            }
+        };
+        assert_eq!(answer["request_seq"], 1);
+        assert_eq!(answer["command"], "initialize");
+        assert_eq!(answer["success"], true);
+        assert_eq!(answer["body"]["supportsConfigurationDoneRequest"], true);
+
+        process.stop();
+        let ended = loop {
+            match receiver.recv_timeout(Duration::from_secs(15)) {
+                Ok(Err(_)) => break true,
+                Ok(Ok(_)) => continue,
+                Err(_) => break false,
+            }
+        };
+        assert!(
+            ended,
+            "stopping the bridge closes the socket and ends the node process"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

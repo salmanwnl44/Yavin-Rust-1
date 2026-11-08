@@ -6,10 +6,11 @@
  * editing the panel component in four places. This module owns the list, its order and which
  * view is showing, so the panel component only has to render whatever it is told about.
  *
- * Order matches VS Code and Antigravity: Problems, Output, Debug Console, Terminal, Ports.
+ * Order matches VS Code and Antigravity: Problems, Output, Debug Console, Terminal, Ports, Test
+ * Results.
  */
 
-export type PanelViewId = "problems" | "output" | "debug" | "terminal" | "ports";
+export type PanelViewId = "problems" | "output" | "debug" | "terminal" | "ports" | "test";
 
 export interface PanelView {
   id: PanelViewId;
@@ -29,6 +30,7 @@ export const PANEL_VIEWS: readonly PanelView[] = [
   { id: "debug", label: "DEBUG CONSOLE" },
   { id: "terminal", label: "TERMINAL", keepMounted: true },
   { id: "ports", label: "PORTS" },
+  { id: "test", label: "TEST RESULTS" },
 ];
 
 const STORAGE_KEY = "yavin.panel.view";

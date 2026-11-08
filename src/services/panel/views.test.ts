@@ -15,10 +15,10 @@ function withStorage(initial: Record<string, string> = {}) {
 
 beforeEach(() => withStorage());
 
-test("the views are the five VS Code shows, in that order", () => {
+test("the views are the ones VS Code shows, in that order", () => {
   assert.deepEqual(
     PANEL_VIEWS.map((view) => view.id),
-    ["problems", "output", "debug", "terminal", "ports"],
+    ["problems", "output", "debug", "terminal", "ports", "test"],
   );
 });
 
@@ -61,8 +61,9 @@ test("storage being unavailable is not fatal", () => {
 
 test("next and previous step through every view and wrap around", () => {
   assert.equal(stepView("problems", 1), "output");
-  assert.equal(stepView("ports", 1), "problems", "wraps forward");
-  assert.equal(stepView("problems", -1), "ports", "wraps backward");
+  assert.equal(stepView("ports", 1), "test");
+  assert.equal(stepView("test", 1), "problems", "wraps forward");
+  assert.equal(stepView("problems", -1), "test", "wraps backward");
   assert.equal(stepView("terminal", -1), "debug");
 
   // Stepping forward through the whole list returns to where it started, so no view is

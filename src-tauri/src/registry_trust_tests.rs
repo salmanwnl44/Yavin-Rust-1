@@ -1081,9 +1081,7 @@ fn the_floor_holds_after_the_replay_record_is_reset_or_lost() {
 fn the_pinned_floor_admits_the_published_registry() {
     let pinned = RegistryAnchors::parse(BUILTIN).unwrap();
     let official = pinned
-        .for_base(
-            "https://raw.githubusercontent.com/salmanwnl44/Yavin-Rust-1/main/registry/",
-        )
+        .for_base("https://raw.githubusercontent.com/salmanwnl44/Yavin-Rust-1/main/registry/")
         .unwrap();
     let published: serde_json::Value =
         serde_json::from_str(include_str!("../../registry/index.json")).unwrap();

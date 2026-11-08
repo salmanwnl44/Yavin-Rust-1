@@ -6,6 +6,7 @@ use crate::lsp_framing::{frame, FrameReader};
 use crate::process::{kill_tree, poll_interval};
 use crate::sandbox::{SandboxPolicy, SandboxedChild};
 use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -270,6 +271,48 @@ impl ServerProcess {
             Some(Box::new(spawned.stdin)),
             spawned.stdout,
             spawned.stderr,
+            events,
+        ))
+    }
+
+    /// A started child whose protocol runs over a **TCP socket** (loopback) instead of its stdio
+    /// (WS6): js-debug's transport. The socket carries the framed messages; the child's own stdout
+    /// and stderr are only logs. The child is owned here for process-tree cleanup exactly as a
+    /// stdio server is — `stop` closes the socket (dropping the write half) and ends the process
+    /// tree. This feeds the same `run` reader/writer/exit machinery: there is no second session
+    /// path, framing, or size limit. The caller has already started `child` and connected `stream`
+    /// to the adapter's loopback port.
+    pub fn from_tcp(
+        mut child: Child,
+        stream: TcpStream,
+        events: Arc<dyn ServerEvents>,
+    ) -> Result<ServerProcess, String> {
+        // In the servers' job before it can start anything of its own that would outlive it.
+        #[cfg(windows)]
+        if let Some(job) = job::servers() {
+            job.assign(&child);
+        }
+        // The child's stdout/stderr are logs (the socket is the protocol channel): pump stdout
+        // here, hand stderr to `run` as its log stream.
+        if let Some(out) = child.stdout.take() {
+            let log = events.clone();
+            std::thread::spawn(move || {
+                pump_lines(out, MAX_LOG_LINE, &mut |line| log.log(line));
+            });
+        }
+        let stderr: Box<dyn Read + Send + 'static> = match child.stderr.take() {
+            Some(err) => Box::new(err),
+            None => Box::new(std::io::empty()),
+        };
+        // One half reads the framed messages, the other writes them; `stop`/EOF closes both.
+        let reader = stream
+            .try_clone()
+            .map_err(|error| format!("The debug adapter socket could not be used: {error}"))?;
+        Ok(Self::run(
+            Process::Plain(child),
+            Some(Box::new(stream)),
+            reader,
+            stderr,
             events,
         ))
     }

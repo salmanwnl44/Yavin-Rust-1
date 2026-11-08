@@ -194,8 +194,12 @@ export interface DebugService {
   getSnapshot(): DebugSnapshot;
   subscribe(listener: () => void): () => void;
   controls(): DebugControls;
-  /** Starts configuration `configId` (the only one, when there is one). */
-  start(configId?: string): Promise<void>;
+  /**
+   * Starts a debug session. With no argument, the workspace's only configuration; with a string,
+   * the configured one of that id; with a full {@link ResolvedDebugConfiguration}, that ad-hoc
+   * configuration (not persisted) — the seam the Testing Platform uses to debug one test (WS5.3).
+   */
+  start(config?: string | ResolvedDebugConfiguration): Promise<void>;
   stop(): Promise<void>;
   continue(): Promise<void>;
   pause(): Promise<void>;
@@ -759,7 +763,7 @@ export function createDebugService(options: DebugServiceOptions): DebugService {
       };
     },
 
-    async start(configId) {
+    async start(configOrId) {
       if (disposed || options.workspace === null || !options.folders.length)
         throw new DebugError("NoWorkspace", "Open a folder to debug its programs.");
       if (live && !isFinal(live.info.state))
@@ -767,13 +771,19 @@ export function createDebugService(options: DebugServiceOptions): DebugService {
           "AlreadyRunning",
           "A debug session is already running. Stop it first.",
         );
+      // An ad-hoc configuration (an object) is launched as given — the Testing Platform's
+      // test-debug config (WS5.3); a string (or nothing) resolves from the workspace's configured
+      // list, as Start Debugging does.
+      const adHoc = typeof configOrId === "object" ? configOrId : null;
+      const configId = typeof configOrId === "string" ? configOrId : undefined;
       const all = configurations();
       const config =
-        configId === undefined
+        adHoc ??
+        (configId === undefined
           ? all.length === 1
             ? all[0]
             : undefined
-          : all.find((one) => one.id === configId);
+          : all.find((one) => one.id === configId));
       if (!config)
         throw new DebugError(
           "InvalidConfiguration",

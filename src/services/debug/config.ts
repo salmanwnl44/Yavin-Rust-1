@@ -17,6 +17,12 @@ export interface DebugConfiguration {
   request: "launch" | "attach";
   /** `launch`: the program, relative to the workspace root or absolute inside it. */
   program: string | null;
+  /**
+   * `launch` alternative to `program`: a module to run with `-m` (debugpy), e.g. `pytest`. The
+   * interpreter resolves it, so it is not a workspace path. A launch needs a `program` or a
+   * `module`. Used by the Testing Platform's pytest debug configuration (WS5.5).
+   */
+  module?: string;
   /** Where it runs: relative to the root (or absolute inside it); the root when absent. */
   cwd: string | null;
   env: Record<string, string>;
@@ -52,6 +58,7 @@ export function readConfiguration(raw: unknown, index = 0): DebugConfiguration |
     "adapter",
     "request",
     "program",
+    "module",
     "cwd",
     "env",
     "args",
@@ -75,7 +82,11 @@ export function readConfiguration(raw: unknown, index = 0): DebugConfiguration |
   const program = value.program ?? null;
   if (program !== null && !oneLine(program, 1000))
     return `${named}: "program" must be one line (a path).`;
-  if (request === "launch" && program === null) return `${named}: a launch needs a "program".`;
+  const moduleValue = value.module;
+  if (moduleValue !== undefined && !oneLine(moduleValue, 200))
+    return `${named}: "module" must be one line (a module name).`;
+  if (request === "launch" && program === null && moduleValue === undefined)
+    return `${named}: a launch needs a "program" or a "module".`;
   const cwd = value.cwd ?? null;
   if (cwd !== null && !oneLine(cwd, 1000)) return `${named}: "cwd" must be one line (a path).`;
   const args = value.args ?? [];
@@ -113,6 +124,7 @@ export function readConfiguration(raw: unknown, index = 0): DebugConfiguration |
     adapter: value.adapter,
     request,
     program,
+    ...(moduleValue !== undefined ? { module: moduleValue } : {}),
     cwd,
     env,
     args: args as string[],

@@ -101,6 +101,9 @@ interface Commands {
   dap_send: { args: { session: number; message: string }; result: void };
   dap_stop: { args: { session: number }; result: void };
   dap_stop_all: { args: Record<string, never>; result: void };
+  /** Which allow-listed DAP adapters actually resolve in this workspace (WS6): the renderer gates
+   * Debug Test on this, so a framework is enabled only when its debugger is installed. */
+  dap_available_adapters: { args: { root: string }; result: string[] };
   /** Installed extensions' manifests (IDE-07, `src-tauri/src/extensions.rs`); never their code. */
   /** Extension host processes (IDE-08, `src-tauri/src/extension_host.rs`); trust-gated. */
   /** Starts a host in its OS sandbox (EXT-10), with the user's resources (bounded natively). */
@@ -333,6 +336,25 @@ interface Commands {
     };
   };
   cancel_checker: { args: undefined; result: void };
+  /**
+   * Run a project test framework through the authorized, allow-listed runner (WS5). Mirrors
+   * `run_checker`: the renderer names an `adapter` id (never a program) and passes the adapter's
+   * argv; the native side re-authorizes it — the program is resolved natively (the project's own
+   * `node_modules/.bin` first), the argv is rebuilt against the adapter's grammar, and a file
+   * selector is confined to the workspace root. `args` cross the boundary as a structured vector,
+   * never a shell string, so a test name or path with shell metacharacters is one argument. A
+   * stopped or timed-out run is an `outcome`, not an error; `root` is where it ran.
+   */
+  run_test: {
+    args: { adapter: string; args: string[] };
+    result: {
+      outcome: "completed" | "cancelled" | "timedOut";
+      output: string;
+      code: number;
+      root: string;
+    };
+  };
+  cancel_test: { args: undefined; result: void };
   open_workspace: { args: { path: string }; result: string };
   read_session: { args: undefined; result: Session };
   save_workspace_session: { args: { state: WorkspaceSession }; result: void };

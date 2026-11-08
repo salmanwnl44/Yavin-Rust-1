@@ -25,6 +25,39 @@ export interface DebugAdapterDefinition {
 
 export const DEBUG_ADAPTERS: readonly DebugAdapterDefinition[] = [
   {
+    // JavaScript / TypeScript via vscode-js-debug's standalone DAP server (WS6). Source maps let
+    // breakpoints bind in the original TypeScript; `<node_internals>` is skipped so stepping stays
+    // in the user's code. The adapter is resolved natively (a workspace-local `@vscode/js-debug`);
+    // it is reported unavailable, with how to install it, when absent — never downloaded silently.
+    id: "node",
+    label: "JavaScript (js-debug)",
+    adapterID: "pwa-node",
+    install: "npm install -D @vscode/js-debug",
+    launchArguments: (config, resolved) => ({
+      name: config.name,
+      type: "pwa-node",
+      request: "launch",
+      program: resolved.program,
+      args: config.args,
+      cwd: resolved.cwd,
+      env: config.env,
+      stopOnEntry: config.stopOnEntry,
+      console: "internalConsole",
+      sourceMaps: true,
+      // Keep stepping in the user's own code, not Node's internals or dependencies.
+      skipFiles: ["<node_internals>/**"],
+    }),
+    attachArguments: (config, resolved) => ({
+      name: config.name,
+      type: "pwa-node",
+      request: "attach",
+      port: config.port,
+      cwd: resolved.cwd,
+      sourceMaps: true,
+      skipFiles: ["<node_internals>/**"],
+    }),
+  },
+  {
     id: "debugpy",
     label: "Python (debugpy)",
     adapterID: "debugpy",
@@ -33,7 +66,8 @@ export const DEBUG_ADAPTERS: readonly DebugAdapterDefinition[] = [
       name: config.name,
       type: "debugpy",
       request: "launch",
-      program: resolved.program,
+      // A module launch (`python -m <module>`, e.g. pytest) when `module` is set, else a program.
+      ...(config.module ? { module: config.module } : { program: resolved.program }),
       args: config.args,
       cwd: resolved.cwd,
       env: config.env,

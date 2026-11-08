@@ -21,6 +21,8 @@ import { OutputView } from "../panel/views/OutputView";
 import { DebugConsoleView } from "../panel/views/DebugConsoleView";
 import type { DebugService } from "../../services/debug/service";
 import { PortsView } from "../panel/views/PortsView";
+import { TestingView } from "../panel/views/TestingView";
+import { useWorkspaceTestingPlatform } from "../../services/testing/useTestingPlatform";
 
 const MIN_HEIGHT = 120;
 
@@ -97,6 +99,7 @@ export function TerminalPanel({
   onOpenProblem,
   ide,
   debugService,
+  workspaceFolder,
   extensionViews = [],
 }: {
   hidden: boolean;
@@ -123,6 +126,8 @@ export function TerminalPanel({
   ide?: TerminalViewIde & { revealFolder(id: TerminalId): void };
   /** The workspace's debugger, for the Debug Console (IDE-05). */
   debugService?: DebugService;
+  /** The open folder, for the Test Explorer's framework detection (WS5); null when none is open. */
+  workspaceFolder?: string | null;
   /** Extensions' panel views (IDE-08): extra tabs after Yavin's own; content made by the window. */
   extensionViews?: readonly { id: string; label: string; content: ReactNode }[];
 }) {
@@ -133,6 +138,18 @@ export function TerminalPanel({
     problemsVersion,
   );
   const [activeTab, setActiveTabState] = useState<PanelViewId>(readActiveView);
+  // The Test Explorer's view-model for this folder (WS5): detects the framework and runs it
+  // through the authorized runner. Null until a folder is open and its markers are read.
+  const testingPlatform = useWorkspaceTestingPlatform(
+    workspaceFolder ?? null,
+    debugService ?? null,
+  );
+  // The failed-test count, for the tab badge (like VS Code). Reactive so it tracks runs.
+  const failedTests = useSyncExternalStore(
+    (listener) => testingPlatform?.subscribe(listener) ?? (() => {}),
+    () => testingPlatform?.getViewState().summary?.failed ?? 0,
+    () => 0,
+  );
   /** An extension's panel view in front, instead of one of Yavin's own (IDE-08). */
   const [extensionTab, setExtensionTabState] = useState<string | null>(null);
   const shownExtension = extensionViews.find((one) => one.id === extensionTab) ?? null;
@@ -263,6 +280,7 @@ export function TerminalPanel({
     debug: 0,
     terminal: sessions.length > 1 ? sessions.length : 0,
     ports: 0,
+    test: failedTests,
   };
 
   const search = (
@@ -759,6 +777,13 @@ export function TerminalPanel({
           <DebugConsoleView service={debugService} />
         )}
         {!hidden && !shownExtension && activeTab === "ports" && <PortsView />}
+        {!hidden && !shownExtension && activeTab === "test" && (
+          <TestingView
+            platform={testingPlatform}
+            onOpen={(file, line) => onOpenProblem?.(file, line ?? 1, 1)}
+            onDebugStarted={() => setActiveTab("debug")}
+          />
+        )}
         {!hidden && shownExtension && (
           <div className="h-full overflow-y-auto">{shownExtension.content}</div>
         )}
