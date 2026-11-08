@@ -72,6 +72,19 @@ const ADAPTERS: &[AdapterSpec] = &[
         node_entry: Some("node_modules/@vscode/js-debug/src/dapDebugServer.js"),
         install: "npm install -D @vscode/js-debug",
     },
+    AdapterSpec {
+        // Rust/C/C++ via LLVM's `lldb-dap`, which speaks DAP over **stdio** -- so it runs on the
+        // shared process host directly, with no bridge (WS6 Part 3). The debuggee (a Rust
+        // executable, or a Cargo test binary resolved from build metadata) is named in the launch
+        // request, never on the adapter's command line.
+        id: "lldb",
+        label: "Rust/C++ (lldb-dap)",
+        program: "lldb-dap",
+        args: &[],
+        python: false,
+        node_entry: None,
+        install: "install LLVM (lldb-dap) or the CodeLLDB extension",
+    },
 ];
 
 fn find(id: &str) -> Option<&'static AdapterSpec> {
@@ -415,7 +428,8 @@ mod tests {
     fn only_a_listed_adapter_can_be_started() {
         assert!(find("debugpy").is_some());
         assert!(find("node").is_some());
-        for id in ["", "python", "cmd", "debugpy; calc", "../debugpy", "lldb"] {
+        assert!(find("lldb").is_some());
+        for id in ["", "python", "cmd", "debugpy; calc", "../debugpy", "gdb"] {
             assert!(find(id).is_none(), "{id}");
         }
         for adapter in ADAPTERS {

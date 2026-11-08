@@ -98,7 +98,7 @@ use terminal::{
     terminal_resize, terminal_shells, terminal_stats, terminal_subscribe, terminal_unsubscribe,
     terminal_write, Terminals,
 };
-use test_runner::{cancel_test, run_test, TestRuns};
+use test_runner::{cancel_test, cargo_test_executable, run_test, TestRuns};
 use trust::{forget_trusted_folder, set_workspace_trust, trusted_folders, workspace_trust, Trust};
 use workbench::{cancel_search, search_project, write_file_guarded};
 
@@ -904,6 +904,7 @@ pub fn run() {
             cancel_checker,
             run_test,
             cancel_test,
+            cargo_test_executable,
             list_listening_ports,
             stop_listening_process,
             git_repo_state,

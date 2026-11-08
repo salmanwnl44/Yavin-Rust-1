@@ -354,6 +354,186 @@ fn authorize_cargo(args: &[String]) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
+// --- Cargo test-executable resolution (WS6 Part 3, for Rust debugging) ---------------------------
+
+/// One compiled Cargo **test** binary, from `cargo test --no-run --message-format=json`.
+#[derive(Serialize, Debug, PartialEq, Eq, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CargoTestBinary {
+    pub package: String,
+    pub target: String,
+    pub kind: String,
+    pub executable: String,
+}
+
+/// The result of resolving a workspace's test executables: the binaries, or the compiler
+/// diagnostics when the build failed (kept **distinct** from test failures — a build break is
+/// never a failing test, and no debugger is started).
+#[derive(Serialize, Debug)]
+#[serde(tag = "outcome", rename_all = "camelCase")]
+pub enum CargoTestExecutables {
+    Compiled { binaries: Vec<CargoTestBinary> },
+    CompileFailed { diagnostics: Vec<String> },
+}
+
+/// The package name from a Cargo `package_id` — either new-style
+/// `path+file:///…#name@version` / `…#name` or old-style `name version (source)`.
+fn package_name(package_id: &str) -> String {
+    if let Some(hash) = package_id.rfind('#') {
+        let (before, after) = (&package_id[..hash], &package_id[hash + 1..]);
+        let name = after.split('@').next().unwrap_or(after);
+        // `#name@version` or `#name`: the name is after `#`.
+        if !name.is_empty() && !name.chars().next().unwrap().is_ascii_digit() {
+            return name.to_string();
+        }
+        // `#version` alone: the name is the last path segment before `#`.
+        if let Some(segment) = before.rsplit(['/', '\\']).next() {
+            if !segment.is_empty() {
+                return segment.to_string();
+            }
+        }
+    }
+    package_id
+        .split_whitespace()
+        .next()
+        .unwrap_or(package_id)
+        .to_string()
+}
+
+/// Parse `cargo test --no-run --message-format=json` output into the compiled **test** binaries,
+/// or the compiler diagnostics when the build failed. A test binary is a `compiler-artifact` with
+/// `profile.test == true` and a non-null `executable`; ordinary binaries (no test profile) are
+/// skipped. Non-JSON noise, blank lines and a truncated final line are tolerated.
+fn parse_cargo_test_artifacts(output: &str) -> CargoTestExecutables {
+    let mut binaries: Vec<CargoTestBinary> = Vec::new();
+    let mut diagnostics: Vec<String> = Vec::new();
+    let mut build_failed = false;
+
+    for raw in output.lines() {
+        let line = raw.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        match value["reason"].as_str() {
+            Some("compiler-artifact") => {
+                let is_test = value["profile"]["test"].as_bool().unwrap_or(false);
+                if let (true, Some(executable)) = (is_test, value["executable"].as_str()) {
+                    let binary = CargoTestBinary {
+                        package: package_name(value["package_id"].as_str().unwrap_or("")),
+                        target: value["target"]["name"].as_str().unwrap_or("").to_string(),
+                        kind: value["target"]["kind"][0]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string(),
+                        executable: executable.to_string(),
+                    };
+                    // Duplicate artifact messages (a fresh rebuild re-reports) collapse to one.
+                    if !binaries.contains(&binary) {
+                        binaries.push(binary);
+                    }
+                }
+            }
+            Some("compiler-message") => {
+                if value["message"]["level"].as_str() == Some("error") {
+                    build_failed = true;
+                    if let Some(rendered) = value["message"]["rendered"].as_str() {
+                        diagnostics.push(rendered.to_string());
+                    }
+                }
+            }
+            Some("build-finished") if value["success"].as_bool() == Some(false) => {
+                build_failed = true;
+            }
+            _ => {}
+        }
+    }
+
+    if build_failed {
+        CargoTestExecutables::CompileFailed { diagnostics }
+    } else {
+        CargoTestExecutables::Compiled { binaries }
+    }
+}
+
+/// How long `cargo test --no-run` may take (a cold compile of a large workspace is minutes).
+const CARGO_BUILD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Resolve a workspace's compiled Cargo test executables natively (WS6 Part 3), for debugging a
+/// Rust test through lldb-dap. Runs `cargo test --no-run --message-format=json` (optionally for one
+/// validated package), parses the build metadata, and **confines every executable to the workspace**
+/// — a path is never guessed, never taken from the renderer, and never outside the workspace. A
+/// build failure returns structured diagnostics and no executable, so the caller does not start a
+/// debugger.
+#[tauri::command]
+pub async fn cargo_test_executable(
+    app: AppHandle,
+    state: State<'_, Workspace>,
+    trust: State<'_, Trust>,
+    package: Option<String>,
+) -> Result<CargoTestExecutables, String> {
+    require_trust(&app, &state, &trust)?;
+    if let Some(pkg) = &package {
+        if !is_cargo_ident(pkg) {
+            return Err(format!("Invalid Cargo package name: {pkg:?}."));
+        }
+    }
+    let root = with_workspace(&state, |manager| Ok(manager.root().to_path_buf()))?;
+    let program = resolve_program("cargo", false, &root, std::env::var_os("PATH"))
+        .ok_or_else(|| "No cargo found on PATH. Install the Rust toolchain.".to_string())?;
+
+    let mut argv: Vec<String> = ["test", "--no-run", "--message-format", "json"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if let Some(pkg) = &package {
+        argv.push("-p".to_string());
+        argv.push(pkg.clone());
+    }
+
+    let run_root = root.clone();
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        let mut command = Command::new(program);
+        command.current_dir(&run_root).args(&argv);
+        capture_classified(
+            command,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            CARGO_BUILD_TIMEOUT,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let output = match output {
+        Ok(out) => out,
+        Err(CaptureError::TimedOut) => return Err("The cargo build timed out.".to_string()),
+        Err(CaptureError::Cancelled) => return Err("The cargo build was cancelled.".to_string()),
+        Err(CaptureError::Failed(error)) => return Err(format!("Could not run cargo: {error}")),
+    };
+
+    // Cargo writes the JSON artifacts to stdout; compiler messages may be on either stream.
+    let parsed = parse_cargo_test_artifacts(&format!("{}\n{}", output.stdout, output.stderr));
+    if let CargoTestExecutables::Compiled { binaries } = &parsed {
+        // Every executable must lie inside the workspace (its `target/`); a path that does not is
+        // not handed back.
+        for binary in binaries {
+            with_workspace(&state, |manager| manager.validate_path(&binary.executable)).map_err(
+                |_| {
+                    format!(
+                        "A compiled test executable is outside the workspace: {}",
+                        binary.executable
+                    )
+                },
+            )?;
+        }
+    }
+    Ok(parsed)
+}
+
 /// A Playwright project/browser name: one line, bounded, with no control characters. Unlike a
 /// Cargo package it may contain spaces ("Mobile Chrome"), and it is never a path or a flag — it
 /// travels as a single opaque `--project` argument, so there is no injection surface.
@@ -908,6 +1088,101 @@ mod tests {
         assert!(!is_cargo_ident("has space"));
         assert!(!is_cargo_ident("../escape"));
         assert!(!is_cargo_ident("semi;colon"));
+    }
+
+    // --- Cargo test-executable resolution (WS6 Part 3) -------------------------------------
+
+    #[test]
+    fn parse_cargo_artifacts_identifies_test_binaries_across_targets_and_packages() {
+        let out = [
+            // A library unit-test binary.
+            r#"{"reason":"compiler-artifact","package_id":"path+file:///w/a#crate_a@0.1.0","target":{"name":"crate_a","kind":["lib"]},"profile":{"test":true},"executable":"/w/a/target/debug/deps/crate_a-111.exe"}"#,
+            // An integration-test binary in another package.
+            r#"{"reason":"compiler-artifact","package_id":"crate_b 0.2.0 (path+file:///w/b)","target":{"name":"it","kind":["test"]},"profile":{"test":true},"executable":"/w/b/target/debug/deps/it-222.exe"}"#,
+            // An ordinary (non-test) binary artifact: skipped.
+            r#"{"reason":"compiler-artifact","package_id":"crate_a 0.1.0","target":{"name":"crate_a","kind":["bin"]},"profile":{"test":false},"executable":"/w/a/target/debug/crate_a.exe"}"#,
+            r#"{"reason":"build-finished","success":true}"#,
+        ]
+        .join("\n");
+        match parse_cargo_test_artifacts(&out) {
+            CargoTestExecutables::Compiled { binaries } => {
+                assert_eq!(
+                    binaries.len(),
+                    2,
+                    "two test binaries, the plain bin skipped"
+                );
+                assert_eq!(binaries[0].package, "crate_a");
+                assert_eq!(binaries[0].kind, "lib");
+                assert!(binaries[0].executable.contains("crate_a-111"));
+                assert_eq!(
+                    binaries[1].package, "crate_b",
+                    "old-style package_id parses too"
+                );
+                assert_eq!(binaries[1].kind, "test");
+            }
+            other => panic!("expected Compiled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cargo_artifacts_collapses_duplicates_and_skips_artifacts_without_an_executable() {
+        let line = r#"{"reason":"compiler-artifact","package_id":"a 0.1.0","target":{"name":"a","kind":["lib"]},"profile":{"test":true},"executable":"/w/target/debug/deps/a-1.exe"}"#;
+        // A test profile with no executable (e.g. a doctest build step) is skipped.
+        let no_exe = r#"{"reason":"compiler-artifact","package_id":"a 0.1.0","target":{"name":"a","kind":["lib"]},"profile":{"test":true},"executable":null}"#;
+        let out = [
+            line,
+            line,
+            no_exe,
+            r#"{"reason":"build-finished","success":true}"#,
+        ]
+        .join("\n");
+        match parse_cargo_test_artifacts(&out) {
+            CargoTestExecutables::Compiled { binaries } => assert_eq!(binaries.len(), 1),
+            other => panic!("expected Compiled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cargo_artifacts_reports_a_compile_failure_as_diagnostics_not_a_test() {
+        let out = [
+            r#"{"reason":"compiler-message","message":{"level":"error","rendered":"error[E0425]: cannot find value `x`"}}"#,
+            r#"{"reason":"build-finished","success":false}"#,
+        ]
+        .join("\n");
+        match parse_cargo_test_artifacts(&out) {
+            CargoTestExecutables::CompileFailed { diagnostics } => {
+                assert_eq!(diagnostics.len(), 1);
+                assert!(diagnostics[0].contains("cannot find value"));
+            }
+            other => panic!("expected CompileFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cargo_artifacts_tolerates_noise_and_truncation_and_empty() {
+        let out = [
+            "   Compiling crate v0.1.0",
+            "",
+            r#"{"reason":"compiler-artifact","package_id":"a 0.1.0","target":{"name":"a","kind":["lib"]},"profile":{"test":true},"executable":"/w/target/debug/deps/a-1.exe"}"#,
+            r#"{"reason":"build-finished","success":tru"#, // truncated
+        ]
+        .join("\n");
+        match parse_cargo_test_artifacts(&out) {
+            CargoTestExecutables::Compiled { binaries } => assert_eq!(binaries.len(), 1),
+            other => panic!("expected Compiled, got {other:?}"),
+        }
+        assert!(matches!(
+            parse_cargo_test_artifacts(""),
+            CargoTestExecutables::Compiled { binaries } if binaries.is_empty()
+        ));
+    }
+
+    #[test]
+    fn package_name_parses_new_and_old_package_ids() {
+        assert_eq!(package_name("path+file:///w/a#crate_a@0.1.0"), "crate_a");
+        assert_eq!(package_name("path+file:///w/a#0.1.0"), "a"); // name-less #version
+        assert_eq!(package_name("crate_b 0.2.0 (registry+...)"), "crate_b");
+        assert_eq!(package_name("registry+https://x#serde@1.0"), "serde");
     }
 
     // --- Playwright argument authorization -------------------------------------------------
@@ -1495,6 +1770,77 @@ mod real_tests {
             out.output
         );
         eprintln!("LEVEL C (cargo): ran a real nightly Cargo test and got libtest JSON.");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_cargo_test_executable_resolution_finds_the_compiled_test_binary() {
+        // Level C for the WS6 Part 3 resolution: build a real fixture crate with `cargo test
+        // --no-run --message-format=json` (stable; no nightly needed) and confirm the parser finds
+        // its compiled test executable, on disk. cargo is installed, so this really runs.
+        let path = std::env::var_os("PATH");
+        let Some(cargo) = resolve_program("cargo", false, Path::new("."), path) else {
+            eprintln!("skipped: cargo is not installed");
+            return;
+        };
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("cargoexe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"ws6fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src").join("lib.rs"),
+            "#[test]\nfn it_builds() { assert_eq!(2 + 2, 4); }\n",
+        )
+        .unwrap();
+        let out = execute(
+            &cargo,
+            &dir,
+            &args_vec(&["test", "--no-run", "--message-format", "json"]),
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_secs(300),
+            "cargo",
+            None,
+        )
+        .expect("cargo runs");
+        assert_eq!(
+            out.outcome,
+            TestOutcome::Completed,
+            "cargo --no-run: {}",
+            out.output
+        );
+        match parse_cargo_test_artifacts(&out.output) {
+            CargoTestExecutables::Compiled { binaries } => {
+                assert!(
+                    !binaries.is_empty(),
+                    "a test binary was resolved: {}",
+                    out.output
+                );
+                let binary = &binaries[0];
+                assert_eq!(binary.package, "ws6fixture");
+                assert!(
+                    Path::new(&binary.executable).is_file(),
+                    "the compiled test executable exists on disk: {}",
+                    binary.executable
+                );
+                assert!(
+                    Path::new(&binary.executable).starts_with(&dir),
+                    "the executable is inside the fixture's target dir"
+                );
+                eprintln!(
+                    "LEVEL C (cargo-exe): resolved real test binary {}",
+                    binary.executable
+                );
+            }
+            CargoTestExecutables::CompileFailed { diagnostics } => {
+                panic!("fixture should compile: {diagnostics:?}")
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

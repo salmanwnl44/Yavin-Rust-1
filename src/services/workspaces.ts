@@ -18,8 +18,10 @@ import { createSettingsRegistry } from "./settings/settings.ts";
 import { ICON_THEME_SETTING, iconThemes } from "./extensions/iconThemes.ts";
 import { createWebviewStore } from "./extensions/webviews.ts";
 import { EDITOR_SETTING_LIST } from "../editor/editorSettings.ts";
-import { TASK_DEFINITIONS } from "./tasks/model.ts";
+import { TASK_DEFINITIONS, type ResolvedTask } from "./tasks/model.ts";
 import { createTaskService, type TaskService } from "./tasks/service.ts";
+import { createTaskDiscovery, type TaskDiscovery } from "./tasks/taskDiscovery.ts";
+import { onResourceChanges } from "./native.ts";
 import { readTrust } from "./trust.ts";
 import { createBreakpointRegistry } from "./debug/breakpoints.ts";
 import { DEBUG_SETTING_LIST } from "./debug/config.ts";
@@ -92,6 +94,8 @@ export interface WorkspaceServices {
    * run in the workspace's terminals; disposing the workspace stops what they are running.
    */
   tasks: TaskService;
+  /** Keeps the workspace's discovered tasks live (WS7 Part 3); disposed with the workspace. */
+  taskDiscovery: TaskDiscovery | null;
   /**
    * The workspace's debugger (IDE-05): its debug session, over a debug adapter the native side
    * runs. Disposing the workspace ends the session, the adapter and the program it debugs.
@@ -339,6 +343,11 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
               { onProgress: onLocalGitProgress },
             )
           : null;
+      // Discovered tasks (WS7): npm/pnpm/yarn scripts, Cargo subcommands and Makefile targets read
+      // from the folders' convention files (no execution). A user/workspace task of the same id
+      // overrides a discovered one. The list is kept **live** (WS7 Part 3): a coordinator re-reads
+      // it when a manifest/lockfile changes, through the existing filesystem watch.
+      let discoveredTasks: readonly ResolvedTask[] = [];
       const tasks = createTaskService({
         workspace: folders.length ? id : null,
         folders,
@@ -348,8 +357,36 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
         profiles: terminalProfiles.forWorkspace(id),
         // Workspace Trust, asked of the native side before every execution.
         trusted: () => readTrust().then((trust) => trust.trusted),
+        discovered: () => discoveredTasks,
         publish: publishProblems,
       });
+      const taskDiscovery =
+        folders.length && isTauri()
+          ? createTaskDiscovery({
+              folders,
+              read: (path) =>
+                native("read_file_content", { path }).then(
+                  (content) => content,
+                  () => null,
+                ),
+              // Lists a directory's immediate children so monorepo workspace globs (`packages/*`)
+              // can be expanded; native listing is workspace-confined. Failure → null (no members).
+              listDir: (path) =>
+                native("list_workspace_files", { path, maxDepth: 1 }).then(
+                  (node) =>
+                    (node.children ?? []).map((child) => ({
+                      name: child.name,
+                      isDir: child.is_dir,
+                    })),
+                  () => null,
+                ),
+              subscribe: onResourceChanges,
+              onTasks: (found) => {
+                discoveredTasks = found;
+                tasks.refresh();
+              },
+            })
+          : null;
       return {
         git,
         localGit,
@@ -364,6 +401,7 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
           publishProblems,
         ),
         tasks,
+        taskDiscovery,
         extensions: createExtensionHostManager({
           registry: extensionRegistry,
           settings,
@@ -417,6 +455,8 @@ export const workspaces = createWorkspaceManager<WorkspaceServices>(
       await services.localGit?.close();
       // A checker still running in the folder left is stopped, and its answer never published.
       services.checkers.dispose();
+      // Its live task rediscovery stops watching (no leaked filesystem subscription).
+      services.taskDiscovery?.dispose();
       // What its tasks are running is ended: they ran for its folders.
       services.tasks.dispose();
       // Its debug session ends, and the adapter and the program it debugs with it.

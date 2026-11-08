@@ -199,6 +199,8 @@ async function setup(
     folders?: string[];
     /** `false`: the shells are not discovered yet (no terminal was ever opened). */
     discovered?: boolean;
+    /** Discovered tasks (WS7), merged below the configured ones. */
+    discoveredTasks?: ResolvedTask[];
   } = {},
 ) {
   resetProblems();
@@ -227,6 +229,7 @@ async function setup(
     },
     profiles,
     trusted: async () => trusted,
+    discovered: () => options.discoveredTasks ?? [],
     publish: publishProblems,
     killAfterMs: 20,
   });
@@ -459,4 +462,178 @@ test("a task run before any terminal was opened waits for the shells to be disco
   await t.finish(0, 0);
   assert.equal((await done).state, "succeeded");
   assert.equal(t.opens().length, 1);
+});
+
+// --- WS7: discovered tasks ---------------------------------------------------------------------
+
+/** A discovered task (as task discovery produces): scope "discovered", a plain command line. */
+function discovered(id: string, command: string, over: Partial<ResolvedTask> = {}): ResolvedTask {
+  return {
+    id,
+    label: id,
+    command,
+    args: [],
+    cwd: null,
+    env: {},
+    profile: null,
+    dependsOn: [],
+    group: null,
+    isDefault: false,
+    problemMatcher: [],
+    presentation: { reveal: "always", terminal: "dedicated", clear: true },
+    scope: "discovered",
+    ...over,
+  };
+}
+
+test("discovered tasks appear in the snapshot alongside configured ones", async () => {
+  const t = await setup([{ id: "lint", label: "Lint", command: "eslint ." }], {
+    discoveredTasks: [
+      discovered("npm:build", "npm run build"),
+      discovered("cargo:test", "cargo test"),
+    ],
+  });
+  assert.deepEqual(
+    t.service
+      .getSnapshot()
+      .tasks.map((task) => task.id)
+      .sort(),
+    ["cargo:test", "lint", "npm:build"],
+  );
+  const build = t.service.getSnapshot().tasks.find((task) => task.id === "npm:build")!;
+  assert.equal(build.scope, "discovered");
+});
+
+test("a configured task overrides a discovered one of the same id", async () => {
+  const t = await setup(
+    [{ id: "npm:build", label: "My Build", command: "npm run build -- --prod" }],
+    { discoveredTasks: [discovered("npm:build", "npm run build")] },
+  );
+  const tasks = t.service.getSnapshot().tasks.filter((task) => task.id === "npm:build");
+  assert.equal(tasks.length, 1, "no duplicate id");
+  assert.equal(tasks[0]!.scope, "workspace", "the configured task wins");
+  assert.equal(tasks[0]!.command, "npm run build -- --prod");
+});
+
+test("a discovered task runs through the existing TaskService (trust, terminal, record)", async () => {
+  const t = await setup([], { discoveredTasks: [discovered("npm:test", "npm test")] });
+  const done = t.service.run("npm:test");
+  await t.finish(0, 0);
+  assert.equal((await done).state, "succeeded");
+  assert.equal(t.opens().length, 1, "it ran in one terminal");
+});
+
+test("refresh re-reads the task list and notifies subscribers (for when discovery updates)", async () => {
+  // The discovered getter reads this mutable list each time; refresh picks up its change.
+  const live: ResolvedTask[] = [];
+  const t = await setup([], { discoveredTasks: live });
+  assert.equal(t.service.getSnapshot().tasks.length, 0);
+  let notified = 0;
+  t.service.subscribe(() => notified++);
+  live.push(discovered("make:all", "make all"));
+  t.service.refresh();
+  assert.ok(notified >= 1, "refresh notifies subscribers");
+  assert.deepEqual(
+    t.service.getSnapshot().tasks.map((task) => task.id),
+    ["make:all"],
+    "the newly discovered task is now in the snapshot",
+  );
+});
+
+// --- WS7 Part 2: discovered-task integration ---------------------------------------------------
+
+test("a configured task may depend on discovered tasks; the planner orders them", () => {
+  // Discovered tasks participate in dependency planning exactly like configured ones — the plan is
+  // over the merged list. Dependencies are only those explicitly configured, never inferred.
+  const tasks = [
+    resolved("ci", ["cargo:test", "npm:build"]),
+    discovered("cargo:test", "cargo test"),
+    discovered("npm:build", "npm run build"),
+  ];
+  assert.deepEqual(
+    planTask(tasks, "ci").map((t) => t.id),
+    ["cargo:test", "npm:build", "ci"],
+  );
+});
+
+test("a cycle through discovered tasks is detected before anything runs", () => {
+  const tasks = [
+    discovered("a", "echo a", { dependsOn: ["b"] }),
+    discovered("b", "echo b", { dependsOn: ["a"] }),
+  ];
+  assert.throws(
+    () => planTask(tasks, "a"),
+    (e: Error) => /circle/.test(e.message),
+  );
+});
+
+test("a discovered Cargo task's output reaches the existing Cargo matcher and Problems", async () => {
+  const t = await setup([], {
+    discoveredTasks: [discovered("cargo:check", "cargo check", { problemMatcher: ["cargo"] })],
+  });
+  const run = t.service.run("cargo:check");
+  await t.finish(0, 101, "src/main.rs:10:5: error[E0308]: mismatched types\r\n");
+  await run;
+  assert.equal(allProblems().length, 1);
+  assert.equal(
+    allProblems()[0].owner,
+    taskOwner("cargo:check"),
+    "diagnostics carry the task origin",
+  );
+  assert.equal(
+    groupByFile(allProblems())[0].file,
+    "C:/work/src/main.rs",
+    "canonical ResourceUri path",
+  );
+  assert.equal(groupByFile(allProblems())[0].problems[0].line, 10);
+});
+
+test("a discovered task can be cancelled and restarted through the existing service", async () => {
+  const t = await setup([], { discoveredTasks: [discovered("npm:dev", "npm run dev")] });
+  const run = t.service.run("npm:dev");
+  await settle();
+  const exec = t.service.getSnapshot().runs[0]!;
+  t.service.cancel(exec.executionId);
+  await t.finish(0, 130);
+  assert.equal((await run).state, "cancelled");
+  // Restart runs it again (a fresh terminal/launch).
+  const again = t.service.restart("npm:dev");
+  await t.finish(1, 0);
+  assert.equal((await again).state, "succeeded");
+});
+
+// --- WS7 Part 3: live-refresh lifecycle --------------------------------------------------------
+
+test("a running discovered task keeps its original config when discovery refreshes it away", async () => {
+  const live: ResolvedTask[] = [discovered("npm:build", "npm run build")];
+  const t = await setup([], { discoveredTasks: live });
+  const run = t.service.run("npm:build");
+  await settle();
+  assert.equal(t.service.getSnapshot().runs[0]!.state, "running");
+  // Discovery refreshes the list — the task's definition changes, and it is even removed.
+  live.length = 0;
+  live.push(discovered("npm:build", "pnpm run build")); // a package-manager change
+  t.service.refresh();
+  live.length = 0; // then removed entirely
+  t.service.refresh();
+  // The in-flight execution still finishes on its ORIGINAL launch — never restarted or redefined.
+  await t.finish(0, 0);
+  assert.equal((await run).state, "succeeded");
+  assert.equal(t.opens().length, 1, "it ran once, with the config captured at start");
+});
+
+test("after a refresh removes a discovered task it cannot be run; a configured task survives", async () => {
+  const live: ResolvedTask[] = [discovered("npm:build", "npm run build")];
+  const t = await setup([{ id: "lint", label: "Lint", command: "eslint ." }], {
+    discoveredTasks: live,
+  });
+  assert.ok(t.service.getSnapshot().tasks.some((task) => task.id === "npm:build"));
+  live.length = 0; // the manifest's script was deleted
+  t.service.refresh();
+  assert.deepEqual(
+    t.service.getSnapshot().tasks.map((task) => task.id),
+    ["lint"],
+    "the discovered task is gone; the configured one survives",
+  );
+  await assert.rejects(t.service.run("npm:build"), /no task/i);
 });

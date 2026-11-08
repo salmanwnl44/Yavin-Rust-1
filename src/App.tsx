@@ -3203,7 +3203,13 @@ export default function App() {
           taskSnapshot.tasks.map((task) => ({
             id: task.id,
             label: task.label,
-            detail: `${task.command}${task.scope === "workspace" ? " (workspace)" : ""}`,
+            detail: `${task.command}${
+              task.scope === "workspace"
+                ? " (workspace)"
+                : task.scope === "discovered"
+                  ? " (discovered)"
+                  : ""
+            }`,
           })),
           runTask,
         );
@@ -3975,6 +3981,7 @@ export default function App() {
             visible={isSidebarOpen && activeActivityTab === "run"}
             hasWorkspace={!!taskSnapshot.workspace}
             onRun={runTask}
+            onRerun={(id) => void tasks.restart(id).catch(reportTaskError)}
             onRunGroup={runGroup}
             onStop={(id) => tasks.cancel(id)}
             onShowTerminal={showTaskTerminal}

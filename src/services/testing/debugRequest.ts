@@ -161,8 +161,47 @@ export function buildTestDebugConfiguration(
     };
   }
   if (support.dapAdapter === "node") return buildNodeTestConfiguration(request, base);
+  if (support.dapAdapter === "lldb")
+    // Cargo's debug launch needs the compiled test executable, which only the native side can
+    // resolve (`cargo test --no-run`); the renderer must use buildCargoDebugConfiguration with it.
+    throw new TestDebugError(
+      "Cargo test debugging resolves the compiled test executable natively; build it with buildCargoDebugConfiguration.",
+    );
   // Other debugpy-backed runners: launch the test file, filtering by the opaque full name.
   return { ...base, program: request.file, args: ["-k", request.fullName] };
+}
+
+/**
+ * The lldb-dap launch configuration for one Cargo test (WS6 Part 3). The `program` is the compiled
+ * test executable the **native side** resolved from `cargo test --no-run` metadata (absolute, and
+ * confined to the workspace there) — never a renderer path. Only the selected test runs: its full
+ * node-id path is passed to the test binary as **one opaque argument** plus `--exact`, never a
+ * shell string, so the whole suite is not run.
+ */
+export function buildCargoDebugConfiguration(
+  request: TestDebugRequest,
+  executable: string,
+  available?: ReadonlySet<string>,
+): ResolvedDebugConfiguration {
+  const support = testDebugSupport(request.adapterId, available);
+  if (!support.supported || support.dapAdapter !== "lldb")
+    throw new TestDebugError(support.reason ?? "This test cannot be debugged with lldb-dap.");
+  if (!executable.trim()) throw new TestDebugError("No compiled test executable was resolved.");
+  return {
+    id: `test-debug:${request.caseId}`,
+    name: `Debug Test: ${request.fullName}`,
+    adapter: "lldb",
+    request: "launch",
+    program: executable,
+    cwd: null,
+    env: {},
+    // libtest: run exactly the selected test. The node-id path is one opaque argument.
+    args: [request.fullName, "--exact"],
+    stopOnEntry: false,
+    port: null,
+    preLaunchTask: null,
+    scope: "workspace",
+  };
 }
 
 /**

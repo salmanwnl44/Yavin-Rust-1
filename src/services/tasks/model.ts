@@ -49,9 +49,13 @@ export interface TaskDefinition {
   presentation: TaskPresentation;
 }
 
-/** A task with where it comes from: a workspace task overrides the user's of the same id. */
+/**
+ * A task with where it comes from. `discovered` tasks are read from project conventions
+ * (package.json scripts, Cargo.toml, Makefile — WS7) rather than configured; a user or workspace
+ * task of the same id overrides a discovered one.
+ */
 export interface ResolvedTask extends TaskDefinition {
-  scope: "user" | "workspace";
+  scope: "user" | "workspace" | "discovered";
 }
 
 export const DEFAULT_PRESENTATION: TaskPresentation = Object.freeze({
@@ -60,7 +64,9 @@ export const DEFAULT_PRESENTATION: TaskPresentation = Object.freeze({
   clear: true,
 });
 
-const ID = /^[A-Za-z0-9._-]{1,64}$/;
+// `:` is allowed so a configured task can share a discovered task's id (e.g. `npm:build`) and
+// thereby override it (WS7); discovery generates exactly these `<source>:<name>` ids.
+const ID = /^[A-Za-z0-9._:-]{1,64}$/;
 /** One line: no control characters at all (no line breaks, no NUL). */
 const ONE_LINE = /^[^\u0000-\u001f\u007f]*$/;
 

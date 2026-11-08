@@ -93,6 +93,8 @@ export interface TaskRun {
 
 export interface TaskSnapshot {
   readonly workspace: WorkspaceId | null;
+  /** The workspace's folders (roots) — lets a view project tasks per workspace/package (WS7 Part 5). */
+  readonly folders: readonly string[];
   readonly tasks: readonly ResolvedTask[];
   /** Newest first: what is running, then what finished recently. */
   readonly runs: readonly TaskRun[];
@@ -115,6 +117,13 @@ export interface TaskServiceOptions {
   profiles: Pick<WorkspaceProfiles, "resolve"> & { registry: Pick<ProfileRegistry, "load"> };
   /** Whether the folder is trusted now (Workspace Trust; asked before every execution). */
   trusted(): Promise<boolean>;
+  /**
+   * The workspace's **discovered** tasks (WS7): npm scripts, Cargo subcommands, Makefile targets,
+   * read from project files (never executed to discover them). Merged below the configured tasks,
+   * so a user or workspace task of the same id overrides a discovered one. The caller refreshes
+   * the service when this list changes.
+   */
+  discovered?: () => readonly ResolvedTask[];
   publish(owner: string, label: string, diagnostics: readonly Diagnostic[]): void;
   /** How long a cancelled task has to stop after Ctrl+C before its terminal is killed. */
   killAfterMs?: number;
@@ -142,6 +151,8 @@ export interface TaskService {
   restart(taskId: string): Promise<TaskRun>;
   /** Stops an execution (its dependencies too): Ctrl+C, then its terminal killed if need be. */
   cancel(executionId: string): void;
+  /** Re-reads the task list and republishes — called after discovery updates (WS7). */
+  refresh(): void;
   dispose(): void;
 }
 
@@ -194,10 +205,20 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
   const dedicated = new Map<string, TerminalId>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
 
-  const tasks = () => configuredTasks(options.settings, options.workspace);
+  const tasks = (): ResolvedTask[] => {
+    const discovered = options.discovered?.() ?? [];
+    if (discovered.length === 0) return configuredTasks(options.settings, options.workspace);
+    // Discovered tasks sit below configured ones: a user/workspace task of the same id wins.
+    const byId = new Map<string, ResolvedTask>();
+    for (const task of discovered) byId.set(task.id, task);
+    for (const task of configuredTasks(options.settings, options.workspace))
+      byId.set(task.id, task);
+    return [...byId.values()];
+  };
   const publishSnapshot = () => {
     snapshot = Object.freeze({
       workspace: options.workspace,
+      folders: options.folders,
       tasks: Object.freeze(tasks()),
       runs: Object.freeze([...runs]),
       revealRequest,
@@ -681,6 +702,10 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
       cancelled.add(root);
       for (const watch of active.values()) if (watch.root === root) stopActive(watch);
       for (const wake of wakers.get(root) ?? []) wake();
+    },
+
+    refresh() {
+      if (!disposed) publishSnapshot();
     },
 
     dispose() {

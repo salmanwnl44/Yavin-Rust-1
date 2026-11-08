@@ -2122,11 +2122,15 @@ test("arrow keys move between panel views", async ({ page }) => {
   await openPanel(page);
   const tabs = page.getByRole("tablist", { name: "Panel views" });
 
-  await tabs.getByRole("tab", { name: "TERMINAL" }).focus();
+  await tabs.getByRole("tab", { name: "TERMINAL" }).click();
   await page.keyboard.press("ArrowRight");
   await expect(tabs.getByRole("tab", { name: "PORTS" })).toHaveAttribute("aria-selected", "true");
-  // Wraps rather than dead-ending at the last view.
-  await tabs.getByRole("tab", { name: "PORTS" }).focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(tabs.getByRole("tab", { name: "TEST RESULTS" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  // Wraps rather than dead-ending at the last view (TEST RESULTS).
   await page.keyboard.press("ArrowRight");
   await expect(tabs.getByRole("tab", { name: "PROBLEMS" })).toHaveAttribute(
     "aria-selected",
@@ -3548,6 +3552,78 @@ test("Configure Tasks edits the task list in Settings, refusing an invalid one",
   // The Run view, still open beside the editor, lists it at once.
   await page.getByRole("button", { name: "Close settings" }).click();
   await expect(run.getByRole("group", { name: "Lint", exact: true })).toBeVisible();
+});
+
+const GROUPED_TASKS = [
+  { id: "build", label: "Build", command: "npx tsc --noEmit", group: "build" },
+  { id: "test", label: "Test", command: "npm test", group: "test" },
+  { id: "lint", label: "Lint", command: "npm run lint" },
+  { id: "serve", label: "Serve", command: "npm run serve" },
+];
+
+test("WS7.5 the Run view groups tasks and the search box narrows them (hierarchical)", async ({
+  page,
+}) => {
+  await withTasks(page, GROUPED_TASKS);
+  await desktop(page);
+  const run = await runView(page);
+  // Tasks are grouped under their presentation group's disclosure header.
+  await expect(run.getByRole("button", { name: "Build tasks" })).toBeVisible();
+  await expect(run.getByRole("button", { name: "Lint tasks" })).toBeVisible();
+  await expect(run.getByRole("button", { name: "Run tasks" })).toBeVisible();
+  await expect(run.getByRole("group", { name: "Serve", exact: true })).toBeVisible();
+
+  // Searching narrows to matching tasks; the others' groups disappear.
+  await run.getByRole("searchbox", { name: "Search tasks" }).fill("serve");
+  await expect(run.getByRole("group", { name: "Serve", exact: true })).toBeVisible();
+  await expect(run.getByRole("group", { name: "Build", exact: true })).toHaveCount(0);
+  await expect(run.getByRole("button", { name: "Build tasks" })).toHaveCount(0);
+
+  // Clearing restores the full tree.
+  await run.getByRole("button", { name: "Clear" }).click();
+  await expect(run.getByRole("group", { name: "Build", exact: true })).toBeVisible();
+});
+
+test("WS7.5 a group header collapses and re-expands its tasks", async ({ page }) => {
+  await withTasks(page, GROUPED_TASKS);
+  await desktop(page);
+  const run = await runView(page);
+  await expect(run.getByRole("group", { name: "Serve", exact: true })).toBeVisible();
+
+  const header = run.getByRole("button", { name: "Run tasks" });
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  await header.click();
+  await expect(header).toHaveAttribute("aria-expanded", "false");
+  await expect(run.getByRole("group", { name: "Serve", exact: true })).toHaveCount(0);
+  // A sibling group's task is unaffected.
+  await expect(run.getByRole("group", { name: "Build", exact: true })).toBeVisible();
+
+  await header.click();
+  await expect(run.getByRole("group", { name: "Serve", exact: true })).toBeVisible();
+});
+
+test("WS7.6 a task leaf shows the dependencies it runs after", async ({ page }) => {
+  await withTasks(page, [
+    { id: "lib", label: "Lib", command: "npm run build", group: "build" },
+    { id: "app", label: "App", command: "npm run build", group: "build", dependsOn: ["lib"] },
+  ]);
+  await desktop(page);
+  const run = await runView(page);
+  const app = run.getByRole("group", { name: "App", exact: true });
+  await expect(app).toContainText("after Lib");
+  // The independent dependency shows no "after" line.
+  await expect(run.getByRole("group", { name: "Lib", exact: true })).not.toContainText("after");
+});
+
+test("WS7.5 keyboard: focusing a task leaf and pressing Enter runs it", async ({ page }) => {
+  await withTasks(page, GROUPED_TASKS);
+  await desktop(page);
+  const run = await runView(page);
+  const serve = run.getByRole("group", { name: "Serve", exact: true });
+  await serve.focus();
+  await page.keyboard.press("Enter");
+  const launch = await taskLaunch(page, "serve");
+  expect(launch.profile.args).toEqual(["/d", "/s", "/c", "npm run serve"]);
 });
 
 test("the Run menu holds the task commands; Stop Task waits for a running task", async ({

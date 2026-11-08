@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   authorizeTestDebug,
   buildTestDebugConfiguration,
+  buildCargoDebugConfiguration,
   testDebugSupport,
   TestDebugError,
   type TestDebugRequest,
@@ -31,12 +32,38 @@ test("support maps each framework to its registered DAP adapter (the capability)
   assert.equal(testDebugSupport("pytest").dapAdapter, "debugpy");
   assert.equal(testDebugSupport("pytest").supported, true);
   assert.ok(DEBUG_ADAPTERS.some((a) => a.id === "node"));
-  // Rust's adapter (lldb) is not registered yet (WS6 Part 2), so Cargo stays unsupported.
-  const cargo = testDebugSupport("cargo");
-  assert.equal(cargo.supported, false);
-  assert.match(cargo.reason ?? "", /native \(LLDB\)/);
+  // Rust's adapter (lldb) is now registered (WS6 Part 3), so Cargo is a capability.
+  assert.equal(testDebugSupport("cargo").dapAdapter, "lldb");
+  assert.equal(testDebugSupport("cargo").supported, true);
+  assert.ok(DEBUG_ADAPTERS.some((a) => a.id === "lldb"));
+  // ...but availability-gated off until lldb-dap is installed.
+  const cargoAbsent = testDebugSupport("cargo", new Set<string>());
+  assert.equal(cargoAbsent.supported, false);
+  assert.match(cargoAbsent.reason ?? "", /not installed/);
+  assert.match(cargoAbsent.reason ?? "", /lldb-dap/);
   // An unknown framework is unsupported, not a crash.
   assert.equal(testDebugSupport("nope").supported, false);
+});
+
+test("the Cargo lldb debug config launches the resolved test executable, test as one opaque arg", () => {
+  const request: TestDebugRequest = {
+    adapterId: "cargo",
+    caseId: "crate\u0000math::tests::adds",
+    workspace: WS,
+    file: "crate",
+    fullName: "math::tests::adds",
+  };
+  const exe = "D:/w/target/debug/deps/crate-abc123.exe";
+  const config = buildCargoDebugConfiguration(request, exe, new Set(["lldb"]));
+  assert.equal(config.adapter, "lldb");
+  assert.equal(config.program, exe, "the native-resolved executable, not a renderer path");
+  assert.deepEqual(config.args, ["math::tests::adds", "--exact"], "only this test runs");
+  // buildTestDebugConfiguration refuses Cargo (it needs the native executable).
+  assert.throws(
+    () => buildTestDebugConfiguration(request, new Set(["lldb"])),
+    (e: Error) =>
+      e instanceof TestDebugError && /resolves the compiled test executable/.test(e.message),
+  );
 });
 
 test("a registered adapter is still unsupported until its binary is actually installed", () => {
@@ -62,8 +89,8 @@ test("authorize accepts a valid request for a supported framework", () => {
 test("authorize rejects an unsupported framework with its reason", () => {
   const ctx = { workspace: WS, currentCaseIds: new Set(["c"]) };
   assert.throws(
-    () => authorizeTestDebug(request({ adapterId: "cargo", caseId: "c" }), ctx),
-    (e: Error) => e instanceof TestDebugError && /native \(LLDB\)/.test(e.message),
+    () => authorizeTestDebug(request({ adapterId: "mocha", caseId: "c" }), ctx),
+    (e: Error) => e instanceof TestDebugError && /not available for "mocha"/.test(e.message),
   );
 });
 
@@ -138,8 +165,8 @@ test("the node (JS) debug config launches the runner with the test as opaque arg
 });
 
 test("building a configuration for an unsupported framework throws, never fabricates one", () => {
-  // Cargo's adapter (lldb) is not registered, so it is genuinely unsupported.
-  assert.throws(() => buildTestDebugConfiguration(request({ adapterId: "cargo" })), TestDebugError);
+  // An unknown framework has no adapter mapping at all.
+  assert.throws(() => buildTestDebugConfiguration(request({ adapterId: "mocha" })), TestDebugError);
   // A registered adapter that is not installed (empty availability) also refuses to build.
   assert.throws(
     () => buildTestDebugConfiguration(request({ adapterId: "jest" }), new Set<string>()),

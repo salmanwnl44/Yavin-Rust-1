@@ -58,6 +58,31 @@ export const DEBUG_ADAPTERS: readonly DebugAdapterDefinition[] = [
     }),
   },
   {
+    // Rust/C/C++ via LLVM's lldb-dap, which speaks DAP over stdio (WS6 Part 3) — no bridge. The
+    // `program` is a compiled executable: for a Cargo test it is the test binary the native side
+    // resolves from `cargo test --no-run` metadata, never a renderer path.
+    id: "lldb",
+    label: "Rust/C++ (lldb-dap)",
+    adapterID: "lldb-dap",
+    install: "install LLVM (lldb-dap) or the CodeLLDB extension",
+    launchArguments: (config, resolved) => ({
+      name: config.name,
+      type: "lldb-dap",
+      request: "launch",
+      program: resolved.program,
+      args: config.args,
+      cwd: resolved.cwd,
+      env: config.env,
+      stopOnEntry: config.stopOnEntry,
+    }),
+    attachArguments: (config, resolved) => ({
+      name: config.name,
+      type: "lldb-dap",
+      request: "attach",
+      cwd: resolved.cwd,
+    }),
+  },
+  {
     id: "debugpy",
     label: "Python (debugpy)",
     adapterID: "debugpy",

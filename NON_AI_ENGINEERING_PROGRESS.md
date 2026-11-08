@@ -7,6 +7,213 @@ Continuous engineering log for Yavin's desktop IDE quality (AI/LLM functionality
 
 ---
 
+## WS7 Part 6 — Monorepo dependency graph integration — ✅ IMPLEMENTED + VERIFIED
+
+**Goal:** order a monorepo's tasks by the package relationships **declared** in its manifests, feeding the **existing** dependency planner (`plan.ts`) — not a second scheduler. A package's build runs after the builds of the local packages it depends on, derived from a pure, validated graph.
+
+**Package graph architecture (`packageGraph.ts`, new — pure projection).** Over the manifests discovery already read, it builds a directed graph whose nodes are discovered packages (node id = the package's **build task id**, the single source of truth now exported from discovery as `discoveredTaskId`) and whose edges are **local, resolved** dependencies only. It builds no scheduler and executes nothing.
+
+**Supported dependency declarations.**
+
+- **JavaScript (npm/pnpm/Yarn):** `dependencies`, `devDependencies`, `optionalDependencies`, `peerDependencies`. A dependency is **local** when its **name** matches another discovered workspace package **in the same root** — exactly how a workspace resolves it (a `workspace:*`/`workspace:^` protocol or a `file:` ref is one such entry; the spec string is irrelevant, only the name matters). Scoped names (`@acme/ui`) are handled. **Never inferred from directory names.**
+- **Cargo:** `dependencies`, `dev-dependencies`, `build-dependencies`, and `target.*.dependencies` — in inline-table (`core = { path = "../core" }`), bare sub-table (`[dependencies.core]` / `path = …`), and dotted-key forms. A dependency is **local** when it is a **path dependency** resolving (relative to the package dir) to a discovered member's directory, or a `workspace = true` entry whose `[workspace.dependencies]` declaration (relative to the workspace root) carries such a path. A version-only (registry) dependency is **external** and never becomes a node or edge.
+
+**Isolation & robustness.** Packages are **isolated per workspace root** (indices are keyed by root), so a name or path never links packages under different roots. **Ambiguous** (duplicate) package names within one root are not guessed (no edge); **missing** dependencies are dropped; **invalid manifests** parse to nothing; **external** deps are excluded; **cycles** are detected and **broken deterministically** (the back-edge that would close a cycle is dropped and recorded) so a pathological manifest never makes a build un-runnable.
+
+**Task dependency policy (small, deterministic, documented).** `packageTaskDependsOn` applies exactly one rule: **a package's `build` task depends on the `build` tasks of its local dependencies.** Nothing else is wired automatically — test/lint/run stay independent unless the user configures `dependsOn`. Only edges between build tasks that **actually exist** in the discovered task list are kept, and edges are de-duplicated. `applyPackageDependencies` merges these onto the discovered build tasks' `dependsOn`; **explicit `dependsOn` is preserved** and, since a configured task overrides a discovered one in the TaskService, **user configuration stays authoritative**. The augmentation runs inside `discoverWorkspaceTasks`, so it flows through the existing live rediscovery unchanged.
+
+**Execution semantics — reuse of the existing planner.** The edges are ordinary `dependsOn`, so the existing `planTask` provides everything: **dependencies build before dependents**, a **shared dependency is planned once** (verified: `app → {x, y} → shared` plans `shared` exactly once, first), an **unknown edge is refused** (so only real build ids are injected), and a **cycle is refused** (so the graph is pre-broken). Failure-blocks-dependents, cancellation propagation, concurrent independent packages, terminal ownership and running-task snapshot preservation are the existing, already-tested TaskService behaviours — unchanged, because this adds edges, not a new execution path.
+
+**Cycle behaviour.** The package graph may contain a cycle (valid Cargo never does; npm can). The projection **breaks** it deterministically (sorted DFS, drop the back-edge, record the broken cycle) rather than emitting a cyclic `dependsOn` the planner would reject — so builds remain runnable, and the cycle is surfaced for logging/UI.
+
+**Live graph refresh.** Reuses the existing discovery watcher only: a change to a `package.json`, `Cargo.toml` or a workspace manifest re-runs `discoverWorkspaceTasks`, which re-derives the graph and the edges, preserving stale-result protection and workspace isolation — **no new watcher or polling loop** (verified: adding a `workspace:*` dependency to a package's `package.json` makes its build depend on the dependency's build after one debounced re-discovery).
+
+**UI integration.** The hierarchical Tasks view (WS7 Part 5) now shows a task leaf's dependency ordering inline — `↳ after <labels>` (resolved from the dependency task ids), with a `Builds after: …` tooltip — for both package-derived and configured dependencies. Blocked/failed dependency runs are already shown by the Executions section (the dependency run chain and its error). The tree stays simple; no separate execution interface.
+
+**Verification — all green (parser/graph fixtures are pure; execution is the existing planner):**
+
+- **`node --test` package graph (`packageGraph.test.ts`, new) → 15 passed:** the JS and Cargo manifest parsers (four JS sections; Cargo path/inline/sub-table/target/workspace-inheritance; version-only excluded); npm-by-name and Cargo-by-path resolution; **externals excluded** (no invented nodes); **cross-root isolation**; **ambiguous/missing** handling; the **build→build policy** feeding `planTask` (correct order); **build-only** wiring (test/lint untouched); edge to a build-less package dropped; **explicit override merged**; **cycle broken** (planner never throws); **shared dependency once**.
+- **`node --test` all task suites → 103 passed, 0 failed** (graph + discovery + monorepo + projection + live rediscovery + service).
+- **`node --test` live rediscovery → 11 passed** (adds the live dependency-edge refresh).
+- **Broad frontend regression (`src/**/*.test.ts`) → 1,296 (1,294 passed, 0 failed, 2 pre-existing skips).** `tsc --noEmit` exit 0; `prettier --check` clean.
+- **Playwright → existing Run/task tests (6) + WS7.5 (3) + new WS7.6** (a leaf shows "after <dep>"; an independent task shows none) all green.
+- **No Rust changed** (a frontend-only graph + planner edges), so native suites/clippy are unaffected.
+
+**Changed files:** new `src/services/tasks/packageGraph.ts` (+ `packageGraph.test.ts`); `discovery.ts` (`root` on `TaskSource`, exported `discoveredTaskId`, augmentation in `discoverWorkspaceTasks`); `taskTree.ts` (`dependsOn` on task leaves + in the signature); `RunPanel.tsx` (the `after …` line); `taskDiscovery.test.ts` (+ live-edge test); `tests/ui/terminal.spec.ts` (+1 test). No change to `model`/`plan`/`service` logic, native code, protected files, or C1/C2; task identity and ResourceUri preserved; nothing executed during discovery; workspace trust untouched.
+
+**Known limitations:** resolution is **structural** (declared names/paths), not a package-manager resolution — it does not read lockfiles, follow npm alias (`"x": "npm:y@1"`) targets, evaluate pnpm `catalog:` entries, or expand Cargo `cfg(...)` target predicates (every `target.*` dependency is considered regardless of platform); `default-members` is not distinguished; the policy is build→build only (test-after-dependency-build is deliberately not auto-wired); a multi-line Cargo inline table is not parsed (TOML keeps inline tables single-line, so this is only a concern for hand-wrapped manifests).
+
+**Next genuinely missing IDE capability (assessed).** The build/test/debug/task stack is now substantial. The clearest remaining gap for a local-first IDE is a **Source Control (SCM) decorations + diff-review loop beyond the existing Git panel** — e.g. inline per-line blame, a staged-hunk review view, or a multi-file review surface — or, alternatively, **a Search-and-Replace-across-files** workflow if not already present. Either is a real, separable capability; neither rebuilds the planner. (Left for a future workstream; not started here.)
+
+---
+
+## WS7 Part 5 — Hierarchical Tasks view & package filtering — ✅ IMPLEMENTED + VERIFIED
+
+**Goal:** make discovered and configured tasks easy to navigate, filter, run and monitor across single-root, multi-root and monorepo projects — as a **projection over the existing task model**, with **no new task service, watcher or process manager**, and preserving every stable task id and the existing execution path.
+
+**Hierarchy design — a pure projection (`taskTree.ts`, new).** `buildTaskTree(tasks, folders)` projects the flat `ResolvedTask[]` the TaskService already owns into **Workspace → Package → Group → Task**. It creates **no** task records and **no** execution state: a task leaf carries the task's own `id` (`node.taskId`), so running/stopping/selection all go through the existing service by that id, and identity survives a re-projection. Node ids are **stable and structural** (`ws\0<i>`, `pkg\0<i>\0<relPath>`, `grp\0<i>\0<relPath>\0<group>`, and the task's own id for leaves — never positional), so expansion and selection survive discovery and lifecycle changes. The **workspace level** appears only in a multi-root workspace; the **package level** is omitted for a plain single-package root (a flat project is not wrapped in a redundant node), and is emitted per sub-package for a monorepo. Package membership is derived from each task's `cwd` relative to the workspace folders (longest-prefix match; a `null` cwd is the primary root; a relative cwd is a sub-path) — structural, not fragile id-parsing. Everything is sorted deterministically (root package first, then by path; groups in canonical order; tasks by label then id).
+
+**Grouping — explicit metadata first.** `presentationGroup(task)` reads **`task.group` (`build`/`test`) first and never lets a name override it**, then problem-matcher metadata (`eslint`/`ruff` → Lint, `tsc` → Typecheck), and only when neither decides falls back to a conservative, convention-based reading of the command/name (clippy/lint → Lint, tsc/typecheck → Typecheck, run/start/serve/dev → Run). Anything unrecognised is **Other**. The six groups — Build, Test, Lint, Typecheck, Run, Other — render in that fixed order.
+
+**Filtering & search — composable (`filterTasks`).** Workspace, package, group and source (`configured` = user/workspace, vs. `discovered`) filters plus a case-insensitive text search over label/id/command, all AND-composed, applied to the task list **before** the tree is built, so the hierarchy only ever shows matching tasks. `filterOptions(tasks, folders)` enumerates exactly the workspaces/packages/groups/sources present, to populate the toolbar's dropdowns (each shown only when it would offer a choice). **Selection/focus is preserved** when its task remains and **cleared safely** when it disappears; the tree is memoised on a `tasksSignature` (task **identity**, not run state) so a running task's state change (a run tick) **never rebuilds the tree** and filtering **never interrupts a running task**.
+
+**Execution integration — reuse only.** The Run panel (`RunPanel.tsx`) keeps the existing TaskService commands — `onRun`/`onRerun`/`onStop`/`onShowTerminal` go through the service by task id (`onRerun` → `service.restart`). A task leaf shows its latest run's **state, duration and exit code** inline and a **Rerun** when finished; the **Executions** section (running first, with Stop and Show-terminal, multiple independent runs) is unchanged, so no new process ownership or execution state is introduced. The snapshot now also carries the workspace `folders` (so the view can locate packages) — additive, no behavioural change.
+
+**Live updates & performance.** The panel binds to the existing `TaskService` snapshot subscription (no polling, no second watcher); package/task addition/removal, configuration changes, workspace changes and run-state changes all arrive through it, and discovery changes flow in from WS7 Part 3/4's live rediscovery. Memoised projections + stable references keep it cheap: **filter + build + flatten measured at 100 → 0.2 ms, 1,000 → 3.6 ms, 5,000 → 6.2 ms** (6,000 rows) — well within budget; rows are pre-flattened so a virtualized window can wrap them later exactly as the file Explorer and Test Explorer do.
+
+**Accessibility.** Disclosure headers are native `<button aria-expanded>` with descriptive labels (`"Build tasks"`, `Package <path>`, `Workspace <name>`); task leaves keep `role="group"` with their label and a `Run <label>` button (the established command contract). Keyboard: Up/Down move focus across visible rows, Right/Left expand/collapse a header, Enter/Space runs a focused task; focus is preserved on its row across updates. Running and failure status are announced through the per-run state text and the unchanged Executions section. A search box (`role="searchbox"`) and a useful empty state ("No tasks match these filters" with a Clear action) complete it.
+
+**Verification — all green:**
+
+- **`node --test` projection (`taskTree.test.ts`, new) → 12 passed:** grouping (explicit metadata wins, conventions fill the gap), single-root/monorepo/multi-root shape, duplicate display names stay distinct, **stable node ids across reordering**, **composable filters**, **search** over label/id/command, `filterOptions`, flatten + collapse/expand, the identity signature, and the **100/1,000/5,000-task performance** check.
+- **`node --test` all task suites → 87 passed, 0 failed** (projection + service + discovery + monorepo + taskDiscovery).
+- **Broad frontend regression (`src/**/*.test.ts`) → 1,280 (1,278 passed, 0 failed, 2 pre-existing skips).** `tsc --noEmit` exit 0; `prettier --check` clean.
+- **Playwright → existing Run/task tests still green (8) + 3 new WS7.5 tests** (grouping + search narrowing; group collapse/expand with `aria-expanded`; keyboard Enter-to-run), and a **full `terminal.spec.ts` + `menus.spec.ts` sweep** (178 tests) to catch collateral: all green after one pre-existing fix and one flake (below).
+- **No Rust changed** (a frontend-only projection + panel), so the native suites/clippy are unaffected.
+
+> **WS5 follow-up found by this verification (not a WS7.5 regression):** the full sweep surfaced `terminal.spec.ts "arrow keys move between panel views"` failing because WS5 added a `TEST RESULTS` panel view (`src/services/panel/views.ts`, committed) **after** `PORTS`, so `PORTS` is no longer the last view and the test's wrap assertion was stale. My WS7.5 changes don't touch panel views; the test was corrected to step to the real last view (`TEST RESULTS`) and wrap to `PROBLEMS` — green 3/3. The other sweep failure (`a crashed extension host is reported…`) passed in isolation — a known flake under the heavy single-worker batch, not a regression.
+
+**Changed files:** new `src/services/tasks/taskTree.ts` (+ `taskTree.test.ts`); rewrote `src/components/layout/RunPanel.tsx` (hierarchy, filters, search, keyboard, inline run status; Executions section preserved); `src/services/tasks/service.ts` (`folders` on `TaskSnapshot`); `src/App.tsx` (`onRerun` → `service.restart`); `tests/ui/terminal.spec.ts` (+3 tests). No change to `model`/`discovery`/`taskDiscovery`/`monorepo`, native code, protected files, or C1/C2; ResourceUri and task identity preserved.
+
+**Known limitations:** rows are pre-flattened but not yet windowed, so a 5,000-task tree renders all expanded rows (the projection is cheap; DOM virtualization is the next step if needed); package labels use the workspace-relative path (stable) rather than a declared package name; the keyboard model is a disclosure-with-roving-focus hybrid (task leaves stay `role="group"` for the command contract) rather than a formal ARIA `tree`.
+
+**Dependency-graph-aware ordering — assessed, not built.** Explicit `dependsOn` ordering already works end-to-end (WS7 Part 2's planner: topological order, cycle and shared-dependency detection). What is genuinely _missing_ is **inferred** ordering from a monorepo's own dependency graph (Cargo path-deps, npm workspace deps) — e.g. building a library package before an app that imports it without the user writing `dependsOn`. That is a real, separable capability for a future workstream; it would feed edges into the **existing** planner, not replace it. Not started here, by design.
+
+---
+
+## WS7 Part 4 — Monorepo & sub-package task discovery — ✅ IMPLEMENTED + VERIFIED
+
+**Goal:** discover tasks for every sub-package of a monorepo — npm/yarn `workspaces`, a `pnpm-workspace.yaml`, or a Cargo `[workspace]` — extending the existing discovery and live-rediscovery architecture. **No new task system, watcher or process manager**; nothing is executed during discovery.
+
+**Declaration parsers (pure, `discovery.ts`).** Three readers parse **declarations only**, never executing a config:
+
+- `parseNpmWorkspaceGlobs` — package.json `workspaces`, either an array of globs or Yarn's `{ packages: [...] }` object; a leading `!` is an exclude; `null` when there is no field (not a monorepo), `{include:[],exclude:[]}` when present-but-empty.
+- `parsePnpmWorkspaceGlobs` — a minimal reader for just the `packages:` key of `pnpm-workspace.yaml` (block sequence or inline `[a, b]` flow list; quotes, comments and a following top-level key handled). Not a full YAML parser.
+- `parseCargoWorkspaceGlobs` — the `[workspace]` table's `members`/`exclude` string arrays (multi-line arrays supported); `[workspace.metadata]` and other sub-tables are correctly **not** treated as the workspace table.
+
+**Bounded glob expansion (injected lister).** A declared glob (`packages/*`, `apps/*/pkg`, `crates/*`, a literal `tools/cli`, or `**`) is expanded against the **real tree** via an injected `DirLister` (backed in the app by the native, workspace-confined `list_workspace_files`, `maxDepth:1` per level). Wildcard matching never crosses a path separator; `node_modules`, `target`, `.git` and dot-directories are **never traversed**; depth and total-directory **budgets** (`MAX_WALK_DEPTH`, `MAX_MEMBER_DIRS`) cap a pathological or symlink-cyclic tree. Excludes (and Cargo `exclude`) subtract from the member set; the root itself and any member that coincides with a declared root folder are removed, so nothing is discovered twice.
+
+**Per-package discovery & package-aware execution.** Each member directory is discovered exactly as a root is (the same `readConventionFiles` → npm/Cargo/Makefile parsers), so a member that is both an npm package and a crate gets both. Identity is **path-qualified and stable**: a member's id key is its workspace-relative path with separators folded to `.` (`npm:packages.web:build`, `cargo:crates.core:build`), prefixed by the root key in a multi-root workspace (`npm:front.packages.ui:build`) — so two packages that both have a `build` script, even two both named `ui`, **never collide**. Each task runs with **cwd = its own package directory**, so the right package's scripts/crate build — **without interpolating the package's (untrusted) name into any command** (the command stays `npm run build` / `cargo build`). A member with no package-manager signal of its own **inherits** the workspace root's manager (a `pnpm-workspace.yaml` ⇒ pnpm; otherwise the root's own field/lockfile/default), while a member that pins its own `packageManager` overrides it.
+
+**Live rediscovery (extends `taskDiscovery.ts`, no new watcher).** `createTaskDiscovery` now takes the same `DirLister` and passes it through, so re-runs re-expand the monorepo. A sub-package manifest created/edited/deleted anywhere under a watched root already matches `isDiscoveryFile` by basename, so **adding, editing or removing a package re-discovers live** through the existing watch; `pnpm-workspace.yaml` was added to `DISCOVERY_FILES` so a change to the member list itself triggers a re-run.
+
+**UI (existing surfaces, no new panel).** Sub-package tasks flow through the existing Run Task picker and Tasks panel. Their **label** now shows the package's **declared name** (or relative path) and the **package manager** (`npm: @acme/web/build`, `pnpm: ui/build`, `cargo: core/build`); the **source** (`(discovered)`) and **command** remain in the picker detail. No picker-detail format change (so the existing Playwright assertions stand), no new panel.
+
+**Security/ownership (unchanged):** discovery still only **reads** fixed, known files and **lists** directories through the native workspace-confined APIs — it never executes a project config, never follows into `node_modules`/`target`/`.git`, and constructs commands structurally (no untrusted package name in any shell line). Execution still goes through the TaskService with workspace trust; no second watcher, process manager or session registry; C1/C2 and protected files untouched.
+
+**Verification — all green:**
+
+- **`node --test` monorepo (`monorepo.test.ts`, new) → 13 passed:** the three declaration parsers (array/object/negation/absence; block/flow/comments; members/exclude/multi-line/sub-table); npm sub-packages become non-colliding path-qualified tasks with per-package cwd and no name interpolation; **pnpm/yarn inheritance** and a **member pinning its own manager**; a **Cargo workspace** with an excluded crate; **nested + literal members** with `target`/`.git` never traversed; **multi-root** key prefixing keeps two `ui` packages distinct; a member equal to a declared root is not added twice; **no lister ⇒ root-only** (back-compat); bounded expansion tolerant of files/ignored dirs in a listing.
+- **`node --test` live rediscovery (`taskDiscovery.test.ts`) → 10 passed** (adds: a monorepo's sub-packages are discovered, and **adding a package re-discovers it live** via the existing watch + injected timers/lister).
+- **All task suites → 75 passed, 0 failed** (`discovery` + `monorepo` + `taskDiscovery` + `tasks`). **Broad frontend regression (`src/**/*.test.ts`) → 1268 (1266 passed, 0 failed, 2 skip).** `tsc --noEmit` exit 0; `prettier --check` clean. **Playwright task/Run tests → 6 passed.** **No Rust changed** (reuses the existing native watch, `read_file_content` and `list_workspace_files`), so the native suites/clippy are unaffected.
+
+**Real vs. simulated:** expansion and live re-discovery are verified with a **fake `DirLister` + fake `onResourceChanges` events + injected timers** (deterministic); the native directory listing and real filesystem watch drive the same path in the app.
+
+**Files changed:** new `src/services/tasks/monorepo.test.ts`; edited `src/services/tasks/discovery.ts` (workspace-declaration parsers, bounded glob expansion, member discovery, inherited manager, `relPath`/`packageName`/`inheritedManager` on `TaskSource`, `labelPrefix`, `pnpm-workspace.yaml` in `DISCOVERY_FILES`, `loadTaskSources`/`discoverWorkspaceTasks` take an optional `DirLister`), `taskDiscovery.ts` (+`.test.ts`) (thread the lister through), `src/services/workspaces.ts` (native `list_workspace_files`-backed lister wired into `createTaskDiscovery`). No change to `model`/`service`/`plan`/`matching`, native code, protected files, or C1/C2.
+
+**Known limitations:** expansion resolves directory globs structurally (it does not read a member's `package.json` to confirm npm-workspace membership the way npm does, and does not evaluate pnpm `catalog:`/Cargo path-dependency graphs); `default-members` is not distinguished from `members`; inter-package dependency ordering remains **explicit-only** (a configured `dependsOn` across package ids works, but relationships are never inferred). **Next capability:** a richer Tasks view (grouping sub-packages, per-package filtering) or Cargo/npm dependency-graph-aware ordering — building on this, not an audit.
+
+---
+
+## WS7 Part 3 — Live task rediscovery + package-manager detection — ✅ IMPLEMENTED + VERIFIED
+
+**Goal:** keep discovered tasks current as project files change, and run npm scripts with the project's real package manager — reusing the existing filesystem watch (no second watcher) and the existing TaskService.
+
+**Live rediscovery (`taskDiscovery.ts`, new) — reuse, not a new watcher.** `createTaskDiscovery` subscribes to the **existing** `onResourceChanges` (the native `resource-changes` watch the Explorer and Git already use) and re-runs discovery when a discovery file changes. It owns no watcher and no polling loop — just a subscription, a debounce timer, and the discovery read. Correctness:
+
+- **Workspace isolation:** a batch is acted on only when its watched `root` is one of this coordinator's folders (`samePathString`), so one workspace's changes never touch another's tasks.
+- **Relevance filter:** only `package.json`, `Cargo.toml`, a Makefile (`GNUmakefile`/`makefile`/`Makefile`), or a lockfile — matched by basename (`isDiscoveryFile`), including a rename's old/new name — schedules a re-discovery; an unrelated file does not. A `rescan` (lost OS events) re-discovers to be safe.
+- **Debounced:** a burst (an editor save writes several times) collapses to one re-discovery.
+- **Stale-result protected:** each run takes a token; a slower run that finishes after a newer one started is dropped, so the newest file state always wins.
+- **Read-failure safe:** a transient read error publishes nothing — the last valid list stands.
+- Wired in `workspaces.ts`: the coordinator replaces the WS7 one-shot read, pushes new lists into the TaskService via `refresh()`, and is **disposed with the workspace** (no leaked subscription). Creation/deletion/rename of a manifest, and workspace switching, all flow through it.
+
+**Package-manager detection (`discovery.ts`).** npm scripts now run with the project's manager — `npm run` / `pnpm run` / `yarn run` — chosen from the project's **files**, never from whichever executable happens to be installed. Deterministic precedence: (1) the `packageManager` field in package.json (Corepack's declaration), (2) a single lockfile (`pnpm-lock.yaml`→pnpm, `yarn.lock`→yarn, `package-lock.json`→npm), (3) no signal → the baseline `npm` (which runs any project's scripts), (4) **conflicting lockfiles with no field → `ambiguous`:** Yavin does not guess pnpm vs yarn — it falls back to the universal `npm` and reports the state rather than inventing a command. An unknown `packageManager` value (e.g. `bun@…`) is ignored, falling through to lockfiles. **Task ids stay `npm:<name>` regardless of the manager** (identity is stable across a lockfile change); only the command and the label (`pnpm: build`) change. `loadTaskSources` reads the lockfiles (presence only — contents are never parsed) and the three Makefile names (make's own precedence: GNUmakefile → makefile → Makefile).
+
+**UI (existing surfaces, no new panel):** the Run Task picker shows the **source** (`(discovered)`), the **package manager** (in the command, `pnpm run build`, and the label), and the **workspace** (multi-root labels are folder-qualified, `pnpm: web/build`). A refresh updates `taskSnapshot.tasks` in the background; the picker reads the list when opened, so it is never force-closed or reset.
+
+**Security/ownership (unchanged):** discovery only reads fixed, known files (never executed, never a renderer-named path); commands are structurally constructed (`<pm> run <name>`, the script name validated); execution still goes through the TaskService with workspace trust before every run; the coordinator uses the existing watch and the existing process authorization — no second watcher, process manager or session registry.
+
+**Running tasks are never disrupted:** a running execution captured its validated config at start, so a re-discovery that changes or removes its definition does not restart or redefine it — verified.
+
+**Verification — all green:**
+
+- **`node --test` discovery → 24 passed** (the 17 from Parts 1–2 plus package-manager precedence, single-lockfile, ambiguous-fallback, unknown-field fall-through, stable-ids-across-managers, `isDiscoveryFile`, Makefile-variant precedence).
+- **`node --test` live rediscovery (`taskDiscovery.test.ts`) → 9 passed** (initial + change re-discovery, **debounce** of a burst, **stale-result** protection, **workspace isolation**, unrelated-file ignored + rescan, deletion/rename + removed-source tasks gone, **read-failure keeps the last list**, **dispose unsubscribes**, **multi-root**). All use **fake filesystem events and injected timers** — deterministic, not a real watch.
+- **`node --test` tasks service → 28 passed** (adds: a **running discovered task keeps its original config** across a refresh; a removed discovered task cannot be run while a configured one survives).
+- **All task suites → 97 (96 passed, 1 pre-existing skip).** `tsc --noEmit` exit 0; `prettier --check` clean; **no Rust changed** (reuses the existing native watch + `read_file_content`), so the native suites/clippy are unaffected. Broad frontend regression (tasks+testing+debug+panel) → 239 (238 passed, 1 skip); Playwright task/Run tests → 10 passed.
+
+**Real vs. simulated:** the watch integration is verified with **fake `onResourceChanges` events + injected timers** (deterministic); a real filesystem watch drives the same path in the app. Task execution remains verified through the FakeNative harness, as before.
+
+**Files changed:** new `src/services/tasks/taskDiscovery.ts` (+ `.test.ts`); edited `src/services/tasks/discovery.ts` (package-manager detection, lockfile/Makefile-variant reads, `isDiscoveryFile`/`DISCOVERY_FILES`) + `discovery.test.ts`, `tasks/tasks.test.ts`, `src/services/workspaces.ts` (coordinator wiring + disposal). No change to `model`/`service`/`plan`/`matching`, native code, protected files, or C1/C2.
+
+**Known limitations:** detection reads lockfiles and the `packageManager` field only (no `.npmrc`/`corepack` version enforcement); a `pnpm-workspace.yaml`/npm-workspaces monorepo is discovered per folder, not as sub-packages; a renamed-away manifest whose new name is unknown still triggers a (correct, cheap) re-read. **Next capability:** monorepo workspace/sub-package discovery, or a richer Tasks view — building on this, not an audit.
+
+---
+
+## WS7 Part 2 — Task discovery integration & execution verification — ✅ HARDENED + VERIFIED
+
+**Goal:** prove discovered tasks integrate correctly with the existing configuration, execution, dependency, terminal, diagnostics and trust systems — and harden the parsers against the edge cases — without rebuilding anything.
+
+**Hardening — the Makefile parser.** The WS7 regex `^name\s*:(?![=])` had a real defect: on a GNU `::=` assignment the lookahead **backtracks** (matches one colon, sees the second colon, not `=`, and wrongly treats the line as a target). Rewritten to capture the **whole colon run** and check what follows (`^(name)[\t ]*(:+)(.*)$`, reject when the rest starts with `=`), which rejects every colon assignment (`:=`, `::=`) robustly while keeping **double-colon rules** (`clean::`) as real targets. Pattern rules (`%.o:`), `.directives` (`.PHONY:`), recipe lines (tab-indented) and comments (`#…`) are all rejected by the `^[A-Za-z0-9_]` anchor.
+
+**Hardening — Cargo manifest detection (found by a Playwright regression).** WS7 offered Cargo tasks on a `Cargo.toml`'s mere presence, relying on the native `read_file_content` to reject a missing file. A Playwright run surfaced the fragility: its mock returns placeholder text for **every** read, so discovery saw a phantom `Cargo.toml` and offered `cargo:build`, which broke the "no build task" test. Fixed robustly — a Cargo manifest must declare `[package]` or `[workspace]` (every real one does; unrelated/garbage content does not), so discovery no longer treats a stray file (or a mock read) as a Rust project. A manifest with those sections but errors elsewhere still offers the tasks (they surface the real error when run).
+
+**Verification added (all green):**
+
+- **Discovery (`discovery.test.ts`) → 16 tests, 16 passed:** the 8 from WS7 plus **Makefile edge cases** (`:=`/`::=`/`?=`/`+=`/`!=` assignments are not targets; double-colon rules are; pattern/special targets and comments handled; empty/targetless → nothing), **stable ids across repeated runs** (deterministic order: npm → cargo → make, file order preserved), **same name from different sources does not collide** (`npm:build` / `cargo:build` / `make:build` coexist), **an invalid-but-present Cargo.toml still offers the fixed subcommands** (presence-based, never parsed or run), and **duplicate script keys** (JSON last-wins).
+- **Service integration (`tasks.test.ts`) → 78 tests, 77 passed, 1 pre-existing skip:** a **configured task may depend on discovered task ids and the planner orders them** (`ci → [cargo:test, npm:build]` plans `cargo:test, npm:build, ci`) — dependencies participate only when **explicitly configured**, never inferred from names; a **cycle through discovered tasks is detected before anything runs**; a **discovered Cargo task's output reaches the existing Cargo matcher and Problems** with the correct task origin (`task:cargo:check`) and **canonical ResourceUri path** (`C:/work/src/main.rs`); a **discovered task can be cancelled and restarted** through the existing service. (These run through the deterministic FakeNative harness — the same path configured tasks use; execution is **simulated**, not a real subprocess.)
+
+**Integration confirmed (ownership unchanged):**
+
+- **Identity/precedence:** discovered ids are stable and source-qualified; a configured/workspace task of the same id **overrides** a discovered one (one display entry, the configured one wins, scope distinguishes them) — never a silent overwrite.
+- **Execution:** discovered tasks run through the existing TaskService (trust before every execution, shell/args via `shell.ts`, terminal-owned processes, exit codes, cancel, restart). Commands stay native-owned and structurally constructed; no renderer-controlled execution added.
+- **Dependencies:** only explicitly-configured `dependsOn` — discovered tasks have none of their own and nothing is inferred from names.
+- **Problem matchers:** discovered Cargo tasks carry the existing `cargo` matcher; npm tasks get a matcher only when the command clearly runs a known tool (`tsc`/`eslint`); Makefile tasks get none (correct — nothing to infer). No arbitrary path is taken from untrusted output; the existing matchers resolve to canonical `ResourceId`s.
+- **UI:** discovered tasks appear in the existing **Run Task… picker / Run panel** (in `taskSnapshot.tasks`), labelled by source (`(discovered)` / `(workspace)`); no new task panel.
+
+**Verify (exact):** `node --test discovery.test.ts` → **16 passed**; `node --test tasks/*.test.ts` → **78 (77 passed, 1 skip)**; broad frontend regression (tasks + testing + debug + panel) → **220 (219 passed, 1 skip)**; `tsc --noEmit` exit 0; `prettier --check` clean; **no Rust changed** (native suites/clippy unaffected); Playwright: all 10 task/Run tests pass (incl. the previously-failing "Run menu" one after the Cargo-manifest fix).
+
+**Real vs. simulated:** task execution is verified through the **deterministic FakeNative harness** (the identical TaskService path for configured and discovered tasks), not a real subprocess — the honest status, since a node unit test cannot spawn a real PTY. A real npm/Cargo/make run happens through the app's native terminal, which the harness faithfully simulates.
+
+**Files changed:** `src/services/tasks/discovery.ts` (Makefile parser hardening) + `discovery.test.ts` and `tasks.test.ts` (coverage). No change to `model.ts`/`service.ts`/`plan.ts`/`matching.ts`, native code, protected files, or C1/C2.
+
+**Known limitations (unchanged):** npm-only (no yarn/pnpm lockfile detection); no Python discovery; discovery runs once on open (no file-watch re-discovery); Makefile `include`/recursive make not expanded; space-separated multi-target rules (`a b:`) take the first token. **Next capability:** file-watch re-discovery (tasks update when a package.json/Makefile changes), or package-manager detection — building on this, not an audit.
+
+---
+
+## WS7 — Integrated Build & Task System: task discovery — ✅ IMPLEMENTED + VERIFIED
+
+**Goal:** a unified Build & Task System. **Inspection first found most of it already built** — `src/services/tasks/` has the typed `TaskDefinition`/`ResolvedTask` model + validation, user/workspace **persistence** (`tasks.definitions` settings), **dependency planning** (`plan.ts`: DFS order, cycle detection, shared-dependency-once, failure refusal before anything runs), the full **lifecycle** service (run/restart/cancel, states, exit codes, output, cancellation, stale-generation protection, one-execution-per-task, dedicated/new terminals), **problem-matcher** integration (`matching.ts` → the one Problems store), and workspace-trust gating. The single genuinely-missing capability was **automatic task discovery** from project conventions — the task list came only from settings. WS7 adds that and wires it through the existing machinery, **duplicating nothing** (no new process/terminal/diagnostics/lifecycle).
+
+**Task discovery (`src/services/tasks/discovery.ts`, new).** Pure parsers that read project files and **never execute anything**:
+
+- **npm scripts** — `package.json` parsed as JSON; each `scripts` entry → `npm run <name>` (id `npm:<name>`), group inferred (`build`→build, `*test*`→test), a problem matcher inferred only when the command clearly runs a known tool (`tsc`/`eslint`/`cargo`/`ruff` as a whole word).
+- **Cargo** — a `Cargo.toml`'s _presence_ offers the fixed safe subcommands `build`/`test`/`check`/`clippy`/`run` (ids `cargo:<cmd>`, matcher `cargo`); `cargo metadata` is **not** run during discovery.
+- **Makefile** — targets read from the text (a `name:` at column 0 that is not a variable, a pattern rule, or a `.directive`); id `make:<target>`.
+- Discovered tasks are ordinary `ResolvedTask`s with **`scope: "discovered"`**; ids are stable and deterministic (`<source>:<name>`), **folder-qualified for multi-root** workspaces (`npm:web:build`, with the folder as cwd). A discovered task's `args` are always empty (the command carries everything), so nothing is interpolated.
+- `loadTaskSources` / `discoverWorkspaceTasks` read only the fixed convention files (`package.json`, `Cargo.toml`, `Makefile`) through an injected reader — never a renderer-named path, never executed.
+
+**Integration (reuse, not duplication).**
+
+- **Model (`model.ts`):** `scope` gains `"discovered"`; the task-id grammar allows `:` so a configured task can share a discovered id and **override** it.
+- **Service (`service.ts`):** a new optional `discovered()` provider is merged **below** the configured tasks (user/workspace of the same id wins), and `refresh()` republishes when discovery updates. Everything else — planning, trust, terminals, matchers, records — is unchanged; discovered tasks run through the exact same path.
+- **Wiring (`workspaces.ts`):** on opening a trusted folder, discovery reads the convention files via the existing `read_file_content` native command (confined to the workspace), populates the list, and calls `tasks.refresh()`. One read on open; no execution.
+- **UI (reused, no redundant surface):** discovered tasks appear in the existing **Run Task…** picker and Run panel automatically (they are in `taskSnapshot.tasks`); the picker now labels a task's source (`(workspace)` / `(discovered)`).
+
+**Security / ownership:** discovery only **reads** fixed, known files — it never executes a build tool or config script to discover tasks, and the renderer never names the files. A discovered task is still just a command line run through the existing TaskService, which enforces **workspace trust before every execution**, resolves shells/args through `shell.ts`, and owns no processes itself (the terminal does). Diagnostics stay owned by the Problems store; the task system owns task identity and lifecycle only.
+
+**Verification — all green:**
+
+- **`node --test` tasks suites → 66 tests (65 passed, 1 pre-existing skip, 0 failed):** `discovery.test.ts` (8 — npm/Cargo/Makefile parsing, invalid/empty config, multi-root ids+cwd, dedup/order, control-char rejection, the loader reading only convention files) + `tasks.test.ts` (new: discovered tasks in the snapshot, **configured overrides discovered by id**, a discovered task runs through the service, `refresh` picks up discovery changes) + the existing `tasks.test.ts`/`tasks.regression.test.ts` unchanged-green (the `:` id-grammar change broke nothing).
+- **Broad frontend regression (tasks + testing + debug + panel) → 208 tests, 207 passed, 1 skipped, 0 failed.** `tsc --noEmit` exit 0; `prettier --check` clean. **No Rust changed** (discovery reuses the existing `read_file_content` command), so the native suites/clippy are unaffected. Playwright panel → 1 passed.
+
+**Files changed:** new `src/services/tasks/discovery.ts` (+ `.test.ts`). Edited `src/services/tasks/{model,service}.ts` (+ `tasks.test.ts`), `src/services/workspaces.ts` (discovery wiring), `src/App.tsx` (picker source label). No change to `plan.ts`/`matching.ts`/`shell.ts`, the process/terminal/diagnostics infra, native code, protected files, or C1/C2.
+
+**Known limitations / follow-ups:** (1) npm scripts assume `npm` (yarn/pnpm detection from a lockfile is a follow-up); (2) Python task discovery is not yet implemented (no safe, convention-based source — `pyproject` script tables vary); (3) discovery runs once on open (no file-watch re-discovery yet); (4) a Makefile `include` or recursive make is not expanded. **Next capability:** a richer Tasks view (dependency visualization, inline output/diagnostics) or file-watch re-discovery — building on this, not an audit.
+
+---
+
 ## WS0 — Build environment recovery
 
 **Context:** the post-consolidation (repo-flatten) audit found the Cargo `target/` cache carried absolute paths to the old `Yavin_2.0.0/…` location, breaking the Tauri build script (`os error 3`); `cargo fmt` failed on one line introduced by the flatten's URL path-fix; and 5 markdown files failed Prettier.
@@ -28,6 +235,42 @@ Continuous engineering log for Yavin's desktop IDE quality (AI/LLM functionality
   - `cargo clean` (in `src-tauri/`) — removed the stale `target/` (build artifacts only; `target/` is gitignored, 0 tracked files). Exit 0.
   - `cargo fmt --all` — reformatted `src-tauri/src/registry_trust_tests.rs` (only file changed). `cargo fmt --all --check` → **exit 0** ✅.
 - **Status:** full `cargo build --workspace` rebuild running (verifies the binary builds with a fresh cache). Test suite / clippy / Tauri build to follow.
+
+---
+
+## WS6 Part 3 — Native Rust DAP adapter (lldb-dap) + Cargo test-executable resolution — ✅ IMPLEMENTED + VERIFIED (resolution real; lldb attachment gated on install)
+
+**Goal:** Rust debugging through `lldb-dap` — ordinary executables and individual Cargo tests — reusing the DAP architecture, process authorization, availability gates and the Debug Test contract.
+
+**Environment:** `lldb-dap` is **not installed** (no `lldb-dap`/`lldb-vscode` on PATH), so **real Rust/LLDB attachment cannot be exercised** here — reported, not claimed. But **cargo is installed**, so the milestone's critical piece — native **Cargo test-executable resolution** — is **genuinely verified** against a real build.
+
+**Rust adapter (`lldb`), stdio — no bridge.** Registered in the native allow-list (`dap.rs`: `program: "lldb-dap"`, stdio, no `node_entry`) and the renderer (`adapters.ts`: `adapterID: "lldb-dap"`, launch/attach args), kept in sync (the `include_str!` consistency test covers `lldb`). lldb-dap speaks DAP over **stdio**, so it runs on the shared process host via `ServerProcess::spawn` directly — no TCP bridge. Availability goes through the existing `dap_available_adapters` (resolves `lldb-dap` on PATH); here it is **absent**, so Cargo debugging is gated off with a precise "install LLVM (lldb-dap) or CodeLLDB" reason. The debuggee is named in the launch request, never on the adapter's command line, and never a renderer path.
+
+**Cargo test-executable resolution (`test_runner.rs`) — the critical, verified piece.** `cargo_test_executable(package?)`:
+
+- runs **`cargo test --no-run --message-format=json`** (optionally for one `is_cargo_ident`-validated package) through the existing `capture_classified` (bounded output, deadline, cancel, process-tree kill);
+- **`parse_cargo_test_artifacts`** (a pure, unit-tested function) collects `compiler-artifact` messages with `profile.test == true` and a non-null `executable` — the **test** binaries — across targets and packages; ordinary (non-test) binaries are skipped, duplicate artifacts collapse, `package_name` handles new- and old-style `package_id`s;
+- **a compilation failure returns structured compiler diagnostics and no executable** (kept distinct from test failures — the caller never starts a debugger on a build break);
+- **every resolved executable is confined to the workspace** (`validate_path`); a path outside it is refused. Paths are read from build metadata, never guessed and never taken from the renderer.
+
+**Cargo Debug Test launch (`debugRequest.ts`).** Cargo → `lldb`. `buildCargoDebugConfiguration(request, executable)` builds the lldb-dap launch with `program` = the **native-resolved** test executable (absolute, workspace-confined there) and `args` = `[<test node-id>, "--exact"]` — the selected test's full path as **one opaque argument**, so only that test runs, never the whole suite, never a shell string. `buildTestDebugConfiguration` deliberately **refuses** Cargo (its executable is native-only), so no wrong config can be fabricated. Cargo stays enabled only when lldb-dap is available (the Part 1 gate) — never marked supported merely because the adapter is registered.
+
+**Security (reused):** adapter allow-list; native executable resolution (`lldb-dap`, `cargo`) — no renderer path; workspace trust before launch; path containment on every resolved executable; safe argv (the test filter is one opaque argument); process-tree termination + deadlines via `capture_classified`; no second process manager/session registry.
+
+**Verification — all green (results in the Results log):**
+
+- **Native — `cargo test --lib test_runner:: --test-threads=1` →** new resolution tests: `parse_cargo_artifacts_identifies_test_binaries_across_targets_and_packages`, `…collapses_duplicates_and_skips_artifacts_without_an_executable`, `…reports_a_compile_failure_as_diagnostics_not_a_test`, `…tolerates_noise_and_truncation_and_empty`, `package_name_parses_new_and_old_package_ids`, and **`real_cargo_test_executable_resolution_finds_the_compiled_test_binary`** — a **real** fixture crate built with `cargo test --no-run --message-format=json` (stable; cargo installed), whose compiled test binary is resolved, exists on disk, and is confined to the fixture's `target/`.
+- **Native — `cargo test --lib test_runner:: → 43 passed, 0 failed`** (incl. the real cargo-exe resolution) and **`cargo test --lib dap:: → 9 passed`** (allow-list now includes `lldb`; the TCP bridge + availability tests from Part 2 still pass).
+- **Frontend — `node --test` (testing + debug) → 135 passed, 0 failed** (debugRequest: Cargo → lldb capability + availability gating + the Cargo lldb launch config; the rest unchanged). `tsc --noEmit` exit 0.
+- `cargo fmt --all --check` exit 0; `cargo clippy --lib -p yavin-ide -p ide-workspace --all-features -- -D warnings` **exit 0** (one `collapsible_match` fixed); `prettier --check` clean; **Playwright panel → 2 passed**.
+
+**Real vs. simulated:** **real Cargo test-executable resolution** is verified end-to-end (a genuine build, a real binary on disk, containment checked). **Real LLDB/DAP attachment to a running Rust process is NOT exercised** (lldb-dap not installed, no download) — stated plainly, not claimed. The adapter is stdio-ready and registered; once lldb-dap is installed, availability turns Cargo Debug Test on and the resolved executable is launched through the existing session manager.
+
+**LLDB resolution & provenance (never auto-installed):** `lldb-dap` resolved on PATH (shipped with LLVM; CodeLLDB is an alternative). Reported unavailable with that install guidance when absent; trust gates the launch.
+
+**Files changed:** `src-tauri/src/dap.rs` (`lldb` adapter + allow-list test), `src-tauri/src/test_runner.rs` (`parse_cargo_test_artifacts` + `cargo_test_executable` + tests), `src-tauri/src/lib.rs` (command registration), `src/services/debug/adapters.ts` (`lldb` definition), `src/services/testing/debugRequest.ts` (+test; Cargo→lldb + `buildCargoDebugConfiguration`), `src/services/native.ts` (`cargo_test_executable` type). No change to the DebugService core, breakpoint manager, protected files, or C1/C2.
+
+**Known limitations / next:** (1) **real LLDB attachment unverified** (not installed); (2) the full frontend Cargo-debug flow (native `cargo_test_executable` → `buildCargoDebugConfiguration` → launch) is implemented in pieces and gated off — it is exercised once lldb-dap is installed; (3) a non-default `CARGO_TARGET_DIR` outside the workspace would make executables fail containment (a documented follow-up). **Next independent capability:** real-environment debugger verification (install js-debug / lldb-dap / Python) to turn the gated paths on, or a new IDE capability — not another audit.
 
 ---
 

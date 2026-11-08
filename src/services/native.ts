@@ -355,6 +355,20 @@ interface Commands {
     };
   };
   cancel_test: { args: undefined; result: void };
+  /**
+   * Resolve a workspace's compiled Cargo test executables for debugging (WS6 Part 3): runs
+   * `cargo test --no-run --message-format=json` and parses the build metadata. Every executable is
+   * confined to the workspace; a build failure returns compiler diagnostics and no executable.
+   */
+  cargo_test_executable: {
+    args: { package: string | null };
+    result:
+      | {
+          outcome: "compiled";
+          binaries: { package: string; target: string; kind: string; executable: string }[];
+        }
+      | { outcome: "compileFailed"; diagnostics: string[] };
+  };
   open_workspace: { args: { path: string }; result: string };
   read_session: { args: undefined; result: Session };
   save_workspace_session: { args: { state: WorkspaceSession }; result: void };
