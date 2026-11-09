@@ -55,6 +55,13 @@ const failures: [RegExp, string][] = [
     "Nothing is staged. Stage the changes you want in the commit first.",
   ],
   [
+    // Git refuses to commit (or merge/rebase/cherry-pick/revert, which also write a commit)
+    // until it knows whose name and email to record. The message family is stable across Git
+    // versions: the preamble "*** Please tell me who you are." plus one of the fatals below.
+    /unable to auto-detect email address|empty ident name|no (name|email) was given|(author|committer) identity unknown|Please tell me who you are/i,
+    'Git does not know who to record as the author. Set an identity with `git config user.name "Your Name"` and `git config user.email "you@example.com"` (add `--global` to apply it everywhere), then try again.',
+  ],
+  [
     /gpg failed|failed to write commit object|signing/i,
     "Commit signing failed. Check your signing key configuration, then commit again.",
   ],
@@ -126,6 +133,7 @@ export type GitErrorCategory =
   | "worktree-conflict"
   | "unmerged-branch"
   | "nothing-to-commit"
+  | "identity"
   | "hook"
   | "stale"
   | "unclassified";
@@ -165,6 +173,10 @@ const categories: [RegExp, GitErrorCategory][] = [
   [/used by worktree|already checked out at/i, "worktree-conflict"],
   [/is not fully merged/i, "unmerged-branch"],
   [/nothing to commit|no changes added to commit|Nothing is staged/i, "nothing-to-commit"],
+  [
+    /unable to auto-detect email address|empty ident name|no (name|email) was given|(author|committer) identity unknown|Please tell me who you are/i,
+    "identity",
+  ],
   [/hook .* (failed|declined)|pre-commit|pre-push/i, "hook"],
 ];
 

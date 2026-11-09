@@ -105,6 +105,25 @@ test("starting a new operation while one is already active is explained instead 
   );
 });
 
+test("a commit blocked by missing Git identity is explained with the exact config to set", () => {
+  // Real stderr from `git commit` in a repository with no user.name/user.email configured
+  // and auto-detection disabled.
+  const raw =
+    'Author identity unknown\n\n*** Please tell me who you are.\n\nRun\n\n  git config --global user.email "you@example.com"\n  git config --global user.name "Your Name"\n\nto set your account\'s default identity.\n\nfatal: unable to auto-detect email address (got \'runner@host.(none)\')';
+  const explained = describeGitError(raw);
+  assert.match(explained, /does not know who to record as the author/);
+  assert.match(explained, /git config user\.name/);
+  assert.match(explained, /git config user\.email/);
+  // The raw text is still shown, nothing hidden.
+  assert.match(explained, /Git said:/);
+  assert.equal(categorizeGitError(raw), "identity");
+  // The shorter fatal Git emits when only the name is empty must classify the same way.
+  assert.equal(
+    categorizeGitError("fatal: empty ident name (for <runner@host>) not allowed"),
+    "identity",
+  );
+});
+
 test("categorizeGitError maps real Git failure text to a machine-checkable category", () => {
   const cases: [string, GitErrorCategory][] = [
     ["Cancelled", "cancelled"],
