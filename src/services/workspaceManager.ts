@@ -1,4 +1,4 @@
-import { fileUri, resourceId } from "./resource.ts";
+import { fileUri, fsPath, resourceId, type ResourceId } from "./resource.ts";
 
 /**
  * The owner of workspace lifecycle and scope. A workspace is the folder (or folders) a window
@@ -26,10 +26,47 @@ export const EMPTY_WORKSPACE = "empty:" as WorkspaceId;
 
 export function workspaceIdOf(folders: readonly string[]): WorkspaceId {
   if (!folders.length) return EMPTY_WORKSPACE;
-  return folders
-    .map((folder) => resourceId(fileUri(folder)))
-    .sort()
-    .join("|") as WorkspaceId;
+  // One id per resource, however it is spelled or however many times it is listed: a folder
+  // given twice (`["/a", "/a"]`, or `["C:/Work", "c:/work"]`) is the same workspace as once,
+  // so the duplicate must not change the identity. Sorted, so order never does either. Nested
+  // roots stay distinct resources and are deliberately not collapsed here (the innermost still
+  // owns a shared child -- see `folderFor`).
+  const ids = new Set<string>();
+  for (const folder of folders) ids.add(resourceId(fileUri(folder)));
+  return [...ids].sort().join("|") as WorkspaceId;
+}
+
+/**
+ * A workspace's folders made canonical and free of duplicates: each spelled the one way the
+ * rest of the app compares and stores a path (`fsPath`), the same resource never listed twice
+ * however its spellings differ, and the first spelling of each kept in the order given. Nested
+ * roots are kept as the distinct roots they are. A folder that cannot be made canonical (a
+ * relative path, say -- which a real root never is) is kept as given rather than dropped, so an
+ * unexpected spelling can never stop a window from opening; it simply is not deduplicated.
+ *
+ * Opening goes through here so neither the workspace's identity nor the services built for it
+ * can be thrown off by a duplicate or a stray spelling: a repository is not opened twice, a
+ * watcher not started twice, and the stored folder list compares cleanly against watcher roots.
+ */
+export function normalizeFolders(folders: readonly string[]): string[] {
+  const seen = new Set<ResourceId>();
+  const result: string[] = [];
+  for (const folder of folders) {
+    let canonical: string;
+    let id: ResourceId;
+    try {
+      const uri = fileUri(folder);
+      canonical = fsPath(uri);
+      id = resourceId(uri);
+    } catch {
+      if (!result.includes(folder)) result.push(folder);
+      continue;
+    }
+    if (seen.has(id)) continue;
+    seen.add(id);
+    result.push(canonical);
+  }
+  return result;
 }
 
 /**
@@ -86,7 +123,10 @@ export function createWorkspaceManager<S>(
   /** How long the last switch took: disposing the old workspace, making the new one. */
   let lastSwitch = { closeMs: 0, openMs: 0 };
 
-  const create = (folders: readonly string[]) => {
+  const create = (requested: readonly string[]) => {
+    // Canonical and duplicate-free before anything is built from them, so a repeated or
+    // oddly-spelled root reaches neither the identity nor the services.
+    const folders = normalizeFolders(requested);
     const controller = new AbortController();
     const cleanups: (() => void | Promise<void>)[] = [];
     let state: WorkspaceState = "opening";

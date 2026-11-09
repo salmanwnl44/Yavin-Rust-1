@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { EMPTY_WORKSPACE, createWorkspaceManager, workspaceIdOf } from "./workspaceManager.ts";
+import {
+  EMPTY_WORKSPACE,
+  createWorkspaceManager,
+  normalizeFolders,
+  workspaceIdOf,
+} from "./workspaceManager.ts";
 
 /** A fake service per workspace that records its life, and whose disposal can be held open. */
 function recorder() {
@@ -40,6 +45,38 @@ test("a workspace's identity is its folders, however they are spelled", () => {
   assert.notEqual(workspaceIdOf(["/work/a"]), workspaceIdOf(["/work/A"]));
   assert.equal(workspaceIdOf(["/b", "/a"]), workspaceIdOf(["/a", "/b"]));
   assert.notEqual(workspaceIdOf(["/a"]), workspaceIdOf(["/a", "/b"]));
+});
+
+test("a duplicate root -- repeated or just spelled differently -- is one root in the identity", () => {
+  // The same folder listed twice is the same workspace as listed once.
+  assert.equal(workspaceIdOf(["/a", "/a"]), workspaceIdOf(["/a"]));
+  // Two spellings of one resource collapse to one; a `..` is resolved first.
+  assert.equal(workspaceIdOf(["C:/Work", "c:/work"]), workspaceIdOf(["C:/Work"]));
+  assert.equal(workspaceIdOf(["/a", "/b/../a"]), workspaceIdOf(["/a"]));
+  // Order and duplication together still land on the two-root identity.
+  assert.equal(workspaceIdOf(["/b", "/a", "/b"]), workspaceIdOf(["/a", "/b"]));
+  // Nested roots are distinct resources and are NOT collapsed: ownership (folderFor) depends
+  // on both being present, so the identity keeps both.
+  assert.notEqual(workspaceIdOf(["/work", "/work/pkg"]), workspaceIdOf(["/work"]));
+  assert.notEqual(workspaceIdOf(["/work", "/work/pkg"]), workspaceIdOf(["/work/pkg"]));
+});
+
+test("normalizeFolders: canonical, order-preserving, duplicate-free, nested kept", () => {
+  // Spelling is canonicalized to the fsPath form, and a trailing `..`/`.` resolved.
+  assert.deepEqual(normalizeFolders(["C:\\Work\\a"]), ["C:/Work/a"]);
+  assert.deepEqual(normalizeFolders(["/w/./a"]), ["/w/a"]);
+  // Duplicates by repetition and by case/separator collapse, first spelling winning.
+  assert.deepEqual(normalizeFolders(["/a", "/a"]), ["/a"]);
+  assert.deepEqual(normalizeFolders(["C:/Work", "c:/work", "C:\\Work"]), ["C:/Work"]);
+  // Order is preserved for the distinct roots that remain.
+  assert.deepEqual(normalizeFolders(["/b", "/a", "/b"]), ["/b", "/a"]);
+  // Nested roots are both kept, as distinct roots.
+  assert.deepEqual(normalizeFolders(["/work", "/work/pkg"]), ["/work", "/work/pkg"]);
+  // An unparseable folder (a relative path, which a real root never is) is kept as given
+  // rather than dropped, so it can never silently stop a window opening -- it just is not
+  // deduplicated against the canonical ones.
+  assert.deepEqual(normalizeFolders(["relative/dir"]), ["relative/dir"]);
+  assert.deepEqual(normalizeFolders([]), []);
 });
 
 test("opening another folder disposes everything of the one left before creating the next", async () => {
@@ -83,6 +120,21 @@ test("opening another folder disposes everything of the one left before creating
   await manager.close();
   assert.equal(manager.current().id, EMPTY_WORKSPACE);
   assert.ok(b.services.disposed);
+});
+
+test("opening canonicalizes and de-duplicates roots before services are built", async () => {
+  const { manager, log } = recorder();
+  // Opened with a repeat and a stray spelling of the same resource; the services see one
+  // canonical root, so a repository is never opened twice nor a watcher started twice.
+  const ws = await manager.open(["C:/Work", "c:/work", "C:/Work/../Work"]);
+  assert.deepEqual(ws.folders, ["C:/Work"]);
+  assert.equal(log.filter((line) => line.startsWith("create C")).length, 1);
+
+  // Reopening the same resource set, spelled differently again, is the same workspace: no
+  // disposal, no new context -- the duplicate-open no-op holds across spellings.
+  const same = await manager.open(["c:/work"]);
+  assert.equal(same, ws);
+  assert.ok(!log.includes("dispose C:/Work"), "the workspace was not torn down and rebuilt");
 });
 
 test("A → B → C quickly: the last folder wins, and nothing overlaps", async () => {
