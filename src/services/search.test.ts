@@ -3,11 +3,14 @@ import test from "node:test";
 import {
   EMPTY_RESULT,
   MAX_HITS,
+  compileReplacer,
   describeSearchResult,
+  expandReplacement,
   hitOffset,
   parseFileList,
   parseSearch,
   replaceHits,
+  replaceHitsWith,
   searchWorkspace,
   type SearchResult,
 } from "./search.ts";
@@ -378,6 +381,47 @@ test("replacing: LF, CRLF on disk, CRLF results in an LF editor, mixed endings",
   );
   // The last line, with no ending.
   assert.equal(replaceHits("a\nfoo", [hit(2, "foo", 0, 3)], "bar"), "a\nbar");
+});
+
+test("expandReplacement: numbered and named groups, whole match, literal $, and escapes (WS8)", () => {
+  const m = /(?<first>\w+)_(?<second>\w+)/.exec("foo_bar")!;
+  assert.equal(expandReplacement("$2-$1", m), "bar-foo");
+  assert.equal(expandReplacement("$<second><$<first>", m), "bar<foo");
+  assert.equal(expandReplacement("[$&]", m), "[foo_bar]", "$& is the whole match");
+  assert.equal(expandReplacement("50$$", m), "50$", "$$ is a literal dollar");
+  assert.equal(expandReplacement("a\\nb\\t$1", m), "a\nb\tfoo", "\\n and \\t escapes expand");
+  assert.equal(expandReplacement("$9", m), "", "a group that did not participate is empty");
+  // Two-digit group index only when that group exists, else single digit + a literal digit.
+  const ten = /(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)/.exec("abcdefghij")!;
+  assert.equal(expandReplacement("$10", ten), "j", "$10 uses group 10 when it exists");
+  assert.equal(expandReplacement("$10", m), "foo0", "with <10 groups, $10 is $1 then a literal 0");
+});
+
+test("compileReplacer: literal vs regex capture-group expansion, and validation (WS8)", () => {
+  const hit = { path: "C:/w/a.ts", line: 1, text: "foo_bar baz\n", start: 0, end: 7 };
+  // Plain (non-regex) replace inserts the literal text, `$1` included, verbatim.
+  const literal = compileReplacer({ regex: false, caseSensitive: true, query: "foo_bar" }, "$1x");
+  assert.equal(replaceHitsWith("foo_bar baz\n", [hit], literal), "$1x baz\n");
+  // Regex replace recovers the match's groups and expands the template.
+  const swap = compileReplacer(
+    { regex: true, caseSensitive: true, query: "(\\w+)_(\\w+)" },
+    "$2-$1",
+  );
+  assert.equal(replaceHitsWith("foo_bar baz\n", [hit], swap), "bar-foo baz\n");
+  // Named groups, case-insensitive.
+  const named = compileReplacer(
+    { regex: true, caseSensitive: false, query: "(?<a>[a-z]+)_(?<b>[a-z]+)" },
+    "$<b>$<a>",
+  );
+  assert.equal(
+    replaceHitsWith("FOO_bar baz\n", [{ ...hit, text: "FOO_bar baz\n" }], named),
+    "barFOO baz\n",
+  );
+  // A template referencing groups the pattern can't provide (uncompilable in JS) is refused.
+  assert.throws(
+    () => compileReplacer({ regex: true, caseSensitive: true, query: "(?P<x>a)" }, "$1"),
+    /Capture groups can't be expanded/,
+  );
 });
 
 test("replacing never touches a line that changed since it was found", () => {

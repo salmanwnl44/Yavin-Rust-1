@@ -368,6 +368,26 @@ body,
   background: rgba(255, 204, 0, 0.14);
 }
 
+/* Inline Git blame (WS9, `editor/blameMonaco.ts`): a dim annotation after the current line only. */
+.yavin-blame-annotation {
+  color: rgba(130, 130, 140, 0.7);
+  font-style: italic;
+}
+
+/* Inline merge-conflict resolution (WS10, `editor/conflictMonaco.ts`): tint each side's lines. */
+.yavin-conflict-current {
+  background: rgba(45, 164, 78, 0.16); /* "current"/ours — green */
+}
+.yavin-conflict-incoming {
+  background: rgba(56, 139, 253, 0.16); /* "incoming"/theirs — blue */
+}
+.yavin-conflict-base {
+  background: rgba(130, 130, 140, 0.12); /* common ancestor — grey */
+}
+.yavin-conflict-header {
+  background: rgba(192, 134, 58, 0.22); /* the marker lines — amber */
+}
+
 /* Extension decorations (IDE-08, `editor/extensionMonaco.ts`): a fixed set of styles -- an
    extension names one, it never supplies CSS. */
 .yavin-ext-highlight {

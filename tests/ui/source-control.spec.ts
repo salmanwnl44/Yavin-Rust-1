@@ -452,6 +452,25 @@ test("a conflicted file offers to resolve by taking either side, and stages the 
   await expect.poll(() => gitCalls(page, "stage")).toBe(1);
 });
 
+test("WS10 Resolve… opens the dedicated three-way conflict editor with the merge sides", async ({
+  page,
+}) => {
+  const region = await panel(page, { state: "merge", status: "UU conflict.ts\0" });
+  await region
+    .getByRole("button", { name: /Resolve .*conflict\.ts in the conflict editor/ })
+    .click();
+  const editor = page.getByRole("region", { name: /Resolve conflicts in conflict\.ts/ });
+  await expect(editor).toBeVisible();
+  // Resolution status and the gated Complete action are shown.
+  await expect(editor.getByRole("status", { name: "Resolution progress" })).toBeVisible();
+  await expect(editor.getByRole("button", { name: "Complete Resolution" })).toBeVisible();
+  // The sides are labelled by Git's merge semantics (ours/theirs), not a branch name.
+  await expect(editor.getByRole("region", { name: "Current (ours)" })).toBeVisible();
+  await expect(editor.getByRole("region", { name: "Incoming (theirs)" })).toBeVisible();
+  // A clear exit back to the normal editor.
+  await expect(editor.getByRole("button", { name: "Open in Editor" })).toBeVisible();
+});
+
 test("a file that is not conflicted offers no take-a-side buttons", async ({ page }) => {
   const region = await panel(page, { status: " M a.ts\0" });
   await expect(region.getByRole("button", { name: /Accept current change/ })).toHaveCount(0);

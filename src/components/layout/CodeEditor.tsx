@@ -14,6 +14,8 @@ import type { EditorHandle, EditorState, LanguageFeatures } from "../../editor/e
 import { addReferencesAction, installLanguageFeatures } from "../../editor/lspMonaco";
 import { createDiffView } from "../../editor/diff";
 import { attachDebugDecorations } from "../../editor/debugMonaco";
+import { attachBlameDecorations, type BlameAnnotationSource } from "../../editor/blameMonaco";
+import { attachConflictResolution } from "../../editor/conflictMonaco";
 import { attachExtensionEditor } from "../../editor/extensionMonaco";
 import {
   attachDeclarativeLanguages,
@@ -101,6 +103,7 @@ export default function CodeEditor({
   editorSettings = DEFAULT_EDITOR_SETTINGS,
   debug,
   extensions,
+  blame,
 }: {
   documentKey: string;
   documents: DocumentService;
@@ -152,6 +155,8 @@ export default function CodeEditor({
     /** Extensions' snippets (EXT-04). */
     declarative?: DeclarativeContributions;
   };
+  /** Inline Git blame (WS9): the current line's annotation source, or absent to show none. */
+  blame?: BlameAnnotationSource;
 }) {
   const container = useRef<HTMLDivElement>(null);
   const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -175,6 +180,7 @@ export default function CodeEditor({
     settings,
     debug,
     extensions,
+    blame,
   });
   latest.current = {
     onState,
@@ -186,6 +192,7 @@ export default function CodeEditor({
     settings,
     debug,
     extensions,
+    blame,
   };
 
   /** The cursor and indentation for the status bar; none while no document is shown. */
@@ -370,6 +377,13 @@ export default function CodeEditor({
       subscriptions.push(addReferencesAction(instance));
     }
     if (TEST_HOOKS) installTestHook(instance, bridge, () => shown.current?.key ?? null);
+    // Inline Git blame (WS9): annotate the current line; the source is stable, built by the host.
+    if (latest.current.blame)
+      subscriptions.push({
+        dispose: attachBlameDecorations(instance, bridge, latest.current.blame),
+      });
+    // Inline merge-conflict resolution (WS10): highlights + accept/navigate actions, self-contained.
+    subscriptions.push({ dispose: attachConflictResolution(instance) });
     return () => {
       element.removeEventListener("contextmenu", minimapClick, true);
       palette.dispose();

@@ -232,24 +232,46 @@ export function ProblemsView({
                 </button>
                 {open &&
                   file.problems.map((problem, index) => (
-                    <button
-                      key={`${problem.line}:${problem.column}:${index}`}
-                      onClick={() => onOpen?.(problem.file, problem.line, problem.column)}
-                      className="flex w-full items-start gap-1.5 py-0.5 pr-3 pl-8 text-left hover:bg-[#0c0c0c]"
-                    >
-                      <span
-                        aria-label={kindOf(problem)}
-                        className={`shrink-0 font-bold ${KIND_STYLE[kindOf(problem)]}`}
+                    <div key={`${problem.line}:${problem.column}:${index}`}>
+                      <button
+                        onClick={() => onOpen?.(problem.file, problem.line, problem.column)}
+                        className="flex w-full items-start gap-1.5 py-0.5 pr-3 pl-8 text-left hover:bg-[#0c0c0c]"
                       >
-                        {KIND_MARK[kindOf(problem)]}
-                      </span>
-                      <span className="flex-1 text-zinc-300">{problem.message}</span>
-                      <span className="shrink-0 text-zinc-600">
-                        {problem.source}
-                        {problem.code ? `(${problem.code})` : ""} [Ln {problem.line}, Col{" "}
-                        {problem.column}]
-                      </span>
-                    </button>
+                        <span
+                          aria-label={kindOf(problem)}
+                          className={`shrink-0 font-bold ${KIND_STYLE[kindOf(problem)]}`}
+                        >
+                          {KIND_MARK[kindOf(problem)]}
+                        </span>
+                        <span className="flex-1 text-zinc-300">{problem.message}</span>
+                        <span className="shrink-0 text-zinc-600">
+                          {problem.source}
+                          {problem.code ? `(${problem.code})` : ""} [Ln {problem.line}, Col{" "}
+                          {problem.column}]
+                        </span>
+                      </button>
+                      {/* WS11: a diagnostic's related/secondary locations (LSP relatedInformation),
+                          each navigable — the same data the editor shows, now listed here too. */}
+                      {problem.related && problem.related.length > 0 && (
+                        <ul aria-label={`Related information for: ${problem.message}`}>
+                          {problem.related.map((related, relatedIndex) => (
+                            <li key={relatedIndex}>
+                              <button
+                                onClick={() => onOpen?.(related.file, related.line, related.column)}
+                                title={`${related.file}:${related.line}`}
+                                className="flex w-full items-start gap-1.5 py-0.5 pr-3 pl-14 text-left text-[11px] text-zinc-500 hover:bg-[#0c0c0c] hover:text-zinc-300"
+                              >
+                                <span className="shrink-0 text-zinc-600">↳</span>
+                                <span className="flex-1 truncate">{related.message}</span>
+                                <span className="shrink-0 text-zinc-600">
+                                  {related.file.split(/[\\/]/).pop()}:{related.line}
+                                </span>
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
                   ))}
               </div>
             );

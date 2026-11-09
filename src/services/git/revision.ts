@@ -32,6 +32,14 @@ export function useGitRevision(): number {
   return useSyncExternalStore(subscribe, snapshot, snapshot);
 }
 
+/** The current revision count, for non-React consumers (e.g. the editor blame cache's token). */
+export const gitRevision = (): number => revision;
+
+/** Subscribe outside React (returns an unsubscribe), for the same consumers. */
+export function subscribeGitRevision(listener: () => void): () => void {
+  return subscribe(listener);
+}
+
 /** Test seam: forgets the count and its subscribers. */
 export function resetGitRevision(): void {
   revision = 0;

@@ -216,6 +216,41 @@ test("Replace All in an open CRLF document edits the editor's text, not a stale 
   await expect.poll(() => editorText(page)).toBe("one\ntwo needle\n");
 });
 
+test("WS8 regex Replace expands capture groups in the preview and the written file", async ({
+  page,
+}) => {
+  await desktop(page, { "C:\\work\\c.ts": 'const version = "1_2";\n' });
+  await page.keyboard.press("Control+Shift+h");
+  // Turn on regex, then search for two numbers around an underscore.
+  await page.getByRole("button", { name: "Regex" }).click();
+  await searchFor(page, "(\\d+)_(\\d+)");
+  await expect(status(page)).toHaveText("1 matches in 1 files");
+  // A capture-group template; the panel confirms groups are expanded (not inserted literally).
+  await page.getByRole("textbox", { name: "Workspace replacement" }).fill("$2.$1");
+  await page.getByTitle("Preview Replacements").click();
+  await expect(status(page)).toContainText("Capture groups");
+  await page.getByRole("button", { name: "Apply 1 reviewed files" }).click();
+  await expect(status(page)).toContainText("1 files updated");
+  expect((await disk(page))["C:\\work\\c.ts"]).toBe('const version = "2.1";\n');
+});
+
+test("WS8 a regex replacement referencing an impossible group is refused before Apply", async ({
+  page,
+}) => {
+  await desktop(page, { "C:\\work\\c.ts": "ab\n" });
+  await page.keyboard.press("Control+Shift+h");
+  await page.getByRole("button", { name: "Regex" }).click();
+  await searchFor(page, "a");
+  await expect(status(page)).toHaveText("1 matches in 1 files");
+  // `(?P<x>…)` is a ripgrep-only group syntax JS cannot compile: with a `$1` template the panel
+  // refuses rather than writing a wrong replacement.
+  await page.getByRole("textbox", { name: "Workspace replacement" }).fill("$1");
+  // The query must itself be the uncompilable pattern for the replacer to reject it.
+  await searchFor(page, "(?P<x>a)");
+  await expect(page.getByRole("alert")).toContainText("Capture groups can't be expanded");
+  await expect(page.getByTitle("Preview Replacements")).toBeDisabled();
+});
+
 test("a running search can be cancelled, and says so", async ({ page }) => {
   await desktop(page, FILES);
   await page.evaluate(() => {

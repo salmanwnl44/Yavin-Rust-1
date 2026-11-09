@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   EMPTY_RESULT,
+  compileReplacer,
   describeSearchResult,
-  replaceHits,
+  replaceHitsWith,
   searchWorkspace,
 } from "../../services/search";
 import { workspaces } from "../../services/workspaces";
@@ -300,15 +301,16 @@ export function SearchPanel({
   const makePreview = async () => {
     setWriting(true);
     try {
+      const replace = compileReplacer({ regex, caseSensitive, query }, replacement);
       const chosen = result.hits.filter((h) => selected.has(hitId(h)));
       const changes: Replacement[] = [];
       let bytes = 0;
       for (const path of new Set(chosen.map((h) => h.path))) {
         const before = await read(path);
-        const after = replaceHits(
+        const after = replaceHitsWith(
           before,
           chosen.filter((h) => h.path === path),
-          replacement,
+          replace,
         );
         bytes += (before.length + after.length) * 2;
         if (bytes > 20 * 1024 * 1024)
@@ -318,11 +320,13 @@ export function SearchPanel({
       setPreview(changes);
       setStatus(
         changes.length
-          ? `Review replacement in ${changes.length} files. Replacement text is literal.`
+          ? `Review replacement in ${changes.length} files. ${
+              regex ? "Capture groups ($1, $<name>) are expanded." : "Replacement text is literal."
+            }`
           : "No changes to apply",
       );
     } catch (error) {
-      setStatus(String(error));
+      setStatus(error instanceof Error ? error.message : String(error));
     } finally {
       setWriting(false);
     }
@@ -364,14 +368,15 @@ export function SearchPanel({
 
     setWriting(true);
     try {
+      const replace = compileReplacer({ regex, caseSensitive, query }, replacement);
       const changes: Replacement[] = [];
       let bytes = 0;
       for (const path of new Set(chosen.map((h) => h.path))) {
         const before = await read(path);
-        const after = replaceHits(
+        const after = replaceHitsWith(
           before,
           chosen.filter((h) => h.path === path),
-          replacement,
+          replace,
         );
         bytes += (before.length + after.length) * 2;
         if (bytes > 20 * 1024 * 1024)
@@ -405,6 +410,18 @@ export function SearchPanel({
   const hasActiveFilters = Boolean(
     include || exclude || scope !== "workspace" || hidden || ignored,
   );
+
+  // Validate the replacement before Preview/Replace is allowed (WS8): a regex replacement whose
+  // template references capture groups the pattern can't provide is refused up front.
+  const replaceError = useMemo(() => {
+    if (!replace || !replacement) return null;
+    try {
+      compileReplacer({ regex, caseSensitive, query }, replacement);
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }, [replace, regex, caseSensitive, query, replacement]);
 
   return (
     <aside
@@ -584,39 +601,47 @@ export function SearchPanel({
 
           {/* Replace Input Row (when replace active) */}
           {replace && (
-            <div className="flex items-center gap-1.5 pl-5">
-              <div className="relative flex-1 flex items-center bg-[#0a0a0a] border border-[#222222] focus-within:border-indigo-500 rounded transition-colors">
-                <input
-                  ref={replaceInput}
-                  aria-label="Workspace replacement"
-                  value={replacement}
-                  onChange={(e) => {
-                    setReplacement(e.target.value);
-                    setPreview([]);
-                  }}
-                  placeholder="Replace with (literal)…"
-                  className="w-full bg-transparent px-2 py-1.5 text-xs text-zinc-100 placeholder:text-zinc-600 focus:outline-none min-w-0"
-                />
+            <div className="flex flex-col gap-1 pl-5">
+              <div className="flex items-center gap-1.5">
+                <div className="relative flex-1 flex items-center bg-[#0a0a0a] border border-[#222222] focus-within:border-indigo-500 rounded transition-colors">
+                  <input
+                    ref={replaceInput}
+                    aria-label="Workspace replacement"
+                    value={replacement}
+                    onChange={(e) => {
+                      setReplacement(e.target.value);
+                      setPreview([]);
+                    }}
+                    placeholder={regex ? "Replace with ($1, $<name>)…" : "Replace with (literal)…"}
+                    aria-invalid={!!replaceError}
+                    className="w-full bg-transparent px-2 py-1.5 text-xs text-zinc-100 placeholder:text-zinc-600 focus:outline-none min-w-0"
+                  />
+                </div>
+
+                {/* Replace Action Buttons */}
+                <button
+                  disabled={busy || writing || !selected.size || !!replaceError}
+                  onClick={() => void makePreview()}
+                  title="Preview Replacements"
+                  className="px-2 py-1.5 rounded bg-[#161616] hover:bg-[#222222] border border-[#262626] text-[11px] font-medium text-zinc-200 hover:text-white transition-colors disabled:opacity-40"
+                >
+                  Preview ({selected.size})
+                </button>
+
+                <button
+                  disabled={busy || writing || !selected.size || !!replaceError}
+                  onClick={() => void replaceAllDirectly()}
+                  title="Replace All in Selection"
+                  className="p-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white transition-colors disabled:opacity-40 shadow-sm"
+                >
+                  <ReplaceAllIcon size={13} />
+                </button>
               </div>
-
-              {/* Replace Action Buttons */}
-              <button
-                disabled={busy || writing || !selected.size}
-                onClick={() => void makePreview()}
-                title="Preview Replacements"
-                className="px-2 py-1.5 rounded bg-[#161616] hover:bg-[#222222] border border-[#262626] text-[11px] font-medium text-zinc-200 hover:text-white transition-colors disabled:opacity-40"
-              >
-                Preview ({selected.size})
-              </button>
-
-              <button
-                disabled={busy || writing || !selected.size}
-                onClick={() => void replaceAllDirectly()}
-                title="Replace All in Selection"
-                className="p-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white transition-colors disabled:opacity-40 shadow-sm"
-              >
-                <ReplaceAllIcon size={13} />
-              </button>
+              {replaceError && (
+                <p role="alert" className="px-1 text-[10px] text-red-400">
+                  {replaceError}
+                </p>
+              )}
             </div>
           )}
         </div>

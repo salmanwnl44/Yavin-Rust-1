@@ -30,6 +30,7 @@ import {
   opensStagedDiff,
 } from "../../services/git/changeGroups";
 import type { ChangeGroup } from "../../services/git/changeGroups";
+import { hasConflictMarkers } from "../../services/git/conflict";
 import { buildChangeMenu, gitignoreLine, withIgnored } from "../../services/git/changeMenu";
 import { InlineGraphSection } from "../git/InlineGraphSection";
 import { StashesSection } from "../git/StashesSection";
@@ -150,6 +151,7 @@ export function SourceControlPanel({
   onShowOutput,
   onDialog,
   onOpenFile,
+  onResolveConflict,
   onReveal,
 }: {
   workspace: string;
@@ -173,6 +175,9 @@ export function SourceControlPanel({
   onDialog: (request: DialogRequest) => void;
   /** Opens a changed file in the editor ("Open File"). */
   onOpenFile?: (path: string) => void;
+  /** Opens a conflicted file in the dedicated three-way conflict editor (WS10); the code is the
+   * entry's `index`+`worktree` status letters (e.g. `"UU"`). */
+  onResolveConflict?: (path: string, code: string) => void;
   /** Shows a changed file in the Explorer ("Reveal in Explorer"). */
   onReveal?: (path: string) => void;
 }) {
@@ -483,19 +488,32 @@ export function SourceControlPanel({
 
   /** The row checkbox: checked means fully staged, so clicking it unstages; anything less
    * (empty or partly staged) stages what is left. */
-  const toggleStage = (entry: GitEntry) => {
+  const toggleStage = async (entry: GitEntry) => {
     if (!activeRepo) return;
     const fullyStaged = hasStagedPart(entry) && !hasUnstagedPart(entry);
-    if (
-      !fullyStaged &&
-      entry.conflict &&
-      !window.confirm("Stage this file as resolved? Review and remove conflict markers first.")
-    )
-      return;
+    if (!fullyStaged && entry.conflict) {
+      // WS10: never stage a conflicted file that still contains conflict markers — resolve first.
+      let content = "";
+      try {
+        content = await native("read_file_content", { path: entry.path });
+      } catch {
+        /* unreadable (e.g. a delete conflict) → fall through; resolveFile verifies the index */
+      }
+      if (hasConflictMarkers(content)) {
+        activeRepo.store.setNotice(
+          "This file still has conflict markers. Resolve every region before staging it as resolved.",
+        );
+        return;
+      }
+      if (!window.confirm("Stage this file as resolved?")) return;
+    }
     void guarded(fullyStaged ? "unstage" : "stage", () =>
       fullyStaged
         ? activeRepo.store.repository.unstage(entry.path)
-        : activeRepo.store.repository.stage(entry.path),
+        : entry.conflict
+          ? // resolveFile stages and verifies no unmerged index stage is left (WS10).
+            activeRepo.store.repository.resolveFile(entry.path).then(() => "")
+          : activeRepo.store.repository.stage(entry.path),
     );
   };
 
@@ -713,14 +731,28 @@ export function SourceControlPanel({
     return statusLetter(entry);
   };
 
-  const stageOne = (entry: GitEntry) => {
+  const stageOne = async (entry: GitEntry) => {
     if (!activeRepo) return;
-    if (
-      entry.conflict &&
-      !window.confirm("Stage this file as resolved? Review and remove conflict markers first.")
-    )
-      return;
-    void guarded("stage", () => activeRepo.store.repository.stage(entry.path));
+    if (entry.conflict) {
+      let content = "";
+      try {
+        content = await native("read_file_content", { path: entry.path });
+      } catch {
+        /* unreadable → fall through; resolveFile verifies the index */
+      }
+      if (hasConflictMarkers(content)) {
+        activeRepo.store.setNotice(
+          "This file still has conflict markers. Resolve every region before staging it as resolved.",
+        );
+        return;
+      }
+      if (!window.confirm("Stage this file as resolved?")) return;
+    }
+    void guarded("stage", () =>
+      entry.conflict
+        ? activeRepo.store.repository.resolveFile(entry.path).then(() => "")
+        : activeRepo.store.repository.stage(entry.path),
+    );
   };
   const unstageOne = (entry: GitEntry) => {
     if (!activeRepo) return;
@@ -930,6 +962,18 @@ export function SourceControlPanel({
               means hand-editing conflict markers. Both are undoable, like Discard. */}
           {entry.conflict && (
             <>
+              {onResolveConflict && (
+                <button
+                  disabled={busy || loading}
+                  aria-label={`Resolve ${entry.path} in the conflict editor`}
+                  title={`Open ${fileName} in the three-way conflict editor`}
+                  tabIndex={-1}
+                  onClick={() => onResolveConflict(entry.path, entry.index + entry.worktree)}
+                  className="rounded px-1 text-[10px] text-ink-3 hover:bg-border-strong hover:text-ink"
+                >
+                  Resolve…
+                </button>
+              )}
               <button
                 disabled={busy || loading}
                 aria-label={`Accept current change for ${entry.path}`}

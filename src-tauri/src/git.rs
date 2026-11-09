@@ -198,8 +198,8 @@ fn operation_scope(subcommand: &str, rest: &[String]) -> Scope {
             Some("list") | Some("show") => Scope::Read,
             _ => Scope::WorktreeLocal,
         },
-        "status" | "log" | "show" | "diff" | "for-each-ref" | "rev-parse" | "cat-file"
-        | "check-ref-format" => Scope::Read,
+        "status" | "log" | "show" | "diff" | "blame" | "ls-files" | "for-each-ref" | "rev-parse"
+        | "cat-file" | "check-ref-format" => Scope::Read,
         // `git remote <verb> ...` can add/remove/rename; only the bare listing is a read.
         "remote" if rest.is_empty() || rest.first().map(String::as_str) == Some("get-url") => {
             Scope::Read
@@ -924,6 +924,15 @@ const STASH: &[FlagRule] = &[
 const TAG: &[FlagRule] = &[flag("-l"), flag("-d")];
 // The patch content itself travels over stdin, not argv -- see `git_exec`'s `input`.
 const APPLY: &[FlagRule] = &[flag("--cached"), flag("-R")];
+// WS9: `blame --porcelain -- <path>` for inline line annotations. Porcelain is the stable
+// machine format (never colored, no textconv). No revision positional is permitted
+// (`validate_shape` pins exactly one path after `--`), so blame only ever reads the working-tree
+// file's own history -- a read, confined to the repository like every other path argument.
+const BLAME: &[FlagRule] = &[flag("--porcelain")];
+// WS10: `ls-files -u -z -- <path>` lists the unmerged index stages for a path, so a merge-conflict
+// resolution can be *verified* (no stages left) after it stages the file. A read, confined to a
+// path like every other; `validate_shape` allows the whole index or one path.
+const LS_FILES: &[FlagRule] = &[flag("-u"), flag("-z")];
 // The branch name being validated is the whole point of this call, so it must pass
 // through untouched (even if it starts with '-') for Git's own check to accept/reject.
 const CHECK_REF_FORMAT: &[FlagRule] = &[value_flag("--branch")];
@@ -979,6 +988,8 @@ fn rules_for(subcommand: &str) -> Option<&'static [FlagRule]> {
         "rev-parse" => REV_PARSE,
         "cat-file" => CAT_FILE,
         "diff" => DIFF,
+        "blame" => BLAME,
+        "ls-files" => LS_FILES,
         "add" => NONE,
         "restore" => RESTORE,
         "rm" => RM,
@@ -1270,6 +1281,19 @@ fn validate_shape(subcommand: &str, flags: &[&str], positionals: &[&str]) -> Res
         // the confirm-and-keep-a-recovery-copy flow the UI puts in front of discarding.
         "rm" if !flags.contains(&"--cached") => refuse("only --cached (unstaging) is allowed"),
         "restore" if !flags.contains(&"--staged") => refuse("only --staged (unstaging) is allowed"),
+        // WS9: blame reads exactly one file's working-tree history. Pinning it to a single path
+        // positional forbids a revision/range positional (`blame <rev> -- <path>`, `blame a..b`),
+        // so it can never be steered to blame arbitrary history the UI never asks for.
+        "blame" => match positionals {
+            [path] if !path.is_empty() => Ok(()),
+            _ => refuse("blame takes exactly one file path after --"),
+        },
+        // WS10: ls-files is a read; it lists the whole index or exactly one path's unmerged stages.
+        "ls-files" => match positionals {
+            [] => Ok(()),
+            [path] if !path.is_empty() => Ok(()),
+            _ => refuse("ls-files takes at most one file path after --"),
+        },
         // merge/rebase additionally allow starting one against a plain, unambiguous branch
         // name ("Merge…"/"Rebase Branch…") -- never a refspec, and never combined with
         // --abort/--continue/--skip in the same call.
@@ -3249,6 +3273,10 @@ mod tests {
                 "b",
             ],
             &["diff", "--name-only", "--diff-filter=U"],
+            // WS9: inline blame — porcelain, one path after `--`.
+            &["blame", "--porcelain", "--", "a.txt"],
+            // WS10: list a path's unmerged index stages, to verify a conflict resolution.
+            &["ls-files", "-u", "-z", "--", "a.txt"],
             &["apply", "--cached", "-R"],
             &["add", "--", "a.txt"],
             &["restore", "--staged", "--", "a.txt"],
@@ -3546,6 +3574,11 @@ mod tests {
             &["log", "+feature"],
             &["log", "feature:other"],
             &["log", "feature", "other"],
+            // blame: exactly one path after `--`; no revision/range positional, no second path
+            &["blame", "--porcelain", "HEAD", "--", "a.txt"],
+            &["blame", "--porcelain", "--", "a.txt", "b.txt"],
+            &["blame", "--porcelain", "--"],
+            &["blame", "--line-porcelain", "--", "a.txt"],
         ];
         for shape in refused {
             let a = args(shape);

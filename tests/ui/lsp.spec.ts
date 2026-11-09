@@ -189,6 +189,26 @@ test("diagnostics: squiggles in the editor and the problem in the Problems view"
   await expect(problems).not.toContainText("TODO left in code");
 });
 
+test("WS11 diagnostics: related information is listed in the Problems panel and navigates", async ({
+  page,
+}) => {
+  await installFakeLsp(page);
+  await fixture(page, { "/work/a.ts": "let y = 1;\nlet x = error;\n" });
+  await openServed(page, "a.ts");
+  await page.getByTitle(/error/).click();
+  const problems = page.getByRole("region", { name: "Problems" });
+  await expect(problems).toContainText("Something is wrong");
+  // The secondary location the server attached (relatedInformation) is now listed in the panel,
+  // like the editor already shows it (WS11).
+  const related = problems.getByRole("button", { name: /Related to the start of the file/ });
+  await expect(related).toBeVisible();
+  // Move the cursor away, then click the related location: it navigates to the file's start.
+  await page.locator("[data-editor=monaco] .view-lines").click();
+  await page.keyboard.press("Control+End");
+  await related.click();
+  await expect.poll(() => editorSelections(page)).toEqual([{ start: 0, end: 0 }]);
+});
+
 test("definition: F12 opens the file it is in, with the name selected", async ({ page }) => {
   await installFakeLsp(page);
   await fixture(page, { "/work/a.ts": "function helper() {}\n", "/work/b.ts": "helper();\n" });

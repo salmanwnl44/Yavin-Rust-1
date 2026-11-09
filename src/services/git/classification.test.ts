@@ -24,6 +24,8 @@ const CLASSIFIED: Record<string, Scope> = {
   "rev-parse": "read",
   "cat-file": "read",
   diff: "read",
+  blame: "read", // WS9: `blame --porcelain` for inline annotations
+  "ls-files": "read", // WS10: `ls-files -u` to verify a conflict resolution's index stages
   show: "read",
   log: "read",
   "for-each-ref": "read",

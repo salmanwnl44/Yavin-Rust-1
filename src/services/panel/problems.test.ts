@@ -40,6 +40,20 @@ test("a tool running again replaces its own results and leaves other tools alone
   assert.equal(files[1].problems[0].message, "x", "ESLint's result is untouched");
 });
 
+test("groupByFile preserves a diagnostic's related information for the panel (WS11)", () => {
+  publishProblems("tsc", "TypeScript", [
+    {
+      ...at("a.ts", 3, "error", "cannot redeclare"),
+      related: [{ file: "a.ts", line: 1, column: 5, message: "first declared here" }],
+    },
+  ]);
+  const problem = groupByFile(allProblems())[0]!.problems[0]!;
+  assert.deepEqual(problem.related, [
+    { file: "a.ts", line: 1, column: 5, message: "first declared here" },
+  ]);
+  assert.equal(problem.source, "TypeScript", "source is carried alongside the related info");
+});
+
 test("a tool that finds nothing clears its previous results rather than leaving them stale", () => {
   publishProblems("tsc", "TypeScript", [at("a.ts", 1, "error")]);
   publishProblems("tsc", "TypeScript", []);

@@ -131,6 +131,12 @@ import {
   useWorkspace,
   workspaces,
 } from "./services/workspaces";
+import { createBlameCache, blameToken } from "./services/git/blame";
+import { gitRevision, subscribeGitRevision } from "./services/git/revision";
+import type { BlameAnnotationSource } from "./editor/blameMonaco";
+import { createConflictSession, type ConflictSession } from "./services/git/conflictSession";
+import { ConflictEditor } from "./components/layout/ConflictEditor";
+import type { Repository } from "./services/git/repository";
 import { EDITOR_SETTINGS } from "./editor/editorSettings";
 import { useEditorSettings } from "./editor/useEditorSettings";
 import type { SettingDefinition } from "./services/settings/settings";
@@ -165,6 +171,7 @@ import type {
 import { commandRegistry } from "./services/commandRegistry";
 import { DebugError } from "./services/debug/errors";
 import type { ResourceUri } from "./services/resource";
+import { containsPath } from "./services/resource";
 import { TaskError } from "./services/tasks/errors";
 import { isFinal, type TaskRun } from "./services/tasks/service";
 import { createOverlayTracker } from "./services/localgit/overlays";
@@ -415,6 +422,17 @@ export default function App() {
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const [activeActivityTab, setActiveActivityTab] = useState("explorer");
   const [diff, setDiff] = useState<DiffDocument | null>(null);
+  // WS10: the dedicated three-way conflict editor's session, when resolving a conflicted file.
+  const [conflictSession, setConflictSession] = useState<ConflictSession | null>(null);
+  // Dispose the session when the workspace changes (or the app unmounts) — no leaked listeners.
+  useEffect(
+    () => () =>
+      setConflictSession((session) => {
+        session?.dispose();
+        return null;
+      }),
+    [workspacePath],
+  );
   /**
    * What the panel has been asked to show, if anything.
    *
@@ -2271,6 +2289,83 @@ export default function App() {
     }),
     [editorContextCommands],
   );
+
+  // Inline Git blame (WS9): the editor's current-line annotation source. A per-file cache keyed by
+  // the git revision + document version runs `git blame` at most once per (file, revision, edit) —
+  // a cursor move reuses it. The owning worktree is the innermost one whose root contains the file
+  // (multi-root isolation); a file in no repository, or a document with unsaved edits (disk blame
+  // would not match the buffer), shows nothing. Read-only — it never stages or writes.
+  const blameCacheRef = useRef(
+    createBlameCache((path) => {
+      const repo = repoForPath(path);
+      return repo ? repo.blame(path) : Promise.reject(new Error("No repository for this file"));
+    }),
+  );
+  const repoForPath = (path: string): Repository | null => {
+    let best: { root: string; store: { repository: Repository } } | null = null;
+    for (const repo of currentGit().getSnapshot().repos)
+      if (containsPath(repo.root, path) && (!best || repo.root.length > best.root.length))
+        best = repo;
+    return best ? best.store.repository : null;
+  };
+
+  /**
+   * Open the dedicated three-way conflict editor for a conflicted file (WS10). The session reads
+   * the three index stages and the working-tree result through the file's **owning** repository
+   * (innermost containing repo — multi-root/nested isolation), writes the resolved Result through
+   * the guarded apply path (DocumentService for an open document), and stages with the
+   * index-verifying `resolveFile`.
+   */
+  const openConflictEditor = (path: string, code: string) => {
+    const repo = repoForPath(path);
+    if (!repo) {
+      reportError("No repository contains this file.");
+      return;
+    }
+    const read = async () =>
+      documentsRef.current?.get(path)?.text ?? (await native("read_file_content", { path }));
+    conflictSession?.dispose();
+    const session = createConflictSession({
+      path,
+      code,
+      loadResult: read,
+      liveResult: read,
+      loadSide: (side) =>
+        side === "base"
+          ? repo.conflictBase(path)
+          : repo.conflictSide(path, side === "current" ? "ours" : "theirs"),
+      apply: async (text) => {
+        const before = await read();
+        const { errors } = await applyReplacements([{ path, before, after: text }]);
+        if (errors.length) throw new Error(errors.join(" "));
+      },
+      stageResolved: () => repo.resolveFile(path),
+    });
+    setDiff(null);
+    setConflictSession(session);
+  };
+  const editorBlame = useMemo<BlameAnnotationSource>(
+    () => ({
+      linesFor(path) {
+        if (!repoForPath(path)) return null;
+        const doc = documentsRef.current?.get(path);
+        if (doc?.dirty) return null; // the edited buffer differs from the disk blame reads
+        return blameCacheRef.current.get(path, blameToken(gitRevision(), doc?.version ?? 0));
+      },
+      subscribe(listener) {
+        const offGit = subscribeGitRevision(listener);
+        const offDocs = documentsRef.current?.subscribe(() => listener()) ?? (() => {});
+        return () => {
+          offGit();
+          offDocs();
+        };
+      },
+    }),
+    // Stable: it reads the live git registry and documents through refs on each call.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
   // Extensions' Explorer context-menu items (IDE-08); a command gets the entry's file URI.
   const explorerExtensionItems = useMemo(
     () =>
@@ -3954,6 +4049,7 @@ export default function App() {
             visible={isSidebarOpen && activeActivityTab === "git"}
             dirty={hasUnsavedChanges}
             onDiff={setDiff}
+            onResolveConflict={openConflictEditor}
             onChanged={reconcileWorkspace}
             apply={(changes) => applyReplacements(changes, true)}
             onEntries={(entries) => {
@@ -4122,6 +4218,22 @@ export default function App() {
                   setSettingsQuery("");
                 }}
               />
+            ) : conflictSession ? (
+              <ConflictEditor
+                key={conflictSession.getState().path}
+                session={conflictSession}
+                onClose={() => {
+                  conflictSession.dispose();
+                  setConflictSession(null);
+                  bumpGitRevision();
+                }}
+                onOpenInEditor={() => {
+                  const path = conflictSession.getState().path;
+                  conflictSession.dispose();
+                  setConflictSession(null);
+                  void handleOpenFile(path);
+                }}
+              />
             ) : diff ? (
               <DiffEditor
                 key={diff.path + diff.title + diff.text}
@@ -4200,6 +4312,7 @@ export default function App() {
                 editorSettings={editorView.settings}
                 debug={editorDebug}
                 extensions={editorExtensions}
+                blame={editorBlame}
               />
             )}
 

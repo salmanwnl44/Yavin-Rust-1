@@ -309,7 +309,19 @@ export function hitOffset(content: string, hit: SearchHit): number | null {
   return lines.slice(0, hit.line - 1).reduce((n, line) => n + line.length + 1, 0) + hit.start;
 }
 
-export function replaceHits(content: string, hits: SearchHit[], replacement: string): string {
+/**
+ * Apply a replacement across a content's hits, where the replacement for each hit is produced by
+ * `replacementFor(matchedText, hit)` — a literal string for a plain replace, or a capture-group
+ * expansion for a regex replace (WS8). Hits are spliced from the end so earlier offsets never
+ * shift; a line that changed since it was found (its ending aside) is **stale** and refuses the
+ * whole replace, and overlapping matches are refused — so a stale or conflicting result never
+ * produces a partial write.
+ */
+export function replaceHitsWith(
+  content: string,
+  hits: SearchHit[],
+  replacementFor: (matchedText: string, hit: SearchHit) => string,
+): string {
   const lines = content.split("\n");
   const offsets = [0];
   for (let i = 0; i < lines.length - 1; i++) offsets.push(offsets[i] + lines[i].length + 1);
@@ -320,14 +332,129 @@ export function replaceHits(content: string, hits: SearchHit[], replacement: str
       // results replace in its open (LF) document, and in its own CRLF text on disk.
       if (line === undefined || lineBody(line) !== lineBody(hit.text))
         throw new Error("Search results are stale. Search again before replacing.");
-      return { start: offsets[hit.line - 1] + hit.start, end: offsets[hit.line - 1] + hit.end };
+      const start = offsets[hit.line - 1] + hit.start;
+      const end = offsets[hit.line - 1] + hit.end;
+      return { start, end, matched: content.slice(start, end), hit };
     })
     .sort((a, b) => b.start - a.start);
   let previous = content.length + 1;
   for (const range of ranges) {
     if (range.end > previous) throw new Error("Overlapping search matches");
-    content = content.slice(0, range.start) + replacement + content.slice(range.end);
+    content =
+      content.slice(0, range.start) +
+      replacementFor(range.matched, range.hit) +
+      content.slice(range.end);
     previous = range.start;
   }
   return content;
+}
+
+/** Apply a single literal replacement string across a content's hits. */
+export function replaceHits(content: string, hits: SearchHit[], replacement: string): string {
+  return replaceHitsWith(content, hits, () => replacement);
+}
+
+/**
+ * Expand a regex replacement template against a match (WS8): `$1`…`$99` and `$<name>` for capture
+ * groups, `$&` for the whole match, `$$` for a literal `$`, and `\n`/`\t`/`\r`/`\\` escapes — the
+ * same syntax the editor's find/replace uses. A reference to a group that did not participate
+ * expands to the empty string.
+ */
+export function expandReplacement(
+  template: string,
+  match: ReadonlyArray<string | undefined> & { groups?: Record<string, string | undefined> },
+): string {
+  let out = "";
+  for (let i = 0; i < template.length; i++) {
+    const ch = template[i]!;
+    if (ch === "\\" && i + 1 < template.length) {
+      const n = template[i + 1]!;
+      const mapped =
+        n === "n" ? "\n" : n === "t" ? "\t" : n === "r" ? "\r" : n === "\\" ? "\\" : null;
+      if (mapped !== null) {
+        out += mapped;
+        i++;
+        continue;
+      }
+      out += ch;
+      continue;
+    }
+    if (ch === "$" && i + 1 < template.length) {
+      const n = template[i + 1]!;
+      if (n === "$") {
+        out += "$";
+        i++;
+        continue;
+      }
+      if (n === "&") {
+        out += match[0] ?? "";
+        i++;
+        continue;
+      }
+      if (n === "<") {
+        const close = template.indexOf(">", i + 2);
+        if (close !== -1) {
+          out += match.groups?.[template.slice(i + 2, close)] ?? "";
+          i = close;
+          continue;
+        }
+      }
+      if (n >= "0" && n <= "9") {
+        const n2 = template[i + 2];
+        // Two digits only when that group exists; else a single-digit group, then a literal digit.
+        if (n2 && n2 >= "0" && n2 <= "9" && Number(n + n2) < match.length) {
+          out += match[Number(n + n2)] ?? "";
+          i += 2;
+        } else {
+          out += match[Number(n)] ?? "";
+          i += 1;
+        }
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/** The inputs that decide how a replacement is produced (mirrors the search's own mode). */
+export interface ReplaceMode {
+  readonly regex: boolean;
+  readonly caseSensitive: boolean;
+  /** The regex pattern that was searched — used to recover capture groups per match. */
+  readonly query: string;
+}
+
+/**
+ * Build the per-hit replacement function for a replace (WS8). A plain replace inserts the literal
+ * text. A **regex** replace recovers each match's capture groups by re-running the pattern against
+ * the matched span (anchored, so the whole span is one match) and expands the template with
+ * {@link expandReplacement}. If the template references groups but the pattern cannot be compiled
+ * as a JS RegExp (a ripgrep-only construct), this throws so Apply is refused rather than writing a
+ * wrong replacement; a group-free template falls back to the literal (escapes aside).
+ */
+export function compileReplacer(
+  mode: ReplaceMode,
+  replacement: string,
+): (matchedText: string, hit: SearchHit) => string {
+  if (!mode.regex) return () => replacement;
+  const usesGroups = /\$(?:\d|&|<)/.test(replacement);
+  let re: RegExp | null = null;
+  try {
+    re = new RegExp(`^(?:${mode.query})$`, mode.caseSensitive ? "s" : "is");
+  } catch {
+    re = null;
+  }
+  if (!re) {
+    if (usesGroups)
+      throw new Error(
+        "Capture groups can't be expanded for this pattern; use plain replace or simplify the pattern.",
+      );
+    const literal = expandReplacement(replacement, [""]); // escapes only (no group refs present)
+    return () => literal;
+  }
+  return (matchedText) => {
+    const m = re!.exec(matchedText);
+    return expandReplacement(replacement, m ?? [matchedText]);
+  };
 }

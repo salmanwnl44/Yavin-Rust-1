@@ -214,6 +214,47 @@ export class Repository {
     ]);
   }
 
+  /**
+   * The common-ancestor (stage 1, "base") content of a conflicted file, for the three-way view
+   * (WS10). Like {@link conflictSide}, it reads the index stage through `cat-file`; a conflict
+   * without a base stage (e.g. both-added) has none, so this rejects and the caller shows the base
+   * side as unavailable.
+   */
+  conflictBase(absolutePath: string): Promise<string> {
+    return this.run(["cat-file", "--filters", `:1:${relativeToRoot(this.root, absolutePath)}`]);
+  }
+
+  /**
+   * The unmerged index stages present for a path (WS10): the stage numbers (1 = base, 2 = ours,
+   * 3 = theirs) Git still holds. Used to **verify** a resolution — an empty result means the path
+   * is no longer conflicted in the index. Reads `git ls-files -u -z`, which prints one
+   * `<mode> <sha> <stage>\t<path>` record per stage.
+   */
+  async unmergedStages(absolutePath: string): Promise<number[]> {
+    const out = await this.run([
+      "ls-files",
+      "-u",
+      "-z",
+      "--",
+      relativeToRoot(this.root, absolutePath),
+    ]);
+    const stages = new Set<number>();
+    for (const record of out.split("\0")) {
+      const match = /^\d+ [0-9a-f]+ ([123])\t/.exec(record);
+      if (match) stages.add(Number(match[1]));
+    }
+    return [...stages].sort();
+  }
+
+  /**
+   * `git blame --porcelain` for one file (WS9), for inline line annotations. Porcelain is the
+   * stable machine format; the native allow-list pins this to a single repo-relative path (no
+   * revision/range), so it only ever reads this file's working-tree history — a confined read.
+   */
+  blame(absolutePath: string): Promise<string> {
+    return this.run(["blame", "--porcelain", "--", relativeToRoot(this.root, absolutePath)]);
+  }
+
   diff(absolutePath: string, staged: boolean, oldAbsolutePath?: string): Promise<string> {
     const args = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "-M"];
     if (staged) args.push("--cached");
@@ -253,6 +294,24 @@ export class Repository {
 
   stage(absolutePath: string): Promise<string> {
     return this.run(["add", "--", relativeToRoot(this.root, absolutePath)]);
+  }
+
+  /**
+   * Mark a conflicted file resolved (WS10): stage the working-tree content with `git add` (which
+   * replaces the unmerged stages 1/2/3 with a single stage-0 entry), then **verify** no unmerged
+   * stage remains. Throws if the index still holds conflict stages — so a caller never reports a
+   * resolution that did not take. The resolved, marker-free content must already have been written
+   * through the app's own apply path; this only updates the index.
+   */
+  async resolveFile(absolutePath: string): Promise<void> {
+    await this.stage(absolutePath);
+    const remaining = await this.unmergedStages(absolutePath);
+    if (remaining.length > 0)
+      throw new Error(
+        `Still conflicted: the index keeps unmerged ${
+          remaining.length === 1 ? "stage" : "stages"
+        } ${remaining.join(", ")} for this file. Resolve every region, then try again.`,
+      );
   }
 
   async unstage(absolutePath: string): Promise<string> {

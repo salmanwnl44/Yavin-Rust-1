@@ -756,6 +756,38 @@ test("the editor's right-click menu ends with the Command Palette", async ({ pag
   await expect(page.getByRole("combobox", { name: "Search files or commands" })).toBeFocused();
 });
 
+test("WS10 inline merge-conflict resolution: sides are highlighted and Accept rewrites just that region", async ({
+  page,
+}) => {
+  const conflicted = "top\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\nbottom\n";
+  await fixture(page, { "/work/c.ts": conflicted });
+  await open(page, "c.ts");
+  // The conflict's sides are highlighted in the editor.
+  await expect(page.locator("[data-editor=monaco] .yavin-conflict-current")).not.toHaveCount(0);
+  await expect(page.locator("[data-editor=monaco] .yavin-conflict-incoming")).not.toHaveCount(0);
+
+  // Put the cursor inside the region (offset 18 is on the "ours" line) and accept the incoming side.
+  await withEditor(page, "(editor) => editor.setSelections([{ start: 18, end: 18 }])");
+  await withEditor(page, "(editor) => editor.run('yavin.conflict.acceptIncoming')");
+  // Only that region changed — the surrounding lines are untouched and the markers are gone.
+  await expect.poll(() => editorText(page)).toBe("top\ntheirs\nbottom\n");
+});
+
+test("WS10 Accept Both keeps current then incoming; other regions are untouched", async ({
+  page,
+}) => {
+  const conflicted =
+    "a\n<<<<<<< HEAD\nX\n=======\nY\n>>>>>>> f\nb\n<<<<<<< HEAD\nP\n=======\nQ\n>>>>>>> f\nc\n";
+  await fixture(page, { "/work/d.ts": conflicted });
+  await open(page, "d.ts");
+  // Resolve only the first region (cursor on its "X" line, offset 6) with Accept Both.
+  await withEditor(page, "(editor) => editor.setSelections([{ start: 6, end: 6 }])");
+  await withEditor(page, "(editor) => editor.run('yavin.conflict.acceptBoth')");
+  await expect
+    .poll(() => editorText(page))
+    .toBe("a\nX\nY\nb\n<<<<<<< HEAD\nP\n=======\nQ\n>>>>>>> f\nc\n");
+});
+
 test("the minimap's right-click menu changes it, and the choice is remembered", async ({
   page,
 }) => {

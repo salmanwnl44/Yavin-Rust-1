@@ -97,6 +97,7 @@ export function EditorArea({
   editorSettings,
   debug,
   extensions,
+  blame,
   onMinimapChange,
   markdownMode,
   onMarkdownMode,
@@ -153,6 +154,8 @@ export function EditorArea({
   debug?: ComponentProps<typeof import("./CodeEditor").default>["debug"];
   /** Extensions in the editor (IDE-08). */
   extensions?: ComponentProps<typeof import("./CodeEditor").default>["extensions"];
+  /** Inline Git blame (WS9): forwarded to the editor's current-line annotation. */
+  blame?: ComponentProps<typeof import("./CodeEditor").default>["blame"];
   onMinimapChange?: (change: Partial<MinimapPreferences>) => void;
   /** Set for a Markdown document: how it is shown, and the buttons that change it. */
   markdownMode?: MarkdownMode;
@@ -518,6 +521,7 @@ export function EditorArea({
                       editorSettings={editorSettings}
                       debug={debug}
                       extensions={extensions}
+                      blame={blame}
                       onMinimapChange={onMinimapChange}
                       languageFeatures={languageFeatures}
                     />
