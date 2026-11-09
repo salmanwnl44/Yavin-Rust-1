@@ -6,7 +6,40 @@ import {
   applyTextEdits,
   encodingOf,
   incrementalChange,
+  isValidPosition,
+  isValidTextEdit,
 } from "./positions.ts";
+
+test("isValidTextEdit treats a server's edits as untrusted input (WS17)", () => {
+  const range = { start: { line: 0, character: 0 }, end: { line: 1, character: 2 } };
+  assert.equal(isValidPosition({ line: 0, character: 0 }), true);
+  assert.equal(isValidPosition({ line: 3, character: 10 }), true);
+  assert.equal(isValidPosition({ line: -1, character: 0 }), false, "negative line");
+  assert.equal(isValidPosition({ line: 0, character: Number.NaN }), false, "NaN character");
+  assert.equal(isValidPosition({ line: 1.5, character: 0 }), false, "fractional line");
+  assert.equal(isValidPosition({ line: 0 }), false, "missing character");
+  assert.equal(isValidPosition(null), false);
+
+  assert.equal(isValidTextEdit({ range, newText: "ok" }), true);
+  assert.equal(isValidTextEdit({ range, newText: "" }), true, "an empty replacement is valid");
+  assert.equal(isValidTextEdit({ range }), false, "missing newText");
+  assert.equal(isValidTextEdit({ range, newText: 42 }), false, "non-string newText");
+  assert.equal(
+    isValidTextEdit({ range: { start: { line: -1, character: 0 }, end: range.end }, newText: "x" }),
+    false,
+    "a negative position in the range",
+  );
+  assert.equal(
+    isValidTextEdit({
+      range: { start: range.start, end: { line: 0, character: Number.NaN } },
+      newText: "x",
+    }),
+    false,
+    "a NaN character in the range",
+  );
+  assert.equal(isValidTextEdit({ newText: "x" }), false, "missing range");
+  assert.equal(isValidTextEdit(null), false);
+});
 
 test("positions and offsets agree in every encoding, around multi-unit characters", () => {
   // "é" is 1 UTF-16 unit / 2 UTF-8 bytes; "😀" is 2 UTF-16 units / 4 bytes / 1 code point.

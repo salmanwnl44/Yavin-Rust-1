@@ -10,7 +10,7 @@ import { createCallHierarchy } from "../services/lsp/callHierarchy";
 import { createTypeHierarchy } from "../services/lsp/typeHierarchy";
 import type { Hierarchy } from "../services/lsp/hierarchy";
 import { CancelledError } from "../services/lsp/jsonrpc";
-import { LineIndex } from "../services/lsp/positions";
+import { LineIndex, isValidTextEdit } from "../services/lsp/positions";
 import {
   applySemanticDelta,
   isValidTokenData,
@@ -611,11 +611,28 @@ function registerServer(definition: LanguageServerDefinition, capabilities: P.Se
     } satisfies monaco.languages.RenameProvider);
   }
 
+  /**
+   * A server's formatting edits as Monaco edits, with the server's responses treated as untrusted
+   * (WS17): a malformed edit (a `NaN`/negative/fractional range, or a non-string `newText`) makes
+   * the whole set be rejected — returning `undefined` so the document is left unformatted rather
+   * than formatted from a partial, possibly-inconsistent result. An empty set is a valid no-op.
+   */
   const textEditsOf = (
     ctx: NonNullable<ReturnType<LspManager["context"]>>,
     model: monaco.editor.ITextModel,
     edits: P.TextEdit[] | null | undefined,
-  ) => (edits ?? []).map((one) => ({ range: fromRange(ctx, model, one.range), text: one.newText }));
+  ): monaco.languages.TextEdit[] | undefined => {
+    const list = edits ?? [];
+    const out: monaco.languages.TextEdit[] = [];
+    for (const one of list) {
+      if (!isValidTextEdit(one)) {
+        console.warn("formatting: a malformed text edit was rejected; the document is left as is");
+        return undefined;
+      }
+      out.push({ range: fromRange(ctx, model, one.range), text: one.newText });
+    }
+    return out;
+  };
   const formatting = (options: monaco.languages.FormattingOptions) => ({
     tabSize: options.tabSize,
     insertSpaces: options.insertSpaces,

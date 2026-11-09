@@ -146,6 +146,33 @@ export function incrementalChange(
   };
 }
 
+/** A well-formed LSP position: a finite, non-negative integer line and character. */
+export function isValidPosition(position: unknown): position is Position {
+  if (!position || typeof position !== "object") return false;
+  const { line, character } = position as Position;
+  return Number.isInteger(line) && line >= 0 && Number.isInteger(character) && character >= 0;
+}
+
+/**
+ * Whether a server's `TextEdit` is well-formed: a `newText` string and a range of two valid
+ * positions. A server's responses are untrusted input (WS17): a malformed range — `NaN`, negative
+ * or fractional positions — would convert to a corrupt editor range (`offsetAt` cannot guard a
+ * `NaN` character), so the caller rejects such an edit rather than applying it.
+ */
+export function isValidTextEdit(edit: unknown): edit is TextEdit {
+  if (!edit || typeof edit !== "object") return false;
+  const { range, newText } = edit as {
+    range?: { start?: unknown; end?: unknown };
+    newText?: unknown;
+  };
+  return (
+    typeof newText === "string" &&
+    !!range &&
+    isValidPosition(range.start) &&
+    isValidPosition(range.end)
+  );
+}
+
 export class OverlappingEditsError extends Error {
   constructor() {
     super("The edits overlap.");

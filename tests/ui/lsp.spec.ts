@@ -276,6 +276,32 @@ test("formatting: Format Document applies the server's edits", async ({ page }) 
   await expectText(page, "let a = 1;\n  let b = 2;\n");
 });
 
+test("WS17 formatting: Format Selection formats only the selected lines, through DocumentService", async ({
+  page,
+}) => {
+  await installFakeLsp(page);
+  // Two untidy lines; selecting only the first means only it is formatted.
+  await fixture(page, { "/work/a.ts": "let a = 1;   \n\tlet b = 2;   \n" });
+  await openServed(page, "a.ts");
+  await page.keyboard.press("Control+Home");
+  await page.keyboard.press("Shift+End"); // select the first line only
+  await menu(page, "Edit", "Format Selection");
+  // The first line's trailing spaces are gone; the second line (not selected) is untouched.
+  await expectText(page, "let a = 1;\n\tlet b = 2;   \n");
+});
+
+test("WS17 formatting: a malformed formatting edit is rejected, leaving the document unchanged", async ({
+  page,
+}) => {
+  await installFakeLsp(page, { options: { typescript: { badFormatEdit: true } } });
+  const original = "let a = 1;   \n\tlet b = 2;\n";
+  await fixture(page, { "/work/a.ts": original });
+  await openServed(page, "a.ts");
+  await menu(page, "Edit", "Format Document");
+  // The server returned an out-of-range edit; the provider rejects it, so nothing changes.
+  await expectText(page, original);
+});
+
 test("code actions: Ctrl+. offers the server's quick fix, and applying it edits the file", async ({
   page,
 }) => {

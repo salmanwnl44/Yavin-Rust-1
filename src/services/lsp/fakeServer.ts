@@ -28,6 +28,8 @@ export interface FakeServerOptions {
   diagnosticsDelay?: number;
   /** WS16: answer semantic-token delta requests with an out-of-range (inapplicable) edit. */
   badSemanticDelta?: boolean;
+  /** WS17: answer document-formatting requests with a malformed (invalid-range) text edit. */
+  badFormatEdit?: boolean;
 }
 
 export interface FakeServerIO {
@@ -460,7 +462,16 @@ export function createFakeServer(options: FakeServerOptions, io: FakeServerIO) {
         };
       }
       case "textDocument/formatting":
-        return doc ? formatEdits(doc) : [];
+        if (!doc) return [];
+        // WS17 fixture: a malformed edit (a negative line) the client must reject rather than apply.
+        if (options.badFormatEdit)
+          return [
+            {
+              range: { start: { line: -1, character: 0 }, end: { line: 0, character: 0 } },
+              newText: "x",
+            },
+          ];
+        return formatEdits(doc);
       case "textDocument/rangeFormatting":
         return doc ? formatEdits(doc, params.range.start.line, params.range.end.line) : [];
       case "textDocument/onTypeFormatting": {

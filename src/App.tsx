@@ -3606,6 +3606,16 @@ export default function App() {
           capabilities?.documentFormattingProvider,
           "Shift+Alt+f",
         ),
+        // WS17: Format Selection — Monaco's built-in action formats only the selection (and an
+        // empty selection's current line, never the whole document). Gated on the server's range
+        // capability so it is offered only where it can be done.
+        action(
+          "lsp.formatSelection",
+          "Edit",
+          "Format Selection",
+          "editor.action.formatSelection",
+          capabilities?.documentRangeFormattingProvider,
+        ),
         action(
           "lsp.quickFix",
           "Edit",
