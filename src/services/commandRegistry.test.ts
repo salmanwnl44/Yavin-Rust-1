@@ -144,6 +144,48 @@ test("subscribers fire when the contributed set changes, not on an identical set
   assert.equal(fired, 2, "unsubscribed listener no longer fires");
 });
 
+test("a user override replaces a core command's shortcut, and the default is restored when removed", () => {
+  const r = createCommandRegistry();
+  r.setCore([core("file.save", { shortcut: "Mod+s" })]);
+  const map = new Map<string, string | null>();
+  r.setKeybindings({ override: (id) => (map.has(id) ? map.get(id)! : undefined) });
+  assert.equal(r.get("file.save")?.shortcut, "Mod+s", "with no override the default stands");
+  map.set("file.save", "Mod+k");
+  r.setKeybindings({ override: (id) => (map.has(id) ? map.get(id)! : undefined) });
+  assert.equal(r.get("file.save")?.shortcut, "Mod+k", "the override is in force");
+  map.set("file.save", null);
+  r.setKeybindings({ override: (id) => (map.has(id) ? map.get(id)! : undefined) });
+  assert.equal(r.get("file.save")?.shortcut, undefined, "unbound: no key");
+});
+
+test("a user override frees a core key for an extension that wanted it", () => {
+  const r = createCommandRegistry();
+  r.setCore([core("file.save", { shortcut: "Mod+s" })]);
+  r.setExtensions(
+    [ext("pub.e.save", "pub.e", "Mod+s")],
+    () => {},
+    (id) => id,
+  );
+  assert.equal(
+    r.get("pub.e.save")?.shortcut,
+    undefined,
+    "colliding with the core default: refused",
+  );
+  // The user moves the core command off Mod+s; the extension's contribution now applies.
+  r.setKeybindings({ override: (id) => (id === "file.save" ? "Mod+Shift+s" : undefined) });
+  assert.equal(r.get("file.save")?.shortcut, "Mod+Shift+s");
+  assert.equal(r.get("pub.e.save")?.shortcut, "Mod+s", "the freed key is now the extension's");
+});
+
+test("setKeybindings notifies subscribers so the window recomposes", () => {
+  const r = createCommandRegistry();
+  r.setCore([core("file.save", { shortcut: "Mod+s" })]);
+  let fired = 0;
+  r.subscribe(() => fired++);
+  r.setKeybindings({ override: () => undefined });
+  assert.equal(fired, 1);
+});
+
 test("a contributed shortcut that collides with a core one is refused, not taken", () => {
   const r = createCommandRegistry();
   r.setCore([core("file.save", { shortcut: "Ctrl+S" })]);

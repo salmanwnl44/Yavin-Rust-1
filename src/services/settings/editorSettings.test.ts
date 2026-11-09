@@ -53,6 +53,36 @@ test("font, size, tabs, line numbers, wrap, theme and zoom reach the editor's op
   assert.equal(options.theme, "yavin-light");
 });
 
+test("the newly exposed Monaco settings reach the editor's options", () => {
+  const registry = createSettingsRegistry(EDITOR_SETTING_LIST, new MemoryStorage());
+  registry.set(EDITOR_SETTINGS.cursorStyle, "user", "block");
+  registry.set(EDITOR_SETTINGS.renderWhitespace, "user", "all");
+  registry.set(EDITOR_SETTINGS.renderControlCharacters, "user", false);
+  registry.set(EDITOR_SETTINGS.bracketPairColorization, "user", false);
+  registry.set(EDITOR_SETTINGS.stickyScroll, "user", false);
+  registry.set(EDITOR_SETTINGS.smoothScrolling, "user", false);
+  registry.set(EDITOR_SETTINGS.folding, "user", false);
+  const { settings, wordWrap, zoom } = resolveEditorSettings(registry, A);
+  const options = editorOptions(settings, { wordWrap, zoom, readOnly: false, ariaLabel: "x" });
+  assert.equal(options.cursorStyle, "block");
+  assert.equal(options.renderWhitespace, "all");
+  assert.equal(options.renderControlCharacters, false);
+  assert.deepEqual(options.bracketPairColorization, { enabled: false });
+  assert.deepEqual(options.stickyScroll, { enabled: false });
+  assert.equal(options.smoothScrolling, false);
+  assert.equal(options.folding, false);
+});
+
+test("the newly exposed settings refuse values Monaco cannot use", () => {
+  const registry = createSettingsRegistry(EDITOR_SETTING_LIST, new MemoryStorage());
+  for (const [definition, value] of [
+    [EDITOR_SETTINGS.cursorStyle, "triangle"],
+    [EDITOR_SETTINGS.renderWhitespace, "sometimes"],
+    [EDITOR_SETTINGS.stickyScroll, "yes"],
+  ] as const)
+    assert.throws(() => registry.set(definition as never, "user", value as never), /not a valid/);
+});
+
 test("each setting refuses what the editor cannot use", () => {
   const registry = createSettingsRegistry(EDITOR_SETTING_LIST, new MemoryStorage());
   for (const [definition, value] of [

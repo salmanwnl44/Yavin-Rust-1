@@ -15,6 +15,8 @@ import type { TerminalUi } from "./terminalUi.ts";
 import { createProfileRegistry } from "./terminalProfiles.ts";
 import { createTerminalSettings } from "./terminalSettings.ts";
 import { createSettingsRegistry } from "./settings/settings.ts";
+import { createKeybindingsStore } from "./settings/keybindings.ts";
+import { commandRegistry } from "./commandRegistry.ts";
 import { ICON_THEME_SETTING, iconThemes } from "./extensions/iconThemes.ts";
 import { createWebviewStore } from "./extensions/webviews.ts";
 import { EDITOR_SETTING_LIST } from "../editor/editorSettings.ts";
@@ -144,6 +146,16 @@ export const settings = createSettingsRegistry([
   ...HOST_RESOURCE_SETTING_LIST,
   ICON_THEME_SETTING,
 ]);
+
+/**
+ * The window's user keybinding overrides (IDE-03 / WS20): the shortcuts the user has reassigned,
+ * kept across restarts. It owns no commands -- the command registry reads it so each command's
+ * effective shortcut already reflects the user's choice (`commandRegistry.setKeybindings`), and
+ * the keyboard handler, menus and palette need no change. User scope, like `editor.zoom`.
+ */
+export const keybindings = createKeybindingsStore();
+commandRegistry.setKeybindings(keybindings);
+keybindings.subscribe(() => commandRegistry.setKeybindings(keybindings));
 
 /**
  * The window's breakpoints (IDE-05), one set per workspace by resource identity: kept while the

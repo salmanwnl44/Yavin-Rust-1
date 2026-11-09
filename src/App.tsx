@@ -129,6 +129,7 @@ import {
   provideExtensionWindow,
   setPermissionReview,
   settings,
+  keybindings,
   terminalSettings,
   terminalProfiles,
   useWorkspace,
@@ -144,6 +145,7 @@ import { EDITOR_SETTINGS } from "./editor/editorSettings";
 import { useEditorSettings } from "./editor/useEditorSettings";
 import type { SettingDefinition } from "./services/settings/settings";
 import { SettingsView } from "./components/settings/SettingsView";
+import { KeyboardShortcutsView } from "./components/settings/KeyboardShortcutsView";
 import { RunPanel } from "./components/layout/RunPanel";
 import { DebugPanel } from "./components/layout/DebugPanel";
 import {
@@ -324,6 +326,11 @@ export default function App() {
   };
   /** The Settings view (IDE-03) is shown in the editor's place. */
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** The Keyboard Shortcuts view (WS20) is shown in the editor's place, like Settings. */
+  const [keybindingsOpen, setKeybindingsOpen] = useState(false);
+  // WS20: re-render when a keyboard-shortcut override changes, so the command list (palette,
+  // menus, welcome hints) recomputes each command's effective key through the registry.
+  const [, setBindingTick] = useState(0);
   const [paletteMode, setPaletteMode] = useState<
     "files" | "commands" | "symbols" | "workspaceSymbols"
   >("files");
@@ -1049,6 +1056,7 @@ export default function App() {
     run(async () => {
       setDiff(null);
       setSettingsOpen(false);
+      setKeybindingsOpen(false);
       if (panelOfTab(path)) {
         // EXT-31: a webview panel's tab is only brought to the front.
         if (openTabs.some((tab) => tab.id === path)) setActiveTabId(path);
@@ -1481,6 +1489,19 @@ export default function App() {
     show();
     return settings.onProblems(show);
   }, [reportError]);
+  // Keyboard shortcuts that could not be read (corrupt, invalid, from a newer Yavin) are said once.
+  useEffect(() => {
+    const show = () => {
+      const problems = keybindings.takeProblems();
+      if (problems.length) reportError(problems.join(" "));
+    };
+    show();
+    return keybindings.onProblems(show);
+  }, [reportError]);
+  // WS20: a reassigned/unbound/reset shortcut must reach the palette, menus and welcome hints.
+  // The command registry reads the overrides live; re-render here so `commandRegistry.list()`
+  // (computed below) recomposes with each command's effective key.
+  useEffect(() => keybindings.subscribe(() => setBindingTick((tick) => tick + 1)), []);
   // --- Tasks (IDE-04): the window's commands on the workspace's TaskService -----------------------
   const tasks = workspace.services.tasks;
   const taskSnapshot = useSyncExternalStore(tasks.subscribe, tasks.getSnapshot, tasks.getSnapshot);
@@ -3110,7 +3131,20 @@ export default function App() {
       menu: "File",
       label: "Settings",
       shortcut: "Mod+,",
-      run: () => setSettingsOpen(true),
+      run: () => {
+        setKeybindingsOpen(false);
+        setSettingsOpen(true);
+      },
+    },
+    {
+      id: "file.keyboardShortcuts",
+      menu: "File",
+      label: "Keyboard Shortcuts",
+      shortcut: "Mod+Alt+,",
+      run: () => {
+        setSettingsOpen(false);
+        setKeybindingsOpen(true);
+      },
     },
     {
       // The status bar only carries a trust entry point while restricted, so this is the way
@@ -3914,6 +3948,10 @@ export default function App() {
     runExtensionCommand,
     (id) => extensionRegistry.get(id)?.manifest.displayName ?? id,
   );
+  // WS20: the user's keybinding overrides, read (not owned) by the registry, so every command's
+  // effective shortcut below already reflects a reassignment. Re-pushed each render; the store's
+  // change subscription (above) re-renders, so a live reassignment recomposes the one command list.
+  commandRegistry.setKeybindings(keybindings);
   const commands: AppCommand[] = commandRegistry.list();
   const extensionConflicts = commandRegistry.conflicts();
 
@@ -4237,7 +4275,13 @@ export default function App() {
 
           {/* Center: Editor + Bottom Terminal Panel */}
           <div className="flex flex-1 flex-col min-w-0 bg-[#000000]">
-            {extensionPage && !settingsOpen ? (
+            {keybindingsOpen ? (
+              <KeyboardShortcutsView
+                registry={commandRegistry}
+                keybindings={keybindings}
+                onClose={() => setKeybindingsOpen(false)}
+              />
+            ) : extensionPage && !settingsOpen ? (
               <ExtensionDetails
                 key={extensionPage}
                 id={extensionPage}

@@ -226,6 +226,58 @@ test("unreadable settings are said once, and the editor works with its defaults"
   );
 });
 
+const kbView = (page: Page) => page.getByRole("region", { name: "Keyboard Shortcuts" });
+const kbRow = (page: Page, id: string) => kbView(page).locator(`[data-command="${id}"]`);
+const kbButton = (page: Page, id: string, label: string) =>
+  kbRow(page, id).getByRole("button", { name: `Change shortcut for ${label}` });
+
+test("a keyboard shortcut is reassigned, remembered across a restart, conflicts are shown, and resets", async ({
+  page,
+}) => {
+  await desktop(page);
+  await page.keyboard.press("Control+Alt+,");
+  await expect(kbView(page)).toBeVisible();
+
+  // Reassign "Search in Files" (default Ctrl+Shift+F) to Ctrl+Alt+K by pressing the keys.
+  await expect(kbButton(page, "view.search", "Search in Files")).toContainText("Ctrl+Shift+f");
+  await kbButton(page, "view.search", "Search in Files").click();
+  await kbRow(page, "view.search").getByRole("textbox").press("Control+Alt+K");
+  await expect(kbButton(page, "view.search", "Search in Files")).toContainText("Ctrl+Alt+k");
+  // Written to the keybindings store (canonical form), not the general settings.
+  const kept = await page.evaluate(() =>
+    JSON.parse(localStorage.getItem("yavin.keybindings.user")!),
+  );
+  expect(kept.bindings["view.search"]).toBe("Mod+Alt+k");
+
+  // The new key reaches the command palette's shown shortcut.
+  await page.keyboard.press("Control+Shift+p");
+  // The palette opens in command mode with a ">" prefix; keep it (fill replaces the whole value).
+  await page.getByRole("combobox", { name: "Search files or commands" }).fill(">Search in Files");
+  await expect(page.getByRole("option", { name: /Search in Files/ }).first()).toContainText(
+    "Ctrl+Alt+k",
+  );
+  await page.keyboard.press("Escape");
+
+  // Survives a reload (a restart), read back from storage.
+  await page.reload();
+  await expect(page.getByText("work", { exact: true }).first()).toBeVisible();
+  await page.keyboard.press("Control+Alt+,");
+  await expect(kbButton(page, "view.search", "Search in Files")).toContainText("Ctrl+Alt+k");
+
+  // Reassigning it onto Settings' key (Ctrl+,) is a conflict both rows report.
+  await kbButton(page, "view.search", "Search in Files").click();
+  await kbRow(page, "view.search").getByRole("textbox").press("Control+,");
+  await expect(kbRow(page, "view.search")).toContainText("Also used by Settings");
+  await expect(kbRow(page, "file.settings")).toContainText("Also used by Search in Files");
+
+  // Reset returns it to its default and clears the conflict.
+  await kbRow(page, "view.search").getByRole("button", { name: "Reset" }).click();
+  await expect(kbButton(page, "view.search", "Search in Files")).toContainText("Ctrl+Shift+f");
+  await expect(kbRow(page, "view.search")).not.toContainText("Also used by");
+  const after = await page.evaluate(() => localStorage.getItem("yavin.keybindings.user"));
+  expect(JSON.parse(after!).bindings["view.search"]).toBeUndefined();
+});
+
 test("the terminal's settings are shown and changed through the terminal's own store", async ({
   page,
 }) => {
