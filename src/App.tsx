@@ -6,6 +6,7 @@ import type { MarkdownPreviewHandle } from "./components/layout/MarkdownPreview"
 import type { DialogRequest } from "./components/ui/AppDialog";
 import type { EditorHandle, EditorState, EditorAction } from "./editor/editorTypes";
 import { createEditorViews } from "./services/editorViews";
+import { createNavigationHistory, type NavLocation } from "./services/navigationHistory";
 import { matchesShortcut, shortcutLabel } from "./services/commands";
 import type { AppCommand } from "./services/commands";
 import { useTerminalUiState } from "./services/terminalHooks";
@@ -304,6 +305,13 @@ export default function App() {
    * document's (see `services/editorViews.ts`).
    */
   const views = useRef(createEditorViews()).current;
+  /**
+   * Back / Forward navigation history (WS25): the trail of places the user jumped to -- Go to
+   * Definition, references, a search hit, a breadcrumb -- that the Back and Forward commands
+   * walk. Not the document's and not the editor's; see `services/navigationHistory.ts`.
+   */
+  const navHistory = useRef(createNavigationHistory()).current;
+  const navState = useSyncExternalStore(navHistory.subscribe, navHistory.snapshot);
   const [editorState, setEditorState] = useState<EditorState>({
     canUndo: false,
     canRedo: false,
@@ -1000,6 +1008,7 @@ export default function App() {
           );
           setActiveTabId((active) => (active === previousKey ? key : active));
           views.rename(previousKey, key);
+          navHistory.rename(previousKey, key);
         } else if (event.type === "conflict") {
           const doc = documents.all().find((one) => one.id === event.id);
           reportError(
@@ -1009,7 +1018,7 @@ export default function App() {
           );
         }
       }),
-    [documents, reportError, views],
+    [documents, reportError, views, navHistory],
   );
 
   // Development builds only, and only for the UI tests: opens a proposal in the editor. Nothing
@@ -1124,6 +1133,9 @@ export default function App() {
     for (const doc of docs) {
       documents.close(doc.key, { discard: true });
       views.forget(doc.key);
+      // A disk file stays in the Back trail -- Back reopens it. An untitled or proposed buffer
+      // is gone for good once closed, so it leaves the trail.
+      if (doc.source.kind !== "disk") navHistory.forget(doc.key);
     }
     setTabs((prev) => prev.filter((tab) => !closing.has(tab.id)));
     for (const id of ids) {
@@ -1148,6 +1160,10 @@ export default function App() {
   const otherTabs = (id: string) => tabs.filter((tab) => tab.id !== id).map((tab) => tab.id);
   const tabsRightOf = (id: string) =>
     tabs.slice(tabs.findIndex((tab) => tab.id === id) + 1).map((tab) => tab.id);
+  const tabsLeftOf = (id: string) => {
+    const index = tabs.findIndex((tab) => tab.id === id);
+    return index <= 0 ? [] : tabs.slice(0, index).map((tab) => tab.id);
+  };
   const savedTabs = () =>
     tabs
       .filter((tab) => {
@@ -1199,6 +1215,8 @@ export default function App() {
     setPendingHit(null);
     documents.reset();
     views.clear();
+    // Histories never mix across folders (WS25): the trail of the folder left goes with it.
+    navHistory.clear();
     setTabs([WELCOME_TAB]);
     setActiveTabId("welcome");
     setRecentFiles([]);
@@ -1310,7 +1328,12 @@ export default function App() {
       documents.removed(entry.path);
     }
     setTabs((prev) => prev.filter((tab) => !doomed(tab.path)));
-    for (const tab of openTabs) if (doomed(tab.path)) views.forget(tab.path);
+    for (const tab of openTabs)
+      if (doomed(tab.path)) {
+        views.forget(tab.path);
+        // A deleted file has no document to come back to: its trail entries leave too.
+        navHistory.forget(tab.path);
+      }
     if (doomed(activeTabId)) setActiveTabId("welcome");
     setRecentFiles((prev) => prev.filter((file) => !doomed(file.path)));
     await refreshAround(...entries.map((entry) => entry.path));
@@ -1924,9 +1947,37 @@ export default function App() {
     /** WS13: after the editor shows this location, open its Quick Fix (code-action) menu. */
     thenQuickFix?: boolean;
   } | null>(null);
-  const openLocation = (path: string, range?: EditorRange, options?: { quickFix?: boolean }) => {
+  /**
+   * Where the editor in front is now -- the document it shows and the cursor's line/column --
+   * so a jump can remember the spot to come Back to. Null when the welcome page or a webview
+   * (not a document) is in front.
+   */
+  const currentNavLocation = (): NavLocation | null => {
+    const active = tabs.find((tab) => tab.id === activeTabId);
+    if (!active || active.id === "welcome" || panelOfTab(active.id)) return null;
+    const doc = documents.get(active.path);
+    if (!doc) return null;
+    const cursor = cursorStatus.get();
+    const range = cursor
+      ? {
+          startLineNumber: cursor.line,
+          startColumn: cursor.column,
+          endLineNumber: cursor.line,
+          endColumn: cursor.column,
+        }
+      : undefined;
+    return { key: doc.key, range };
+  };
+  const openLocation = (
+    path: string,
+    range?: EditorRange,
+    options?: { quickFix?: boolean; fromHistory?: boolean },
+  ) => {
     const key = documents.get(path)?.key ?? path;
     const thenQuickFix = options?.quickFix;
+    // A real jump (not Back/Forward itself) is remembered, with the spot it left from so Back
+    // returns there. Ordinary cursor moves and typing never reach here, so they never enter it.
+    if (!options?.fromHistory) navHistory.record({ key, range }, currentNavLocation());
     setPendingLocation({ key, range, thenQuickFix });
     void handleOpenFile(path).then(() => {
       // Opened: wait for the tab the document is actually keyed by (another spelling of the
@@ -1955,6 +2006,25 @@ export default function App() {
     }
     setPendingLocation(null);
   }, [activeTabId, documentState, pendingLocation, diff, editorState]);
+
+  /** Shows a place from the Back/Forward trail, without recording it as a fresh jump. */
+  const revealNavLocation = (location: NavLocation) => {
+    // A disk file closed since is reopened by its path (its key); a document still open is found
+    // by key. Entries for documents gone for good were pruned (`forget`), so this always has a
+    // place to go.
+    const doc = documents.get(location.key);
+    openLocationRef.current(doc?.path ?? location.key, location.range, { fromHistory: true });
+  };
+  /** Go Back: to the place before the last jump. */
+  const goBack = () => {
+    const location = navHistory.back();
+    if (location) revealNavLocation(location);
+  };
+  /** Go Forward: to the place a Back stepped away from. */
+  const goForward = () => {
+    const location = navHistory.forward();
+    if (location) revealNavLocation(location);
+  };
 
   /** A list of places to go (references, several definitions), as a picker. */
   const showLocations = (
@@ -2127,6 +2197,11 @@ export default function App() {
         label: "Close Others",
         disabled: tabs.length <= 1,
         onClick: () => closeTabs(otherTabs(id)),
+      },
+      {
+        label: "Close to the Left",
+        disabled: !tabsLeftOf(id).length,
+        onClick: () => closeTabs(tabsLeftOf(id)),
       },
       {
         label: "Close to the Right",
@@ -2800,6 +2875,12 @@ export default function App() {
     if (hasUnsavedChanges && !window.confirm("Discard all unsaved changes and close all editors?"))
       return;
     rememberClosed(tabs.flatMap((tab) => documents.get(tab.id)?.path ?? []));
+    // Untitled and proposed buffers cannot be reopened once everything closes: drop their trail
+    // entries. Disk files stay, so Back still reopens them.
+    for (const tab of tabs) {
+      const doc = documents.get(tab.id);
+      if (doc && doc.source.kind !== "disk") navHistory.forget(doc.key);
+    }
     setTabs([WELCOME_TAB]);
     setActiveTabId("welcome");
     documents.reset();
@@ -2864,6 +2945,11 @@ export default function App() {
     revealFolder: revealTerminalFolder,
   };
 
+  // Read through `navState` so the Back/Forward commands re-enable as the trail grows and the
+  // cursor moves along it (`useSyncExternalStore` above redraws the window when it changes).
+  void navState;
+  const canGoBack = navHistory.canGoBack();
+  const canGoForward = navHistory.canGoForward();
   const builtInCommands: AppCommand[] = [
     // --- Extensions (IDE-09) ---
     {
@@ -3081,6 +3167,22 @@ export default function App() {
       label: "Close Other Editors",
       disabled: tabs.length <= 1,
       run: () => closeTabs(otherTabs(activeTabId)),
+    },
+    {
+      id: "file.closeLeft",
+      menu: "File",
+      label: "Close Editors to the Left",
+      disabled: !tabsLeftOf(activeTabId).length,
+      reason: "No editors to the left of this one",
+      run: () => closeTabs(tabsLeftOf(activeTabId)),
+    },
+    {
+      id: "file.closeRight",
+      menu: "File",
+      label: "Close Editors to the Right",
+      disabled: !tabsRightOf(activeTabId).length,
+      reason: "No editors to the right of this one",
+      run: () => closeTabs(tabsRightOf(activeTabId)),
     },
     {
       id: "file.closeSaved",
@@ -3705,6 +3807,24 @@ export default function App() {
             editorRef.current?.goToLine(Number(value));
           },
         }),
+    },
+    {
+      id: "go.back",
+      menu: "Go",
+      label: "Go Back",
+      shortcut: "Alt+ArrowLeft",
+      disabled: !canGoBack,
+      reason: "No earlier place to go back to",
+      run: goBack,
+    },
+    {
+      id: "go.forward",
+      menu: "Go",
+      label: "Go Forward",
+      shortcut: "Alt+ArrowRight",
+      disabled: !canGoForward,
+      reason: "No later place to go forward to",
+      run: goForward,
     },
     {
       id: "go.previous",
