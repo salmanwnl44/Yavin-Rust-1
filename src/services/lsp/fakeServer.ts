@@ -30,6 +30,8 @@ export interface FakeServerOptions {
   badSemanticDelta?: boolean;
   /** WS17: answer document-formatting requests with a malformed (invalid-range) text edit. */
   badFormatEdit?: boolean;
+  /** WS18: answer rename with an edit to a file outside the workspace, which the engine refuses. */
+  escapingRename?: boolean;
 }
 
 export interface FakeServerIO {
@@ -448,6 +450,22 @@ export function createFakeServer(options: FakeServerOptions, io: FakeServerIO) {
       case "textDocument/rename": {
         const here = doc && wordAt(doc, params.position);
         if (!here) return null;
+        if (options.escapingRename)
+          // WS18 fixture: an edit to a file outside the workspace root; the engine must refuse it
+          // and change nothing, so one server cannot rewrite resources outside its scope.
+          return {
+            documentChanges: [
+              {
+                textDocument: { uri: "file:///outside/secret.ts", version: null },
+                edits: [
+                  {
+                    range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+                    newText: params.newName,
+                  },
+                ],
+              },
+            ],
+          };
         const byDoc = new Map<Doc, object[]>();
         for (const one of occurrences(here.word))
           byDoc.set(one.doc, [

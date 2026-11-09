@@ -20,8 +20,10 @@ import {
 import type { PositionEncoding } from "../services/lsp/positions";
 import type * as P from "../services/lsp/protocol";
 import type { LanguageServerDefinition } from "../services/lsp/registry";
+import { isValidRenameName } from "../services/lsp/rename";
 import { lspPath, lspResourceId } from "../services/lsp/uris";
 import { resourceId } from "../services/resource";
+import type { ResourceUri } from "../services/resource";
 
 /**
  * The language servers' features in Monaco: LSP in, Monaco out, and nothing else.
@@ -53,6 +55,8 @@ export interface LanguageFeaturesHost {
     edit: P.WorkspaceEdit,
     encoding: PositionEncoding,
     label: string,
+    /** The workspace folders the edit may touch -- the owning server's scope (WS18). */
+    within?: readonly ResourceUri[],
   ): Promise<{ applied: boolean; failureReason?: string }>;
   /** Something the user asked for could not be done. */
   report(message: string): void;
@@ -578,6 +582,16 @@ function registerServer(definition: LanguageServerDefinition, capabilities: P.Se
         }
       },
       async provideRenameEdits(model, position, newName, token) {
+        // Monaco's own report of a refused rename goes to a notification service that, in the
+        // standalone editor, only logs: the window says why instead.
+        const refuse = (rejectReason: string) => {
+          installed?.host.report(`Rename to ${newName}: ${rejectReason}`);
+          return { edits: [], rejectReason };
+        };
+        // Basic request safety (WS18): a name that is empty, blank or spans lines is never valid,
+        // so no server is asked and the document is left untouched. The server judges the rest.
+        if (!isValidRenameName(newName))
+          return refuse("the new name is empty or not a valid symbol name.");
         const answer = await ask<P.WorkspaceEdit>(
           id,
           model,
@@ -589,22 +603,18 @@ function registerServer(definition: LanguageServerDefinition, capabilities: P.Se
           }),
           token,
         );
-        // Monaco's own report of a refused rename goes to a notification service that, in the
-        // standalone editor, only logs: the window says why instead.
-        const refuse = (rejectReason: string) => {
-          installed?.host.report(`Rename to ${newName}: ${rejectReason}`);
-          return { edits: [], rejectReason };
-        };
         if (!answer || !installed)
           return refuse(
             "the rename could not be computed (the file changed, or the server declined).",
           );
         // Applied by Yavin's engine -- through the Document Model, never by Monaco directly --
-        // so Monaco is handed nothing further to apply.
+        // so Monaco is handed nothing further to apply. The edit may touch only this server's
+        // workspace scope (WS18): an edit to a resource outside it is refused whole.
         const outcome = await installed.host.applyWorkspaceEdit(
           answer.result,
           answer.context.encoding,
           `Rename to ${newName}`,
+          answer.context.roots,
         );
         return outcome.applied ? { edits: [] } : refuse(outcome.failureReason ?? "not applied.");
       },

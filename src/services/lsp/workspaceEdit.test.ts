@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createDocumentService } from "../documents.ts";
 import type { DocumentIO } from "../documents.ts";
+import { fileUri } from "../resource.ts";
 import { applyWorkspaceEdit } from "./workspaceEdit.ts";
 import type { WorkspaceEditHost } from "./workspaceEdit.ts";
 
@@ -166,6 +167,50 @@ test("create, rename and delete go through the host's file operations, in order"
     host,
   );
   assert.match(refused.failureReason!, /unsaved changes/);
+});
+
+test("an edit that reaches outside the given workspace scope is refused whole (WS18)", async () => {
+  const { documents, host, writes } = setup({ "/w/a.ts": "const old = 1;\n" });
+  // A server rooted at /w returns an edit to its own file and to a file outside the workspace.
+  const refused = await applyWorkspaceEdit(
+    {
+      documentChanges: [
+        {
+          textDocument: { uri: "file:///w/a.ts", version: null },
+          edits: [edit(0, 6, 9, "renamed")],
+        },
+        {
+          textDocument: { uri: "file:///outside/secret.ts", version: null },
+          edits: [edit(0, 0, 0, "x")],
+        },
+      ],
+    },
+    host,
+    "utf-16",
+    { within: [fileUri("/w")] },
+  );
+  assert.equal(refused.applied, false);
+  assert.match(refused.failureReason!, /outside the workspace/);
+  // Nothing changed, not even the in-scope file: the whole edit is refused.
+  assert.equal(documents.get("/w/a.ts"), undefined);
+  assert.deepEqual(writes, []);
+
+  // The same edit without the out-of-scope change applies normally under the same scope.
+  const applied = await applyWorkspaceEdit(
+    {
+      documentChanges: [
+        {
+          textDocument: { uri: "file:///w/a.ts", version: null },
+          edits: [edit(0, 6, 9, "renamed")],
+        },
+      ],
+    },
+    host,
+    "utf-16",
+    { within: [fileUri("/w")] },
+  );
+  assert.equal(applied.applied, true, applied.failureReason);
+  assert.equal(documents.get("/w/a.ts")!.text, "const renamed = 1;\n");
 });
 
 test("a file operation failing part-way stops there and says what was done", async () => {

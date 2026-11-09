@@ -1,5 +1,6 @@
 import type { DocumentService, TextDocument } from "../documents.ts";
-import { resourceId } from "../resource.ts";
+import { isEqualOrAncestor, resourceId } from "../resource.ts";
+import type { ResourceUri } from "../resource.ts";
 import { applyTextEdits, OverlappingEditsError } from "./positions.ts";
 import type { PositionEncoding } from "./positions.ts";
 import type { CreateFile, DeleteFile, RenameFile, TextEdit, WorkspaceEdit } from "./protocol.ts";
@@ -23,6 +24,12 @@ import { fromLspUri, lspPath } from "./uris.ts";
  * document is still at that version, no target is read-only, no edits overlap. One failure
  * refuses the whole edit (the protocol's "abort" failure handling). A file operation that fails
  * after text edits were made stops there, and says what was done.
+ *
+ * When `within` is given (WS18), every file an edit touches must be inside one of those folders --
+ * the scope of the server that produced the edit. A language server rooted at one workspace folder
+ * cannot rewrite, create, rename or delete a resource outside it: an edit that tries is refused
+ * whole, changing nothing. URIs that are not files (`untitled:`) cannot reach the disk and are not
+ * constrained. Edits made by Yavin itself (no `within`) are not restricted.
  */
 
 export interface WorkspaceEditHost {
@@ -78,6 +85,7 @@ export async function applyWorkspaceEdit(
   edit: WorkspaceEdit,
   host: WorkspaceEditHost,
   encoding: PositionEncoding = "utf-16",
+  options: { within?: readonly ResourceUri[] } = {},
 ): Promise<WorkspaceEditResult> {
   const operations = operationsOf(edit);
   /** Documents opened only to check this edit; a refusal closes them again. */
@@ -99,6 +107,23 @@ export async function applyWorkspaceEdit(
   for (const operation of operations) {
     if (operation.kind === "create") created.add(operation.uri);
     if (operation.kind === "rename") created.add(operation.newUri);
+  }
+
+  // --- Scope: a server's edit may touch only resources inside its workspace (WS18) ----------
+  const roots = options.within;
+  if (roots && roots.length) {
+    const outside = (uri: string): boolean => {
+      const resource = fromLspUri(uri);
+      // Not a file (an `untitled:` document): it cannot reach the disk, so it is not constrained.
+      if (!resource) return false;
+      return !roots.some((root) => isEqualOrAncestor(root, resource));
+    };
+    for (const operation of operations) {
+      const uris =
+        operation.kind === "rename" ? [operation.oldUri, operation.newUri] : [operation.uri];
+      for (const uri of uris)
+        if (outside(uri)) return refuse(`${lspPath(uri) ?? uri} is outside the workspace.`);
+    }
   }
 
   // --- Check everything --------------------------------------------------------------------

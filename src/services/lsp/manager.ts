@@ -8,7 +8,7 @@ import {
   relativePath,
   resourceId,
 } from "../resource.ts";
-import type { ResourceId, WorkspaceFolder } from "../resource.ts";
+import type { ResourceId, ResourceUri, WorkspaceFolder } from "../resource.ts";
 import { createLanguageClient } from "./client.ts";
 import type {
   LanguageClient,
@@ -82,6 +82,8 @@ export interface LspManagerOptions {
     edit: WorkspaceEdit,
     encoding: PositionEncoding,
     label: string | undefined,
+    /** The workspace folders the edit may touch -- the server's own scope (WS18). */
+    within?: readonly ResourceUri[],
   ) => Promise<{ applied: boolean; failureReason?: string }>;
   log?: (server: string, text: string, level: string) => void;
   /** Restarts allowed within `restartWindow` before a crashing server is left stopped. */
@@ -306,7 +308,8 @@ export function createLspManager(options: LspManagerOptions) {
         transport: options.transport,
         handlers: {
           diagnostics: (params) => onDiagnostics(server, params),
-          applyEdit: (edit, label) => options.applyEdit(edit, server.client.encoding, label),
+          applyEdit: (edit, label) =>
+            options.applyEdit(edit, server.client.encoding, label, [server.folder.uri]),
           log: (text, level) => options.log?.(definition.label, text, level),
           refresh: () => changed(),
         },
@@ -662,6 +665,8 @@ export function createLspManager(options: LspManagerOptions) {
         encoding: found.server.client.encoding,
         index: indexOf(found.doc),
         label: found.server.client.definition.label,
+        /** The workspace folder this server is rooted at: the scope its edits may touch (WS18). */
+        roots: [found.server.folder.uri] as readonly ResourceUri[],
       };
     },
 

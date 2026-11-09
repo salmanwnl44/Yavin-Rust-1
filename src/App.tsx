@@ -1381,9 +1381,14 @@ export default function App() {
             ? nativeAvailability()
             : Promise.resolve({ trusted: false, installed: new Set<string>() }),
         problems: { publish: publishProblems, clear: clearProblems },
-        applyEdit: (edit, encoding) =>
+        applyEdit: (edit, encoding, _label, within) =>
           workspaceEditHost.current
-            ? applyWorkspaceEdit(edit, workspaceEditHost.current, encoding)
+            ? applyWorkspaceEdit(
+                edit,
+                workspaceEditHost.current,
+                encoding,
+                within ? { within } : {},
+              )
             : Promise.resolve({ applied: false, failureReason: "Not ready" }),
         log: (server, text, level) =>
           lspOutput.appendLine(
@@ -1959,9 +1964,9 @@ export default function App() {
   const languageFeaturesHost = useRef<LanguageFeaturesHost>({
     openLocation: (path, range) => openLocationRef.current(path, range),
     showLocations: (title, locations) => showLocationsRef.current(title, locations),
-    applyWorkspaceEdit: (edit, encoding) =>
+    applyWorkspaceEdit: (edit, encoding, _label, within) =>
       workspaceEditHost.current
-        ? applyWorkspaceEdit(edit, workspaceEditHost.current, encoding)
+        ? applyWorkspaceEdit(edit, workspaceEditHost.current, encoding, within ? { within } : {})
         : Promise.resolve({ applied: false, failureReason: "Not ready" }),
     report: (message) => reportError(message),
     openExternal: (url) => void native("open_external_url", { url }).catch(reportError),

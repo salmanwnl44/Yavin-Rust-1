@@ -509,6 +509,29 @@ test("a read-only file is analysed, but a rename that would change it is refused
   await expectText(page, "function helper() {}\nlet x = error;\n");
 });
 
+test("WS18 rename: an edit that would escape the workspace is refused, changing nothing", async ({
+  page,
+}) => {
+  // The server answers rename with an edit to a file outside the workspace root (/work). The
+  // engine must refuse it whole: one server cannot rewrite resources outside its own scope.
+  await installFakeLsp(page, { options: { typescript: { escapingRename: true } } });
+  await fixture(page, { "/work/a.ts": "function helper() {}\n" });
+  await openServed(page, "a.ts");
+  await page.keyboard.press("Control+Home");
+  await page.keyboard.press("Control+ArrowRight");
+  await page.keyboard.press("Control+ArrowRight");
+  await page.keyboard.press("F2");
+  const input = page.locator(".rename-box input, .rename-input").first();
+  await expect(input).toBeFocused();
+  await page.keyboard.press("Control+a");
+  await page.keyboard.type("assist");
+  await page.keyboard.press("Enter");
+  await expect(appAlert(page)).toContainText("outside the workspace");
+  // The open document is untouched, and the out-of-workspace file was never created.
+  await expectText(page, "function helper() {}\n");
+  expect(await disk(page, "/outside/secret.ts")).toBeUndefined();
+});
+
 test("with no server installed, or in Restricted Mode, the status bar says so plainly", async ({
   page,
   browser,
