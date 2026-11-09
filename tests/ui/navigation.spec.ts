@@ -82,7 +82,10 @@ async function openServed(page: Page, name: string) {
   await expect(status(page)).toHaveAccessibleName("Language server: TypeScript");
 }
 
-const selectedTab = (page: Page) => page.getByRole("tab", { selected: true });
+// The editor tab strip only; the Activity Bar is also a tablist (WS28), so scope to the tabs
+// that control the editor panel rather than every selected tab on the page.
+const selectedTab = (page: Page) =>
+  page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]');
 
 test("Go Back and Go Forward are disabled until there is somewhere to go", async ({ page }) => {
   await installFakeLsp(page);
