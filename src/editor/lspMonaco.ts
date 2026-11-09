@@ -1023,14 +1023,43 @@ async function runCodeAction(key: string, action: P.CodeAction, encoding: Positi
     installed.host.report(action.disabled.reason);
     return;
   }
-  if (action.edit) {
-    const outcome = await installed.host.applyWorkspaceEdit(action.edit, encoding, action.title);
-    if (!outcome.applied) {
-      installed.host.report(`${action.title}: ${outcome.failureReason ?? "not applied"}`);
+  // A **deferred** action carries no edit yet (only `data`): resolve it through
+  // `codeAction/resolve` — but only when the owning server advertised resolve support, and routed
+  // through the same document-scoped request path (so a stale document version is rejected). The
+  // resolved action's edit still goes through the guarded WorkspaceEdit engine below.
+  let resolved = action;
+  const codeActionProvider = installed.manager.capabilities(key)?.codeActionProvider;
+  const resolveProvider =
+    typeof codeActionProvider === "object" && codeActionProvider.resolveProvider === true;
+  if (!action.edit && resolveProvider) {
+    try {
+      const answer = await installed.manager.request<P.CodeAction>(
+        key,
+        "codeAction/resolve",
+        action,
+      );
+      if (answer) resolved = answer;
+    } catch (error) {
+      installed.host.report(
+        error instanceof StaleResultError
+          ? `${action.title}: the document changed before the fix could be resolved; try again.`
+          : `${action.title}: ${error instanceof Error ? error.message : String(error)}`,
+      );
       return;
     }
   }
-  if (action.command) await runServerCommand(key, action.command);
+  if (resolved.edit) {
+    const outcome = await installed.host.applyWorkspaceEdit(
+      resolved.edit,
+      encoding,
+      resolved.title,
+    );
+    if (!outcome.applied) {
+      installed.host.report(`${resolved.title}: ${outcome.failureReason ?? "not applied"}`);
+      return;
+    }
+  }
+  if (resolved.command) await runServerCommand(key, resolved.command);
 }
 
 /** Every reference to what is under the cursor, as a list to pick from (Shift+F12). */

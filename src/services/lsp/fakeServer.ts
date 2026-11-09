@@ -279,7 +279,10 @@ export function createFakeServer(options: FakeServerOptions, io: FakeServerIO) {
       referencesProvider: true,
       documentSymbolProvider: true,
       workspaceSymbolProvider: true,
-      codeActionProvider: { codeActionKinds: ["quickfix", "source"] },
+      codeActionProvider: {
+        codeActionKinds: ["quickfix", "source"],
+        resolveProvider: true,
+      },
       codeLensProvider: { resolveProvider: true },
       documentLinkProvider: { resolveProvider: false },
       documentFormattingProvider: true,
@@ -476,7 +479,41 @@ export function createFakeServer(options: FakeServerOptions, io: FakeServerIO) {
           kind: "source",
           command: { title: "Echo", command: "fake.echo", arguments: ["hello"] },
         });
+        // A **deferred** action: no edit yet — the client must call codeAction/resolve to get it.
+        // Offered only for a file carrying the sentinel, so it is a self-contained fixture for the
+        // resolve path and never changes any other quick-fix menu.
+        if (doc.text.includes("resolve-me"))
+          actions.push({
+            title: "Add file header (deferred)",
+            kind: "quickfix",
+            data: { uri: doc.uri },
+          });
         return actions;
+      }
+      case "codeAction/resolve": {
+        const action = params as { title?: string; data?: { uri?: string } };
+        const target = action.data?.uri ? docs.get(action.data.uri) : undefined;
+        return {
+          ...action,
+          edit: target
+            ? {
+                documentChanges: [
+                  {
+                    textDocument: { uri: target.uri, version: target.version },
+                    edits: [
+                      {
+                        range: {
+                          start: { line: 0, character: 0 },
+                          end: { line: 0, character: 0 },
+                        },
+                        newText: "// header\n",
+                      },
+                    ],
+                  },
+                ],
+              }
+            : undefined,
+        };
       }
       case "workspace/executeCommand":
         if (params.command === "fake.echo") return { echoed: params.arguments ?? [] };

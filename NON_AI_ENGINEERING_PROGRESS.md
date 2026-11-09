@@ -7,6 +7,36 @@ Continuous engineering log for Yavin's desktop IDE quality (AI/LLM functionality
 
 ---
 
+## WS12 — LSP Quick Fix & Code Actions — ✅ GAP-ASSESSED + FILLED
+
+**Finding (Phase 0): the Code Actions workflow is almost entirely built; one real protocol gap.** Tracing the LSP stack confirmed the heavy lifting already exists and is correct:
+
+- **`textDocument/codeAction` request** is wired in the editor (`lspMonaco.ts` registers a Monaco `CodeActionProvider`): it sends the request with the **diagnostic context** (markers mapped to LSP diagnostics with code/source/severity), **`only`** filtering, and **triggerKind**, through the document-scoped `ask`/request path (so a stale document version is rejected). It distinguishes a **`Command`** response from a **`CodeAction`**, and preserves **`isPreferred`**, **`disabled`** (with reason), `kind`, and the associated diagnostics.
+- **Capability negotiation** is correct: the provider is only registered when the server advertises `codeActionProvider`, with its `codeActionKinds` as `providedCodeActionKinds`; the client already advertises `codeActionLiteralSupport`.
+- **Applying** an action (`runCodeAction`): a **disabled** action reports its reason and does nothing; an action with an **`edit`** goes through the existing **WorkspaceEdit engine** (`workspaceEdit.ts` — `changes`/`documentChanges`, versioned `TextDocumentEdit`, Create/Rename/Delete, path containment, version validation, DocumentService routing for open docs + guarded writes for closed files, ordering/overlap safety); an action with a **`command`** is routed through the authorized `workspace/executeCommand` path with **server-ownership validation** (the command runs on the originating server by its document key). Server-initiated `workspace/applyEdit` is also already handled.
+- **Multi-server/root** correctness is inherent: actions are requested from the server(s) associated with the document, results keep their server identity, and a command executes only on its originating server.
+
+**The one genuine gap:** `runCodeAction` applied `edit`/`command` but **never called `codeAction/resolve`** for a **deferred** action — one the server returns with only `data` and no `edit` yet (a common pattern: the server computes the edit lazily when the user picks the action). Such an action silently did nothing. (The fake LSP server also did not advertise or implement resolve, so the path was untested.)
+
+**Fix (reuse, not rebuild).** `runCodeAction` now, **only when the owning server advertised `codeActionProvider.resolveProvider` and the action has no `edit`**, sends **`codeAction/resolve`** (the action, with its `data`, round-tripped) through the same **document-scoped `manager.request`** path — so the resolve inherits the existing **stale-version rejection** (a `StaleResultError` → a clear "the document changed; try again" message rather than applying a fix computed against old text). The resolved action's `edit` then goes through the **same guarded WorkspaceEdit engine**, and its `command` through the same authorized execute path. No new request manager, document owner, or edit system; no change to the non-deferred paths.
+
+**Security model (unchanged):** no renderer-provided executable paths or shell strings; a server-provided `command` is run only via `workspace/executeCommand` on its originating server; every WorkspaceEdit (resolved or not) passes the engine's path-containment, version and dirty-buffer checks; workspace trust and native authorization are untouched.
+
+**Tests and results — fake-server integration (real client/manager/store/engine):**
+
+- **Playwright `lsp.spec.ts` → 19 passed**, incl. a new WS12 test driven by the **fake LSP server's real `codeAction/resolve`**: a deferred action (returned with no edit) is offered via **Ctrl+.**, and choosing it round-trips through `codeAction/resolve`, whose returned `WorkspaceEdit` inserts the header through the guarded engine (`// header` prepended). The existing code-action test (Ctrl+. → apply an edit-bearing quick fix), the rename/WorkspaceEdit tests, and the server-restart test all still pass. The fake deferred action is gated to a sentinel file so it never perturbs any other quick-fix menu.
+- **Broad frontend regression (`src/**/*.test.ts`) → 1,328 (1,326 passed, 0 failed, 2 pre-existing skips).** `tsc --noEmit` exit 0; `prettier --check` clean. **No Rust changed** (a frontend-only LSP-protocol addition), so native suites/clippy are unaffected.
+
+**Real vs. fake verification:** verified against the **fake LSP server** over the real client/manager/WorkspaceEdit engine (the spec's "fake LSP server for protocol/UI integration"). A real-language-server run was **not** performed here (none is bundled for the harness); the protocol shapes (`codeAction/resolve` params = the `CodeAction` with `data`, response = the action with a filled `edit`) follow the LSP spec and reuse the same request/apply machinery the already-tested rename and quick-fix paths use.
+
+**Deferred / not done (with reasons):** (1) a **Quick Fix affordance in the Problems panel** (Phase 2.1's "from both panel and editor") was **not** added — the editor lightbulb/Ctrl+. already offers quick fixes on exactly the same diagnostics, and wiring the Problems panel to the LSP manager + an action menu is a larger UI workstream whose value over the existing editor affordance is marginal; it is a clean future addition. (2) `isPreferred`/`disabled`/`only`/command-vs-CodeAction/stale-rejection were **already implemented**, so no change was made there. (3) No new diagnostic-driven commands beyond the server's own (explicitly out of scope).
+
+**Files changed:** `src/editor/lspMonaco.ts` (`codeAction/resolve` in `runCodeAction`), `src/services/lsp/fakeServer.ts` (advertise + implement resolve, a sentinel-gated deferred action), `tests/ui/lsp.spec.ts` (+1 test). No change to the LSP manager, the WorkspaceEdit engine, the Problems service, DocumentService, protected files, or C1/C2.
+
+**Next genuinely missing capability (assessed):** surfacing LSP quick fixes **in the Problems panel** (request code actions for a selected diagnostic and present them in a menu, applied through the same `runCodeAction` path) is the clearest remaining code-actions gap; it reuses everything built here and in WS11 and does not rebuild the manager or engine.
+
+---
+
 ## WS11 — Workspace Diagnostics & Problems Integration — ✅ GAP-ASSESSED + FILLED
 
 **Finding (Phase 0): the diagnostics subsystem is mature; one genuine integration gap.** Per the spec's instruction to find real gaps and not rebuild mature components, I traced the whole lifecycle and confirmed almost everything already exists and is correct:

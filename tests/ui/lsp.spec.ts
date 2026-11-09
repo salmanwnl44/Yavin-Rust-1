@@ -292,6 +292,22 @@ test("code actions: Ctrl+. offers the server's quick fix, and applying it edits 
   await expectText(page, "// DONE later\n");
 });
 
+test("WS12 code actions: a deferred action is resolved via codeAction/resolve, then applied", async ({
+  page,
+}) => {
+  await installFakeLsp(page);
+  await fixture(page, { "/work/a.ts": "// resolve-me\n" });
+  await openServed(page, "a.ts");
+  await page.keyboard.press("Control+Home");
+  await page.keyboard.press("Control+.");
+  // The action is offered with no edit; choosing it round-trips through codeAction/resolve, whose
+  // returned WorkspaceEdit inserts the header through the guarded apply engine.
+  const deferred = page.getByText("Add file header (deferred)");
+  await expect(deferred).toBeVisible();
+  await deferred.click();
+  await expectText(page, "// header\n// resolve-me\n");
+});
+
 test("signature help: the parameters appear inside a call", async ({ page }) => {
   await installFakeLsp(page);
   await fixture(page, { "/work/a.ts": "" });
