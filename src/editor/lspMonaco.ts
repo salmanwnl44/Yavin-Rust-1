@@ -6,9 +6,17 @@ import { allProblems, subscribeProblems } from "../services/panel/problems";
 import { problemResourceId } from "../services/panel/problemLocations";
 import type { LspManager } from "../services/lsp/manager";
 import { StaleResultError } from "../services/lsp/manager";
+import { createCallHierarchy } from "../services/lsp/callHierarchy";
+import { createTypeHierarchy } from "../services/lsp/typeHierarchy";
+import type { Hierarchy } from "../services/lsp/hierarchy";
 import { CancelledError } from "../services/lsp/jsonrpc";
 import { LineIndex } from "../services/lsp/positions";
-import { applySemanticDelta, toUtf16Tokens } from "../services/lsp/semanticTokens";
+import {
+  applySemanticDelta,
+  isValidTokenData,
+  SemanticDeltaError,
+  toUtf16Tokens,
+} from "../services/lsp/semanticTokens";
 import type { PositionEncoding } from "../services/lsp/positions";
 import type * as P from "../services/lsp/protocol";
 import type { LanguageServerDefinition } from "../services/lsp/registry";
@@ -50,7 +58,12 @@ export interface LanguageFeaturesHost {
   report(message: string): void;
   /** Opens a web address in the system browser. */
   openExternal(url: string): void;
+  /** Shows a call (WS14) or type (WS15) hierarchy for exploration — the host renders the lazy tree. */
+  showHierarchy(session: Hierarchy, kind: HierarchyKind): void;
 }
+
+/** Which hierarchy a {@link LanguageFeaturesHost.showHierarchy} session is — picks the view's labels. */
+export type HierarchyKind = "call" | "type";
 
 const COMMAND = "yavin.lsp.command";
 const CODE_ACTION = "yavin.lsp.codeAction";
@@ -863,6 +876,36 @@ function registerServer(definition: LanguageServerDefinition, capabilities: P.Se
      * here and the whole array converted, since converting columns needs every token.
      */
     const last = new WeakMap<monaco.editor.ITextModel, { resultId?: string; data: number[] }>();
+    /**
+     * Take a server's **full** token array, reject it if malformed (rather than coerce garbage into
+     * `Uint32Array` and draw it), retain it for the next delta, and hand Monaco the UTF-16 tokens.
+     * A dropped response leaves the editor on its native tokenizer — no semantic colour, no
+     * corruption. Reused by the delta path to recover when a delta cannot be applied.
+     */
+    const fullTokens = async (
+      model: monaco.editor.ITextModel,
+      token: monaco.CancellationToken,
+    ): Promise<monaco.languages.SemanticTokens | null> => {
+      const answer = await ask<P.SemanticTokens | P.SemanticTokensDelta>(
+        id,
+        model,
+        "textDocument/semanticTokens/full",
+        (ctx) => ({ textDocument: { uri: ctx.uri } }),
+        token,
+      );
+      if (!answer) return null;
+      const { result, context: ctx } = answer;
+      // A full request answered with a delta is a protocol violation: drop it, don't guess.
+      if ("edits" in result || !isValidTokenData(result.data)) {
+        console.warn("semantic tokens: full response rejected (malformed token data)");
+        return null;
+      }
+      last.set(model, { resultId: result.resultId, data: result.data });
+      return {
+        resultId: result.resultId,
+        data: new Uint32Array(toUtf16Tokens(result.data, ctx.index, ctx.encoding)),
+      };
+    };
     register(L.registerDocumentSemanticTokensProvider, {
       getLegend: () => semantic.legend,
       async provideDocumentSemanticTokens(model, lastResultId, token) {
@@ -870,22 +913,49 @@ function registerServer(definition: LanguageServerDefinition, capabilities: P.Se
         const useDelta = Boolean(
           delta && lastResultId && previous && previous.resultId === lastResultId,
         );
+        if (!useDelta) return fullTokens(model, token);
+
         const answer = await ask<P.SemanticTokens | P.SemanticTokensDelta>(
           id,
           model,
-          useDelta ? "textDocument/semanticTokens/full/delta" : "textDocument/semanticTokens/full",
-          (ctx) => ({
-            textDocument: { uri: ctx.uri },
-            ...(useDelta ? { previousResultId: lastResultId } : {}),
-          }),
+          "textDocument/semanticTokens/full/delta",
+          (ctx) => ({ textDocument: { uri: ctx.uri }, previousResultId: lastResultId }),
           token,
         );
         if (!answer) return null;
         const { result, context: ctx } = answer;
-        const data =
-          "edits" in result ? applySemanticDelta(previous?.data ?? [], result.edits) : result.data;
+
+        // The server may answer a delta request with a full set (it chose not to diff): validate it
+        // like any full response.
+        if (!("edits" in result)) {
+          if (!isValidTokenData(result.data)) {
+            console.warn("semantic tokens: full (from delta) response rejected (malformed)");
+            return null;
+          }
+          last.set(model, { resultId: result.resultId, data: result.data });
+          return {
+            resultId: result.resultId,
+            data: new Uint32Array(toUtf16Tokens(result.data, ctx.index, ctx.encoding)),
+          };
+        }
+
+        // A delta: apply it to the retained previous. If it cannot be applied cleanly (out-of-range
+        // or inconsistent with the previous result), recover with a fresh full request rather than
+        // drawing corrupt highlighting.
+        let data: number[];
+        try {
+          data = applySemanticDelta(previous!.data, result.edits);
+        } catch (error) {
+          if (!(error instanceof SemanticDeltaError)) throw error;
+          console.warn(
+            `semantic tokens: delta not applicable (${error.message}); re-fetching full`,
+          );
+          return fullTokens(model, token);
+        }
         last.set(model, { resultId: result.resultId, data });
-        if ("edits" in result && ctx.encoding === "utf-16")
+        // UTF-16 server: hand Monaco the edits (it applies them to the same retained previous). The
+        // edits' values were validated inside applySemanticDelta above.
+        if (ctx.encoding === "utf-16")
           return {
             resultId: result.resultId,
             edits: result.edits.map((edit) => ({
@@ -1192,6 +1262,17 @@ export function installLanguageFeatures(init: {
 }
 
 /** Adds Find All References (Shift+F12) to an editor: a list, rather than Monaco's peek view. */
+/**
+ * Whether an LSP server for this (open) document advertises code actions (WS13). LSP servers only
+ * diagnose files they have opened, so a diagnostic from a server is always for an open document —
+ * this gates the Problems panel's Quick Fix affordance so it is never shown when no eligible server
+ * could offer a fix. Reads the same per-document capabilities the editor's own Quick Fix uses; it
+ * requests nothing.
+ */
+export function codeActionCapable(path: string): boolean {
+  return !!installed?.manager.capabilities(path)?.codeActionProvider;
+}
+
 export function addReferencesAction(
   editor: monaco.editor.IStandaloneCodeEditor,
 ): monaco.IDisposable {
@@ -1204,5 +1285,161 @@ export function addReferencesAction(
     contextMenuGroupId: "navigation",
     contextMenuOrder: 2,
     run: (editor) => findReferences(editor),
+  });
+}
+
+/**
+ * Prepare a call hierarchy at the cursor and hand the lazy tree to the host (WS14). Monaco has no
+ * built-in call-hierarchy UI, so this uses the LSP requests directly through the manager (the same
+ * document-scoped path, with server routing and cancellation) and the host renders the tree.
+ * Incoming/outgoing expansions are `staleOk` — exploring callers/callees is a read that a later
+ * edit should not block.
+ */
+async function showCallHierarchy(editor: monaco.editor.ICodeEditor): Promise<void> {
+  if (!installed) return;
+  const model = editor.getModel();
+  const position = editor.getPosition();
+  const doc = model ? documentOf(model) : undefined;
+  const context = doc && installed.manager.context(doc.key);
+  if (
+    !model ||
+    !doc ||
+    !context ||
+    !position ||
+    !installed.manager.capabilities(doc.key)?.callHierarchyProvider
+  ) {
+    installed?.host.report("No language server offers a call hierarchy for this file.");
+    return;
+  }
+  const key = doc.key;
+  try {
+    const items = await installed.manager.request<P.CallHierarchyItem[]>(
+      key,
+      "textDocument/prepareCallHierarchy",
+      { textDocument: { uri: context.uri }, position: toPosition(context, model, position) },
+    );
+    if (!items?.length) {
+      installed.host.report("No call hierarchy for the symbol here.");
+      return;
+    }
+    installed.host.showHierarchy(
+      createCallHierarchy({
+        direction: "incoming",
+        root: items[0]!,
+        incoming: (item) =>
+          installed!.manager.request<P.CallHierarchyIncomingCall[]>(
+            key,
+            "callHierarchy/incomingCalls",
+            { item },
+            undefined,
+            { staleOk: true },
+          ),
+        outgoing: (item) =>
+          installed!.manager.request<P.CallHierarchyOutgoingCall[]>(
+            key,
+            "callHierarchy/outgoingCalls",
+            { item },
+            undefined,
+            { staleOk: true },
+          ),
+      }),
+      "call",
+    );
+  } catch (error) {
+    if (error instanceof StaleResultError || error instanceof CancelledError) return;
+    installed.host.report(
+      `Call hierarchy: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+export function addCallHierarchyAction(
+  editor: monaco.editor.IStandaloneCodeEditor,
+): monaco.IDisposable {
+  return editor.addAction({
+    id: "yavin.lsp.callHierarchy",
+    label: "Show Call Hierarchy",
+    keybindings: [monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyH],
+    contextMenuGroupId: "navigation",
+    contextMenuOrder: 3,
+    run: (editor) => void showCallHierarchy(editor),
+  });
+}
+
+/**
+ * Prepare a type hierarchy at the cursor and hand the lazy tree to the host (WS15). Mirrors
+ * {@link showCallHierarchy} exactly — same document-scoped request path (server routing,
+ * cancellation), same host-rendered tree, same `staleOk` on the supertypes/subtypes expansions
+ * (navigating inheritance is a read a later edit should not block). The only differences are the
+ * capability gated on, the LSP requests, and the hierarchy model used.
+ */
+async function showTypeHierarchy(editor: monaco.editor.ICodeEditor): Promise<void> {
+  if (!installed) return;
+  const model = editor.getModel();
+  const position = editor.getPosition();
+  const doc = model ? documentOf(model) : undefined;
+  const context = doc && installed.manager.context(doc.key);
+  if (
+    !model ||
+    !doc ||
+    !context ||
+    !position ||
+    !installed.manager.capabilities(doc.key)?.typeHierarchyProvider
+  ) {
+    installed?.host.report("No language server offers a type hierarchy for this file.");
+    return;
+  }
+  const key = doc.key;
+  try {
+    const items = await installed.manager.request<P.TypeHierarchyItem[]>(
+      key,
+      "textDocument/prepareTypeHierarchy",
+      { textDocument: { uri: context.uri }, position: toPosition(context, model, position) },
+    );
+    if (!items?.length) {
+      installed.host.report("No type hierarchy for the symbol here.");
+      return;
+    }
+    installed.host.showHierarchy(
+      createTypeHierarchy({
+        direction: "supertypes",
+        root: items[0]!,
+        supertypes: (item) =>
+          installed!.manager.request<P.TypeHierarchyItem[]>(
+            key,
+            "typeHierarchy/supertypes",
+            { item },
+            undefined,
+            { staleOk: true },
+          ),
+        subtypes: (item) =>
+          installed!.manager.request<P.TypeHierarchyItem[]>(
+            key,
+            "typeHierarchy/subtypes",
+            { item },
+            undefined,
+            { staleOk: true },
+          ),
+      }),
+      "type",
+    );
+  } catch (error) {
+    if (error instanceof StaleResultError || error instanceof CancelledError) return;
+    installed.host.report(
+      `Type hierarchy: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+export function addTypeHierarchyAction(
+  editor: monaco.editor.IStandaloneCodeEditor,
+): monaco.IDisposable {
+  return editor.addAction({
+    id: "yavin.lsp.typeHierarchy",
+    label: "Show Type Hierarchy",
+    keybindings: [monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyT],
+    contextMenuGroupId: "navigation",
+    contextMenuOrder: 4,
+    run: (editor) => void showTypeHierarchy(editor),
   });
 }

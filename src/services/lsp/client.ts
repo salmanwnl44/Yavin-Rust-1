@@ -434,6 +434,8 @@ export const CLIENT_CAPABILITIES = {
     typeDefinition: { linkSupport: true },
     implementation: { linkSupport: true },
     references: {},
+    callHierarchy: { dynamicRegistration: false },
+    typeHierarchy: { dynamicRegistration: false },
     documentSymbol: {
       hierarchicalDocumentSymbolSupport: true,
       symbolKind: { valueSet: range(26) },

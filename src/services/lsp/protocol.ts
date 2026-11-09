@@ -228,6 +228,47 @@ export interface SymbolInformation {
   containerName?: string;
 }
 
+/** Call hierarchy (WS14): a function/method node and its callers/callees. */
+export interface CallHierarchyItem {
+  name: string;
+  /** A {@link SymbolKind}. */
+  kind: number;
+  tags?: number[];
+  detail?: string;
+  uri: string;
+  range: Range;
+  selectionRange: Range;
+  /** Opaque server data, round-tripped to incoming/outgoing requests. */
+  data?: unknown;
+}
+export interface CallHierarchyIncomingCall {
+  /** The caller. */
+  from: CallHierarchyItem;
+  /** Where in the caller the call occurs. */
+  fromRanges: Range[];
+}
+export interface CallHierarchyOutgoingCall {
+  /** The callee. */
+  to: CallHierarchyItem;
+  /** Where in the current item the call occurs. */
+  fromRanges: Range[];
+}
+
+/** Type hierarchy (WS15): a class/interface node and its supertypes/subtypes. Same shape as a
+ * {@link CallHierarchyItem}. */
+export interface TypeHierarchyItem {
+  name: string;
+  /** A {@link SymbolKind}. */
+  kind: number;
+  tags?: number[];
+  detail?: string;
+  uri: string;
+  range: Range;
+  selectionRange: Range;
+  /** Opaque server data, round-tripped to supertypes/subtypes requests. */
+  data?: unknown;
+}
+
 export interface CodeAction {
   title: string;
   kind?: string;
@@ -299,6 +340,8 @@ export interface ServerCapabilities {
   typeDefinitionProvider?: boolean | object;
   implementationProvider?: boolean | object;
   referencesProvider?: boolean | object;
+  callHierarchyProvider?: boolean | object;
+  typeHierarchyProvider?: boolean | object;
   documentSymbolProvider?: boolean | object;
   workspaceSymbolProvider?: boolean | object;
   codeActionProvider?: boolean | { codeActionKinds?: string[]; resolveProvider?: boolean };

@@ -11,7 +11,12 @@ import type { EditorModel, EditorModelBridge } from "../../services/editorModelB
 import type { DocumentService, TextDocument } from "../../services/documents";
 import type { EditorViews } from "../../services/editorViews";
 import type { EditorHandle, EditorState, LanguageFeatures } from "../../editor/editorTypes";
-import { addReferencesAction, installLanguageFeatures } from "../../editor/lspMonaco";
+import {
+  addCallHierarchyAction,
+  addReferencesAction,
+  addTypeHierarchyAction,
+  installLanguageFeatures,
+} from "../../editor/lspMonaco";
 import { createDiffView } from "../../editor/diff";
 import { attachDebugDecorations } from "../../editor/debugMonaco";
 import { attachBlameDecorations, type BlameAnnotationSource } from "../../editor/blameMonaco";
@@ -375,6 +380,8 @@ export default function CodeEditor({
         });
       }
       subscriptions.push(addReferencesAction(instance));
+      subscriptions.push(addCallHierarchyAction(instance));
+      subscriptions.push(addTypeHierarchyAction(instance));
     }
     if (TEST_HOOKS) installTestHook(instance, bridge, () => shown.current?.key ?? null);
     // Inline Git blame (WS9): annotate the current line; the source is stable, built by the host.

@@ -45,6 +45,8 @@ export function ProblemsView({
   onManageTrust,
   activeFile,
   onOpen,
+  onQuickFix,
+  canQuickFix,
 }: {
   /** Running a checker starts the project's own build tooling, so it needs trust. */
   trusted?: boolean;
@@ -53,6 +55,11 @@ export function ProblemsView({
   activeFile?: string;
   /** Opens a file at a position (1-based line and column), for click-to-navigate. */
   onOpen?: (file: string, line: number, column: number) => void;
+  /** Invoke Quick Fix at a diagnostic (WS13): the host navigates there and opens the editor's
+   * existing code-action menu — this view never requests or applies actions itself. */
+  onQuickFix?: (file: string, line: number, column: number) => void;
+  /** Whether an eligible LSP server offers code actions for a file, to gate the Quick Fix action. */
+  canQuickFix?: (file: string) => boolean;
 }) {
   // The version is a dependency of the grouping below, not just a re-render trigger:
   // without it the memo kept returning the list from before the checker published.
@@ -233,23 +240,38 @@ export function ProblemsView({
                 {open &&
                   file.problems.map((problem, index) => (
                     <div key={`${problem.line}:${problem.column}:${index}`}>
-                      <button
-                        onClick={() => onOpen?.(problem.file, problem.line, problem.column)}
-                        className="flex w-full items-start gap-1.5 py-0.5 pr-3 pl-8 text-left hover:bg-[#0c0c0c]"
-                      >
-                        <span
-                          aria-label={kindOf(problem)}
-                          className={`shrink-0 font-bold ${KIND_STYLE[kindOf(problem)]}`}
+                      <div className="group/problem flex items-stretch hover:bg-[#0c0c0c]">
+                        <button
+                          onClick={() => onOpen?.(problem.file, problem.line, problem.column)}
+                          className="flex flex-1 items-start gap-1.5 py-0.5 pl-8 text-left"
                         >
-                          {KIND_MARK[kindOf(problem)]}
-                        </span>
-                        <span className="flex-1 text-zinc-300">{problem.message}</span>
-                        <span className="shrink-0 text-zinc-600">
-                          {problem.source}
-                          {problem.code ? `(${problem.code})` : ""} [Ln {problem.line}, Col{" "}
-                          {problem.column}]
-                        </span>
-                      </button>
+                          <span
+                            aria-label={kindOf(problem)}
+                            className={`shrink-0 font-bold ${KIND_STYLE[kindOf(problem)]}`}
+                          >
+                            {KIND_MARK[kindOf(problem)]}
+                          </span>
+                          <span className="flex-1 text-zinc-300">{problem.message}</span>
+                          <span className="shrink-0 text-zinc-600">
+                            {problem.source}
+                            {problem.code ? `(${problem.code})` : ""} [Ln {problem.line}, Col{" "}
+                            {problem.column}]
+                          </span>
+                        </button>
+                        {/* WS13: Quick Fix — a contextual action (not a permanent control) shown only
+                            when an eligible LSP server offers code actions for this file. It opens the
+                            editor's existing code-action menu; this view requests/applies nothing. */}
+                        {onQuickFix && canQuickFix?.(problem.file) && (
+                          <button
+                            aria-label={`Quick Fix: ${problem.message}`}
+                            title="Quick Fix…"
+                            onClick={() => onQuickFix(problem.file, problem.line, problem.column)}
+                            className="shrink-0 px-2 text-[11px] text-indigo-300 opacity-0 hover:text-indigo-200 group-hover/problem:opacity-100 focus:opacity-100"
+                          >
+                            Quick Fix
+                          </button>
+                        )}
+                      </div>
                       {/* WS11: a diagnostic's related/secondary locations (LSP relatedInformation),
                           each navigable — the same data the editor shows, now listed here too. */}
                       {problem.related && problem.related.length > 0 && (

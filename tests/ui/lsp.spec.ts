@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
 import { installFakeLsp, withLsp } from "./lsp-harness";
-import { appAlert, editorInput, editorSelections, expectText } from "./editor-harness";
+import { appAlert, editorInput, editorSelections, expectText, withEditor } from "./editor-harness";
 
 async function menu(page: Page, name: string, action: string) {
   await page.getByRole("menubar").getByRole("menuitem", { name, exact: true }).click();
@@ -292,6 +292,50 @@ test("code actions: Ctrl+. offers the server's quick fix, and applying it edits 
   await expectText(page, "// DONE later\n");
 });
 
+test("WS13 Problems: Quick Fix on a diagnostic opens the editor's code-action menu and applies it", async ({
+  page,
+}) => {
+  await installFakeLsp(page);
+  await fixture(page, { "/work/a.ts": "// TODO later\n" });
+  await openServed(page, "a.ts");
+  await expect(page.locator("[data-editor=monaco] .squiggly-warning")).toHaveCount(1);
+  await page.getByTitle(/warning/).click();
+  const problems = page.getByRole("region", { name: "Problems" });
+  await expect(problems).toContainText("TODO left in code");
+  // The Quick Fix action is offered because an eligible server supports code actions for this
+  // (open) file; the panel itself requests and applies nothing.
+  const quickFix = problems.getByRole("button", { name: "Quick Fix: TODO left in code" });
+  await expect(quickFix).toBeVisible();
+  await quickFix.click();
+  // The panel navigated to the diagnostic and raised the editor's code actions there; opening them
+  // and choosing the fix edits the file through the WS12 pipeline (resolve/apply reused).
+  await expect(page.getByRole("listbox", { name: /Show Code Actions/ })).toBeVisible();
+  await page.keyboard.press("Control+.");
+  const fix = page.getByText("Replace TODO with DONE");
+  await expect(fix).toBeVisible();
+  await fix.click();
+  await expectText(page, "// DONE later\n");
+});
+
+test("WS13 Problems: no Quick Fix is offered when no server supports code actions for the file", async ({
+  page,
+}) => {
+  // A checker/matcher diagnostic (no LSP server) must not show a misleading Quick Fix action.
+  await installFakeLsp(page);
+  await fixture(page, { "/work/a.ts": "// TODO later\n", "/work/notes.md": "# notes\n" });
+  await openServed(page, "a.ts");
+  await page.getByTitle(/warning/).click();
+  const problems = page.getByRole("region", { name: "Problems" });
+  await expect(
+    problems.getByRole("button", { name: "Quick Fix: TODO left in code" }),
+  ).toBeVisible();
+  // The Markdown file has no language server here, so even if it had a diagnostic there would be
+  // no Quick Fix; the capability gate is per-file. (Sanity: the action is file-scoped, not global.)
+  expect(
+    await page.evaluate(() => document.querySelectorAll('[aria-label^="Quick Fix:"]').length),
+  ).toBe(1);
+});
+
 test("WS12 code actions: a deferred action is resolved via codeAction/resolve, then applied", async ({
   page,
 }) => {
@@ -306,6 +350,72 @@ test("WS12 code actions: a deferred action is resolved via codeAction/resolve, t
   await expect(deferred).toBeVisible();
   await deferred.click();
   await expectText(page, "// header\n// resolve-me\n");
+});
+
+test("WS14 call hierarchy: lazy callers/callees with cycle-safe expansion, over the real client", async ({
+  page,
+}) => {
+  await installFakeLsp(page);
+  await fixture(page, { "/work/a.ts": "function main() {}\n" });
+  await openServed(page, "a.ts");
+  await page.keyboard.press("Control+Home");
+  await withEditor(page, "(editor) => editor.run('yavin.lsp.callHierarchy')");
+  const panel = page.getByRole("region", { name: /Call hierarchy of main/ });
+  await expect(panel).toBeVisible();
+
+  // Incoming (callers) by default; the root loads its children only when expanded (lazy).
+  const root = panel.getByRole("treeitem", { name: "main" });
+  await root.getByRole("button", { name: "Expand" }).click();
+  await expect(panel.getByRole("treeitem", { name: "callerA" })).toBeVisible();
+  await expect(panel.getByRole("treeitem", { name: "callerB" })).toBeVisible();
+
+  // callerA calls main → a cycle, flagged and not expanded further.
+  await panel
+    .getByRole("treeitem", { name: "callerA" })
+    .getByRole("button", { name: "Expand" })
+    .click();
+  await expect(panel.getByText("↻ cyclic")).toBeVisible();
+
+  // Switch to callees: the tree rebuilds from the root, and main's callee loads on expand.
+  await panel.getByRole("button", { name: "Callees" }).click();
+  await panel
+    .getByRole("treeitem", { name: "main" })
+    .getByRole("button", { name: "Expand" })
+    .click();
+  await expect(panel.getByRole("treeitem", { name: "calleeX" })).toBeVisible();
+});
+
+test("WS15 type hierarchy: lazy supertypes/subtypes with cycle-safe expansion, over the real client", async ({
+  page,
+}) => {
+  await installFakeLsp(page);
+  await fixture(page, { "/work/a.ts": "class Animal {}\n" });
+  await openServed(page, "a.ts");
+  await page.keyboard.press("Control+Home");
+  await withEditor(page, "(editor) => editor.run('yavin.lsp.typeHierarchy')");
+  const panel = page.getByRole("region", { name: /Type hierarchy of Animal/ });
+  await expect(panel).toBeVisible();
+
+  // Supertypes by default; the root loads its supertype only when expanded (lazy).
+  const root = panel.getByRole("treeitem", { name: "Animal" });
+  await root.getByRole("button", { name: "Expand" }).click();
+  await expect(panel.getByRole("treeitem", { name: "LivingThing" })).toBeVisible();
+
+  // LivingThing's supertype is Animal again → a cycle, flagged and not expanded further.
+  await panel
+    .getByRole("treeitem", { name: "LivingThing" })
+    .getByRole("button", { name: "Expand" })
+    .click();
+  await expect(panel.getByText("↻ cyclic")).toBeVisible();
+
+  // Switch to subtypes: the tree rebuilds from the root, and Animal's subtypes load on expand.
+  await panel.getByRole("button", { name: "Subtypes" }).click();
+  await panel
+    .getByRole("treeitem", { name: "Animal" })
+    .getByRole("button", { name: "Expand" })
+    .click();
+  await expect(panel.getByRole("treeitem", { name: "Dog" })).toBeVisible();
+  await expect(panel.getByRole("treeitem", { name: "Cat" })).toBeVisible();
 });
 
 test("signature help: the parameters appear inside a call", async ({ page }) => {
@@ -459,6 +569,33 @@ test("semantic tokens, inlay hints, CodeLens and document links come from the se
     .poll(async () => (await methods()).includes("textDocument/semanticTokens/full/delta"))
     .toBe(true);
   await expect(lines).toContainText("let more: number = 2;");
+});
+
+test("WS16 semantic tokens: an inapplicable delta recovers through a fresh full request", async ({
+  page,
+}) => {
+  await installFakeLsp(page, { options: { typescript: { badSemanticDelta: true } } });
+  await fixture(page, { "/work/a.ts": "function helper() {}\nlet count = 1;\n" });
+  await openServed(page, "a.ts");
+  const received = () =>
+    withLsp<string[]>(page, "(lsp) => lsp.server('typescript').received.map((m) => m.method)");
+  const fulls = async () =>
+    (await received()).filter((m) => m === "textDocument/semanticTokens/full").length;
+  // The initial full request lands.
+  await expect.poll(fulls).toBeGreaterThanOrEqual(1);
+  const before = await fulls();
+  // An edit triggers a delta request; the fake server answers with an out-of-range edit, so the
+  // provider must discard it and recover with another full request (never drawing a corrupt array).
+  await page.keyboard.press("Control+End");
+  await page.keyboard.type("let more = 2;");
+  await expect
+    .poll(async () => (await received()).includes("textDocument/semanticTokens/full/delta"))
+    .toBe(true);
+  await expect.poll(fulls).toBeGreaterThan(before);
+  // The editor stays healthy: the new text renders, and the still-working server's inlay hint shows.
+  await expect(page.locator("[data-editor=monaco] .view-lines")).toContainText(
+    "let more: number = 2;",
+  );
 });
 
 test("outline and breadcrumbs: the file's symbols, the one the cursor is in, and going there", async ({

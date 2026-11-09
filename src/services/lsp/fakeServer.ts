@@ -26,6 +26,8 @@ export interface FakeServerOptions {
   crashOn?: string;
   /** Milliseconds before publishing diagnostics after a change. */
   diagnosticsDelay?: number;
+  /** WS16: answer semantic-token delta requests with an out-of-range (inapplicable) edit. */
+  badSemanticDelta?: boolean;
 }
 
 export interface FakeServerIO {
@@ -99,6 +101,26 @@ export function createFakeServer(options: FakeServerOptions, io: FakeServerIO) {
     start: positionAt(text, start),
     end: positionAt(text, end),
   });
+  // WS14 call-hierarchy helpers: each symbol name gets its own (distinct) line, so two items are
+  // the same symbol only when their names match — which is what makes cycle detection meaningful.
+  const callLine = (name: string) => name.charCodeAt(0) % 50;
+  const lineRange = (line: number) => ({
+    start: { line, character: 0 },
+    end: { line, character: 20 },
+  });
+  const callItem = (name: string, uri: string) => ({
+    name,
+    kind: 12,
+    uri,
+    range: lineRange(callLine(name)),
+    selectionRange: {
+      start: { line: callLine(name), character: 0 },
+      end: { line: callLine(name), character: name.length },
+    },
+  });
+  // WS15 type-hierarchy helper: like callItem but a class (kind 5). Same per-name line, so a repeat
+  // of the same type at a deeper level keys the same and reads as a cycle.
+  const typeItem = (name: string, uri: string) => ({ ...callItem(name, uri), kind: 5 });
   const wordAt = (doc: Doc, position: { line: number; character: number }) => {
     const offset = offsetAt(doc.text, position);
     for (const match of doc.text.matchAll(WORD)) {
@@ -283,6 +305,8 @@ export function createFakeServer(options: FakeServerOptions, io: FakeServerIO) {
         codeActionKinds: ["quickfix", "source"],
         resolveProvider: true,
       },
+      callHierarchyProvider: true,
+      typeHierarchyProvider: true,
       codeLensProvider: { resolveProvider: true },
       documentLinkProvider: { resolveProvider: false },
       documentFormattingProvider: true,
@@ -490,6 +514,54 @@ export function createFakeServer(options: FakeServerOptions, io: FakeServerIO) {
           });
         return actions;
       }
+      // --- Call hierarchy (WS14): a small fixed graph, main → callers/callees -------------------
+      case "textDocument/prepareCallHierarchy": {
+        if (!doc) return null;
+        return [callItem("main", doc.uri)];
+      }
+      case "callHierarchy/incomingCalls": {
+        const item = (params as { item?: { name?: string; uri?: string } }).item;
+        const uri = item?.uri ?? "file:///main.ts";
+        // main is called by callerA and callerB; callerA is called by main (a cycle).
+        const callers: Record<string, string[]> = {
+          main: ["callerA", "callerB"],
+          callerA: ["main"],
+        };
+        return (callers[item?.name ?? ""] ?? []).map((name) => ({
+          from: callItem(name, uri),
+          fromRanges: [lineRange(callItem(name, uri).selectionRange.start.line)],
+        }));
+      }
+      case "callHierarchy/outgoingCalls": {
+        const item = (params as { item?: { name?: string; uri?: string } }).item;
+        const uri = item?.uri ?? "file:///main.ts";
+        const callees: Record<string, string[]> = { main: ["calleeX"] };
+        return (callees[item?.name ?? ""] ?? []).map((name) => ({
+          to: callItem(name, uri),
+          fromRanges: [lineRange(callItem(name, uri).selectionRange.start.line)],
+        }));
+      }
+      // --- Type hierarchy (WS15): a small fixed graph, Animal → supertypes/subtypes ---------------
+      case "textDocument/prepareTypeHierarchy": {
+        if (!doc) return null;
+        return [typeItem("Animal", doc.uri)];
+      }
+      case "typeHierarchy/supertypes": {
+        const item = (params as { item?: { name?: string; uri?: string } }).item;
+        const uri = item?.uri ?? "file:///main.ts";
+        // Animal extends LivingThing; LivingThing extends Animal (a cycle, flagged, not re-expanded).
+        const supers: Record<string, string[]> = {
+          Animal: ["LivingThing"],
+          LivingThing: ["Animal"],
+        };
+        return (supers[item?.name ?? ""] ?? []).map((name) => typeItem(name, uri));
+      }
+      case "typeHierarchy/subtypes": {
+        const item = (params as { item?: { name?: string; uri?: string } }).item;
+        const uri = item?.uri ?? "file:///main.ts";
+        const subs: Record<string, string[]> = { Animal: ["Dog", "Cat"] };
+        return (subs[item?.name ?? ""] ?? []).map((name) => typeItem(name, uri));
+      }
       case "codeAction/resolve": {
         const action = params as { title?: string; data?: { uri?: string } };
         const target = action.data?.uri ? docs.get(action.data.uri) : undefined;
@@ -610,6 +682,13 @@ export function createFakeServer(options: FakeServerOptions, io: FakeServerIO) {
         const resultId = String(++semanticResult);
         previousTokens.set(resultId, data);
         if (!old) return { resultId, data };
+        // WS16 fixture: an edit starting past the end of the previous result — inapplicable, so the
+        // client must recover with a full request rather than draw a corrupt token array.
+        if (options.badSemanticDelta)
+          return {
+            resultId,
+            edits: [{ start: old.length + 50, deleteCount: 0, data: [0, 0, 1, 0, 0] }],
+          };
         return { resultId, edits: [{ start: 0, deleteCount: old.length, data }] };
       }
       case "textDocument/inlayHint": {

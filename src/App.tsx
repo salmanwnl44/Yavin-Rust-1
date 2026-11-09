@@ -107,7 +107,10 @@ import { applyExtensionEdit } from "./services/extensions/documentEdit";
 import { browserWindowFocus, tauriWindowFocus } from "./services/windowFocus";
 import { createPromptService } from "./services/extensions/prompts";
 import { ExtensionPrompt } from "./components/extensions/ExtensionPrompt";
-import type { LanguageFeaturesHost } from "./editor/lspMonaco";
+import type { LanguageFeaturesHost, HierarchyKind } from "./editor/lspMonaco";
+import { codeActionCapable } from "./editor/lspMonaco";
+import type { Hierarchy, HierarchyItem } from "./services/lsp/hierarchy";
+import { HierarchyView } from "./components/layout/HierarchyView";
 import type { EditorRange } from "./editor/editorTypes";
 import type { PaletteSymbol, SymbolScope } from "./components/command-palette/CommandPalette";
 import { clearProblems, publishProblems } from "./services/panel/problems";
@@ -424,6 +427,19 @@ export default function App() {
   const [diff, setDiff] = useState<DiffDocument | null>(null);
   // WS10: the dedicated three-way conflict editor's session, when resolving a conflicted file.
   const [conflictSession, setConflictSession] = useState<ConflictSession | null>(null);
+  // WS14/WS15: the open hierarchy session (call: callers/callees, or type: supertypes/subtypes),
+  // shown in one shared side drawer; `kind` picks the view's labels.
+  const [hierarchy, setHierarchy] = useState<{ session: Hierarchy; kind: HierarchyKind } | null>(
+    null,
+  );
+  useEffect(
+    () => () =>
+      setHierarchy((current) => {
+        current?.session.dispose();
+        return null;
+      }),
+    [workspacePath],
+  );
   // Dispose the session when the workspace changes (or the app unmounts) — no leaked listeners.
   useEffect(
     () => () =>
@@ -1879,16 +1895,19 @@ export default function App() {
   const [pendingLocation, setPendingLocation] = useState<{
     key: string;
     range?: EditorRange;
+    /** WS13: after the editor shows this location, open its Quick Fix (code-action) menu. */
+    thenQuickFix?: boolean;
   } | null>(null);
-  const openLocation = (path: string, range?: EditorRange) => {
+  const openLocation = (path: string, range?: EditorRange, options?: { quickFix?: boolean }) => {
     const key = documents.get(path)?.key ?? path;
-    setPendingLocation({ key, range });
+    const thenQuickFix = options?.quickFix;
+    setPendingLocation({ key, range, thenQuickFix });
     void handleOpenFile(path).then(() => {
       // Opened: wait for the tab the document is actually keyed by (another spelling of the
       // path, once it loaded). Not opened (the failure is already reported): nothing waits.
       const opened = documents.get(path)?.key;
       setPendingLocation((pending) =>
-        pending?.key !== key ? pending : opened ? { key: opened, range } : null,
+        pending?.key !== key ? pending : opened ? { key: opened, range, thenQuickFix } : null,
       );
     });
   };
@@ -1898,6 +1917,16 @@ export default function App() {
     if (!editorRef.current) return;
     if (pendingLocation.range) editorRef.current.select(pendingLocation.range);
     else editorRef.current.focus();
+    // WS13: with the cursor now on the diagnostic, open the editor's own Quick Fix menu (the WS12
+    // request/resolve/apply pipeline). One frame later, so Monaco has settled the new cursor
+    // position before it collects the actions at it.
+    if (pendingLocation.thenQuickFix) {
+      const handle = editorRef.current;
+      requestAnimationFrame(() => {
+        handle.focus();
+        void handle.runAction("editor.action.quickFix");
+      });
+    }
     setPendingLocation(null);
   }, [activeTabId, documentState, pendingLocation, diff, editorState]);
 
@@ -1936,6 +1965,11 @@ export default function App() {
         : Promise.resolve({ applied: false, failureReason: "Not ready" }),
     report: (message) => reportError(message),
     openExternal: (url) => void native("open_external_url", { url }).catch(reportError),
+    showHierarchy: (session, kind) =>
+      setHierarchy((previous) => {
+        previous?.session.dispose();
+        return { session, kind };
+      }),
   }).current;
   const openLocationRef = useRef(openLocation);
   openLocationRef.current = openLocation;
@@ -4361,6 +4395,22 @@ export default function App() {
                       endColumn: column,
                     })
                   }
+                  // WS13: Quick Fix from Problems — navigate to the diagnostic, then open the
+                  // editor's own code-action menu (the WS12 request/resolve/apply pipeline). This
+                  // reuses runCodeAction entirely; App requests and applies nothing itself.
+                  canQuickFix={codeActionCapable}
+                  onQuickFixProblem={(file, line, column) =>
+                    openLocation(
+                      file,
+                      {
+                        startLineNumber: line,
+                        startColumn: column,
+                        endLineNumber: line,
+                        endColumn: column,
+                      },
+                      { quickFix: true },
+                    )
+                  }
                 />
               </Suspense>
             )}
@@ -4368,6 +4418,36 @@ export default function App() {
 
           {/* Right AI Drawer */}
           {isAIOpen && <AIAssistantPanel onClose={() => setIsAIOpen(false)} />}
+
+          {/* WS14/WS15: the shared hierarchy drawer (call or type) — the editor stays visible so
+              navigating a node updates it. onNavigate converts the LSP (0-based) item location to
+              the editor's. The kind picks the labels; the tree, drawer and navigation are shared. */}
+          {hierarchy && (
+            <div className="w-[320px] shrink-0 border-l border-[#141414]">
+              <HierarchyView
+                session={hierarchy.session}
+                kindLabel={hierarchy.kind === "type" ? "Type hierarchy" : "Call hierarchy"}
+                directionLabels={
+                  hierarchy.kind === "type"
+                    ? { supertypes: "Supertypes", subtypes: "Subtypes" }
+                    : { incoming: "Callers", outgoing: "Callees" }
+                }
+                onClose={() => {
+                  hierarchy.session.dispose();
+                  setHierarchy(null);
+                }}
+                onNavigate={(item: HierarchyItem) => {
+                  const path = item.uri.replace(/^file:\/\//, "").replace(/^\/([a-zA-Z]:)/, "$1");
+                  openLocation(decodeURIComponent(path), {
+                    startLineNumber: item.selectionRange.start.line + 1,
+                    startColumn: item.selectionRange.start.character + 1,
+                    endLineNumber: item.selectionRange.end.line + 1,
+                    endColumn: item.selectionRange.end.character + 1,
+                  });
+                }}
+              />
+            </div>
+          )}
         </div>
 
         {/* Status Bar */}

@@ -97,6 +97,8 @@ export function TerminalPanel({
   onManageTrust,
   activeFile,
   onOpenProblem,
+  onQuickFixProblem,
+  canQuickFix,
   ide,
   debugService,
   workspaceFolder,
@@ -118,6 +120,10 @@ export function TerminalPanel({
   activeFile?: string;
   /** Opens a file at a position, for clicking a problem. */
   onOpenProblem?: (file: string, line: number, column: number) => void;
+  /** Quick Fix at a diagnostic (WS13): navigate there and open the editor's code-action menu. */
+  onQuickFixProblem?: (file: string, line: number, column: number) => void;
+  /** Whether an eligible LSP server offers code actions for a file (gates the Quick Fix action). */
+  canQuickFix?: (file: string) => boolean;
   /**
    * The IDE's side of its terminals (TERMINAL-06): opening printed file paths, the IDE's own
    * keys, and revealing a terminal's folder in the Explorer. Without it a terminal is a plain
@@ -768,6 +774,8 @@ export function TerminalPanel({
             onManageTrust={onManageTrust}
             activeFile={activeFile}
             onOpen={onOpenProblem}
+            onQuickFix={onQuickFixProblem}
+            canQuickFix={canQuickFix}
           />
         )}
         {!hidden && !shownExtension && activeTab === "output" && (
