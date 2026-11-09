@@ -8,3 +8,7 @@ playwright-report
 
 # The extension registry is generated (scripts/build-registry.mjs); its bytes are checksummed.
 registry/
+
+# The extension author typings are generated from api.ts (authoringTypings.ts); the drift-guard
+# test in authoring.test.ts compares them byte-for-byte, so Prettier must not reflow them.
+extensions/yavin.d.ts
