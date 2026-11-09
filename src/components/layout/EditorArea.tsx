@@ -205,7 +205,10 @@ export function EditorArea({
   };
 
   return (
-    <div className="flex flex-1 flex-col min-w-0 bg-[#000000] select-none text-[12px] overflow-hidden font-sans">
+    <main
+      aria-label="Editor"
+      className="flex flex-1 flex-col min-w-0 bg-[#000000] select-none text-[12px] overflow-hidden font-sans"
+    >
       {/* Tab Bar */}
       <div className="flex h-9 items-center border-b border-[#151515] bg-[#050505] pl-1 gap-0.5 shrink-0">
         {/* Only the tabs scroll; the actions to their right stay where they are. */}
@@ -560,6 +563,6 @@ export function EditorArea({
           onError={onMenuError}
         />
       )}
-    </div>
+    </main>
   );
 }

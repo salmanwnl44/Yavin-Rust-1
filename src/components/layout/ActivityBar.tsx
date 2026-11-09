@@ -1,3 +1,5 @@
+import { useRef, type KeyboardEvent } from "react";
+
 export function ActivityBar({
   activeTab,
   gitBadge = "",
@@ -22,6 +24,7 @@ export function ActivityBar({
   const topTabs = [
     {
       id: "explorer",
+      name: "Explorer",
       title: "Explorer (Ctrl+Shift+E)",
       icon: (
         <svg
@@ -40,6 +43,7 @@ export function ActivityBar({
     },
     {
       id: "search",
+      name: "Search",
       title: "Search (Ctrl+Shift+F)",
       icon: (
         <svg
@@ -59,6 +63,7 @@ export function ActivityBar({
     },
     {
       id: "git",
+      name: "Source Control",
       title: "Source Control (Ctrl+Shift+G)",
       badge: gitBadge,
       icon: (
@@ -80,6 +85,7 @@ export function ActivityBar({
     },
     {
       id: "history",
+      name: "Local History",
       title: "Local History",
       icon: (
         <svg
@@ -100,6 +106,7 @@ export function ActivityBar({
     },
     {
       id: "run",
+      name: "Run",
       title: "Run",
       icon: (
         <svg
@@ -118,6 +125,7 @@ export function ActivityBar({
     },
     {
       id: "debug",
+      name: "Run and Debug",
       title: "Run and Debug",
       icon: (
         <svg
@@ -137,6 +145,7 @@ export function ActivityBar({
     },
     {
       id: "extensions",
+      name: "Extensions & Plugins",
       title: "Extensions & Plugins (Ctrl+Shift+X)",
       badge: extensionsBadge,
       icon: (
@@ -159,39 +168,78 @@ export function ActivityBar({
     },
   ];
 
+  const tabs = [
+    ...topTabs,
+    ...extensionTabs.map((tab) => ({
+      id: tab.id,
+      name: tab.title,
+      title: tab.title,
+      badge: undefined as string | undefined,
+      icon: (
+        <svg
+          width="20"
+          height="20"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.75"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M10 3h4v3a2 2 0 1 0 4 0V3h3v7h-3a2 2 0 1 0 0 4h3v7h-7v-3a2 2 0 1 0-4 0v3H3v-7h3a2 2 0 1 0 0-4H3V3h7z" />
+        </svg>
+      ),
+    })),
+  ];
+  // The active container is the one in the tab order; when none is (an extension container that
+  // is gone, say), the first keeps the rail reachable by Tab. Arrow keys then rove among the rest.
+  const anyActive = tabs.some((tab) => tab.id === activeTab);
+  const tablistRef = useRef<HTMLDivElement>(null);
+  const onTablistKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const buttons = Array.from(
+      tablistRef.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [],
+    );
+    if (buttons.length === 0) return;
+    const current = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    let next = current;
+    if (event.key === "ArrowDown") next = current < 0 ? 0 : (current + 1) % buttons.length;
+    else if (event.key === "ArrowUp")
+      next = current < 0 ? buttons.length - 1 : (current - 1 + buttons.length) % buttons.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = buttons.length - 1;
+    else return;
+    event.preventDefault();
+    buttons[next]?.focus();
+  };
+
   return (
-    <aside className="flex w-12 flex-col items-center border-r border-[#151515] bg-[#000000] py-3 select-none shrink-0 z-10">
-      {/* Top Nav Buttons */}
-      <div className="flex flex-col items-center gap-1.5 w-full">
-        {[
-          ...topTabs,
-          ...extensionTabs.map((tab) => ({
-            id: tab.id,
-            title: tab.title,
-            badge: undefined as string | undefined,
-            icon: (
-              <svg
-                width="20"
-                height="20"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.75"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M10 3h4v3a2 2 0 1 0 4 0V3h3v7h-3a2 2 0 1 0 0 4h3v7h-7v-3a2 2 0 1 0-4 0v3H3v-7h3a2 2 0 1 0 0-4H3V3h7z" />
-              </svg>
-            ),
-          })),
-        ].map((tab) => {
+    <aside
+      aria-label="Activity Bar"
+      className="flex w-12 flex-col items-center border-r border-[#151515] bg-[#000000] py-3 select-none shrink-0 z-10"
+    >
+      {/* Top Nav Buttons — a vertical tablist: one container per view, arrow keys rove. */}
+      <div
+        ref={tablistRef}
+        role="tablist"
+        aria-label="Views"
+        aria-orientation="vertical"
+        onKeyDown={onTablistKeyDown}
+        className="flex flex-col items-center gap-1.5 w-full"
+      >
+        {tabs.map((tab, index) => {
           const isActive = activeTab === tab.id;
+          const tabbable = isActive || (!anyActive && index === 0);
           return (
             <button
               key={tab.id}
+              role="tab"
+              aria-selected={isActive}
+              aria-label={tab.badge ? `${tab.name}, ${tab.badge}` : tab.name}
+              tabIndex={tabbable ? 0 : -1}
               onClick={() => onSelectTab(tab.id)}
               title={tab.title}
-              className={`group relative flex size-10 items-center justify-center rounded-lg transition-all ${
+              className={`group relative flex size-10 items-center justify-center rounded-lg transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus ${
                 isActive
                   ? "text-white bg-[#0e0e0e]"
                   : "text-ink-3 hover:text-ink-2 hover:bg-[#080808]"
@@ -203,9 +251,12 @@ export function ActivityBar({
               )}
               {tab.icon}
 
-              {/* Notification Badge */}
+              {/* Notification Badge (announced via the button's aria-label, so hidden here). */}
               {tab.badge && (
-                <span className="absolute top-1 right-1 flex size-3.5 items-center justify-center rounded-full bg-indigo-600 text-[8.5px] font-bold text-white shadow-sm">
+                <span
+                  aria-hidden="true"
+                  className="absolute top-1 right-1 flex size-3.5 items-center justify-center rounded-full bg-indigo-600 text-[8.5px] font-bold text-white shadow-sm"
+                >
                   {tab.badge}
                 </span>
               )}
@@ -219,18 +270,24 @@ export function ActivityBar({
         <button
           onClick={onOpenAccounts}
           title="Accounts"
-          className="group relative flex size-10 items-center justify-center rounded-lg text-ink-3 hover:text-ink-2 hover:bg-[#080808] transition-all"
+          aria-label="Accounts"
+          className="group relative flex size-10 items-center justify-center rounded-lg text-ink-3 hover:text-ink-2 hover:bg-[#080808] transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
         >
-          <div className="size-5 rounded-full bg-gradient-to-tr from-zinc-700 to-zinc-500 flex items-center justify-center text-[10px] font-bold text-white">
+          <div
+            aria-hidden="true"
+            className="size-5 rounded-full bg-gradient-to-tr from-zinc-700 to-zinc-500 flex items-center justify-center text-[10px] font-bold text-white"
+          >
             S
           </div>
         </button>
         <button
           onClick={onOpenSettings}
           title="Settings (Ctrl+,)"
-          className="group relative flex size-10 items-center justify-center rounded-lg text-ink-3 hover:text-white hover:bg-[#080808] transition-all"
+          aria-label="Settings"
+          className="group relative flex size-10 items-center justify-center rounded-lg text-ink-3 hover:text-white hover:bg-[#080808] transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
         >
           <svg
+            aria-hidden="true"
             width="20"
             height="20"
             viewBox="0 0 24 24"

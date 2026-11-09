@@ -153,10 +153,16 @@ export function StatusBar({
           <button
             onClick={onShowProblems}
             title={`${counts.error} error${counts.error === 1 ? "" : "s"}, ${counts.warning} warning${counts.warning === 1 ? "" : "s"}`}
+            aria-label={`${counts.error} error${counts.error === 1 ? "" : "s"}, ${counts.warning} warning${counts.warning === 1 ? "" : "s"} — open Problems`}
             className="flex shrink-0 items-center gap-1.5 hover:text-zinc-200"
           >
-            <span className={counts.error ? "text-red-400" : ""}>× {counts.error}</span>
-            <span className={counts.warning ? "text-amber-400" : ""}>! {counts.warning}</span>
+            {/* The glyphs carry the colour; the count is in the label so it is not "times 3". */}
+            <span aria-hidden="true" className={counts.error ? "text-red-400" : ""}>
+              × {counts.error}
+            </span>
+            <span aria-hidden="true" className={counts.warning ? "text-amber-400" : ""}>
+              ! {counts.warning}
+            </span>
           </button>
         )}
         <span className="truncate">{activeFile || "Yavin IDE"}</span>
