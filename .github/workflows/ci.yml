@@ -152,6 +152,11 @@ jobs:
         shell: pwsh
       - name: The installer, built, extracted and driven end to end (test identifier)
         run: npm run test:real-host
+      # The installer the run just built: expected name (version + x64), a sane size, and its
+      # SHA-256 for the record. A fast metadata/security gate on top of the end-to-end run; it adds
+      # no second build (it reads the bundle the job already produced).
+      - name: The built installer is well-formed (name, architecture, size, checksum)
+        run: node scripts/validate-artifact.mjs --installer auto
 
   release-gate:
     if: always()
