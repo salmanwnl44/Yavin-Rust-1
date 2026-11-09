@@ -107,6 +107,15 @@ export interface LanguageClient {
   onState(listener: (state: ServerState) => void): () => void;
   /** Mark as restarting (the manager's decision, between a crash and the next start). */
   setState(state: ServerState, message?: string): void;
+  /**
+   * Replaces the live definition after a configuration change, so the settings served on
+   * pull (`workspace/configuration`) and the launch parameters of the next `start` are the
+   * new ones. It does not itself tell a running server: the manager decides whether to push
+   * the change live (`notifyConfiguration`) or restart.
+   */
+  reconfigure(next: LanguageServerDefinition): void;
+  /** Pushes the current settings to a ready server (`workspace/didChangeConfiguration`). */
+  notifyConfiguration(): void;
 }
 
 export function createLanguageClient(init: {
@@ -116,7 +125,10 @@ export function createLanguageClient(init: {
   transport: ServerTransport;
   handlers: ClientHandlers;
 }): LanguageClient {
-  const { definition, root, transport, handlers } = init;
+  const { root, transport, handlers } = init;
+  // Reassignable: a configuration change replaces it (see `reconfigure`). Every closure below
+  // -- the settings served on pull, the launch parameters -- reads the current one.
+  let definition = init.definition;
   let state: ServerState = "stopped";
   let message = "";
   let capabilities: ServerCapabilities = {};
@@ -203,7 +215,9 @@ export function createLanguageClient(init: {
   });
 
   const client: LanguageClient = {
-    definition,
+    get definition() {
+      return definition;
+    },
     get state() {
       return state;
     },
@@ -339,6 +353,17 @@ export function createLanguageClient(init: {
 
     notify(method: string, params: unknown) {
       if (connection && state === "ready") connection.sendNotification(method, params);
+    },
+
+    reconfigure(next) {
+      definition = next;
+    },
+
+    notifyConfiguration() {
+      if (connection && state === "ready")
+        connection.sendNotification("workspace/didChangeConfiguration", {
+          settings: definition.settings ?? {},
+        });
     },
   };
   return client;

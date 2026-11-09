@@ -552,3 +552,157 @@ test("a server whose folder left the workspace cannot report into the next one",
   await leaving;
   assert.deepEqual(all(), []);
 });
+
+// --- WS19: configuration changes, duplicate prevention, restart cancellation -----------------
+
+/**
+ * A manager whose TypeScript definition (settings, initialization options, timeouts) can be
+ * changed between calls, so `configChanged` compares what a server was started with against the
+ * current configuration -- as the real registry would hand back a fresh object after a change.
+ */
+function configurable(
+  files: Record<string, string>,
+  init: {
+    settings?: Record<string, unknown>;
+    initializationOptions?: unknown;
+    requestTimeout?: number;
+    extra?: LanguageServerDefinition[];
+    installed?: string[];
+  } = {},
+) {
+  const state = {
+    settings: init.settings,
+    initializationOptions: init.initializationOptions,
+    requestTimeout: init.requestTimeout ?? 2_000,
+  };
+  const tsDef = (): LanguageServerDefinition => ({
+    ...typescript,
+    settings: state.settings,
+    initializationOptions: state.initializationOptions,
+    requestTimeout: state.requestTimeout,
+  });
+  const list = (): LanguageServerDefinition[] => [tsDef(), ...(init.extra ?? [])];
+  const base = setup(files, {
+    installed: init.installed ?? ["typescript"],
+    manager: {
+      serversFor: (languageId) => list().filter((one) => one.languages.includes(languageId)),
+    },
+  });
+  return { ...base, state };
+}
+
+test("WS19: a settings-only change is pushed to the running server, which is not restarted", async () => {
+  const c = configurable({ "/w/a.ts": "let x = 1;\n" }, { settings: { ts: { strict: false } } });
+  await c.documents.open("/w/a.ts");
+  await until(() => c.manager.status()[0]?.state === "ready");
+  const server = c.fake.server("typescript");
+  const configs = () =>
+    server.received.filter((m) => m.method === "workspace/didChangeConfiguration");
+  await until(() => configs().length === 1); // sent once, right after initialize
+  const opensBefore = server.received.filter((m) => m.method === "textDocument/didOpen").length;
+
+  c.state.settings = { ts: { strict: true } };
+  await c.manager.configChanged();
+
+  await until(() => configs().length === 2);
+  assert.deepEqual(configs()[1].params.settings, { ts: { strict: true } });
+  assert.equal(c.fake.started.length, 1, "the server was not restarted");
+  assert.equal(
+    server.received.filter((m) => m.method === "textDocument/didOpen").length,
+    opensBefore,
+    "the document was not re-opened",
+  );
+});
+
+test("WS19: a change to initialization options restarts the server and resyncs its documents", async () => {
+  const c = configurable({ "/w/a.ts": "let x = 1;\n" }, { initializationOptions: { mode: "a" } });
+  await c.documents.open("/w/a.ts");
+  await until(() => c.manager.status()[0]?.state === "ready");
+  const first = c.fake.server("typescript");
+  await until(() => first.document(uriOf("/w/a.ts"))?.text === "let x = 1;\n");
+
+  c.state.initializationOptions = { mode: "b" };
+  await c.manager.configChanged();
+
+  await until(() => c.fake.started.length === 2 && c.manager.status()[0]?.state === "ready");
+  const second = c.fake.server("typescript");
+  assert.notEqual(second, first);
+  assert.ok(
+    first.received.some((m) => m.method === "shutdown"),
+    "the old server was shut down",
+  );
+  assert.deepEqual(second.received[0].params.initializationOptions, { mode: "b" });
+  // The document is preserved and told to the fresh server.
+  await until(() => second.document(uriOf("/w/a.ts"))?.text === "let x = 1;\n");
+  // Edits after the restart reach the new server.
+  c.documents.edit("/w/a.ts", "let x = 2;\n");
+  await until(() => second.document(uriOf("/w/a.ts"))?.text === "let x = 2;\n");
+});
+
+test("WS19: configChanged leaves an unchanged server alone, and never disturbs an unrelated one", async () => {
+  const pyright: LanguageServerDefinition = {
+    id: "pyright",
+    label: "Pyright",
+    languages: ["python"],
+    settings: { python: { analysis: { typeCheckingMode: "basic" } } },
+    startupTimeout: 30_000,
+    requestTimeout: 2_000,
+    untitled: false,
+  };
+  const c = configurable(
+    { "/w/a.ts": "let x = 1;\n", "/w/b.py": "x = 1\n" },
+    { settings: { ts: { strict: false } }, extra: [pyright], installed: ["typescript", "pyright"] },
+  );
+  await c.documents.open("/w/a.ts");
+  await c.documents.open("/w/b.py");
+  await until(() => c.manager.status().filter((s) => s.state === "ready").length === 2);
+  const ts = c.fake.server("typescript");
+  const py = c.fake.server("pyright");
+  const tsConfigs = () =>
+    ts.received.filter((m) => m.method === "workspace/didChangeConfiguration").length;
+  const pyConfigs = () =>
+    py.received.filter((m) => m.method === "workspace/didChangeConfiguration").length;
+  await until(() => tsConfigs() === 1 && pyConfigs() === 1);
+
+  // Nothing changed: nothing sent, nothing restarted.
+  await c.manager.configChanged();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(c.fake.started.length, 2, "no restarts for an unchanged configuration");
+  assert.equal(tsConfigs(), 1);
+  assert.equal(pyConfigs(), 1);
+
+  // Only TypeScript's settings change: Pyright is neither told nor restarted.
+  c.state.settings = { ts: { strict: true } };
+  await c.manager.configChanged();
+  await until(() => tsConfigs() === 2);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(pyConfigs(), 1, "the unrelated server was not reconfigured");
+  assert.equal(c.fake.started.length, 2, "the unrelated server was not restarted");
+});
+
+test("WS19: two documents of one language in one folder share a single server", async () => {
+  const { documents, manager, fake } = setup({ "/w/a.ts": "a\n", "/w/b.ts": "b\n" });
+  await documents.open("/w/a.ts");
+  await documents.open("/w/b.ts");
+  await until(() => manager.status().some((s) => s.state === "ready"));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(fake.started.length, 1, "one server serves both documents");
+  const server = fake.server("typescript");
+  await until(() => !!server.document(uriOf("/w/a.ts")) && !!server.document(uriOf("/w/b.ts")));
+  assert.equal(manager.status().length, 1);
+});
+
+test("WS19: disposing during the restart backoff cancels the pending restart", async () => {
+  const { documents, manager, fake } = setup(
+    { "/w/a.ts": "x\n" },
+    { manager: { backoff: [10_000] } }, // a long backoff keeps the restart pending
+  );
+  await documents.open("/w/a.ts");
+  await until(() => manager.status()[0]?.state === "ready");
+  fake.server("typescript").crash(1);
+  await until(() => manager.status()[0]?.state === "restarting");
+  assert.equal(fake.started.length, 1);
+  await manager.dispose();
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(fake.started.length, 1, "no server was started after dispose");
+});

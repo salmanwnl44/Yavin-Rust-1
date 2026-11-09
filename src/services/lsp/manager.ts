@@ -48,6 +48,39 @@ import { fromLspUri, lspPath, toLspUri } from "./uris.ts";
  * document's own versions, so an older state can never follow a newer one.
  */
 
+/**
+ * A stable string of a value, independent of object-key order, for comparing two configurations
+ * without being fooled by a reordered record. Cycles are cut (they do not occur in config, but a
+ * guard keeps this total).
+ */
+const stableKey = (value: unknown): string => {
+  const seen = new WeakSet<object>();
+  const normalize = (one: unknown): unknown => {
+    if (one === null || typeof one !== "object") return one ?? null;
+    if (seen.has(one)) return null;
+    seen.add(one);
+    if (Array.isArray(one)) return one.map(normalize);
+    return Object.fromEntries(
+      Object.keys(one as Record<string, unknown>)
+        .sort()
+        .map((key) => [key, normalize((one as Record<string, unknown>)[key])]),
+    );
+  };
+  return JSON.stringify(normalize(value));
+};
+
+/**
+ * The part of a server's configuration a running process cannot be told about: it is read only
+ * when the process starts (`initialize`) or when the connection is made (the request timeout), so
+ * a change to any of it means a restart, not a live `workspace/didChangeConfiguration`.
+ */
+const launchKey = (definition: LanguageServerDefinition): string =>
+  stableKey({
+    initializationOptions: definition.initializationOptions,
+    startupTimeout: definition.startupTimeout,
+    requestTimeout: definition.requestTimeout,
+  });
+
 export class StaleResultError extends Error {
   constructor() {
     super("The document changed while the language server was answering.");
@@ -815,6 +848,60 @@ export function createLspManager(options: LspManagerOptions) {
         availability = null;
         unserved.clear();
         for (const one of documents.all()) void attach(one);
+      }
+      changed();
+    },
+
+    /**
+     * The configuration changed (settings, initialization options, timeouts). Each running
+     * server is compared with its current definition and handled by the smallest action that
+     * applies it:
+     *
+     * - a settings-only change is pushed live (`workspace/didChangeConfiguration`), with no
+     *   restart, so analysis options take effect without losing the server's index;
+     * - a launch-affecting change (initialization options or the start-up/request timeouts, which
+     *   a server reads only at `initialize`) restarts just that server, preserving its open
+     *   documents (and their dirty state, owned by the Document Model) and resyncing them, and
+     *   forgetting past crashes so the fresh configuration starts clean;
+     * - an unchanged server is left running, so a change to one server never disturbs another,
+     *   and a workspace-level change cannot restart a server for an unrelated root.
+     *
+     * Documents opened later pick up the new configuration when they attach.
+     */
+    async configChanged() {
+      if (disposed) return;
+      const resolve = options.serversFor ?? serversFor;
+      const currentFor = (previous: LanguageServerDefinition): LanguageServerDefinition | null => {
+        for (const language of previous.languages) {
+          const found = resolve(language).find((one) => one.id === previous.id);
+          if (found) return found;
+        }
+        return null;
+      };
+      for (const server of [...servers.values()]) {
+        if (disposed) return;
+        if (servers.get(server.key) !== server) continue;
+        const previous = server.client.definition;
+        const next = currentFor(previous);
+        // The server is no longer configured for any of its languages: a restart would fail
+        // the same way, so it is left as it is until trust/installation is reconsidered.
+        if (!next) continue;
+        const launchChanged = launchKey(previous) !== launchKey(next);
+        const settingsChanged = stableKey(previous.settings) !== stableKey(next.settings);
+        if (!launchChanged && !settingsChanged) continue;
+        server.client.reconfigure(next);
+        if (launchChanged) {
+          clearTimeout(server.restartTimer);
+          server.restartTimer = undefined;
+          clearDiagnostics(server);
+          server.crashes = [];
+          for (const entry of synced.values())
+            if (entry.clientKey === server.key) entry.version = -1;
+          await server.client.stop();
+          if (!disposed && servers.get(server.key) === server) void server.client.start();
+        } else {
+          server.client.notifyConfiguration();
+        }
       }
       changed();
     },
