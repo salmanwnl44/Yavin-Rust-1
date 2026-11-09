@@ -6,6 +6,7 @@ import {
   groupByFile,
   includeProblem,
   matchesFilter,
+  PROBLEM_KINDS,
   problemCounts,
   publishProblems,
   resetProblems,
@@ -253,4 +254,73 @@ test("clearing one producer leaves the other's diagnostics for the same file", (
   // A workspace's disposal clears them all.
   clearProblems();
   assert.deepEqual(groupByFile(allProblems()), []);
+});
+
+// --- WS27: heavy diagnostics ------------------------------------------------------------------
+//
+// The Problems list is the one un-virtualized list in the app, so a big error count is the
+// workload to watch. `groupByFile` is the whole data cost behind it, and the component memoises
+// the result (recomputed only when the version, filter, severities or active file change) and
+// the snapshot it reads is reference-stable between changes (the test above) -- so this is not a
+// per-render cost. What this guards is that the grouping itself stays near-linear: an accidental
+// O(n^2) (e.g. a linear scan per diagnostic, or sorting inside the loop) would turn a routine
+// 50k-diagnostic project into seconds of blocking work. Deterministic fixtures; the assertions
+// are operation counts (every diagnostic projected exactly once) plus a generous ceiling that
+// only an algorithmic regression breaches -- never a brittle absolute-timing threshold, which
+// would flake while sibling suites share the CPU.
+test("groupByFile stays near-linear as diagnostics scale: every one is projected once", () => {
+  const measurements: string[] = [];
+  const severities = [...PROBLEM_KINDS];
+  for (const n of [1_000, 10_000, 50_000]) {
+    resetProblems();
+    const fileCount = Math.max(1, Math.floor(n / 50));
+    const diagnostics: Diagnostic[] = [];
+    for (let i = 0; i < n; i++)
+      diagnostics.push({
+        // A deterministic spread across files, lines and columns, out of order so the per-file
+        // position sort and the path sort both do real work.
+        file: `C:/w/src/dir${i % fileCount}/file${i % fileCount}.ts`,
+        line: (i * 7) % 2000,
+        column: (i * 3) % 120,
+        severity: i % 3 === 0 ? "error" : i % 3 === 1 ? "warning" : "info",
+        message: `Problem number ${i}`,
+      });
+    publishProblems("tsc", "TypeScript", diagnostics);
+
+    const owned = allProblems();
+    const t0 = performance.now();
+    const files = groupByFile(owned, { severities });
+    const ms = performance.now() - t0;
+
+    // Operation-count correctness: one group per file, and every diagnostic present exactly once.
+    assert.equal(files.length, fileCount, `${n}: one group per file`);
+    const rows = files.reduce((sum, file) => sum + file.problems.length, 0);
+    assert.equal(rows, n, `${n}: every diagnostic is projected exactly once`);
+    // Files are in path order, and within a file diagnostics are in position order.
+    const paths = files.map((file) => file.file);
+    assert.deepEqual(
+      paths,
+      [...paths].sort((a, b) => a.localeCompare(b)),
+      `${n}: files sorted`,
+    );
+    for (const file of files)
+      for (let i = 1; i < file.problems.length; i++) {
+        const prev = file.problems[i - 1];
+        const cur = file.problems[i];
+        assert.ok(
+          prev.line < cur.line || (prev.line === cur.line && prev.column <= cur.column),
+          `${n}: ${file.file} diagnostics in position order`,
+        );
+      }
+
+    measurements.push(`${n.toLocaleString()}: ${ms.toFixed(1)}ms, ${files.length} groups`);
+    // Linear grouping of 50k diagnostics is tens of milliseconds; an O(n^2) regression is
+    // seconds. The ceiling is wide enough to never flake under sibling CPU contention while
+    // still catching that regression by a wide margin.
+    assert.ok(
+      ms < 2_000,
+      `${n} diagnostics grouped in ${ms.toFixed(1)}ms (expected well under 2s)`,
+    );
+  }
+  console.log(`   [perf] groupByFile → ${measurements.join(" | ")}`);
 });
