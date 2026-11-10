@@ -509,9 +509,13 @@ test("closed editors reopen, latest first, and the last tab can be closed too", 
   await expect(page.getByRole("region", { name: "Welcome" })).toBeVisible();
 
   await page.keyboard.press("Control+Shift+t");
-  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("a.ts");
+  await expect(
+    page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]'),
+  ).toContainText("a.ts");
   await page.keyboard.press("Control+Shift+t");
-  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("b.ts");
+  await expect(
+    page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]'),
+  ).toContainText("b.ts");
   await expectText(page, "b");
 });
 
@@ -645,7 +649,9 @@ test("a search result opens its file with the match selected, in a CRLF file too
     .or(page.locator("[aria-label='Search results']"));
   await results.getByText("words").first().click();
 
-  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("a.ts");
+  await expect(
+    page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]'),
+  ).toContainText("a.ts");
   await expect(appAlert(page)).toHaveCount(0);
   // "one\n" is 4 characters, "two " 4 more: the match is characters 8 to 13.
   await expect.poll(() => editorSelections(page)).toEqual([{ start: 8, end: 13 }]);
@@ -730,7 +736,9 @@ test("many tabs scroll without a scrollbar: by the wheel, and to the tab in fron
   expect(start.overflows).toBe(true);
   expect(start.scrollbar).toBe(0);
   // The last tab opened is the one in front, scrolled into view.
-  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toBeInViewport();
+  await expect(
+    page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]'),
+  ).toBeInViewport();
   // The actions to the right are not part of what scrolls: fully shown, and fixed in place.
   const newFile = page.getByTitle("New File (Ctrl+N)");
   await expect(newFile).toBeInViewport({ ratio: 1 });
@@ -915,7 +923,9 @@ test("a Markdown file has a preview: rendered, safe, following its links", async
 
   // A link to another file opens it in the editor.
   await preview.getByRole("link", { name: "the guide" }).click();
-  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("GUIDE.md");
+  await expect(
+    page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]'),
+  ).toContainText("GUIDE.md");
 
   // Ctrl+Shift+V toggles the preview of the file in front.
   await expect(page.locator("[data-editor=monaco]")).toBeVisible();
@@ -1047,7 +1057,9 @@ test("the preview's code blocks, outline, find, images and footnotes", async ({
 
   // Open in Editor: the code in a new document, coloured as Python.
   await block.getByRole("button", { name: "Open in Editor" }).click();
-  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("Untitled");
+  await expect(
+    page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]'),
+  ).toContainText("Untitled");
   await expectText(page, "def hello():\n    return 'hi'");
   expect(await editorLanguage(page)).toBe("python");
 });

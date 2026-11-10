@@ -80,7 +80,9 @@ const isLight = (page: Page) =>
 
 async function openFile(page: Page, name: string) {
   await page.getByRole("treeitem", { name }).click();
-  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText(name);
+  await expect(
+    page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]'),
+  ).toContainText(name);
 }
 
 async function openFolder(page: Page, folder: string) {

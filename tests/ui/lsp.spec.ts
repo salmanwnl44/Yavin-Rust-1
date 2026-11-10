@@ -216,7 +216,9 @@ test("definition: F12 opens the file it is in, with the name selected", async ({
   await openServed(page, "b.ts");
   await page.keyboard.press("Control+Home");
   await page.keyboard.press("F12");
-  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("a.ts");
+  await expect(
+    page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]'),
+  ).toContainText("a.ts");
   // The cursor at the start of the definition, as VS Code puts it.
   await expect.poll(() => editorSelections(page)).toEqual([{ start: 9, end: 9 }]);
 });
@@ -237,7 +239,9 @@ test("references: Shift+F12 lists every use, and choosing one goes there", async
   const list = page.getByRole("dialog", { name: /References to helper \(3\)/ });
   await expect(list).toBeVisible();
   await list.getByRole("option", { name: /b\.ts:2:1/ }).click();
-  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("b.ts");
+  await expect(
+    page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]'),
+  ).toContainText("b.ts");
   await expect.poll(() => editorSelections(page)).toEqual([{ start: 11, end: 17 }]);
 });
 
@@ -481,7 +485,9 @@ test("a stale answer is ignored: a definition that arrives after an edit goes no
   await page.keyboard.press("End");
   await page.keyboard.type(" // moved on");
   await page.waitForTimeout(1_200);
-  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("b.ts");
+  await expect(
+    page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]'),
+  ).toContainText("b.ts");
 });
 
 test("a read-only file is analysed, but a rename that would change it is refused", async ({
@@ -580,7 +586,9 @@ test("symbols: @ lists the file's symbols and # the workspace's; choosing one go
   await page.keyboard.type("oth");
   await expect(results.getByRole("option", { name: /other/ })).toBeVisible();
   await page.keyboard.press("Enter");
-  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("b.ts");
+  await expect(
+    page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]'),
+  ).toContainText("b.ts");
 });
 
 test("semantic tokens, inlay hints, CodeLens and document links come from the server", async ({

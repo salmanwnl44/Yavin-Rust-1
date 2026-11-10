@@ -1896,7 +1896,7 @@ mod real_tests {
         assert!(
             out.output.contains("\"suites\""),
             "Playwright JSON was produced: {}",
-            &out.output.chars().take(400).collect::<String>()
+            out.output.chars().take(400).collect::<String>()
         );
         eprintln!("LEVEL C (playwright): ran a real Playwright project and got reporter JSON.");
         let _ = std::fs::remove_dir_all(&dir);
