@@ -139,7 +139,7 @@ test("a result in a file already open under another spelling lands on the exact 
     "C:\\work\\b.ts": FILES["C:\\work\\b.ts"],
   });
   await page.getByLabel("a.ts", { exact: true }).click();
-  await expect(page.getByRole("tab", { selected: true })).toContainText("a.ts");
+  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("a.ts");
   await searchFor(page, "needle");
   await expect(status(page)).toHaveText("2 matches in 2 files");
   await results(page)
@@ -156,7 +156,7 @@ test("a result in a closed CRLF file opens it at the match", async ({ page }) =>
   await results(page)
     .getByTitle(/b\.ts:2/)
     .click();
-  await expect(page.getByRole("tab", { selected: true })).toContainText("b.ts");
+  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("b.ts");
   // The editor holds "one\ntwo needle\n": the match is 8 to 14.
   await expect.poll(() => editorSelections(page)).toEqual([{ start: 8, end: 14 }]);
 });
@@ -200,7 +200,7 @@ test("Replace All in an open CRLF document edits the editor's text, not a stale 
 }) => {
   await desktop(page, FILES);
   await page.getByLabel("b.ts", { exact: true }).click();
-  await expect(page.getByRole("tab", { selected: true })).toContainText("b.ts");
+  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("b.ts");
   await page.keyboard.press("Control+Shift+h");
   await searchFor(page, "needle");
   await page.getByRole("textbox", { name: "Workspace replacement" }).fill("pin");

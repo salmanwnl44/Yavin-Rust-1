@@ -380,7 +380,7 @@ test("closing the tab in front brings the tab beside it forward, not Welcome", a
   await open(page, "a.ts");
   await open(page, "b.ts");
   await open(page, "c.ts");
-  const selected = page.getByRole("tab", { selected: true });
+  const selected = page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]');
   await page.getByRole("tab", { name: /b\.ts/ }).click();
   await page.keyboard.press("Control+w");
   // The one to the right comes forward...
@@ -505,13 +505,13 @@ test("closed editors reopen, latest first, and the last tab can be closed too", 
   await page.keyboard.press("Control+w");
   // Welcome was the last tab: it closes like the others, and the window shows Welcome anyway.
   await page.getByRole("button", { name: "Close Welcome" }).click();
-  await expect(page.getByRole("tab")).toHaveCount(0);
+  await expect(page.locator('[role="tab"][aria-controls="editor-panel"]')).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Welcome" })).toBeVisible();
 
   await page.keyboard.press("Control+Shift+t");
-  await expect(page.getByRole("tab", { selected: true })).toContainText("a.ts");
+  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("a.ts");
   await page.keyboard.press("Control+Shift+t");
-  await expect(page.getByRole("tab", { selected: true })).toContainText("b.ts");
+  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("b.ts");
   await expectText(page, "b");
 });
 
@@ -645,7 +645,7 @@ test("a search result opens its file with the match selected, in a CRLF file too
     .or(page.locator("[aria-label='Search results']"));
   await results.getByText("words").first().click();
 
-  await expect(page.getByRole("tab", { selected: true })).toContainText("a.ts");
+  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("a.ts");
   await expect(appAlert(page)).toHaveCount(0);
   // "one\n" is 4 characters, "two " 4 more: the match is characters 8 to 13.
   await expect.poll(() => editorSelections(page)).toEqual([{ start: 8, end: 13 }]);
@@ -730,7 +730,7 @@ test("many tabs scroll without a scrollbar: by the wheel, and to the tab in fron
   expect(start.overflows).toBe(true);
   expect(start.scrollbar).toBe(0);
   // The last tab opened is the one in front, scrolled into view.
-  await expect(page.getByRole("tab", { selected: true })).toBeInViewport();
+  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toBeInViewport();
   // The actions to the right are not part of what scrolls: fully shown, and fixed in place.
   const newFile = page.getByTitle("New File (Ctrl+N)");
   await expect(newFile).toBeInViewport({ ratio: 1 });
@@ -750,7 +750,17 @@ test("the editor's right-click menu ends with the Command Palette", async ({ pag
   const items = page.locator(".monaco-menu .action-label");
   await expect(items.filter({ hasText: "Command Palette…" })).toBeVisible();
   const labels = (await items.allTextContents()).filter(Boolean);
-  expect(labels.slice(0, 4)).toEqual(["Change All Occurrences", "Cut", "Copy", "Paste"]);
+  // The navigation group leads with Yavin's LSP actions (Call/Type Hierarchy, added in
+  // CodeEditor.tsx), then Monaco's edit group, and Yavin appends the Command Palette last.
+  expect(labels).toEqual([
+    "Show Call Hierarchy",
+    "Show Type Hierarchy",
+    "Change All Occurrences",
+    "Cut",
+    "Copy",
+    "Paste",
+    "Command Palette…",
+  ]);
   expect(labels.at(-1)).toBe("Command Palette…");
   await items.filter({ hasText: "Command Palette…" }).click();
   await expect(page.getByRole("combobox", { name: "Search files or commands" })).toBeFocused();
@@ -905,7 +915,7 @@ test("a Markdown file has a preview: rendered, safe, following its links", async
 
   // A link to another file opens it in the editor.
   await preview.getByRole("link", { name: "the guide" }).click();
-  await expect(page.getByRole("tab", { selected: true })).toContainText("GUIDE.md");
+  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("GUIDE.md");
 
   // Ctrl+Shift+V toggles the preview of the file in front.
   await expect(page.locator("[data-editor=monaco]")).toBeVisible();
@@ -1037,7 +1047,7 @@ test("the preview's code blocks, outline, find, images and footnotes", async ({
 
   // Open in Editor: the code in a new document, coloured as Python.
   await block.getByRole("button", { name: "Open in Editor" }).click();
-  await expect(page.getByRole("tab", { selected: true })).toContainText("Untitled");
+  await expect(page.locator('[role="tab"][aria-controls="editor-panel"][aria-selected="true"]')).toContainText("Untitled");
   await expectText(page, "def hello():\n    return 'hi'");
   expect(await editorLanguage(page)).toBe("python");
 });

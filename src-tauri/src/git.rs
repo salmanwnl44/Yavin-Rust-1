@@ -198,8 +198,8 @@ fn operation_scope(subcommand: &str, rest: &[String]) -> Scope {
             Some("list") | Some("show") => Scope::Read,
             _ => Scope::WorktreeLocal,
         },
-        "status" | "log" | "show" | "diff" | "blame" | "ls-files" | "for-each-ref" | "rev-parse"
-        | "cat-file" | "check-ref-format" => Scope::Read,
+        "status" | "log" | "show" | "diff" | "blame" | "ls-files" | "for-each-ref"
+        | "rev-parse" | "cat-file" | "check-ref-format" => Scope::Read,
         // `git remote <verb> ...` can add/remove/rename; only the bare listing is a read.
         "remote" if rest.is_empty() || rest.first().map(String::as_str) == Some("get-url") => {
             Scope::Read
