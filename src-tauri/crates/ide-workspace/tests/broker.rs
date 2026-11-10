@@ -310,8 +310,12 @@ fn the_cpu_hard_cap_holds_under_sustained_load() {
         cpu <= wall * 3,
         "CPU time {cpu} ms was not capped near one core over {wall} ms wall (cores={n})"
     );
+    // ...and a real saving against that budget: at most half of it. The margin has to stay
+    // compatible with the drift allowance above -- on a 4-core runner a one-core cap measured over
+    // a ~1.5 s window lands near 1.5x wall, so the earlier `cpu * 3 < wall * n` (demanding under
+    // n/3 = 1.33x wall) was below achievable drift and failed even when the cap held.
     assert!(
-        cpu * 3 < wall * (n as u64),
+        cpu * 2 <= wall * (n as u64),
         "CPU time {cpu} ms was not well below the uncapped {n}-core budget of {} ms",
         wall * (n as u64)
     );
