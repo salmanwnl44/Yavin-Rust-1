@@ -1,3 +1,78 @@
+# Yavin IDE 2.2.0 — engineering hardening
+
+**Status:** release candidate (built and validated with documented limitations — see
+[RELEASE_VALIDATION_2.2.0.md](RELEASE_VALIDATION_2.2.0.md)). **Platform:** Windows x64 (MSI + NSIS).
+Upgrades in place from 2.1.0.
+
+## What's new
+
+This release is an engineering-quality pass over the existing IDE (no new AI/LLM functionality); each
+item below is a verified change recorded in `NON_AI_ENGINEERING_PROGRESS.md` (WS18–WS30):
+
+- **Editor navigation** — Back/Forward navigation history (Alt+Left / Alt+Right, through the single
+  LSP navigation choke point) and Close Editors to the Left.
+- **Customizable keyboard shortcuts** — user keybinding overrides, surfaced consistently to the
+  command palette, menus, and the shortcut handler from one command list.
+- **LSP safety** — rename name-validation and workspace-scope containment on applied edits; runtime
+  handling of language-server configuration changes without a restart.
+- **Git** — an actionable missing-identity commit error (was raw git text), plus expanded real-git
+  integration coverage (commit identity, hunk staging, status parsing, branch lifecycle) against
+  throwaway temp repositories.
+- **Workspace reliability** — workspace-identity de-duplication so the same folder opened with a
+  repeated, differently-cased, or differently-separated path is one workspace (correct session and
+  Git key, no double repo/watcher).
+- **Extension author SDK** — a typed `extensions/yavin.d.ts` generated from the real API (exposes no
+  undeclared capability, drift-guarded) and an authoring guide. No runtime, permission, manifest, or
+  sandbox code changed.
+- **Accessibility** — the Activity Bar is a keyboard-navigable `role="tablist"` with `aria-selected`
+  (no longer colour-only), labelled Status Bar problem counts, a named `<main>` editor landmark, and
+  a focus ring.
+- **Release engineering** — a `scripts/validate-artifact.mjs` metadata/security gate over the built
+  installer and a `RELEASE.md` runbook; CI runs the gate after the packaged end-to-end test.
+
+Verification: **1435 service/unit tests pass**, and the Playwright UI suite passes on CI after a
+WS28 selector regression (20 deterministic failures, masked by an earlier inaccurate local pass
+count) was found and fixed; `tsc`, Prettier, the production `vite build`, `cargo fmt`, Clippy, and
+the Rust `cargo test` suite are green on CI. No product or native behaviour changed — the only Rust
+edits are a `rustfmt` rewrap and a Clippy cleanup in test code — so native authorization, the
+sandbox, path containment, and the C1/C2 architecture are untouched and the production C2 registry
+stays empty.
+
+## Artifacts
+
+- **MSI** — `Yavin IDE_2.2.0_x64_en-US.msi` (11.6 MB).
+  SHA-256 `BEDA7292B341F3BAD94547181DAE6FAB1C8B7BF134F7B3358ADABB252EE7145A`.
+- **NSIS** — `Yavin IDE_2.2.0_x64-setup.exe` (8.4 MB).
+
+Both installers are **not code-signed**, so Windows SmartScreen may warn on first run. Fixed
+`UpgradeCode` with `allowDowngrades:false`: 2.2.0 upgrades 2.1.0 in place and the installer refuses to
+replace a newer Yavin with an older one.
+
+## Validation status & limitations
+
+The MSI **builds cleanly and is structurally valid**, and the packaged application passes the
+end-to-end real-host smoke test for launch, native backend, extension-host lifecycle, full
+marketplace/trust/permissions/recovery, profiles, and Open VSX VS Code-compat install with webview
+isolation (**17 of 21 `tests/real` pass; 2 skip** for missing Open VSX fixtures). The one exception
+is the OS-foreground `vscode.spec` step (below). Not yet validated, and required before a final
+release claim (full detail in `RELEASE_VALIDATION_2.2.0.md`):
+
+- **Clean-VM install and the live upgrade-from-2.1.0 / uninstall cycle** were not run (no clean VM;
+  the dev machine was not mutated). The MSI-level upgrade/downgrade mechanism is verified from the
+  installer metadata.
+- **One real-host test** (`vscode.spec`, the OS-foreground step) requires a controllable interactive
+  desktop and fails in a non-interactive session — **including GitHub's `windows-latest` runner**, so
+  the CI `packaged` job and `release-gate` stay red on this one test. Every other assertion in it
+  (install, activation, status bar, grammar, the edit command, save) passes; only the OS-foreground
+  handoff cannot be observed. The assertion was left unchanged, not weakened.
+- **Code-signing** is not configured (no signing certificate/secret in this repo).
+
+The 2.1.0 known limitations below (registry key custody, index renewal before 2027-10-19, first-install
+replay, Windows-only executable extensions, unverified publisher identity, same-user malware) remain
+open for 2.2.0.
+
+---
+
 # Yavin IDE 2.1.0 — first build
 
 **Released:** 2026-10-19. **Platform:** Windows x64 (MSI). The first published build of Yavin; there is no earlier release to upgrade from.
