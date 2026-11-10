@@ -82,6 +82,10 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: package-lock.json
+      # The `checkers` real_tests shell out to the project's TypeScript (npx tsc); without the
+      # installed node deps npx resolves the wrong `tsc` package and cancels. The other Windows
+      # jobs already `npm ci`; the rust job needs it too for cargo test's real_tests.
+      - run: npm ci
       - run: rustup update stable
       - run: rustup default stable
       - run: rustup component add rustfmt clippy
