@@ -1,6 +1,11 @@
-# Yavin IDE 2.2.0 — Windows MSI Build & Release Validation
+# Yavin IDE 2.2.1 — Windows MSI Build & Release Validation
 
-**Date:** 2026-11-10 · **Branch:** `main` @ `b6f2d9a` · **Version (source of truth — `tauri.conf.json`):** 2.2.0
+**Date:** 2026-11-11 · **Branch:** `main` · **Version (source of truth — `tauri.conf.json`):** 2.2.1
+
+> **Scope note.** Sections 1–7 below record the validation pass performed on the **2.2.0** build at
+> `b6f2d9a`. 2.2.0 was never published; 2.2.1 ships the same product code (everything added since is
+> test and CI only), so that evidence carries over. The **2.2.1 build and its own artifact
+> validation** are recorded in the final section.
 
 This is the evidence record for the Windows release-validation pass requested after WS0–WS30: the
 actual MSI build, artifact inspection, and the packaged-application smoke test. It records what was
@@ -292,15 +297,73 @@ recovery, Open VSX install, webview isolation) pass.
 
 On the latest `workflow_dispatch` run of `main` (`fdce69b`):
 
-| Job                                 | Result                                                                                                                                                              |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `version`, `registry`, `typescript` | success                                                                                                                                                             |
-| `rust`                              | success — `npm ci` resolved the real_tests tsc failure; `cargo fmt` + Clippy (default + `test-registry`) + `cargo test` green                                       |
-| `ui`                                | success — the WS28 selector regression is fixed and the CI retries cleared the two terminal flakes                                                                  |
-| `packaged`                          | **failure** — `vscode.spec` OS-foreground only (documented above)                                                                                                   |
-| `mutations`                         | **in progress at the time of writing — not concluded.** It passed (`success`) on the earlier full run `42799063019` at `b6f2d9a`; this run's result is not assumed. |
-| `release-gate`                      | fails, solely because `packaged` is red                                                                                                                             |
+| Job                                 | Result                                                                                                                        |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `version`, `registry`, `typescript` | success                                                                                                                       |
+| `rust`                              | success — `npm ci` resolved the real_tests tsc failure; `cargo fmt` + Clippy (default + `test-registry`) + `cargo test` green |
+| `ui`                                | success — the WS28 selector regression is fixed and the CI retries cleared the two terminal flakes                            |
+| `packaged`                          | **failure** — `vscode.spec` OS-foreground only (documented above)                                                             |
+| `mutations`                         | **success** (concluded after the first draft of this report; it also passed on run `42799063019`).                            |
+| `release-gate`                      | fails, solely because `packaged` is red                                                                                       |
 
 CI is therefore **not fully green**: `packaged` (and so `release-gate`) remains red on the one
 OS-foreground `vscode.spec` assertion, by the documented decision to leave that test unchanged. Every
 other required job is green.
+
+---
+
+## 2.2.1 — build, artifact validation and release (2026-11-11)
+
+### Why 2.2.1
+
+2.2.0 was prepared but never published (no release tag). Everything added to `main` after the 2.2.0
+installer was built (`b6f2d9a`) is **test and CI only** — editor-tablist test selectors, Prettier and
+Clippy cleanups, `npm ci` in the Rust CI job, CI-only Playwright retries, and the C1 CPU-cap test
+margin. There is **no product behaviour change**, so the version was bumped as a patch (`13eb767`).
+
+### Build
+
+| Item            | Value                                                                                                                                    |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Command         | `npx tauri build` (exit 0)                                                                                                               |
+| MSI             | `src-tauri/target/release/bundle/msi/Yavin IDE_2.2.1_x64_en-US.msi`, 11.6 MB                                                             |
+| **MSI SHA-256** | **`0CA32B0461ED2CAF986F37DCBFCC5D4A669D80F5ADF8B5E94D3317E6A4F4ABD3`**                                                                   |
+| NSIS            | `Yavin IDE_2.2.1_x64-setup.exe`, 8.4 MB                                                                                                  |
+| Signing         | **NotSigned** (MSI and NSIS) — no certificate configured                                                                                 |
+| Gates           | `release-version.mjs` (2.2.1 valid, above `v2.1.0`), `validate-artifact.mjs --installer auto` passed, Prettier clean, script tests 16/16 |
+
+### Additional defect fixed since 2.2.0 — C1 CPU-cap test margin (`c2bbecf`)
+
+`the_cpu_hard_cap_holds_under_sustained_load` asserted both that CPU may drift to `3 × wall`
+(scheduling granularity over a short window) **and** that `cpu * 3 < wall * cores`. On a 4-core
+runner the second demands under `1.33 × wall` — below the drift the first allows, and below what a
+real one-core cap achieves (measured `cores=4 wall=1507ms cpu=2234ms`, i.e. `1.48 ×`). The two were
+mutually unsatisfiable, so the test could fail while the cap held. Evidence it was the threshold and
+not the cap: the same test passed in `cargo test --workspace` and failed minutes later in the
+`--features test-registry` run of the same job, and that test does not use the feature. The margin is
+now "at most half the uncapped budget", which stays compatible with the drift allowance and still
+proves a 4-core spin was throttled to about one core. CI `rust` is green on that change.
+
+### CI state at release
+
+The last push-event run of `main` was **fully green** (`version`, `typescript`, `rust`, `ui`,
+`registry`, `release-gate`). That run does **not** include `mutations` or `packaged`: GitHub skips
+both on push events (they are gated to `v*` tags and `workflow_dispatch`). On the last
+`workflow_dispatch` run, `mutations` passed and **`packaged` failed** on the `vscode.spec`
+OS-foreground assertion. A tag run will therefore show a **red `release-gate`** for that reason.
+
+### Released with known gaps
+
+2.2.1 is published as the first 2.2.x build **with the following still unclosed** — this is not a
+fully validated release:
+
+- **No clean-machine install.** No clean-VM install, no upgrade-from-2.1.0 run, no uninstall test.
+- **`packaged` CI gate red** on the `vscode.spec` OS-foreground assertion (environment limitation of
+  the test; left unchanged, not weakened).
+- **Installers unsigned** — SmartScreen will likely warn.
+- The packaged smoke-test evidence is from the 2.2.0 build of the same product code; the 2.2.1
+  installer was validated structurally and its payload inspected, but its packaged smoke test was
+  not re-run.
+
+Closing these requires a host with a controllable interactive desktop, a code-signing certificate,
+and a live install/upgrade/uninstall cycle.

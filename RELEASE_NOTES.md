@@ -1,7 +1,60 @@
+# Yavin IDE 2.2.1 — first published 2.2.x build
+
+**Released:** 2026-11-11. **Platform:** Windows x64 (MSI + NSIS). Upgrades in place from 2.1.0.
+
+2.2.0 was prepared but **never published** (it carried no release tag); 2.2.1 is the build that ships
+the 2.2.x work. Its product code is the 2.2.0 code — everything added since is test and CI only, so
+there is **no product behaviour change between 2.2.0 and 2.2.1**.
+
+## What's new since 2.1.0
+
+The engineering-hardening work described in the 2.2.0 section below (editor Back/Forward navigation,
+customizable keyboard shortcuts, LSP rename safety and runtime reconfiguration, an actionable Git
+missing-identity error, workspace-identity de-duplication, the typed extension author SDK, Activity
+Bar accessibility, and the release-artifact validation gate), plus in 2.2.1:
+
+- **Test and CI reliability** — editor-tab Playwright selectors scoped to the editor tablist (an
+  Activity Bar `role="tab"` regression that made 20 UI tests fail), `npm ci` added to the Rust CI job
+  so its real TypeScript-checker tests have their toolchain, CI-only Playwright retries, and a
+  recalibrated C1 CPU hard-cap test margin that was unsatisfiable on 4-core runners.
+
+## Artifacts
+
+- **MSI** — `Yavin IDE_2.2.1_x64_en-US.msi` (11.6 MB).
+  SHA-256 `0CA32B0461ED2CAF986F37DCBFCC5D4A669D80F5ADF8B5E94D3317E6A4F4ABD3`.
+- **NSIS** — `Yavin IDE_2.2.1_x64-setup.exe` (8.4 MB).
+
+Both installers are **not code-signed**, so Windows SmartScreen will likely warn on first run. Fixed
+`UpgradeCode` with `allowDowngrades:false`: 2.2.1 upgrades 2.1.0 in place and the installer refuses to
+replace a newer Yavin with an older one.
+
+## Validation status — read before deploying
+
+This build is published with **known, unclosed validation gaps**. It is not a fully validated release:
+
+- **Not installed or tested on a clean machine.** No clean-VM install, no upgrade-from-2.1.0 run, and
+  no uninstall test was performed. The upgrade/downgrade mechanism is verified only from installer
+  metadata.
+- **The packaged CI gate is red.** `tests/real/vscode.spec.ts` fails its OS-foreground assertion on
+  any non-interactive session, including GitHub's `windows-latest` runner, so the `packaged` job and
+  `release-gate` do not pass on a tag run. Every other assertion in that test, and every other
+  packaged check (extension host, marketplace, trust, permissions, profiles, recovery, Open VSX
+  install, webview isolation), passes. The assertion was left unchanged, not weakened.
+- **Unsigned.** No code-signing certificate is configured.
+- The packaged smoke-test evidence was gathered on the 2.2.0 build of the same product code; the
+  2.2.1 installer itself was validated structurally (expected name, architecture, size, SHA-256) and
+  its payload inspected, but its packaged smoke test was not re-run.
+
+Full detail in [RELEASE_VALIDATION_2.2.1.md](RELEASE_VALIDATION_2.2.1.md). The 2.1.0 known
+limitations (registry key custody, index renewal before 2027-10-19, first-install replay,
+Windows-only executable extensions, unverified publisher identity, same-user malware) remain open.
+
+---
+
 # Yavin IDE 2.2.0 — engineering hardening
 
 **Status:** release candidate (built and validated with documented limitations — see
-[RELEASE_VALIDATION_2.2.0.md](RELEASE_VALIDATION_2.2.0.md)). **Platform:** Windows x64 (MSI + NSIS).
+[RELEASE_VALIDATION_2.2.1.md](RELEASE_VALIDATION_2.2.1.md)). **Platform:** Windows x64 (MSI + NSIS).
 Upgrades in place from 2.1.0.
 
 ## What's new
@@ -55,7 +108,7 @@ end-to-end real-host smoke test for launch, native backend, extension-host lifec
 marketplace/trust/permissions/recovery, profiles, and Open VSX VS Code-compat install with webview
 isolation (**17 of 21 `tests/real` pass; 2 skip** for missing Open VSX fixtures). The one exception
 is the OS-foreground `vscode.spec` step (below). Not yet validated, and required before a final
-release claim (full detail in `RELEASE_VALIDATION_2.2.0.md`):
+release claim (full detail in `RELEASE_VALIDATION_2.2.1.md`):
 
 - **Clean-VM install and the live upgrade-from-2.1.0 / uninstall cycle** were not run (no clean VM;
   the dev machine was not mutated). The MSI-level upgrade/downgrade mechanism is verified from the
