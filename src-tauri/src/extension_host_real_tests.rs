@@ -51,18 +51,18 @@ impl HostEvents for Channel {
 
 /// The host binary Cargo built beside this test (`target/<profile>/`).
 fn built_host() -> PathBuf {
-    let path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .and_then(Path::parent)
-        .unwrap()
-        .join(HOST_NAME);
-    assert!(
-        path.is_file(),
-        "{} is not built: run `cargo build -p ide-plugin-host` (or `cargo test --workspace`)",
-        path.display()
-    );
-    path
+    let exe = std::env::current_exe().unwrap();
+    exe.ancestors()
+        .skip(1)
+        .take(6)
+        .map(|dir| dir.join(HOST_NAME))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "{HOST_NAME} is not built beside {}: run `cargo build -p ide-plugin-host` (or `cargo test --workspace`)",
+                exe.display()
+            )
+        })
 }
 
 /// Yavin's side of one or more hosts: the native sessions, the events, the extension inventory.
