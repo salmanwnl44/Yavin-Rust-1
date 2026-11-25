@@ -188,6 +188,7 @@ function setup(options: { trusted?: boolean; failMarketplace?: () => string | nu
     installer,
     host,
     disk,
+    io,
     calls,
     notes,
     manager,
@@ -697,6 +698,26 @@ test("uninstall: out of the registry and the host, folder deleted, data kept or 
   assert.equal(t.storage.getItem(globalStorageKey("acme.docker-tools")), null);
   assert.equal(t.storage.getItem(workspaceStorageKey(A, "acme.docker-tools")), null);
   await m.dispose();
+});
+
+test("uninstall keeps the registry entry until native uninstall completes", async () => {
+  const t = setup();
+  await t.installer.install("acme.docker-tools");
+  let releaseUninstall!: () => void;
+  const uninstallPending = new Promise<void>((resolve) => {
+    releaseUninstall = resolve;
+  });
+  const baseUninstall = t.io.uninstall;
+  t.io.uninstall = async (id) => {
+    await uninstallPending;
+    return baseUninstall(id);
+  };
+  const promise = t.installer.uninstall("acme.docker-tools", false);
+  await Promise.resolve();
+  assert.ok(t.registry.get("acme.docker-tools"), "still in registry while native uninstall runs");
+  releaseUninstall();
+  await promise;
+  assert.equal(t.registry.get("acme.docker-tools"), undefined);
 });
 
 test("only extensions in Yavin's own folder can be uninstalled", async () => {

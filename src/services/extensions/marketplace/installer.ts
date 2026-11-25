@@ -310,14 +310,14 @@ export function createExtensionInstaller(options: {
         );
       begin(id, { kind: "uninstall", phase: "removing", version: entry.manifest.version });
       try {
-        // Its disabled state goes with it: a reinstall starts enabled (EXT-02).
-        options.registry.remove(id, { forget: true });
         try {
           await io.uninstall(id);
         } catch (error) {
           await options.rediscover().catch(() => undefined);
           throw marketplaceErrorOf(error, "UninstallFailed", name);
         }
+        // Its disabled state goes with it: a reinstall starts enabled (EXT-02).
+        options.registry.remove(id, { forget: true });
         const removed = removeData ? options.storage.removeAll(id) : 0;
         options.service.settled(id);
         end(id, null);
